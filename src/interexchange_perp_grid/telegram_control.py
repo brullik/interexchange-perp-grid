@@ -13,9 +13,9 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.shadow import ShadowRuntime
-from interexchange_perp_grid.state import record_command_audit
+from interexchange_perp_grid.state import record_command_audit, record_live_confirmation
 
-DANGEROUS_COMMANDS = {"/close_all_simulated", "/kill"}
+DANGEROUS_COMMANDS = {"/close_all_simulated", "/kill", "/confirm_live"}
 READ_COMMANDS = {
     "/status",
     "/opportunities",
@@ -95,6 +95,15 @@ class TelegramCommandRouter:
         elif command == "/kill":
             await self._runtime.kill()
             response = "killed=true paused=true"
+        elif command == "/confirm_live":
+            confirmed_until = observed_at + timedelta(seconds=self._ttl)
+            await record_live_confirmation(
+                self._runtime.state_path,
+                actor,
+                confirmed_until,
+                observed_at,
+            )
+            response = f"live_confirmed_until={confirmed_until.isoformat()}"
         else:
             await self._audit(
                 actor,

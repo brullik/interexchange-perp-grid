@@ -71,6 +71,10 @@ live:
   require_current_hash_qualification: true
   canary_max_routes: 1
   canary_max_tranches: 1
+  canary_base: BTC
+  canary_long_venue: bybit
+  canary_short_venue: okx
+  qualification_max_age_seconds: 86400
 
 telegram:
   enabled: false

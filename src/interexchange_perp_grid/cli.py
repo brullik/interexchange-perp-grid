@@ -10,13 +10,16 @@ from typing import Annotated
 
 import typer
 
+from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter
 from interexchange_perp_grid.config import Settings, load_settings
+from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.maintenance import (
     backup_sqlite,
     prune_market_history,
     restore_sqlite,
 )
 from interexchange_perp_grid.observability import configure_logging, render_metrics
+from interexchange_perp_grid.private_domain import PrivateCapabilityReport
 from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
 from interexchange_perp_grid.qualification import run_qualification
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
@@ -231,6 +234,24 @@ def prune_history(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         settings.shadow.history_retention_days,
     )
     typer.echo(json.dumps({"status": "PASS", "removed": removed}, sort_keys=True))
+
+
+@app.command("private-probe")
+def private_probe(
+    venue: Annotated[str, typer.Option("--venue")],
+) -> None:
+    """Read-only probe of one Wave 1 venue's CCXT Pro private capabilities."""
+    selected = Venue(venue)
+
+    async def probe() -> PrivateCapabilityReport:
+        adapter = CcxtPrivateAdapter(selected)
+        try:
+            return await adapter.probe_private_capabilities()
+        finally:
+            await adapter.close()
+
+    report = asyncio.run(probe())
+    typer.echo(json.dumps(asdict(report), default=str, sort_keys=True))
 
 
 if __name__ == "__main__":

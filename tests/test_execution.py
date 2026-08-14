@@ -371,3 +371,52 @@ def test_unknown_stale_outage_and_forced_close_have_deterministic_recovery() -> 
     assert_state(unknown, PairActionState.FORCED_CLOSED)
     assert_reason(unknown, ReasonCode.FORCED_CLOSED)
     assert unknown.pnl().net_pnl_usdt == Decimal("-10.60")
+
+
+def test_first_venue_failure_hedges_short_residual_on_third_venue() -> None:
+    coordinator = PairExecutionCoordinator()
+    item = tranche("first-venue-failure")
+    coordinator.precheck_and_reserve(item, ACCEPTED_RISK)
+    coordinator.submit_open(
+        item,
+        result(
+            "failed-long",
+            Venue.BYBIT,
+            Side.BUY,
+            OrderPurpose.NORMAL_OPEN,
+            "1",
+            "0",
+            None,
+            "0",
+            SimulatedOrderStatus.REJECTED,
+        ),
+        result(
+            "filled-short",
+            Venue.OKX,
+            Side.SELL,
+            OrderPurpose.NORMAL_OPEN,
+            "1",
+            "0.3",
+            "110",
+            "0.03",
+            SimulatedOrderStatus.PARTIAL,
+        ),
+    )
+    assert item.signed_residual_quantity == Decimal("-0.3")
+    coordinator.emergency_hedge(
+        item,
+        result(
+            "third-buy",
+            Venue.BINANCE_USDM,
+            Side.BUY,
+            OrderPurpose.EMERGENCY_HEDGE,
+            "0.3",
+            "0.3",
+            "111",
+            "0.03",
+            SimulatedOrderStatus.FILLED,
+            unbounded=True,
+        ),
+    )
+    assert_state(item, PairActionState.EMERGENCY_HEDGED)
+    assert item.residual_quantity == 0

@@ -19,7 +19,7 @@ from interexchange_perp_grid.execution import (
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
@@ -67,6 +67,14 @@ SCHEMA_STATEMENTS = (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         payload_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS live_confirmation (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        confirmed_until TEXT NOT NULL,
+        confirmed_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
     )
     """,
 )
@@ -119,7 +127,7 @@ def _initialise_state_sync(path: Path) -> None:
         existing = database.execute(
             "SELECT value FROM metadata WHERE key = ?", ("schema_version",)
         ).fetchone()
-        if existing is not None and existing[0] not in {"1", SCHEMA_VERSION}:
+        if existing is not None and existing[0] not in {"1", "2", SCHEMA_VERSION}:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
         database.execute(
             """
@@ -523,3 +531,60 @@ def _read_shadow_snapshot_sync(path: Path) -> dict[str, Any] | None:
 
 async def read_shadow_snapshot(path: Path) -> dict[str, Any] | None:
     return await asyncio.to_thread(_read_shadow_snapshot_sync, path)
+
+
+def _record_live_confirmation_sync(
+    path: Path,
+    actor: str,
+    confirmed_until: datetime,
+    now: datetime,
+) -> None:
+    if confirmed_until <= now:
+        raise ValueError("live confirmation expiry must be in the future")
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        database.execute(
+            """
+            INSERT INTO live_confirmation(singleton, confirmed_until, confirmed_by, created_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(singleton) DO UPDATE SET
+                confirmed_until = excluded.confirmed_until,
+                confirmed_by = excluded.confirmed_by,
+                created_at = excluded.created_at
+            """,
+            (confirmed_until.isoformat(), actor, now.isoformat()),
+        )
+        database.commit()
+
+
+async def record_live_confirmation(
+    path: Path,
+    actor: str,
+    confirmed_until: datetime,
+    now: datetime | None = None,
+) -> None:
+    if not actor.strip():
+        raise ValueError("live confirmation actor must be non-empty")
+    await asyncio.to_thread(
+        _record_live_confirmation_sync,
+        path,
+        actor,
+        confirmed_until,
+        now or datetime.now(UTC),
+    )
+
+
+def _live_confirmation_valid_sync(path: Path, now: datetime) -> bool:
+    with _connect(path) as database:
+        row = database.execute(
+            "SELECT confirmed_until FROM live_confirmation WHERE singleton = 1"
+        ).fetchone()
+    return row is not None and datetime.fromisoformat(str(row[0])) >= now
+
+
+async def live_confirmation_valid(path: Path, now: datetime | None = None) -> bool:
+    return await asyncio.to_thread(
+        _live_confirmation_valid_sync,
+        path,
+        now or datetime.now(UTC),
+    )

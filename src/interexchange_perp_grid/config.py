@@ -126,6 +126,18 @@ class LiveConfig(StrictModel):
     require_current_hash_qualification: Literal[True]
     canary_max_routes: Literal[1]
     canary_max_tranches: Literal[1]
+    canary_base: str
+    canary_long_venue: Literal["bybit", "okx", "binanceusdm"]
+    canary_short_venue: Literal["bybit", "okx", "binanceusdm"]
+    qualification_max_age_seconds: int = Field(gt=0, le=604800)
+
+    @model_validator(mode="after")
+    def canary_route_is_directed(self) -> LiveConfig:
+        if not self.canary_base.strip():
+            raise ValueError("canary base must be non-empty")
+        if self.canary_long_venue == self.canary_short_venue:
+            raise ValueError("canary venues must differ")
+        return self
 
 
 class TelegramConfig(StrictModel):
