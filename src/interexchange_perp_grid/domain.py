@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from enum import StrEnum
+
+
+class Venue(StrEnum):
+    BINANCE_USDM = "binanceusdm"
+    BYBIT = "bybit"
+    OKX = "okx"
+
+
+class BookSide(StrEnum):
+    BID = "bid"
+    ASK = "ask"
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class InstrumentKey:
+    base: str
+    settle: str
+
+
+@dataclass(frozen=True, slots=True)
+class Instrument:
+    venue: Venue
+    symbol: str
+    exchange_symbol: str
+    base: str
+    quote: str
+    settle: str
+    contract_size_base: Decimal
+    amount_step_contracts: Decimal
+    price_tick: Decimal
+    minimum_amount_contracts: Decimal
+    minimum_notional: Decimal | None
+    taker_fee_rate: Decimal | None
+    fee_source: str | None
+
+    @property
+    def key(self) -> InstrumentKey:
+        return InstrumentKey(self.base, self.settle)
+
+    @property
+    def base_amount_step(self) -> Decimal:
+        return self.amount_step_contracts * self.contract_size_base
+
+    @property
+    def minimum_base_amount(self) -> Decimal:
+        return self.minimum_amount_contracts * self.contract_size_base
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityReport:
+    venue: Venue
+    bbo_stream: bool
+    l2_stream: bool
+    funding: bool
+    mark_index: bool
+    server_time: bool
+    clock_skew_ms: int | None
+    checked_at: datetime
+    missing: tuple[str, ...]
+
+    @property
+    def public_ready(self) -> bool:
+        return (
+            self.bbo_stream
+            and self.l2_stream
+            and self.funding
+            and self.mark_index
+            and self.server_time
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BboQuote:
+    venue: Venue
+    symbol: str
+    bid_price: Decimal
+    bid_base_quantity: Decimal | None
+    ask_price: Decimal
+    ask_base_quantity: Decimal | None
+    exchange_timestamp_ms: int | None
+    received_at: datetime
+    received_monotonic_ns: int
+    clock_skew_ms: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class BookLevel:
+    price: Decimal
+    base_quantity: Decimal
+
+    def __post_init__(self) -> None:
+        if self.price <= 0 or self.base_quantity <= 0:
+            raise ValueError("book price and quantity must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class OrderBookSnapshot:
+    venue: Venue
+    symbol: str
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    exchange_timestamp_ms: int | None
+    received_at: datetime
+    received_monotonic_ns: int
+    sequence_start: int | None
+    sequence_end: int | None
+    is_snapshot: bool
+    synchronised: bool
+    clock_skew_ms: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class FundingSnapshot:
+    venue: Venue
+    symbol: str
+    rate: Decimal | None
+    next_funding_timestamp_ms: int | None
+    interval: str | None
+    mark_price: Decimal | None
+    index_price: Decimal | None
+    exchange_timestamp_ms: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class CommonInstrument:
+    key: InstrumentKey
+    instruments: tuple[Instrument, ...]
+
+    def for_venue(self, venue: Venue) -> Instrument:
+        for instrument in self.instruments:
+            if instrument.venue == venue:
+                return instrument
+        raise KeyError(venue)
+
+
+@dataclass(frozen=True, slots=True)
+class QuarantineRecord:
+    venue: Venue
+    reason: str
+    observed_at: datetime

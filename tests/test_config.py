@@ -49,6 +49,7 @@ def test_typed_environment_overrides_are_applied() -> None:
             "IPEG_LOG_LEVEL": "WARNING",
             "IPEG_STATE_PATH": "state/from-env.sqlite3",
             "IPEG_PARQUET_DIR": "data/from-env",
+            "IPEG_MAX_CLOCK_SKEW_MS": "2000",
             "IPEG_LIVE_ENABLED": "false",
             "IPEG_TELEGRAM_ENABLED": "true",
         },
@@ -57,6 +58,7 @@ def test_typed_environment_overrides_are_applied() -> None:
     assert settings.app.log_level == "WARNING"
     assert settings.storage.sqlite_path == "state/from-env.sqlite3"
     assert settings.storage.parquet_dir == "data/from-env"
+    assert settings.market_data.max_clock_skew_ms == 2000
     assert settings.live.enabled is False
     assert settings.telegram.enabled is True
 

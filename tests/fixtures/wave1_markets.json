@@ -1,0 +1,104 @@
+{
+  "binanceusdm": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "id": "BTCUSDT",
+      "base": "BTC",
+      "quote": "USDT",
+      "settle": "USDT",
+      "contract": true,
+      "swap": true,
+      "linear": true,
+      "inverse": false,
+      "expiry": null,
+      "contractSize": 1,
+      "taker": "0.0005",
+      "precision": {"amount": "0.001", "price": "0.1"},
+      "limits": {"amount": {"min": "0.001"}, "cost": {"min": "5"}}
+    },
+    {
+      "symbol": "BTC/USDT",
+      "id": "BTCUSDT-SPOT",
+      "base": "BTC",
+      "quote": "USDT",
+      "settle": null,
+      "contract": false,
+      "swap": false,
+      "linear": false,
+      "inverse": false,
+      "expiry": null,
+      "contractSize": 1,
+      "taker": "0.001",
+      "precision": {"amount": "0.00001", "price": "0.01"},
+      "limits": {"amount": {"min": "0.00001"}, "cost": {"min": "5"}}
+    }
+  ],
+  "bybit": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "id": "BTCUSDT",
+      "base": "BTC",
+      "quote": "USDT",
+      "settle": "USDT",
+      "contract": true,
+      "swap": true,
+      "linear": true,
+      "inverse": false,
+      "expiry": null,
+      "contractSize": 1,
+      "taker": "0.0006",
+      "precision": {"amount": "0.001", "price": "0.1"},
+      "limits": {"amount": {"min": "0.001"}, "cost": {"min": null}}
+    },
+    {
+      "symbol": "BTC/USD:BTC",
+      "id": "BTCUSD",
+      "base": "BTC",
+      "quote": "USD",
+      "settle": "BTC",
+      "contract": true,
+      "swap": true,
+      "linear": false,
+      "inverse": true,
+      "expiry": null,
+      "contractSize": 1,
+      "taker": "0.0006",
+      "precision": {"amount": "1", "price": "0.5"},
+      "limits": {"amount": {"min": "1"}, "cost": {"min": null}}
+    }
+  ],
+  "okx": [
+    {
+      "symbol": "BTC/USDT:USDT",
+      "id": "BTC-USDT-SWAP",
+      "base": "BTC",
+      "quote": "USDT",
+      "settle": "USDT",
+      "contract": true,
+      "swap": true,
+      "linear": true,
+      "inverse": false,
+      "expiry": null,
+      "contractSize": "0.01",
+      "taker": "0.0005",
+      "precision": {"amount": "0.01", "price": "0.1"},
+      "limits": {"amount": {"min": "0.01"}, "cost": {"min": null}}
+    },
+    {
+      "symbol": "BTC/USDC:USDC",
+      "id": "BTC-USDC-SWAP",
+      "base": "BTC",
+      "quote": "USDC",
+      "settle": "USDC",
+      "contract": true,
+      "swap": true,
+      "linear": true,
+      "inverse": false,
+      "expiry": null,
+      "contractSize": "0.01",
+      "taker": "0.0005",
+      "precision": {"amount": "0.01", "price": "0.1"},
+      "limits": {"amount": {"min": "0.01"}, "cost": {"min": null}}
+    }
+  ]
+}

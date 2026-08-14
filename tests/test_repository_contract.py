@@ -57,3 +57,18 @@ def test_no_withdrawal_or_transfer_implementation_exists() -> None:
         "create_withdrawal(",
     )
     assert all(token not in source for token in forbidden_callable_tokens)
+
+
+def test_resolved_lock_pins_ccxt_transport() -> None:
+    locked = (ROOT / "requirements.lock").read_text(encoding="utf-8").splitlines()
+    assert "ccxt==4.5.58" in locked
+
+
+def test_ccxt_is_confined_to_adapter_boundary() -> None:
+    violations = []
+    for path in (ROOT / "src" / "interexchange_perp_grid").rglob("*.py"):
+        if "adapters" in path.parts:
+            continue
+        if "import ccxt" in path.read_text(encoding="utf-8"):
+            violations.append(path.relative_to(ROOT))
+    assert violations == []

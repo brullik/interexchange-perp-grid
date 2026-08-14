@@ -124,9 +124,12 @@ def _read_service_health_sync(path: Path, max_age_seconds: int, now: datetime) -
     if not path.is_file():
         return ServiceHealth(False, ReasonCode.SERVICE_STATE_MISSING, None, None, 0)
     with _connect(path) as database:
-        row = database.execute(
-            "SELECT status, heartbeat_at, starts FROM service_runtime WHERE singleton = 1"
-        ).fetchone()
+        try:
+            row = database.execute(
+                "SELECT status, heartbeat_at, starts FROM service_runtime WHERE singleton = 1"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return ServiceHealth(False, ReasonCode.SERVICE_STATE_MISSING, None, None, 0)
     if row is None:
         return ServiceHealth(False, ReasonCode.SERVICE_STATE_MISSING, None, None, 0)
     status, heartbeat_value, starts = str(row[0]), str(row[1]), int(row[2])

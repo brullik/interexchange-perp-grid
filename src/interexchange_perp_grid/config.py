@@ -166,6 +166,7 @@ ENVIRONMENT_BINDINGS: dict[str, tuple[str, str, EnvironmentParser]] = {
     "IPEG_LOG_LEVEL": ("app", "log_level", str),
     "IPEG_STATE_PATH": ("storage", "sqlite_path", str),
     "IPEG_PARQUET_DIR": ("storage", "parquet_dir", str),
+    "IPEG_MAX_CLOCK_SKEW_MS": ("market_data", "max_clock_skew_ms", int),
     "IPEG_LIVE_ENABLED": ("live", "enabled", _parse_bool),
     "IPEG_TELEGRAM_ENABLED": ("telegram", "enabled", _parse_bool),
 }
