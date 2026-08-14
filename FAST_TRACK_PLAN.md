@@ -25,15 +25,15 @@ This is the only implementation plan. Codex updates checkboxes and `STATUS.md`; 
 
 ## C1 — Wave 1 public market vertical slice
 
-- [ ] Own `ExchangeAdapter` interface and normalised domain models.
-- [ ] CCXT Pro implementations for Binance USD-M, Bybit, and OKX.
-- [ ] Runtime capability probes and per-venue quarantine.
-- [ ] Instrument discovery and exact linear-USDT-perpetual matching.
-- [ ] Broad BBO subscriptions; candidate/open-route L2 subscriptions.
-- [ ] Sequence/freshness/clock-skew controls.
-- [ ] Funding, mark/index, contract metadata, and fee-source status.
-- [ ] Directed executable-VWAP route calculation.
-- [ ] Normalised Parquet recorder and DuckDB query smoke test.
+- [x] Own `ExchangeAdapter` interface and normalised domain models.
+- [x] CCXT Pro implementations for Binance USD-M, Bybit, and OKX.
+- [x] Runtime capability probes and per-venue quarantine.
+- [x] Instrument discovery and exact linear-USDT-perpetual matching.
+- [x] Broad BBO subscriptions; candidate/open-route L2 subscriptions.
+- [x] Sequence/freshness/clock-skew controls.
+- [x] Funding, mark/index, contract metadata, and fee-source status.
+- [x] Directed executable-VWAP route calculation.
+- [x] Normalised Parquet recorder and DuckDB query smoke test.
 
 **Exit evidence:** one command prints fresh common routes and executable spreads from at least two available Wave 1 venues; deterministic fixtures cover all three.
 
