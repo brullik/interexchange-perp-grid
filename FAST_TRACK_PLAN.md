@@ -52,14 +52,14 @@ This is the only implementation plan. Codex updates checkboxes and `STATUS.md`; 
 
 ## C3 — usable shadow product and Telegram operations
 
-- [ ] Real-time shadow evaluator runs continuously on Wave 1 data.
-- [ ] Telegram provides status, opportunities, simulated positions/PnL, data health, balances when available, `/pause`, `/resume`, `/close_all_simulated`, and `/kill`.
-- [ ] Owner-only command allowlist and challenge confirmation for dangerous commands.
-- [ ] State survives process/container restart.
-- [ ] Reconciliation blocks entries until state is consistent.
-- [ ] Overload policy prioritises open positions and disables new entries first.
-- [ ] Docker healthcheck, rotation/retention, backup, and recovery commands work.
-- [ ] Qualification runner writes a code/config/data-hash-bound result.
+- [x] Real-time shadow evaluator runs continuously on Wave 1 data.
+- [x] Telegram provides status, opportunities, simulated positions/PnL, data health, balances when available, `/pause`, `/resume`, `/close_all_simulated`, and `/kill`.
+- [x] Owner-only command allowlist and challenge confirmation for dangerous commands.
+- [x] State survives process/container restart.
+- [x] Reconciliation blocks entries until state is consistent.
+- [x] Overload policy prioritises open positions and disables new entries first.
+- [x] Docker healthcheck, rotation/retention, backup, and recovery commands work.
+- [x] Qualification runner writes a code/config/data-hash-bound result.
 
 **Exit evidence:** clean Docker deployment operates in shadow, produces Telegram/CLI visibility, survives injected restart/feed failure, and resumes without inventing positions.
 
