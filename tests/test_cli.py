@@ -21,3 +21,12 @@ def test_public_scan_rejects_non_decimal_quantity_before_network() -> None:
     result = runner.invoke(app, ["public-scan", "--quantity", "not-a-number"])
     assert result.exit_code == 2
     assert "quantity must be a decimal number" in result.output
+
+
+def test_canary_run_requires_explicit_live_money_phrase_before_network() -> None:
+    result = runner.invoke(
+        app,
+        ["canary-run", "--confirmation", "NO"],
+    )
+    assert result.exit_code == 5
+    assert "OWNER_CONFIRMATION_MISSING" in result.output

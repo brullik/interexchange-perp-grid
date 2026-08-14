@@ -11,6 +11,7 @@ from typing import Annotated
 import typer
 
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter
+from interexchange_perp_grid.canary_runtime import run_canary_once
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.maintenance import (
@@ -252,6 +253,31 @@ def private_probe(
 
     report = asyncio.run(probe())
     typer.echo(json.dumps(asdict(report), default=str, sort_keys=True))
+
+
+@app.command("canary-run")
+def canary_run(
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    qualification: Annotated[Path, typer.Option("--qualification")] = Path(
+        "state/qualification.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Run at most one minimum-notional canary pair after every independent gate."""
+    settings = _load(config)
+    result = asyncio.run(
+        run_canary_once(
+            settings,
+            config.resolve(),
+            qualification.resolve(),
+            repo_root.resolve(),
+            confirmation,
+        )
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+    if not result.submitted:
+        raise typer.Exit(code=5)
 
 
 if __name__ == "__main__":

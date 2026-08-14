@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from itertools import permutations
 
 from interexchange_perp_grid.domain import (
@@ -112,6 +112,33 @@ def common_base_quantity(
         short_instrument.base_amount_step,
     )
     return (requested / step).to_integral_value(rounding=ROUND_FLOOR) * step
+
+
+def minimum_common_base_quantity(
+    long_instrument: Instrument,
+    short_instrument: Instrument,
+    long_price: Decimal,
+    short_price: Decimal,
+) -> Decimal:
+    minimum = max(
+        long_instrument.minimum_base_amount,
+        short_instrument.minimum_base_amount,
+        (
+            long_instrument.minimum_notional / long_price
+            if long_instrument.minimum_notional is not None
+            else Decimal(0)
+        ),
+        (
+            short_instrument.minimum_notional / short_price
+            if short_instrument.minimum_notional is not None
+            else Decimal(0)
+        ),
+    )
+    step = _common_decimal_step(
+        long_instrument.base_amount_step,
+        short_instrument.base_amount_step,
+    )
+    return (minimum / step).to_integral_value(rounding=ROUND_CEILING) * step
 
 
 def evaluate_directed_route(
