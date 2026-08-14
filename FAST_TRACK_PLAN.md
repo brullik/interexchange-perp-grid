@@ -39,14 +39,14 @@ This is the only implementation plan. Codex updates checkboxes and `STATUS.md`; 
 
 ## C2 — complete strategy, risk, and simulator
 
-- [ ] Deterministic event replay with controllable latency and disconnects.
-- [ ] Robust adaptive-grid calibration per directed route and size bucket.
-- [ ] Four-leg fee, funding, slippage, and stress-cost model.
-- [ ] Tranche ledger and paired-action state machine.
-- [ ] Atomic pair/global/local-margin risk reservation.
-- [ ] Simulated partial fills, rejected leg, unknown order state, third-venue hedge, and forced close.
-- [ ] Every signal returns a stable reason code and numerical decision breakdown.
-- [ ] Property tests preserve risk and accounting invariants.
+- [x] Deterministic event replay with controllable latency and disconnects.
+- [x] Robust adaptive-grid calibration per directed route and size bucket.
+- [x] Four-leg fee, funding, slippage, and stress-cost model.
+- [x] Tranche ledger and paired-action state machine.
+- [x] Atomic pair/global/local-margin risk reservation.
+- [x] Simulated partial fills, rejected leg, unknown order state, third-venue hedge, and forced close.
+- [x] Every signal returns a stable reason code and numerical decision breakdown.
+- [x] Property tests preserve risk and accounting invariants.
 
 **Exit evidence:** a deterministic replay demonstrates open → add → partial close → full close and every major recovery path without exceeding configured projected risk.
 
