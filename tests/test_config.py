@@ -52,6 +52,7 @@ def test_typed_environment_overrides_are_applied() -> None:
             "IPEG_MAX_CLOCK_SKEW_MS": "2000",
             "IPEG_LIVE_ENABLED": "false",
             "IPEG_TELEGRAM_ENABLED": "true",
+            "IPEG_TELEGRAM_OWNER_CHAT_ID": "42",
         },
     )
     assert settings.app.mode == "replay"
@@ -61,6 +62,7 @@ def test_typed_environment_overrides_are_applied() -> None:
     assert settings.market_data.max_clock_skew_ms == 2000
     assert settings.live.enabled is False
     assert settings.telegram.enabled is True
+    assert settings.telegram.owner_chat_id == 42
 
 
 def test_invalid_environment_boolean_fails_startup() -> None:

@@ -34,7 +34,7 @@ async def run_once(service: BootstrapService, path: Path, expected_starts: int) 
 async def test_service_heartbeat_survives_restart(tmp_path: Path) -> None:
     state_path = tmp_path / "service.sqlite3"
     settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
-    service = BootstrapService(settings, heartbeat_interval_seconds=0.01)
+    service = BootstrapService(settings, heartbeat_interval_seconds=0.01, run_shadow=False)
 
     await run_once(service, state_path, expected_starts=1)
     stopped = await read_service_health(state_path, max_age_seconds=5)

@@ -157,6 +157,7 @@ class CostInputs:
     unmatched_hedge_reserve_usdt: Decimal
     reconciliation_forced_exit_reserve_usdt: Decimal
     liquidation_distance_reserve_usdt: Decimal
+    precomputed_four_leg_fee_usdt: Decimal | None = None
 
     def __post_init__(self) -> None:
         positive = (
@@ -182,6 +183,11 @@ class CostInputs:
             raise ValueError("quantity and prices must be positive finite decimals")
         if any(not value.is_finite() or value < 0 for value in non_negative):
             raise ValueError("cost inputs must be non-negative finite decimals")
+        if self.precomputed_four_leg_fee_usdt is not None and (
+            not self.precomputed_four_leg_fee_usdt.is_finite()
+            or self.precomputed_four_leg_fee_usdt < 0
+        ):
+            raise ValueError("precomputed fees must be non-negative and finite")
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,9 +206,14 @@ class CostBreakdown:
 
 
 def calculate_stressed_cost(inputs: CostInputs) -> CostBreakdown:
-    fees = inputs.quantity * (
-        (inputs.entry_long_price + inputs.target_exit_long_price) * inputs.long_fee_rate
-        + (inputs.entry_short_price + inputs.target_exit_short_price) * inputs.short_fee_rate
+    fees = (
+        inputs.precomputed_four_leg_fee_usdt
+        if inputs.precomputed_four_leg_fee_usdt is not None
+        else inputs.quantity
+        * (
+            (inputs.entry_long_price + inputs.target_exit_long_price) * inputs.long_fee_rate
+            + (inputs.entry_short_price + inputs.target_exit_short_price) * inputs.short_fee_rate
+        )
     )
     impact = inputs.entry_impact_usdt + inputs.exit_impact_usdt
     total = (

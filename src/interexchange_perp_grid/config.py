@@ -130,6 +130,30 @@ class LiveConfig(StrictModel):
 
 class TelegramConfig(StrictModel):
     enabled: bool
+    owner_chat_id: int | None = None
+    challenge_ttl_seconds: int = Field(gt=0, le=600)
+
+    @model_validator(mode="after")
+    def enabled_requires_owner(self) -> TelegramConfig:
+        if self.enabled and self.owner_chat_id is None:
+            raise ValueError("enabled Telegram control requires an owner chat ID")
+        return self
+
+
+class ShadowConfig(StrictModel):
+    base: str
+    quantity: Decimal = Field(gt=0)
+    scan_interval_seconds: int = Field(gt=0, le=300)
+    scan_timeout_seconds: int = Field(gt=0, le=120)
+    overload_pending_limit: int = Field(gt=0, le=10000)
+    history_retention_days: int = Field(gt=0, le=3650)
+    qualification_min_samples: int = Field(ge=1, le=1000000)
+
+    @model_validator(mode="after")
+    def base_is_valid(self) -> ShadowConfig:
+        if not self.base.strip() or not self.base.isascii() or not self.base.isalnum():
+            raise ValueError("shadow base must be a non-empty ASCII asset code")
+        return self
 
 
 class Settings(StrictModel):
@@ -143,6 +167,7 @@ class Settings(StrictModel):
     storage: StorageConfig
     live: LiveConfig
     telegram: TelegramConfig
+    shadow: ShadowConfig
 
     @model_validator(mode="after")
     def live_mode_requires_flag(self) -> Settings:
@@ -160,6 +185,10 @@ def _parse_bool(value: str) -> bool:
     raise ValueError(f"invalid boolean environment value: {value!r}")
 
 
+def _parse_optional_int(value: str) -> int | None:
+    return int(value) if value.strip() else None
+
+
 EnvironmentParser = Callable[[str], object]
 ENVIRONMENT_BINDINGS: dict[str, tuple[str, str, EnvironmentParser]] = {
     "IPEG_MODE": ("app", "mode", str),
@@ -169,6 +198,7 @@ ENVIRONMENT_BINDINGS: dict[str, tuple[str, str, EnvironmentParser]] = {
     "IPEG_MAX_CLOCK_SKEW_MS": ("market_data", "max_clock_skew_ms", int),
     "IPEG_LIVE_ENABLED": ("live", "enabled", _parse_bool),
     "IPEG_TELEGRAM_ENABLED": ("telegram", "enabled", _parse_bool),
+    "IPEG_TELEGRAM_OWNER_CHAT_ID": ("telegram", "owner_chat_id", _parse_optional_int),
 }
 
 

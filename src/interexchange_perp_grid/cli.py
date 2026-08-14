@@ -11,10 +11,17 @@ from typing import Annotated
 import typer
 
 from interexchange_perp_grid.config import Settings, load_settings
+from interexchange_perp_grid.maintenance import (
+    backup_sqlite,
+    prune_market_history,
+    restore_sqlite,
+)
 from interexchange_perp_grid.observability import configure_logging, render_metrics
 from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
+from interexchange_perp_grid.qualification import run_qualification
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.service import run_until_signal
+from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import initialise_state, read_service_health
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -157,6 +164,73 @@ def run_service(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         raise typer.Exit(code=2)
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(run_until_signal(settings))
+
+
+@app.command("shadow-status")
+def shadow_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+    """Print persisted shadow controls, positions, opportunities, and data health."""
+    runtime = ShadowRuntime(_load(config))
+
+    async def read() -> dict[str, object]:
+        await runtime.start()
+        return await runtime.snapshot()
+
+    typer.echo(json.dumps(asyncio.run(read()), default=str, sort_keys=True))
+
+
+@app.command("qualify")
+def qualify(
+    config: ConfigPath = Path("config/defaults.yaml"),
+    evidence: Annotated[Path, typer.Option("--evidence")] = Path("state/qualification.json"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    minimum_samples: Annotated[int, typer.Option("--minimum-samples", min=0)] = 0,
+) -> None:
+    """Write code/config/data-hash-bound shadow qualification evidence."""
+    settings = _load(config)
+    required = minimum_samples or settings.shadow.qualification_min_samples
+    result = run_qualification(
+        repo_root.resolve(),
+        config.resolve(),
+        Path(settings.storage.parquet_dir).resolve(),
+        evidence.resolve(),
+        required,
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+    if not result.accepted:
+        raise typer.Exit(code=4)
+
+
+@app.command("backup-state")
+def backup_state(
+    target: Annotated[Path, typer.Option("--target")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create an online SQLite backup and verify its integrity."""
+    settings = _load(config)
+    written = backup_sqlite(Path(settings.storage.sqlite_path), target)
+    typer.echo(json.dumps({"status": "PASS", "backup": str(written)}, sort_keys=True))
+
+
+@app.command("restore-state")
+def restore_state(
+    backup: Annotated[Path, typer.Option("--backup", exists=True, dir_okay=False)],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Restore the configured SQLite state from an integrity-checked backup."""
+    settings = _load(config)
+    restored = restore_sqlite(backup, Path(settings.storage.sqlite_path))
+    typer.echo(json.dumps({"status": "PASS", "restored": str(restored)}, sort_keys=True))
+
+
+@app.command("prune-history")
+def prune_history(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+    """Apply configured retention to dated Parquet partitions."""
+    settings = _load(config)
+    removed = prune_market_history(
+        Path(settings.storage.parquet_dir),
+        settings.shadow.history_retention_days,
+    )
+    typer.echo(json.dumps({"status": "PASS", "removed": removed}, sort_keys=True))
 
 
 if __name__ == "__main__":

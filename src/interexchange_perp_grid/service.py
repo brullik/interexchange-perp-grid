@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,18 +13,21 @@ from interexchange_perp_grid.observability import (
     SERVICE_UP,
     get_logger,
 )
+from interexchange_perp_grid.shadow import ContinuousShadowEvaluator, ShadowRuntime
 from interexchange_perp_grid.state import (
     initialise_state,
     record_service_heartbeat,
     record_service_started,
     record_service_stopped,
 )
+from interexchange_perp_grid.telegram_control import run_telegram_bot
 
 
 @dataclass(slots=True)
 class BootstrapService:
     settings: Settings
     heartbeat_interval_seconds: float | None = None
+    run_shadow: bool = True
 
     @property
     def state_path(self) -> Path:
@@ -41,8 +45,28 @@ class BootstrapService:
             mode=self.settings.app.mode,
             state_path=str(self.state_path),
         )
+        background_tasks: list[asyncio.Task[None]] = []
+        if self.run_shadow and self.settings.app.mode == "shadow":
+            runtime = ShadowRuntime(self.settings)
+            await runtime.start()
+            background_tasks.append(
+                asyncio.create_task(
+                    ContinuousShadowEvaluator(self.settings, runtime=runtime).run(stop_event),
+                    name="continuous-shadow-evaluator",
+                )
+            )
+            if self.settings.telegram.enabled:
+                background_tasks.append(
+                    asyncio.create_task(
+                        run_telegram_bot(self.settings, runtime, stop_event),
+                        name="telegram-control",
+                    )
+                )
         try:
             while not stop_event.is_set():
+                for task in background_tasks:
+                    if task.done():
+                        await task
                 await record_service_heartbeat(self.state_path)
                 SERVICE_HEARTBEATS.inc()
                 try:
@@ -50,6 +74,13 @@ class BootstrapService:
                 except TimeoutError:
                     continue
         finally:
+            stop_event.set()
+            for task in background_tasks:
+                if not task.done():
+                    task.cancel()
+            for task in background_tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             await record_service_stopped(self.state_path)
             SERVICE_UP.set(0)
             logger.info("service_stopped")

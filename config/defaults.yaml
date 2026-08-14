@@ -74,3 +74,14 @@ live:
 
 telegram:
   enabled: false
+  owner_chat_id: null
+  challenge_ttl_seconds: 120
+
+shadow:
+  base: BTC
+  quantity: "0.001"
+  scan_interval_seconds: 5
+  scan_timeout_seconds: 30
+  overload_pending_limit: 100
+  history_retention_days: 30
+  qualification_min_samples: 100
