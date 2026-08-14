@@ -9,7 +9,11 @@ runner = CliRunner()
 
 def test_cli_and_public_scan_help_render() -> None:
     assert runner.invoke(app, ["--help"]).exit_code == 0
-    public_help = runner.invoke(app, ["public-scan", "--help"])
+    public_help = runner.invoke(
+        app,
+        ["public-scan", "--help"],
+        env={"COLUMNS": "240"},
+    )
     assert public_help.exit_code == 0
     assert "--quantity" in public_help.output
 
