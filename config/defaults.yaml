@@ -2,6 +2,8 @@ app:
   name: interexchange-perp-grid
   mode: shadow
   log_level: INFO
+  heartbeat_interval_seconds: 5
+  health_max_age_seconds: 20
 
 venues:
   wave1_public:

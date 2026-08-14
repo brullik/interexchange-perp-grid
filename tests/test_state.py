@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from interexchange_perp_grid.state import initialise_state
+from interexchange_perp_grid.state import SCHEMA_VERSION, initialise_state
 
 
 @pytest.mark.asyncio
@@ -21,4 +21,4 @@ async def test_state_store_uses_wal_and_is_restart_safe(tmp_path: Path) -> None:
         version = database.execute(
             "SELECT value FROM metadata WHERE key = ?", ("schema_version",)
         ).fetchone()
-        assert version == ("1",)
+        assert version == (SCHEMA_VERSION,)

@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from interexchange_perp_grid.config import Settings, load_settings
+from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.safety import LiveContext, LiveDenyReason, evaluate_live_order
-
 
 CONFIG = Path("config/defaults.yaml")
 
@@ -13,6 +13,7 @@ def test_defaults_deny_live_orders() -> None:
     decision = evaluate_live_order(load_settings(CONFIG), LiveContext())
     assert decision.allowed is False
     assert decision.reason == LiveDenyReason.NON_LIVE_MODE
+    assert decision.reason == ReasonCode.NON_LIVE_MODE
 
 
 def test_live_flag_alone_is_insufficient() -> None:

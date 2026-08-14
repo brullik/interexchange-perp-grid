@@ -7,7 +7,7 @@ services:
     environment:
       IPEG_CONFIG_PATH: /app/config/defaults.yaml
       IPEG_STATE_PATH: /app/state/ipeg.sqlite3
-      IPEG_DATA_DIR: /app/data
+      IPEG_PARQUET_DIR: /app/data/market
     volumes:
       - ipeg-state:/app/state
       - ipeg-data:/app/data
@@ -19,6 +19,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    stop_grace_period: 15s
 
 volumes:
   ipeg-state:

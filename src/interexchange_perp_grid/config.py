@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import os
+from collections.abc import Callable, Mapping
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -15,7 +18,17 @@ class StrictModel(BaseModel):
 class AppConfig(StrictModel):
     name: str
     mode: Literal["replay", "shadow", "live"]
-    log_level: str = "INFO"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    heartbeat_interval_seconds: int = Field(gt=0, le=60)
+    health_max_age_seconds: int = Field(gt=0, le=300)
+
+    @model_validator(mode="after")
+    def health_window_exceeds_heartbeat(self) -> AppConfig:
+        if self.health_max_age_seconds <= self.heartbeat_interval_seconds:
+            raise ValueError("health max age must exceed heartbeat interval")
+        if not self.name.strip():
+            raise ValueError("application name must be non-empty")
+        return self
 
 
 class VenuesConfig(StrictModel):
@@ -99,6 +112,12 @@ class StorageConfig(StrictModel):
     parquet_dir: str
     sqlite_wal: Literal[True]
 
+    @model_validator(mode="after")
+    def paths_are_non_empty(self) -> StorageConfig:
+        if not self.sqlite_path.strip() or not self.parquet_dir.strip():
+            raise ValueError("storage paths must be non-empty")
+        return self
+
 
 class LiveConfig(StrictModel):
     enabled: bool
@@ -132,8 +151,40 @@ class Settings(StrictModel):
         return self
 
 
-def load_settings(path: Path) -> Settings:
+def _parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean environment value: {value!r}")
+
+
+EnvironmentParser = Callable[[str], object]
+ENVIRONMENT_BINDINGS: dict[str, tuple[str, str, EnvironmentParser]] = {
+    "IPEG_MODE": ("app", "mode", str),
+    "IPEG_LOG_LEVEL": ("app", "log_level", str),
+    "IPEG_STATE_PATH": ("storage", "sqlite_path", str),
+    "IPEG_PARQUET_DIR": ("storage", "parquet_dir", str),
+    "IPEG_LIVE_ENABLED": ("live", "enabled", _parse_bool),
+    "IPEG_TELEGRAM_ENABLED": ("telegram", "enabled", _parse_bool),
+}
+
+
+def _apply_environment(raw: dict[str, object], environ: Mapping[str, str]) -> None:
+    for variable, (section, key, parser) in ENVIRONMENT_BINDINGS.items():
+        if variable not in environ:
+            continue
+        section_value = raw.get(section)
+        if not isinstance(section_value, dict):
+            raise ValueError(f"configuration section {section!r} must be a mapping")
+        section_value[key] = parser(environ[variable])
+
+
+def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Settings:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("configuration root must be a mapping")
-    return Settings.model_validate(raw)
+    merged = copy.deepcopy(raw)
+    _apply_environment(merged, os.environ if environ is None else environ)
+    return Settings.model_validate(merged)

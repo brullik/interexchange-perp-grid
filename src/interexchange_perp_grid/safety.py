@@ -1,20 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 
 from interexchange_perp_grid.config import Settings
+from interexchange_perp_grid.observability import LIVE_GUARD_DENIALS
+from interexchange_perp_grid.reason_codes import ReasonCode
 
-
-class LiveDenyReason(StrEnum):
-    NON_LIVE_MODE = "NON_LIVE_MODE"
-    LIVE_FLAG_DISABLED = "LIVE_FLAG_DISABLED"
-    CI_OR_TEST_ENVIRONMENT = "CI_OR_TEST_ENVIRONMENT"
-    LOCAL_UNLOCK_MISSING = "LOCAL_UNLOCK_MISSING"
-    TELEGRAM_CHALLENGE_MISSING = "TELEGRAM_CHALLENGE_MISSING"
-    CURRENT_QUALIFICATION_MISSING = "CURRENT_QUALIFICATION_MISSING"
-    ROUTE_NOT_ALLOWLISTED = "ROUTE_NOT_ALLOWLISTED"
-    PREFLIGHT_FAILED = "PREFLIGHT_FAILED"
+LiveDenyReason = ReasonCode
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,11 +22,11 @@ class LiveContext:
 @dataclass(frozen=True, slots=True)
 class LiveDecision:
     allowed: bool
-    reason: LiveDenyReason | None
+    reason: ReasonCode | None
 
 
 def evaluate_live_order(settings: Settings, context: LiveContext) -> LiveDecision:
-    checks: tuple[tuple[bool, LiveDenyReason], ...] = (
+    checks: tuple[tuple[bool, ReasonCode], ...] = (
         (settings.app.mode == "live", LiveDenyReason.NON_LIVE_MODE),
         (settings.live.enabled, LiveDenyReason.LIVE_FLAG_DISABLED),
         (not context.ci_or_test, LiveDenyReason.CI_OR_TEST_ENVIRONMENT),
@@ -49,5 +41,6 @@ def evaluate_live_order(settings: Settings, context: LiveContext) -> LiveDecisio
     )
     for passed, reason in checks:
         if not passed:
+            LIVE_GUARD_DENIALS.labels(reason=reason.value).inc()
             return LiveDecision(allowed=False, reason=reason)
     return LiveDecision(allowed=True, reason=None)

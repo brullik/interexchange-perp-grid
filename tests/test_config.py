@@ -8,7 +8,6 @@ from pydantic import ValidationError
 
 from interexchange_perp_grid.config import Settings, load_settings
 
-
 CONFIG = Path("config/defaults.yaml")
 
 
@@ -38,5 +37,38 @@ def test_unsupported_product_cannot_be_configured() -> None:
     settings = load_settings(CONFIG)
     raw = settings.model_dump(mode="json")
     raw["products"]["settlement"] = "USDC"
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+def test_typed_environment_overrides_are_applied() -> None:
+    settings = load_settings(
+        CONFIG,
+        {
+            "IPEG_MODE": "replay",
+            "IPEG_LOG_LEVEL": "WARNING",
+            "IPEG_STATE_PATH": "state/from-env.sqlite3",
+            "IPEG_PARQUET_DIR": "data/from-env",
+            "IPEG_LIVE_ENABLED": "false",
+            "IPEG_TELEGRAM_ENABLED": "true",
+        },
+    )
+    assert settings.app.mode == "replay"
+    assert settings.app.log_level == "WARNING"
+    assert settings.storage.sqlite_path == "state/from-env.sqlite3"
+    assert settings.storage.parquet_dir == "data/from-env"
+    assert settings.live.enabled is False
+    assert settings.telegram.enabled is True
+
+
+def test_invalid_environment_boolean_fails_startup() -> None:
+    with pytest.raises(ValueError, match="invalid boolean"):
+        load_settings(CONFIG, {"IPEG_LIVE_ENABLED": "sometimes"})
+
+
+def test_missing_safety_field_fails_startup() -> None:
+    settings = load_settings(CONFIG, {})
+    raw = settings.model_dump(mode="json")
+    del raw["execution"]["normal_intent"]
     with pytest.raises(ValidationError):
         Settings.model_validate(raw)
