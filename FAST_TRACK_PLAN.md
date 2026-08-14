@@ -65,14 +65,14 @@ This is the only implementation plan. Codex updates checkboxes and `STATUS.md`; 
 
 ## C4 — live-canary-ready private execution
 
-- [ ] Private streams, balances, positions, orders, cancel, and fee retrieval for Bybit and OKX; Binance USD-M alternate.
-- [ ] Protected aggressive taker translation for each venue.
-- [ ] Idempotent client order IDs and unknown-result reconciliation.
-- [ ] Account/margin/position-mode preflight and isolated venue quarantine.
-- [ ] Multi-factor live guard and one-route/one-tranche canary allowlist.
-- [ ] Test-environment integration where safely available; otherwise contract fixtures plus a read-only production capability probe.
-- [ ] Emergency close and pre-qualified third-venue hedge paths.
-- [ ] No withdrawal/transfer endpoint is exposed by the application.
+- [x] Private streams, balances, positions, orders, cancel, and fee retrieval for Bybit and OKX; Binance USD-M alternate.
+- [x] Protected aggressive taker translation for each venue.
+- [x] Idempotent client order IDs and unknown-result reconciliation.
+- [x] Account/margin/position-mode preflight and isolated venue quarantine.
+- [x] Multi-factor live guard and one-route/one-tranche canary allowlist.
+- [x] Test-environment integration where safely available; otherwise contract fixtures plus a read-only production capability probe.
+- [x] Emergency close and pre-qualified third-venue hedge paths.
+- [x] No withdrawal/transfer endpoint is exposed by the application.
 
 **Exit evidence:** all `CR-*` criteria pass without production secrets; an exact owner-action file lists the minimum credentials and VPS steps for the canary.
 
