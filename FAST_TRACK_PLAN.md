@@ -13,13 +13,13 @@ This is the only implementation plan. Codex updates checkboxes and `STATUS.md`; 
 
 ## C0 — lean bootstrap
 
-- [ ] Package installs on Python 3.12.
-- [ ] `make verify` passes.
-- [ ] Typed configuration loads from YAML + environment variables.
-- [ ] SQLite WAL state store is initialised transactionally.
-- [ ] Structured logging, reason-code model, metrics skeleton, and CLI exist.
-- [ ] Live guard rejects every default/test/CI configuration.
-- [ ] Docker Compose starts a real application process with health reporting.
+- [x] Package installs on Python 3.12.
+- [x] `make verify` passes.
+- [x] Typed configuration loads from YAML + environment variables.
+- [x] SQLite WAL state store is initialised transactionally.
+- [x] Structured logging, reason-code model, metrics skeleton, and CLI exist.
+- [x] Live guard rejects every default/test/CI configuration.
+- [x] Docker Compose starts a real application process with health reporting.
 
 **Exit evidence:** CI run, `doctor` output, live-guard tests, restart smoke test.
 
