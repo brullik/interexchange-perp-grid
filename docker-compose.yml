@@ -1,0 +1,26 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      IPEG_CONFIG_PATH: /app/config/defaults.yaml
+      IPEG_STATE_PATH: /app/state/ipeg.sqlite3
+      IPEG_DATA_DIR: /app/data
+    volumes:
+      - ipeg-state:/app/state
+      - ipeg-data:/app/data
+      - ipeg-logs:/app/logs
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  ipeg-state:
+  ipeg-data:
+  ipeg-logs:

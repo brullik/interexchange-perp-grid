@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "interexchange-perp-grid"
+version = "0.1.0"
+description = "Fast-track interexchange linear USDT perpetual convergence system"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = {text = "Proprietary"}
+dependencies = [
+  "ccxt==4.5.58",
+  "duckdb>=1.1,<2",
+  "orjson>=3.10,<4",
+  "prometheus-client>=0.21,<1",
+  "pyarrow>=17,<23",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.5,<3",
+  "python-telegram-bot>=21,<23",
+  "PyYAML>=6.0.2,<7",
+  "structlog>=24,<26",
+  "tenacity>=9,<10",
+  "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis>=6.120,<7",
+  "mypy>=1.13,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<2",
+  "ruff==0.16.2",
+  "types-PyYAML>=6.0.12,<7",
+]
+
+[project.scripts]
+interexchange-grid = "interexchange_perp_grid.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/interexchange_perp_grid"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]

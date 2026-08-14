@@ -1,0 +1,158 @@
+{
+  "package": "interexchange-perp-grid-fast-track-v2",
+  "purpose": "lean Codex bootstrap optimized for an end-to-end working product",
+  "payload_file_count_excluding_manifest": 30,
+  "archive_file_count_including_manifest": 31,
+  "files": [
+    {
+      "path": ".dockerignore",
+      "bytes": 119,
+      "sha256": "c7dfb15e7ac5050216c14d4ff4ed435c1085c3d82bf1dc52b48e4d9084c38795"
+    },
+    {
+      "path": ".env.example",
+      "bytes": 498,
+      "sha256": "a9663a4e872d1043d0ded9278eb990ed44a365230c3387bde5a170188c5a3438"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "bytes": 684,
+      "sha256": "c55fa19ab2be72fde092a283e8d03c5627e869454bb5333c96444dc58a1b5573"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 378,
+      "sha256": "69ae77bf971ce63f1b72568d10c5e9c1692b6ea0a592cbc7e49265de37112e49"
+    },
+    {
+      "path": "ACCEPTANCE.md",
+      "bytes": 5025,
+      "sha256": "2a488ae2962da5727059f7ca7a74c6659f66aedba3c45f3a8bc0cd7c42bb9a27"
+    },
+    {
+      "path": "AGENTS.md",
+      "bytes": 3299,
+      "sha256": "2cbea8d23afb2d444bed3cc139452cbd5280388e65f4f8bdfc9c8bc2bb5105f9"
+    },
+    {
+      "path": "CODEX_RESUME_PROMPT_RU.md",
+      "bytes": 1326,
+      "sha256": "de5aca2febc2d0d515f7675e9e73e72d08b985f5168c5ca2f44e377a6a900482"
+    },
+    {
+      "path": "CODEX_START_PROMPT_RU.md",
+      "bytes": 8644,
+      "sha256": "8a7a1f85b5c95969397938423e17b038b8349677514ae4f8be43e2edb7e6ee1d"
+    },
+    {
+      "path": "Dockerfile",
+      "bytes": 649,
+      "sha256": "36732f65f9be511509595f402e2c563de2def2c390d2edd17b37d2c7d403562c"
+    },
+    {
+      "path": "FAST_TRACK_PLAN.md",
+      "bytes": 5568,
+      "sha256": "cdf4679064c091eefdc5531f293c8c6fae717f3a0edb986fadb300416881d036"
+    },
+    {
+      "path": "GOAL.md",
+      "bytes": 11664,
+      "sha256": "4619cee3db2a73abd1ecd82d2b3e828be9e63e4510ed8cf45238b3f33d509663"
+    },
+    {
+      "path": "Makefile",
+      "bytes": 342,
+      "sha256": "26cbd0ee72b3220b5fb0fe7da1708b958ac10743d2d9adfc2e32725d4b27df44"
+    },
+    {
+      "path": "OPTIMIZATION_NOTES_RU.md",
+      "bytes": 2222,
+      "sha256": "c504f0eefd71e4a180d9a887167cafea131c81bf98353bd1d943f2db3f3527b1"
+    },
+    {
+      "path": "OWNER_RUNBOOK_RU.md",
+      "bytes": 1929,
+      "sha256": "077853ff39238430eab5b8360faaf70f45a32ac6bf6e5ed09d95f7b7c420bc0e"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1310,
+      "sha256": "62b1769af84008d681fcd6cd5c927abbd22045b7b65c525560c6895009ed7ebf"
+    },
+    {
+      "path": "STATUS.md",
+      "bytes": 1161,
+      "sha256": "e42d7799c1dbcbb0eed80368845ddc52b5fadee4656092450de54e89631891a1"
+    },
+    {
+      "path": "UPLOAD_TO_GITHUB_RU.md",
+      "bytes": 2766,
+      "sha256": "eb276b590379d4ebbe6346a210c2b6b4069aada5e78abb33ef26df3672f6c124"
+    },
+    {
+      "path": "config/defaults.yaml",
+      "bytes": 1480,
+      "sha256": "a57fa81871231cddd4f33c4109bd8e13347f97d18d70574e61834f0d5af8dc3f"
+    },
+    {
+      "path": "docker-compose.yml",
+      "bytes": 498,
+      "sha256": "ab774da04f8735e5f33299f580bf96897fda328b3b9afcf25b8a18c525d9193f"
+    },
+    {
+      "path": "pyproject.toml",
+      "bytes": 1321,
+      "sha256": "0d4d1db2a7b60162400fff93b045196696a8f88562ef934269843f2f5ef40788"
+    },
+    {
+      "path": "src/interexchange_perp_grid/__init__.py",
+      "bytes": 78,
+      "sha256": "66f2893342725b820a58f418d913c2503266bc3490e9140739af0ba0fc29b2ae"
+    },
+    {
+      "path": "src/interexchange_perp_grid/__main__.py",
+      "bytes": 51,
+      "sha256": "cf929ddeecd71a3143fde1142178207393f59cacca381457426ba5eb8a2a4ccd"
+    },
+    {
+      "path": "src/interexchange_perp_grid/cli.py",
+      "bytes": 2518,
+      "sha256": "593ba982c0412f4d5c045ba73847f73d5a62dd32d9e0316777862e6466c2700b"
+    },
+    {
+      "path": "src/interexchange_perp_grid/config.py",
+      "bytes": 4409,
+      "sha256": "d3fcd7531bca337211ccc5e6c0ac62a3e4869d6703d67421607f823db252d82c"
+    },
+    {
+      "path": "src/interexchange_perp_grid/safety.py",
+      "bytes": 1954,
+      "sha256": "d972e7807df2227a475777b722d8264dfd51765b8de0a6b350092692a398513c"
+    },
+    {
+      "path": "src/interexchange_perp_grid/state.py",
+      "bytes": 769,
+      "sha256": "d74eab2792caf2f576f7885c2b1e73f2aa1d35e798c775d151f0a5f53fad9ac3"
+    },
+    {
+      "path": "tests/test_config.py",
+      "bytes": 1454,
+      "sha256": "da07e61ce3e6c37b0c1c71b1cb8585574b16389c891d32f293516fba31cb5001"
+    },
+    {
+      "path": "tests/test_repository_contract.py",
+      "bytes": 1208,
+      "sha256": "1ea24a16b07af866f10b2fbf9cdaabb267199fa99a23660595cf902e2416a691"
+    },
+    {
+      "path": "tests/test_safety.py",
+      "bytes": 1478,
+      "sha256": "15d3e796fa59341262b2f9b5c60d57db248799b772d02806bdd2ac3e6ad97e37"
+    },
+    {
+      "path": "tests/test_state.py",
+      "bytes": 732,
+      "sha256": "55f017e58f10fd4f08a9473edab30e339e56653684a11a4b83b999710fda325f"
+    }
+  ]
+}

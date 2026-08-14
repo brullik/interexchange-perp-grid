@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+
+# Runtime state and market data
+data/
+state/
+logs/
+artifacts/runtime/
+*.sqlite
+*.sqlite3
+*.db
+*.parquet
+*.duckdb
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
