@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T19:37:32Z",
-  "state": "WAVE1_CORE_P1_REMEDIATION",
-  "phase": "Phase 2 — Production-grade Wave 1 data/private core",
+  "updated_at": "2026-08-15T19:57:10Z",
+  "state": "PHASE3_1_LOCAL_GATE_PASS",
+  "phase": "Phase 3.1 — Multi-instrument universe and broad BBO prefilter",
   "repository": "brullik/interexchange-perp-grid",
-  "branch": "codex/wave1-production-core-v2",
-  "pr": 4,
-  "head_sha": "06379ea12bd2d4d65a5bc1c91b42894cc38dacc4",
-  "ci_run": 31903429499,
-  "artifact": "c4-3-proof-06379ea12bd2d4d65a5bc1c91b42894cc38dacc4",
+  "branch": "codex/multi-instrument-shadow",
+  "pr": null,
+  "head_sha": "0e87a1e58250f91a050b8835fd272926cf859e6c",
+  "ci_run": 31904798345,
+  "artifact": "c4-3-proof-0e87a1e58250f91a050b8835fd272926cf859e6c",
   "completed_criteria": [
     "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
     "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
@@ -17,19 +17,21 @@
     "Wave 1 latest-value cache enforces persisted and ordered event watermarks, bounded reorder recovery, completeness, two-second age, hard timeouts, and measured 250 ms p95",
     "Native Bybit V5 u/seq guard is installed in the CCXT Pro factory and handles explicit u=1 reset",
     "Telegram shadow mode remains healthy without runtime credentials",
-    "Local Phase 2 P1-remediation verify passed: lock, Ruff, strict mypy, 256 tests, and doctor",
-    "Independent adversarial review passed exact checkpoint 76d5f143 with P0/P1/P2 all zero",
-    "Draft PR 4 exact-head run 31903429499 passed all five required checks before the latest cross-channel recovery remediation"
+    "Phase 2 exact head 3bc15a3 passed independent adversarial and release verification with P0/P1/P2 all zero",
+    "PR 4 was squash-merged as 0e87a1e and post-merge run 31904798345 passed all five jobs",
+    "Phase 3.1 local gate passed: lock, Ruff, strict mypy, 265 tests, and doctor",
+    "Deterministic large universe proves 101 common instruments, 606 directed routes, 14-day live age boundary, ambiguity and activity rejection",
+    "Broad BBO cache coalesces 100000 updates within known-key memory bounds and non-executable prefilter p95 is at most 100 ms"
   ],
   "active_work": [
-    "Commit and push the recovery-authoritative REST and private-event stable-FLAT fixes to draft PR 4",
-    "Obtain fresh exact-head required checks and independent adversarial plus release-verification PASS before marking the PR Ready"
+    "Commit and push the Phase 3.1 vertical slice on codex/multi-instrument-shadow",
+    "Open one draft PR and obtain fresh exact-head CI plus independent adversarial and release verification"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Push the locally verified P1 remediation, keep PR 4 draft until fresh green exact-head CI and independent P0/P1-free adversarial plus release verification, then mark Ready and squash-merge under the standing authorization.",
+  "next_action": "Publish Phase 3.1 as one draft PR, keep it draft until exact-head CI and independent P0/P1-free adversarial plus release verification pass, then continue the same PR with Phase 3.2.",
   "known_limitations": [
     "The current repository visibility is PUBLIC.",
     "Operational evidence and secrets remain forbidden while the repository is PUBLIC."

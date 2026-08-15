@@ -628,6 +628,12 @@ def _scan_payload(
         "evaluated_at": datetime.now(UTC).isoformat(),
         "base": result.base,
         "common_instrument_count": result.common_instrument_count,
+        "directed_route_count": result.directed_route_count,
+        "bbo_prefilter": [asdict(observation) for observation in result.prefilter],
+        "bbo_cache": asdict(result.bbo_cache) if result.bbo_cache is not None else None,
+        "prefilter_latency_ms": (
+            str(result.prefilter_latency_ms) if result.prefilter_latency_ms is not None else None
+        ),
         "opportunities": [asdict(quote) for quote in result.quotes],
         "data_health": [asdict(quality) for quality in result.data_quality],
         "quarantined": [asdict(record) for record in result.quarantined],

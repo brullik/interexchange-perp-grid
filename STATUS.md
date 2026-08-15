@@ -4,13 +4,13 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** WAVE1_PRODUCTION_CORE_ADVERSARIAL_REVIEW
-- **Current checkpoint:** Phase 2 Wave 1 data/private core is in draft PR #4; two exact-head P1 findings are fixed locally and await repeat exact-head CI/review
+- **State:** PHASE3_1_MULTI_INSTRUMENT_BBO_LOCAL_VERIFY
+- **Current checkpoint:** Phase 3.1 universe → bounded broad BBO → ranked non-executable prefilter passes the full local gate and awaits draft-PR exact-head review
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
 - **Canary route:** none; selected only from a route-specific qualified allowlist
-- **C5:** forbidden until every P0 blocker in the independent audit is closed and re-verified
+- **C5:** forbidden until the remaining master-plan acceptance gates and external owner actions are complete
 
 ## Checkpoints
 
@@ -21,7 +21,8 @@ This is the only mutable project-status document.
 | C2 strategy/risk/simulator | COMPLETE | [GitHub Actions run 31839163485](https://github.com/brullik/interexchange-perp-grid/actions/runs/31839163485): Linux `make verify` (43 tests) and Docker health/restart passed on `0849413`; deterministic tests cover open/add/partial close/full close, profitable and losing four-leg PnL, funding, protected prices, partial/rejected/unknown orders, private staleness, venue outage, third-venue hedge, forced close, and property-based 5/50 USDT risk invariants |
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
-| Phase 2 Wave 1 data/private core | DRAFT_PR_GATES | Draft PR #4 is rooted at exact `main`; account-wide bounded private snapshots/cache, persistent ordered event watermarks, native Bybit V5 `u/seq`, recovery-priority REST budgeting, hard deadlines, post-REST-event-safe storage-independent recovery snapshots, and private-event-aware stable-FLAT barriers pass 256 local tests; repeat exact-head CI and independent review remain required |
+| Phase 2 Wave 1 data/private core | COMPLETE | PR #4 was independently verified with P0/P1/P2=0 and squash-merged as `0e87a1e`; post-merge [run 31904798345](https://github.com/brullik/interexchange-perp-grid/actions/runs/31904798345) passed all five jobs |
+| Phase 3.1 multi-instrument broad BBO | LOCAL_GATE_PASS | Typed locked universe policy; active/age/ambiguity gates; startup/6h/reconnect refresh; 101-common/606-route deterministic fixture; one-call-per-venue broad BBO; bounded 100k-update cache; stable non-executable prefilter with p95 ≤100 ms; 265 local tests |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -71,6 +72,9 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-15 — Include received private-event watermarks in stable-FLAT signatures and verify the combined journal/private watermark before and after the atomic journal commit — a late cache event must reset the barrier or quarantine the action — private adapter/cache, reconciliation, coordinator, control
 2026-08-15 — Return the newest fully applied complete private state to recovery and reject a REST snapshot when the received watermark is still ahead of cache delivery — emergency close must neither wait on storage nor act on a stale flat view — `private_cache.py`
 2026-08-15 — Bind each recovery result to its complete REST snapshot and reject it after any newer received event, even when that event is applied — local receipt order has no cross-channel/exchange causality, so composed REST/stream state cannot prove account-wide flatness — `private_cache.py`
+2026-08-15 — Validate typed universe/data settings against adjacent locked `RUNTIME_POLICY.yaml` at startup — duplicated operational policy must fail startup on drift rather than silently diverge — config
+2026-08-15 — Keep one immutable latest universe with startup, six-hour, and reconnect refresh; reject inactive, future, young, unknown-age live, and ambiguous instruments — broad discovery must remain deterministic and fail closed — `market_universe.py`, public adapter/engine
+2026-08-15 — Coalesce broad BBO only into known venue-symbol keys and rank observations without execution authority — 100k bursts and one venue outage must not grow memory, subscribe to L2, or create a trade — `bbo_prefilter.py`, `public_engine.py`, shadow snapshot
 
 ## Active blockers / owner actions
 
@@ -81,14 +85,14 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 ## Last verified command
 
 ```text
-2026-08-15 Phase 2 P1-remediation local Windows equivalent of every Makefile verify target: PASS
+2026-08-15 Phase 3.1 local Windows equivalent of every Makefile verify target: PASS
 - exact main lock validation: PASS (64 packages)
-- ruff format --check + ruff check: PASS (85 files)
-- mypy --strict: PASS (83 source/test files)
-- pytest: 256 passed
+- ruff format --check + ruff check: PASS (88 files)
+- mypy --strict: PASS (86 source/test files)
+- pytest: 265 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,
-security evidence and repeat independent exact-head review remain required before merging this checkpoint.
+security evidence and independent exact-head review remain required before merging this checkpoint.
 No production credentials were used and no real order was submitted.
 ```

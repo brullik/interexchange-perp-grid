@@ -35,6 +35,19 @@ def test_wave1_fixtures_accept_only_exact_linear_usdt_perpetuals() -> None:
         qualified[Venue.OKX][0].contract_size_base * qualified[Venue.OKX][0].amount_step_contracts
         == qualified[Venue.OKX][0].base_amount_step
     )
+    assert all(
+        instrument.active and instrument.listed_at is not None
+        for instruments in qualified.values()
+        for instrument in instruments
+    )
+
+
+def test_inactive_market_is_rejected_and_listing_time_is_normalised() -> None:
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    market = payload[Venue.BYBIT.value][0]
+    assert normalize_market(Venue.BYBIT, market) is not None
+    market["active"] = False
+    assert normalize_market(Venue.BYBIT, market) is None
 
 
 class FundingExchange:

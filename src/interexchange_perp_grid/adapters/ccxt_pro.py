@@ -40,9 +40,31 @@ def _supported(value: object) -> bool:
     return value is True or value == "emulated"
 
 
+def _listing_datetime(market: Mapping[str, Any]) -> datetime | None:
+    info = _mapping(market.get("info"))
+    candidates = (
+        market.get("created"),
+        market.get("listingTimestamp"),
+        info.get("onboardDate"),
+        info.get("launchTime"),
+        info.get("listTime"),
+    )
+    for candidate in candidates:
+        timestamp = _decimal(candidate)
+        if timestamp is None or timestamp <= 0:
+            continue
+        milliseconds = timestamp * 1000 if timestamp < Decimal("100000000000") else timestamp
+        try:
+            return datetime.fromtimestamp(float(milliseconds / 1000), tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            continue
+    return None
+
+
 def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | None:
     if not (
-        market.get("contract") is True
+        market.get("active") is True
+        and market.get("contract") is True
         and market.get("swap") is True
         and market.get("linear") is True
         and market.get("inverse") is False
@@ -92,6 +114,8 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
         minimum_notional=minimum_notional,
         taker_fee_rate=taker_fee,
         fee_source="ccxt_market_metadata" if taker_fee is not None else None,
+        active=True,
+        listed_at=_listing_datetime(market),
     )
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -38,6 +38,14 @@ class Instrument:
     minimum_notional: Decimal | None
     taker_fee_rate: Decimal | None
     fee_source: str | None
+    active: bool = True
+    listed_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.listed_at is not None and self.listed_at.tzinfo is None:
+            raise ValueError("instrument listing timestamp must be timezone-aware")
+        if self.listed_at is not None and self.listed_at.utcoffset() is None:
+            raise ValueError("instrument listing timestamp must have a UTC offset")
 
     @property
     def key(self) -> InstrumentKey:
@@ -50,6 +58,13 @@ class Instrument:
     @property
     def minimum_base_amount(self) -> Decimal:
         return self.minimum_amount_contracts * self.contract_size_base
+
+    def listing_age_seconds(self, now: datetime) -> Decimal | None:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("listing-age clock must be timezone-aware")
+        if self.listed_at is None:
+            return None
+        return Decimal(str((now.astimezone(UTC) - self.listed_at.astimezone(UTC)).total_seconds()))
 
 
 @dataclass(frozen=True, slots=True)

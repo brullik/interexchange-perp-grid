@@ -112,6 +112,13 @@ class MarketDataConfig(StrictModel):
     max_clock_skew_ms: int = Field(gt=0)
 
 
+class UniverseConfig(StrictModel):
+    live_min_listing_age_days: int = Field(ge=14, le=3650)
+    instrument_refresh_seconds: int = Field(ge=60, le=86400)
+    max_dynamic_l2_candidates: int = Field(ge=1, le=30)
+    decision_debounce_ms: int = Field(ge=1, le=1000)
+
+
 class StorageConfig(StrictModel):
     sqlite_path: str
     parquet_dir: str
@@ -182,6 +189,7 @@ class Settings(StrictModel):
     strategy: StrategyConfig
     execution: ExecutionConfig
     market_data: MarketDataConfig
+    universe: UniverseConfig
     storage: StorageConfig
     live: LiveConfig
     telegram: TelegramConfig
@@ -236,10 +244,63 @@ def _apply_environment(raw: dict[str, object], environ: Mapping[str, str]) -> No
         section_value[key] = parser(environ[variable])
 
 
+def _require_mapping(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError(f"configuration section {name!r} must be a mapping")
+    return value
+
+
+def _validate_locked_runtime_policy(raw: dict[str, object], path: Path) -> None:
+    policy_path = path.parent / "RUNTIME_POLICY.yaml"
+    policy = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+    if not isinstance(policy, dict):
+        raise ValueError("locked runtime policy root must be a mapping")
+    configured_universe = _require_mapping(raw.get("universe"), "universe")
+    locked_universe = _require_mapping(policy.get("universe"), "runtime_policy.universe")
+    configured_data = _require_mapping(raw.get("market_data"), "market_data")
+    locked_data = _require_mapping(policy.get("data"), "runtime_policy.data")
+    comparisons = {
+        "live_min_listing_age_days": (
+            configured_universe.get("live_min_listing_age_days"),
+            locked_universe.get("live_min_listing_age_days"),
+        ),
+        "instrument_refresh_seconds": (
+            configured_universe.get("instrument_refresh_seconds"),
+            locked_universe.get("instrument_refresh_seconds"),
+        ),
+        "max_dynamic_l2_candidates": (
+            configured_universe.get("max_dynamic_l2_candidates"),
+            locked_universe.get("max_dynamic_l2_candidates"),
+        ),
+        "decision_debounce_ms": (
+            configured_universe.get("decision_debounce_ms"),
+            locked_universe.get("decision_debounce_ms"),
+        ),
+        "max_bbo_age_ms": (
+            configured_data.get("max_bbo_age_ms"),
+            locked_data.get("max_bbo_age_ms"),
+        ),
+    }
+    for name, (configured, locked) in comparisons.items():
+        if configured != locked:
+            raise ValueError(f"configuration {name} differs from locked runtime policy")
+    if (
+        str(configured_data.get("broad_feed", "")).upper()
+        != str(locked_universe.get("broad_feed", "")).upper()
+    ):
+        raise ValueError("configuration broad_feed differs from locked runtime policy")
+    if (
+        str(configured_data.get("candidate_feed", "")).upper()
+        != str(locked_universe.get("candidate_feed", "")).upper()
+    ):
+        raise ValueError("configuration candidate_feed differs from locked runtime policy")
+
+
 def load_settings(path: Path, environ: Mapping[str, str] | None = None) -> Settings:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("configuration root must be a mapping")
     merged = copy.deepcopy(raw)
     _apply_environment(merged, os.environ if environ is None else environ)
+    _validate_locked_runtime_policy(merged, path)
     return Settings.model_validate(merged)

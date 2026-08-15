@@ -269,6 +269,8 @@ def _linear_market(symbol: str = "BTC/USDT:USDT") -> dict[str, object]:
         "base": base,
         "quote": "USDT",
         "settle": "USDT",
+        "active": True,
+        "created": 1_609_459_200_000,
         "contract": True,
         "swap": True,
         "linear": True,

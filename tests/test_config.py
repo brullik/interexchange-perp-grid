@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from interexchange_perp_grid.config import Settings, load_settings
@@ -23,6 +24,26 @@ def test_defaults_are_safe_and_match_owner_limits() -> None:
     assert settings.risk.local_free_margin_floor_ratio >= Decimal("0.20")
     assert settings.risk.initial_effective_leverage_cap <= Decimal("3")
     assert settings.risk.max_hold_seconds <= 86400
+
+
+def test_runtime_universe_policy_is_typed_and_locked() -> None:
+    settings = load_settings(CONFIG)
+    policy = yaml.safe_load(Path("config/RUNTIME_POLICY.yaml").read_text(encoding="utf-8"))
+
+    assert (
+        settings.universe.live_min_listing_age_days
+        == policy["universe"]["live_min_listing_age_days"]
+    )
+    assert (
+        settings.universe.instrument_refresh_seconds
+        == policy["universe"]["instrument_refresh_seconds"]
+    )
+    assert (
+        settings.universe.max_dynamic_l2_candidates
+        == policy["universe"]["max_dynamic_l2_candidates"]
+    )
+    assert settings.universe.decision_debounce_ms == policy["universe"]["decision_debounce_ms"]
+    assert settings.market_data.max_bbo_age_ms == policy["data"]["max_bbo_age_ms"]
 
 
 def test_risk_budget_relationship_is_enforced() -> None:
