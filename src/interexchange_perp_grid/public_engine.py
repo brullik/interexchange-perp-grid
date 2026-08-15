@@ -440,6 +440,7 @@ class PublicMarketEngine:
         return True
 
     async def _sync_bbo_watchers(self) -> None:
+        self._require_open()
         self._cleanup_retired_bbo_tasks()
         desired = {
             venue: self._symbols_for_venue(venue)
@@ -474,6 +475,7 @@ class PublicMarketEngine:
         if retiring:
             await asyncio.wait(retiring, timeout=self._bbo_retirement_grace_seconds)
             self._cleanup_retired_bbo_tasks()
+        self._require_open()
         retiring_venues = {
             *self._retiring_bbo_watchers,
             *self._retiring_bbo_transports,
@@ -536,6 +538,8 @@ class PublicMarketEngine:
                     return
                 started_ns = time.monotonic_ns()
                 quotes = await self._next_bbo_update(venue, symbols)
+                if self._closed:
+                    return
                 if not quotes:
                     raise RuntimeError("batch BBO stream returned no updates")
                 accepted = self._bbo_cache.ingest(
@@ -559,6 +563,8 @@ class PublicMarketEngine:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            if self._closed:
+                return
             self._quarantine(
                 venue,
                 f"BBO stream failed: {type(error).__name__}: {error}",
@@ -723,8 +729,10 @@ class PublicMarketEngine:
         if not self._initialised:
             await self.initialise(timeout_seconds)
         universe = await self.refresh_universe(timeout_seconds)
-        self._require_open()
-        await self._sync_bbo_watchers()
+        async with self._lifecycle_lock:
+            self._require_open()
+            await self._sync_bbo_watchers()
+            self._require_open()
         started_ns = time.perf_counter_ns()
         await self._wait_for_bbo_coverage(timeout_seconds)
         self._require_open()

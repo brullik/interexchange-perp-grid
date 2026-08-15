@@ -92,6 +92,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-16 — Version retired-adapter failures under the recycle lock — concurrent explicit reconnect followers may bypass an old backoff but must coalesce a failure created by the leader they waited behind — `public_engine.py`
 2026-08-16 — Guard every public startup entry point and serialize initialisation with bounded shutdown — a successfully closed engine must never create, probe, discover, or leak a new exchange transport — `public_engine.py`
 2026-08-16 — Own startup, forced refresh, reconnect, and shutdown under one idempotent transactional lifecycle — concurrent cold scans, repeated initialisation, partial factory failure, and late transport completion must neither duplicate ownership nor mutate a closed engine — `public_engine.py`
+2026-08-16 — Synchronize BBO watcher creation with shutdown and discard transport results after the closed barrier — a late or cancellation-resistant public stream must not update cache, reconnect state, or quarantine after teardown — `public_engine.py`
 
 ## Active blockers / owner actions
 
