@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T22:31:51Z",
-  "state": "PHASE3_1_EXACT_65C6_P1_REMEDIATION_LOCAL_GATE",
+  "updated_at": "2026-08-15T22:44:13Z",
+  "state": "PHASE3_1_EXACT_7CCD_P1_REMEDIATION_LOCAL_GATE",
   "phase": "Phase 3.1 — Multi-instrument universe and broad BBO prefilter",
   "repository": "brullik/interexchange-perp-grid",
   "branch": "codex/multi-instrument-shadow",
   "pr": 5,
-  "head_sha": "65c618fea61148ae8eebf1d9924ef3051783b7f8",
-  "ci_run": 31911794968,
-  "artifact": "c4-3-proof-65c618fea61148ae8eebf1d9924ef3051783b7f8",
+  "head_sha": "7ccdeaa3f08159dab404e01543aa7a30a5b7f42c",
+  "ci_run": 31912450274,
+  "artifact": "c4-3-proof-7ccdeaa3f08159dab404e01543aa7a30a5b7f42c",
   "completed_criteria": [
     "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
     "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
@@ -19,23 +19,23 @@
     "Telegram shadow mode remains healthy without runtime credentials",
     "Phase 2 exact head 3bc15a3 passed independent adversarial and release verification with P0/P1/P2 all zero",
     "PR 4 was squash-merged as 0e87a1e and post-merge run 31904798345 passed all five jobs",
-    "Phase 3.1 exact head 65c618f passed five GitHub jobs but independent review found that selected-route funding/L2 could resume after shutdown and cancellation during partial-factory rollback could lose adapter ownership; exact 65c6 remains prohibited from merge",
-    "Current Phase 3.1 local gate passed: lock64, Ruff over 88 files, strict mypy over 86 source files, 303 tests, and doctor shadow/live denied",
+    "Phase 3.1 exact head 7ccdeaa passed five GitHub jobs but independent review found that a recorder held beyond the shutdown deadline could publish market history after close returned; exact 7ccd remains prohibited from merge",
+    "Current Phase 3.1 local gate passed twice: lock64, Ruff over 88 files, strict mypy over 86 source files, 305 tests, and doctor shadow/live denied",
     "Deterministic large universe proves 102 safe common instruments, 608 directed routes, 14-day age boundary, safe ambiguity isolation, and activity rejection",
     "The normalized committed Wave 1 fixture proves one common instrument and six directed routes with native Bybit minimum notional and explicit known-no-fixed-notional OKX semantics",
     "Broad BBO cache coalesces 100000 updates within known-key memory bounds, distinguishes stale from never-observed quotes, and measures latency from actual qualified quote receipt through prefilter ranking",
-    "BBO watchers have a hard progress deadline, cancellation-safe one-per-venue retirement, idempotent transactional startup, single-flight bounded refresh and adapter recycle, tracked broad and selected-route scans, one startup/refresh/scan shutdown lifecycle contract, cancellation-safe partial-factory rollback, explicit shutdown and adapter-teardown failure, six-hour symbol resubscription, and jittered failure streaks reset only by an accepted quote",
+    "BBO watchers have a hard progress deadline, cancellation-safe one-per-venue retirement, idempotent transactional startup, single-flight bounded refresh and adapter recycle, tracked broad and selected-route scans, one startup/refresh/scan shutdown lifecycle contract, cancellation-safe partial-factory rollback and two-phase Parquet publication, explicit shutdown and adapter-teardown failure, six-hour symbol resubscription, and jittered failure streaks reset only by an accepted quote",
     "Closing and reinstantiating the public engine reproduces identical universe, route, and cache bounds without leaked watcher tasks"
   ],
   "active_work": [
-    "Commit and push the locally verified exact-65c6 remediation",
+    "Commit and push the locally verified exact-7ccd remediation",
     "Obtain fresh exact-head CI and independent adversarial and release verification"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Keep PR 5 draft, publish the 303-test exact-65c6 remediation, and require fresh exact-head CI plus independent P0/P1-free adversarial and release verification before Phase 3.2.",
+  "next_action": "Keep PR 5 draft, publish the 305-test exact-7ccd remediation, and require fresh exact-head CI plus independent P0/P1-free adversarial and release verification before Phase 3.2.",
   "known_limitations": [
     "The current repository visibility is PUBLIC.",
     "Operational evidence and secrets remain forbidden while the repository is PUBLIC."

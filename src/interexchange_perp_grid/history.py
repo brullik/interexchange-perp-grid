@@ -39,46 +39,83 @@ class ParquetMarketRecorder:
         self.root = root
 
     async def append_books(self, books: tuple[OrderBookSnapshot, ...]) -> tuple[Path, ...]:
-        return await asyncio.to_thread(self._append_books_sync, books)
+        worker = asyncio.create_task(
+            asyncio.to_thread(self._stage_books_sync, books),
+            name="stage-parquet-books",
+        )
+        try:
+            staged = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            worker.add_done_callback(self._discard_staged_result)
+            raise
+        targets: list[Path] = []
+        try:
+            for pending, target in staged:
+                pending.replace(target)
+                targets.append(target)
+        finally:
+            for pending, _ in staged:
+                pending.unlink(missing_ok=True)
+        return tuple(targets)
 
-    def _append_books_sync(self, books: tuple[OrderBookSnapshot, ...]) -> tuple[Path, ...]:
-        written: list[Path] = []
-        for book in books:
-            event_id = _event_id(book)
-            rows: list[dict[str, object]] = []
-            for side, levels in ((BookSide.BID, book.bids), (BookSide.ASK, book.asks)):
-                for level_index, level in enumerate(levels):
-                    rows.append(
-                        {
-                            "event_id": event_id,
-                            "venue": book.venue.value,
-                            "symbol": book.symbol,
-                            "side": side.value,
-                            "level": level_index,
-                            "price": str(level.price),
-                            "base_quantity": str(level.base_quantity),
-                            "exchange_timestamp_ms": book.exchange_timestamp_ms,
-                            "received_at": book.received_at.isoformat(),
-                            "received_monotonic_ns": book.received_monotonic_ns,
-                            "sequence_start": book.sequence_start,
-                            "sequence_end": book.sequence_end,
-                            "is_snapshot": book.is_snapshot,
-                            "synchronised": book.synchronised,
-                            "clock_skew_ms": book.clock_skew_ms,
-                        }
-                    )
-            if not rows:
-                continue
-            partition = (
-                self.root
-                / f"date={book.received_at.date().isoformat()}"
-                / f"venue={book.venue.value}"
-            )
-            partition.mkdir(parents=True, exist_ok=True)
-            target = partition / f"part-{uuid4().hex}.parquet"
-            pq.write_table(pa.Table.from_pylist(rows), target, compression="zstd")
-            written.append(target)
-        return tuple(written)
+    def _stage_books_sync(
+        self,
+        books: tuple[OrderBookSnapshot, ...],
+    ) -> tuple[tuple[Path, Path], ...]:
+        staged: list[tuple[Path, Path]] = []
+        try:
+            for book in books:
+                event_id = _event_id(book)
+                rows: list[dict[str, object]] = []
+                for side, levels in ((BookSide.BID, book.bids), (BookSide.ASK, book.asks)):
+                    for level_index, level in enumerate(levels):
+                        rows.append(
+                            {
+                                "event_id": event_id,
+                                "venue": book.venue.value,
+                                "symbol": book.symbol,
+                                "side": side.value,
+                                "level": level_index,
+                                "price": str(level.price),
+                                "base_quantity": str(level.base_quantity),
+                                "exchange_timestamp_ms": book.exchange_timestamp_ms,
+                                "received_at": book.received_at.isoformat(),
+                                "received_monotonic_ns": book.received_monotonic_ns,
+                                "sequence_start": book.sequence_start,
+                                "sequence_end": book.sequence_end,
+                                "is_snapshot": book.is_snapshot,
+                                "synchronised": book.synchronised,
+                                "clock_skew_ms": book.clock_skew_ms,
+                            }
+                        )
+                if not rows:
+                    continue
+                partition = (
+                    self.root
+                    / f"date={book.received_at.date().isoformat()}"
+                    / f"venue={book.venue.value}"
+                )
+                partition.mkdir(parents=True, exist_ok=True)
+                target = partition / f"part-{uuid4().hex}.parquet"
+                pending = target.with_suffix(".parquet.pending")
+                pq.write_table(pa.Table.from_pylist(rows), pending, compression="zstd")
+                staged.append((pending, target))
+            return tuple(staged)
+        except Exception:
+            for pending, _ in staged:
+                pending.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _discard_staged_result(
+        worker: asyncio.Task[tuple[tuple[Path, Path], ...]],
+    ) -> None:
+        try:
+            staged = worker.result()
+        except (asyncio.CancelledError, Exception):
+            return
+        for pending, _ in staged:
+            pending.unlink(missing_ok=True)
 
 
 def query_recorded_level_count(root: Path) -> int:

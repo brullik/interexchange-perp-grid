@@ -1001,6 +1001,9 @@ class PublicMarketEngine:
                 )
             except TimeoutError:
                 public_scans_blocked = True
+                for task in tuple(self._active_public_scans):
+                    task.cancel()
+                await asyncio.sleep(0)
         lifecycle_lock_acquired = False
         lifecycle_lock_blocked = False
         try:

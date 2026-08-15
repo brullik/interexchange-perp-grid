@@ -163,6 +163,20 @@ class CoordinatedFundingFakeAdapter(FakeAdapter):
         return await super().fetch_funding(instrument)
 
 
+class CoordinatedRecorder(ParquetMarketRecorder):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.append_started = asyncio.Event()
+        self.allow_append = asyncio.Event()
+        self.appended: tuple[OrderBookSnapshot, ...] = ()
+
+    async def append_books(self, books: tuple[OrderBookSnapshot, ...]) -> tuple[Path, ...]:
+        self.append_started.set()
+        await self.allow_append.wait()
+        self.appended = books
+        return ()
+
+
 class BroadFakeAdapter(ExchangeAdapter):
     def __init__(
         self,
@@ -502,10 +516,34 @@ async def test_shutdown_never_allows_route_scan_to_resume_on_closed_adapters(
     assert all(adapter.book_calls == 0 for adapter in adapters.values())
 
     funding.allow_funding.set()
-    with pytest.raises(RuntimeError, match="public market engine is closed"):
+    with pytest.raises(asyncio.CancelledError):
         await scan
 
     assert all(adapter.book_calls == 0 for adapter in adapters.values())
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_blocked_recorder_before_return(tmp_path: Path) -> None:
+    adapters = {venue: FakeAdapter(venue) for venue in Venue}
+    recorder = CoordinatedRecorder(tmp_path)
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=recorder,
+    )
+
+    scan = asyncio.create_task(engine.scan_once("BTC", Decimal("0.001"), timeout_seconds=5))
+    await asyncio.wait_for(recorder.append_started.wait(), timeout=1)
+    with pytest.raises(RuntimeError, match=r"shutdown deadline exceeded.*public scans"):
+        await engine.close()
+
+    assert recorder.appended == ()
+    recorder.allow_append.set()
+    with pytest.raises(asyncio.CancelledError):
+        await scan
+    assert recorder.appended == ()
     await engine.close()
 
 

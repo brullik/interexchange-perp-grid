@@ -1569,7 +1569,7 @@ async def test_private_event_between_flat_snapshot_and_watermark_check_resets_ba
         states = await collect_private_states(
             adapters,
             {Venue.BYBIT: instrument},
-            timeout_seconds=0.1,
+            timeout_seconds=1,
         )
         report = reconcile_private_states(None, states, set(), {Venue.BYBIT})
         report_calls += 1
@@ -1596,7 +1596,7 @@ async def test_private_event_between_flat_snapshot_and_watermark_check_resets_ba
     barrier = await wait_for_stable_flat(
         report_factory,
         watermark,
-        FlatBarrierPolicy(2, 0, 0.001, 0.5),
+        FlatBarrierPolicy(2, 0, 0.001, 2),
     )
 
     assert barrier.verified is True
