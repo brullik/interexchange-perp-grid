@@ -4,6 +4,7 @@ import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import cast
 
 import pytest
 
@@ -12,8 +13,13 @@ from interexchange_perp_grid.bbo_prefilter import (
     LatestBboCache,
     rank_bbo_prefilter,
 )
-from interexchange_perp_grid.domain import BboQuote, Instrument, Venue
-from interexchange_perp_grid.market_universe import InstrumentRegistry, UniverseService
+from interexchange_perp_grid.domain import BboQuote, Instrument, ProductType, Venue
+from interexchange_perp_grid.market_universe import (
+    InstrumentRegistry,
+    UniverseRoute,
+    UniverseService,
+)
+from interexchange_perp_grid.reason_codes import ReasonCode
 
 NOW = datetime(2026, 8, 15, tzinfo=UTC)
 
@@ -95,16 +101,56 @@ def test_large_live_universe_filters_age_activity_and_ambiguity(
         generation=1,
     )
 
-    assert len(snapshot.common) == 101
-    assert len(snapshot.routes) == 606
-    assert len(snapshot.known_bbo_keys) == 303
+    assert len(snapshot.common) == 102
+    assert len(snapshot.routes) == 608
+    assert len(snapshot.known_bbo_keys) == 305
     assert {item.key.base for item in snapshot.common} == {
         *(f"A{index:03d}" for index in range(100)),
+        "AMBIG",
         "EXACT14",
     }
     assert all(
         route.long_instrument.venue != route.short_instrument.venue for route in snapshot.routes
     )
+    ambiguous = next(item for item in snapshot.common if item.key.base == "AMBIG")
+    assert {instrument.venue for instrument in ambiguous.instruments} == {
+        Venue.BINANCE_USDM,
+        Venue.OKX,
+    }
+
+
+def test_registry_rejects_cross_quote_and_incomplete_contract_metadata() -> None:
+    registry = InstrumentRegistry(minimum_listing_age_days=14, enforce_listing_age=True)
+    valid = _instrument(Venue.BYBIT, "BTC")
+    malformed = (
+        replace(_instrument(Venue.OKX, "BTC"), quote="USDC"),
+        replace(_instrument(Venue.OKX, "ETH"), minimum_notional=None),
+        replace(_instrument(Venue.OKX, "SOL"), price_tick=Decimal("-0.1")),
+        replace(_instrument(Venue.OKX, "XRP"), amount_step_contracts=Decimal(0)),
+        replace(
+            _instrument(Venue.OKX, "DOGE"),
+            product_type=cast(ProductType, "inverse_perpetual"),
+        ),
+    )
+
+    snapshot = registry.build(
+        {
+            Venue.BYBIT: (
+                valid,
+                _instrument(Venue.BYBIT, "ETH"),
+                _instrument(Venue.BYBIT, "SOL"),
+                _instrument(Venue.BYBIT, "XRP"),
+                _instrument(Venue.BYBIT, "DOGE"),
+            ),
+            Venue.OKX: malformed,
+        },
+        now=NOW,
+        monotonic_ns=1,
+        generation=1,
+    )
+
+    assert snapshot.common == ()
+    assert valid.key.quote == valid.quote == "USDT"
 
 
 def test_universe_refreshes_only_on_six_hour_expiry_or_reconnect(
@@ -189,13 +235,14 @@ def test_bbo_cache_rejects_stale_future_crossed_and_unknown_clock_quotes() -> No
             replace(valid, received_monotonic_ns=now_ns - 1_500_000_001),
             replace(valid, received_monotonic_ns=now_ns + 1),
             replace(valid, bid_price=Decimal(102), ask_price=Decimal(101)),
+            replace(valid, bid_price=Decimal(101), ask_price=Decimal(101)),
             replace(valid, clock_skew_ms=None),
         ),
         now_monotonic_ns=now_ns,
     )
 
     assert cache.stats.entries == 0
-    assert cache.stats.rejected_updates == 4
+    assert cache.stats.rejected_updates == 5
     cache.ingest((valid,), now_monotonic_ns=now_ns)
     assert cache.fresh(now_monotonic_ns=now_ns) == (valid,)
     assert cache.fresh(now_monotonic_ns=now_ns + 1_500_000_001) == ()
@@ -227,7 +274,27 @@ def test_bbo_prefilter_is_stable_non_executable_and_p95_under_100ms(
         item.stable_key
         for item in sorted(
             ranked,
-            key=lambda item: (-item.estimated_edge_bps, *item.stable_key),
+            key=lambda item: (
+                item.estimated_edge_bps is None,
+                -(item.estimated_edge_bps or Decimal(0)),
+                *item.stable_key,
+            ),
         )
     )
     assert p95 <= 100
+
+
+def test_prefilter_reports_missing_fee_instead_of_omitting_route() -> None:
+    long = replace(_instrument(Venue.BYBIT, "BTC"), taker_fee_rate=None)
+    short = _instrument(Venue.OKX, "BTC")
+    route = UniverseRoute(long, short)
+
+    observations = rank_bbo_prefilter(
+        (route,),
+        (_quote(long, 1), _quote(short, 1, offset=1)),
+    )
+
+    assert len(observations) == 1
+    assert observations[0].reason == ReasonCode.FEE_UNKNOWN
+    assert observations[0].estimated_edge_bps is None
+    assert observations[0].execution_authorized is False

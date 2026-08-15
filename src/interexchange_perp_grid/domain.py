@@ -17,10 +17,16 @@ class BookSide(StrEnum):
     ASK = "ask"
 
 
+class ProductType(StrEnum):
+    LINEAR_USDT_PERPETUAL = "linear_usdt_perpetual"
+
+
 @dataclass(frozen=True, slots=True, order=True)
 class InstrumentKey:
     base: str
     settle: str
+    quote: str = "USDT"
+    product_type: ProductType = ProductType.LINEAR_USDT_PERPETUAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +46,7 @@ class Instrument:
     fee_source: str | None
     active: bool = True
     listed_at: datetime | None = None
+    product_type: ProductType = ProductType.LINEAR_USDT_PERPETUAL
 
     def __post_init__(self) -> None:
         if self.listed_at is not None and self.listed_at.tzinfo is None:
@@ -49,7 +56,12 @@ class Instrument:
 
     @property
     def key(self) -> InstrumentKey:
-        return InstrumentKey(self.base, self.settle)
+        return InstrumentKey(
+            base=self.base,
+            settle=self.settle,
+            quote=self.quote,
+            product_type=self.product_type,
+        )
 
     @property
     def base_amount_step(self) -> Decimal:

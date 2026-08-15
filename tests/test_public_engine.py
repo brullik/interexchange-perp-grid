@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import time
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,7 +21,7 @@ from interexchange_perp_grid.domain import (
     Venue,
 )
 from interexchange_perp_grid.history import ParquetMarketRecorder, query_recorded_level_count
-from interexchange_perp_grid.public_engine import PublicMarketEngine
+from interexchange_perp_grid.public_engine import PublicMarketEngine, reconnect_backoff_seconds
 
 CONFIG = Path("config/defaults.yaml")
 
@@ -36,9 +38,10 @@ def make_instrument(venue: Venue) -> Instrument:
         amount_step_contracts=Decimal("0.001"),
         price_tick=Decimal("0.1"),
         minimum_amount_contracts=Decimal("0.001"),
-        minimum_notional=None,
+        minimum_notional=Decimal("0.01"),
         taker_fee_rate=Decimal("0.0005"),
         fee_source="fixture",
+        listed_at=datetime(2025, 1, 1, tzinfo=UTC),
     )
 
 
@@ -159,9 +162,11 @@ class BroadFakeAdapter(ExchangeAdapter):
         self.fail_bbo = fail_bbo
         self.instruments = make_many_instruments(venue)
         self.discover_calls = 0
+        self.probe_calls = 0
         self.bbo_calls = 0
 
     async def probe_public_capabilities(self) -> CapabilityReport:
+        self.probe_calls += 1
         if self.fail_probe:
             raise ConnectionError("fixture probe outage")
         return CapabilityReport(
@@ -182,7 +187,7 @@ class BroadFakeAdapter(ExchangeAdapter):
 
     async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
         self.bbo_calls += 1
-        assert symbols == tuple(instrument.symbol for instrument in self.instruments)
+        assert set(symbols).issubset({instrument.symbol for instrument in self.instruments})
         if self.fail_bbo:
             raise ConnectionError("fixture BBO outage")
         offset = Decimal(list(Venue).index(self.venue))
@@ -200,6 +205,7 @@ class BroadFakeAdapter(ExchangeAdapter):
                 0,
             )
             for instrument in self.instruments
+            if instrument.symbol in symbols
         )
 
     async def watch_order_book(
@@ -216,6 +222,41 @@ class BroadFakeAdapter(ExchangeAdapter):
 
     async def close(self) -> None:
         return None
+
+
+class IncrementalBroadFakeAdapter(BroadFakeAdapter):
+    def __init__(self, venue: Venue, received_ns: int) -> None:
+        super().__init__(venue, received_ns)
+        self._next_index = 0
+        self.active_calls = 0
+        self.peak_concurrent_calls = 0
+
+    async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
+        self.bbo_calls += 1
+        self.active_calls += 1
+        self.peak_concurrent_calls = max(self.peak_concurrent_calls, self.active_calls)
+        try:
+            await asyncio.sleep(0)
+            instrument = self.instruments[self._next_index % len(self.instruments)]
+            self._next_index += 1
+            assert instrument.symbol in symbols
+            offset = Decimal(list(Venue).index(self.venue))
+            return (
+                BboQuote(
+                    self.venue,
+                    instrument.symbol,
+                    Decimal(100) + offset,
+                    Decimal(1),
+                    Decimal("100.5") + offset,
+                    Decimal(1),
+                    1_700_000_000_000,
+                    datetime.now(UTC),
+                    self.received_ns,
+                    0,
+                ),
+            )
+        finally:
+            self.active_calls -= 1
 
 
 @pytest.mark.asyncio
@@ -296,7 +337,8 @@ async def test_broad_bbo_scans_100_common_instruments_and_isolates_one_venue(
     await engine.close()
 
     assert result.common_instrument_count == 100
-    assert result.directed_route_count == 600
+    assert result.discovered_route_count == 600
+    assert result.directed_route_count == 200
     assert len(result.bbo) == 200
     assert len(result.prefilter) == 200
     assert all(observation.execution_authorized is False for observation in result.prefilter)
@@ -333,3 +375,110 @@ async def test_reconnect_forces_universe_refresh_and_restores_venue(tmp_path: Pa
     assert len(refreshed.routes) == 600
     assert refreshed.generation == initial.generation + 1
     assert adapters[Venue.OKX].discover_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_incremental_batch_updates_fill_bounded_cache_with_one_watcher_per_venue(
+    tmp_path: Path,
+) -> None:
+    clock = 1_000_000_000
+    adapters = {venue: IncrementalBroadFakeAdapter(venue, clock) for venue in Venue}
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+    )
+
+    result = await engine.scan_broad_bbo(timeout_seconds=2)
+    await engine.close()
+
+    assert result.cache.known_keys == result.cache.entries == 300
+    assert len(result.bbo) == 300
+    assert len(result.prefilter) == 600
+    assert all(adapter.bbo_calls >= 100 for adapter in adapters.values())
+    assert all(adapter.peak_concurrent_calls == 1 for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_failed_bbo_venue_is_retried_automatically_after_backoff(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue}
+    adapters[Venue.OKX].fail_probe = True
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+
+    initial = await engine.scan_broad_bbo(timeout_seconds=1)
+    adapters[Venue.OKX].fail_probe = False
+    before_retry = await engine.scan_broad_bbo(timeout_seconds=1)
+    clock[0] += 1_000_000_000
+    for adapter in adapters.values():
+        adapter.received_ns = clock[0]
+    recovered = await engine.scan_broad_bbo(timeout_seconds=1)
+    await engine.close()
+
+    assert initial.directed_route_count == before_retry.directed_route_count == 200
+    assert recovered.directed_route_count == recovered.discovered_route_count == 600
+    assert recovered.quarantined == ()
+    assert adapters[Venue.OKX].probe_calls == 2
+
+
+def test_reconnect_backoff_is_exponential_and_capped_at_30_seconds() -> None:
+    assert tuple(reconnect_backoff_seconds(attempt) for attempt in range(1, 9)) == (
+        1,
+        2,
+        4,
+        8,
+        16,
+        30,
+        30,
+        30,
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_universe_excludes_young_and_unknown_age_from_candidate_routes(
+    tmp_path: Path,
+) -> None:
+    clock = 1_000_000_000
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    adapters = {venue: BroadFakeAdapter(venue, clock) for venue in Venue}
+    for adapter in adapters.values():
+        template = adapter.instruments[0]
+        adapter.instruments = (
+            *adapter.instruments,
+            replace(
+                template,
+                symbol="YOUNG/USDT:USDT",
+                exchange_symbol=f"{adapter.venue.value}-YOUNG",
+                base="YOUNG",
+                listed_at=now - timedelta(days=13),
+            ),
+            replace(
+                template,
+                symbol="UNKNOWN/USDT:USDT",
+                exchange_symbol=f"{adapter.venue.value}-UNKNOWN",
+                base="UNKNOWN",
+                listed_at=None,
+            ),
+        )
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+        now_factory=lambda: now,
+    )
+
+    result = await engine.scan_broad_bbo(timeout_seconds=1)
+    await engine.close()
+
+    assert result.common_instrument_count == 100
+    assert all(observation.base not in {"YOUNG", "UNKNOWN"} for observation in result.prefilter)

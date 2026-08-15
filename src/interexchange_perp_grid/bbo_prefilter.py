@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from interexchange_perp_grid.domain import BboQuote, Venue
 from interexchange_perp_grid.market_universe import UniverseRoute
+from interexchange_perp_grid.reason_codes import ReasonCode
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,10 +26,11 @@ class BboPrefilterObservation:
     short_venue: Venue
     long_symbol: str
     short_symbol: str
-    gross_entry_spread_bps: Decimal
-    estimated_four_leg_fee_bps: Decimal
-    estimated_edge_bps: Decimal
+    gross_entry_spread_bps: Decimal | None
+    estimated_four_leg_fee_bps: Decimal | None
+    estimated_edge_bps: Decimal | None
     observed_monotonic_ns: int
+    reason: ReasonCode
     execution_authorized: bool = field(default=False, init=False)
 
     @property
@@ -98,7 +100,7 @@ class LatestBboCache:
             0 <= age_ns <= self._maximum_age_ns
             and quote.bid_price > 0
             and quote.ask_price > 0
-            and quote.bid_price <= quote.ask_price
+            and quote.bid_price < quote.ask_price
             and (quote.bid_base_quantity is None or quote.bid_base_quantity > 0)
             and (quote.ask_base_quantity is None or quote.ask_base_quantity > 0)
             and quote.clock_skew_ms is not None
@@ -117,12 +119,41 @@ def rank_bbo_prefilter(
         short = route.short_instrument
         long_quote = by_key.get((long.venue, long.symbol))
         short_quote = by_key.get((short.venue, short.symbol))
-        if (
-            long_quote is None
-            or short_quote is None
-            or long.taker_fee_rate is None
-            or short.taker_fee_rate is None
-        ):
+        observed_ns = max(
+            long_quote.received_monotonic_ns if long_quote is not None else 0,
+            short_quote.received_monotonic_ns if short_quote is not None else 0,
+        )
+        if long_quote is None or short_quote is None:
+            observations.append(
+                BboPrefilterObservation(
+                    long.base,
+                    long.venue,
+                    short.venue,
+                    long.symbol,
+                    short.symbol,
+                    None,
+                    None,
+                    None,
+                    observed_ns,
+                    ReasonCode.BOOK_EMPTY,
+                )
+            )
+            continue
+        if long.taker_fee_rate is None or short.taker_fee_rate is None:
+            observations.append(
+                BboPrefilterObservation(
+                    long.base,
+                    long.venue,
+                    short.venue,
+                    long.symbol,
+                    short.symbol,
+                    None,
+                    None,
+                    None,
+                    observed_ns,
+                    ReasonCode.FEE_UNKNOWN,
+                )
+            )
             continue
         reference = (long_quote.ask_price + short_quote.bid_price) / Decimal(2)
         if reference <= 0:
@@ -139,15 +170,17 @@ def rank_bbo_prefilter(
                 spread_bps,
                 fee_bps,
                 spread_bps - fee_bps,
-                max(
-                    long_quote.received_monotonic_ns,
-                    short_quote.received_monotonic_ns,
-                ),
+                observed_ns,
+                ReasonCode.QUOTE_READY,
             )
         )
     return tuple(
         sorted(
             observations,
-            key=lambda item: (-item.estimated_edge_bps, *item.stable_key),
+            key=lambda item: (
+                item.estimated_edge_bps is None,
+                -(item.estimated_edge_bps or Decimal(0)),
+                *item.stable_key,
+            ),
         )
     )

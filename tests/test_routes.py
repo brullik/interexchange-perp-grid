@@ -28,7 +28,7 @@ def instrument(venue: Venue, contract_size: str, amount_step: str, fee: str) -> 
         amount_step_contracts=Decimal(amount_step),
         price_tick=Decimal("0.1"),
         minimum_amount_contracts=Decimal(amount_step),
-        minimum_notional=None,
+        minimum_notional=Decimal("0.01"),
         taker_fee_rate=Decimal(fee),
         fee_source="fixture",
     )
@@ -144,6 +144,27 @@ def test_unknown_mark_or_index_blocks_route() -> None:
     )
     assert quote.eligible is False
     assert quote.reason == ReasonCode.MARK_INDEX_UNKNOWN
+
+
+def test_unknown_minimum_notional_blocks_route() -> None:
+    bybit = replace(instrument(Venue.BYBIT, "1", "0.001", "0.0006"), minimum_notional=None)
+    okx = instrument(Venue.OKX, "0.01", "0.01", "0.0005")
+    accepted = DataQualityAssessment(True, ReasonCode.QUOTE_READY, 1)
+
+    quote = evaluate_directed_route(
+        bybit,
+        okx,
+        book(Venue.BYBIT, "100", "101"),
+        book(Venue.OKX, "103", "104"),
+        funding(Venue.BYBIT, "0.0001"),
+        funding(Venue.OKX, "0.0002"),
+        accepted,
+        accepted,
+        Decimal("0.001"),
+    )
+
+    assert quote.eligible is False
+    assert quote.reason == ReasonCode.CONTRACT_METADATA_UNKNOWN
 
 
 def test_ambiguous_contract_mapping_is_rejected() -> None:

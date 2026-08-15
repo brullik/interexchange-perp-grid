@@ -63,7 +63,7 @@ def match_common_instruments(
             for venue, venue_instruments in by_venue.items()
             if len(venue_instruments) == 1
         }
-        if len(unambiguous) < minimum_venues or len(unambiguous) != len(by_venue):
+        if len(unambiguous) < minimum_venues:
             continue
         common.append(
             CommonInstrument(
@@ -253,7 +253,12 @@ def evaluate_directed_route(
 
 
 def _meets_notional(instrument: Instrument, price: Decimal, quantity: Decimal) -> bool:
-    return instrument.minimum_notional is None or price * quantity >= instrument.minimum_notional
+    return (
+        instrument.minimum_notional is not None
+        and instrument.minimum_notional.is_finite()
+        and instrument.minimum_notional > 0
+        and price * quantity >= instrument.minimum_notional
+    )
 
 
 def _rejected(

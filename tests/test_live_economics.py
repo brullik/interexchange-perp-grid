@@ -38,7 +38,7 @@ def _instrument(venue: Venue) -> Instrument:
         amount_step_contracts=Decimal("1"),
         price_tick=Decimal("0.1"),
         minimum_amount_contracts=Decimal("1"),
-        minimum_notional=None,
+        minimum_notional=Decimal("0.01"),
         taker_fee_rate=Decimal("0.0005"),
         fee_source="public",
     )

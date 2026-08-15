@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -150,9 +149,7 @@ class CcxtProAdapter(ExchangeAdapter):
 
     async def probe_public_capabilities(self) -> CapabilityReport:
         await self._exchange.load_markets()
-        bbo_stream = any(
-            self._has(capability) for capability in ("watchBidsAsks", "watchTickers", "watchTicker")
-        )
+        bbo_stream = any(self._has(capability) for capability in ("watchBidsAsks", "watchTickers"))
         l2_stream = self._has("watchOrderBook")
         funding = self._has("fetchFundingRate") or self._has("fetchFundingRates")
         mark_index = self._has("fetchMarkPrice") or self._has("fetchTicker")
@@ -249,10 +246,7 @@ class CcxtProAdapter(ExchangeAdapter):
                 for raw in raw_result.values()
                 if isinstance(raw, Mapping) and raw.get("symbol") in symbols
             )
-        raw_tickers = await asyncio.gather(
-            *(self._exchange.watch_ticker(symbol) for symbol in symbols)
-        )
-        return tuple(self._normalise_bbo(raw) for raw in raw_tickers if isinstance(raw, Mapping))
+        raise RuntimeError("batch BBO stream capability is required")
 
     async def watch_order_book(self, instrument: Instrument, limit: int = 50) -> OrderBookSnapshot:
         if self.venue == Venue.OKX:

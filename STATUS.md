@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE3_1_MULTI_INSTRUMENT_BBO_EXACT_REVIEW
-- **Current checkpoint:** Draft PR #5 contains the locally verified Phase 3.1 universe → bounded broad BBO → ranked non-executable prefilter and awaits exact-head CI plus independent review
+- **State:** PHASE3_1_MULTI_INSTRUMENT_BBO_P1_REMEDIATION
+- **Current checkpoint:** Draft PR #5 exact head `818e856` failed independent review with P0=0/P1=4; all four findings are remediated locally and await the complete gate plus a new exact-head review
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -22,7 +22,7 @@ This is the only mutable project-status document.
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
 | Phase 2 Wave 1 data/private core | COMPLETE | PR #4 was independently verified with P0/P1/P2=0 and squash-merged as `0e87a1e`; post-merge [run 31904798345](https://github.com/brullik/interexchange-perp-grid/actions/runs/31904798345) passed all five jobs |
-| Phase 3.1 multi-instrument broad BBO | DRAFT_PR_GATES | Draft PR #5; typed locked universe policy; active/age/ambiguity gates; startup/6h/reconnect refresh; 101-common/606-route deterministic fixture; one-call-per-venue broad BBO; bounded 100k-update cache; stable non-executable prefilter with p95 ≤100 ms; 265 local tests |
+| Phase 3.1 multi-instrument broad BBO | P1_REMEDIATION_LOCAL | Draft PR #5; canonical product/mandatory metadata and universal age gates; 102-safe-common/608-route fixture; one long-running batch watcher per venue; incremental-update coverage; bounded cache; automatic 1→30 s reconnect; stable non-executable prefilter; 273 local tests |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -75,6 +75,9 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-15 — Validate typed universe/data settings against adjacent locked `RUNTIME_POLICY.yaml` at startup — duplicated operational policy must fail startup on drift rather than silently diverge — config
 2026-08-15 — Keep one immutable latest universe with startup, six-hour, and reconnect refresh; reject inactive, future, young, unknown-age live, and ambiguous instruments — broad discovery must remain deterministic and fail closed — `market_universe.py`, public adapter/engine
 2026-08-15 — Coalesce broad BBO only into known venue-symbol keys and rank observations without execution authority — 100k bursts and one venue outage must not grow memory, subscribe to L2, or create a trade — `bbo_prefilter.py`, `public_engine.py`, shadow snapshot
+2026-08-15 — Require canonical linear-USDT product identity and positive contract metadata at the typed registry and economics boundaries — adapter trust or missing minimum notional must never create a candidate or executable route — domain, universe, routes, live economics
+2026-08-15 — Consume incremental batch BBO updates through one long-running watcher per venue and reject per-symbol transport fallback — CCXT `newUpdates` emits changed tickers and broad coverage must remain concurrency-bounded — public adapter/engine
+2026-08-15 — Retry quarantined public venues automatically with deterministic exponential backoff capped at 30 seconds — a transient feed failure must fail closed without excluding a recovered venue for six hours — `public_engine.py`
 
 ## Active blockers / owner actions
 
@@ -89,7 +92,7 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (88 files)
 - mypy --strict: PASS (86 source/test files)
-- pytest: 265 passed
+- pytest: 273 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,

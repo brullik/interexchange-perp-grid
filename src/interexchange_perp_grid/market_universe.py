@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from interexchange_perp_grid.domain import CommonInstrument, Instrument, Venue
+from interexchange_perp_grid.domain import CommonInstrument, Instrument, ProductType, Venue
 from interexchange_perp_grid.routes import directed_pairs, match_common_instruments
 
 
@@ -85,7 +85,27 @@ class InstrumentRegistry:
         )
 
     def _eligible(self, instrument: Instrument, now: datetime) -> bool:
-        if not instrument.active:
+        required_positive = (
+            instrument.contract_size_base,
+            instrument.amount_step_contracts,
+            instrument.price_tick,
+            instrument.minimum_amount_contracts,
+            instrument.minimum_notional,
+        )
+        if (
+            not instrument.active
+            or instrument.product_type != ProductType.LINEAR_USDT_PERPETUAL
+            or instrument.quote != "USDT"
+            or instrument.settle != "USDT"
+            or not instrument.base
+            or instrument.base != instrument.base.upper()
+            or not instrument.symbol
+            or not instrument.exchange_symbol
+            or any(
+                not isinstance(value, Decimal) or not value.is_finite() or value <= 0
+                for value in required_positive
+            )
+        ):
             return False
         age = instrument.listing_age_seconds(now)
         if age is not None and age < 0:

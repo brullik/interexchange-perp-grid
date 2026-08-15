@@ -123,6 +123,29 @@ class SequenceBookExchange:
         }
 
 
+class TickerOnlyExchange:
+    has: ClassVar[dict[str, object]] = {"watchTicker": True}
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def watch_ticker(self, symbol: str) -> dict[str, object]:
+        del symbol
+        self.calls += 1
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_broad_bbo_rejects_unbounded_per_symbol_ticker_fallback() -> None:
+    exchange = TickerOnlyExchange()
+    adapter = CcxtProAdapter(Venue.BYBIT, exchange=exchange)
+
+    with pytest.raises(RuntimeError, match="batch BBO stream capability"):
+        await adapter.watch_bbo(tuple(f"A{index}/USDT:USDT" for index in range(101)))
+
+    assert exchange.calls == 0
+
+
 @pytest.mark.asyncio
 async def test_ccxt_book_carries_native_non_contiguous_sequence_evidence() -> None:
     adapter = CcxtProAdapter(Venue.BYBIT, exchange=SequenceBookExchange())

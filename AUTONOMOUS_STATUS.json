@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T20:03:34Z",
-  "state": "PHASE3_1_EXACT_REVIEW",
+  "updated_at": "2026-08-15T20:24:20Z",
+  "state": "PHASE3_1_P1_REMEDIATION_LOCAL_GATE",
   "phase": "Phase 3.1 — Multi-instrument universe and broad BBO prefilter",
   "repository": "brullik/interexchange-perp-grid",
   "branch": "codex/multi-instrument-shadow",
   "pr": 5,
-  "head_sha": "dd8f9e41f2a595eecb3b2c3a3708141154f1c295",
-  "ci_run": null,
-  "artifact": null,
+  "head_sha": "818e8562eb8dfb0b34121db3f030729540d42ce8",
+  "ci_run": 31905691760,
+  "artifact": "c4-3-proof-818e8562eb8dfb0b34121db3f030729540d42ce8",
   "completed_criteria": [
     "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
     "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
@@ -19,19 +19,19 @@
     "Telegram shadow mode remains healthy without runtime credentials",
     "Phase 2 exact head 3bc15a3 passed independent adversarial and release verification with P0/P1/P2 all zero",
     "PR 4 was squash-merged as 0e87a1e and post-merge run 31904798345 passed all five jobs",
-    "Phase 3.1 local gate passed: lock, Ruff, strict mypy, 265 tests, and doctor",
-    "Deterministic large universe proves 101 common instruments, 606 directed routes, 14-day live age boundary, ambiguity and activity rejection",
+    "Phase 3.1 P1 remediation local tests passed: Ruff, strict mypy, and 273 tests",
+    "Deterministic large universe proves 102 safe common instruments, 608 directed routes, 14-day age boundary, safe ambiguity isolation, and activity rejection",
     "Broad BBO cache coalesces 100000 updates within known-key memory bounds and non-executable prefilter p95 is at most 100 ms"
   ],
   "active_work": [
-    "Obtain fresh exact-head CI for draft PR 5",
-    "Obtain independent Phase 3.1 adversarial and release verification before continuing Phase 3.2"
+    "Run the complete pre-commit gate for the Phase 3.1 P1 remediation",
+    "Commit and push the remediation, then obtain fresh exact-head CI and independent review"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Keep PR 5 draft until exact-head CI and independent P0/P1-free adversarial plus release verification pass, then continue the same PR with Phase 3.2.",
+  "next_action": "Keep PR 5 draft, publish the locally verified remediation, and require fresh exact-head CI plus independent P0/P1-free adversarial and release verification before Phase 3.2.",
   "known_limitations": [
     "The current repository visibility is PUBLIC.",
     "Operational evidence and secrets remain forbidden while the repository is PUBLIC."

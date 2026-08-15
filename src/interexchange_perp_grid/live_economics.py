@@ -412,7 +412,7 @@ def _quantity_is_executable(
     if units != units.to_integral_value():
         return False
     if instrument.minimum_notional is None:
-        return True
+        return False
     if not book.bids or not book.asks:
         return False
     return quantity * min(book.bids[0].price, book.asks[0].price) >= instrument.minimum_notional
