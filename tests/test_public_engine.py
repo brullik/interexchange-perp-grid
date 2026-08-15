@@ -321,6 +321,18 @@ class CoordinatedProbeBroadFakeAdapter(BroadFakeAdapter):
         return await super().probe_public_capabilities()
 
 
+class CoordinatedDiscoveryBroadFakeAdapter(BroadFakeAdapter):
+    def __init__(self, venue: Venue, received_ns: int) -> None:
+        super().__init__(venue, received_ns)
+        self.discovery_started = asyncio.Event()
+        self.allow_discovery = asyncio.Event()
+
+    async def discover_instruments(self) -> tuple[Instrument, ...]:
+        self.discovery_started.set()
+        await self.allow_discovery.wait()
+        return await super().discover_instruments()
+
+
 class PermanentlyCancellationResistantBroadFakeAdapter(BroadFakeAdapter):
     def __init__(self, venue: Venue, received_ns: int) -> None:
         super().__init__(venue, received_ns)
@@ -931,7 +943,7 @@ async def test_shutdown_during_replacement_probe_cannot_report_recovery(tmp_path
     assert str(recovered) == "public market engine is closed"
     assert len(created_okx_adapters) == 2
     assert replacement.probe_calls == 1
-    assert replacement.discover_calls == 1
+    assert replacement.discover_calls == 0
     assert replacement.closed is True
     assert Venue.OKX in engine._quarantined
     assert Venue.OKX not in engine._instruments
@@ -971,6 +983,93 @@ async def test_closed_uninitialised_engine_cannot_create_adapters(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_concurrent_initialise_calls_share_one_adapter_generation(tmp_path: Path) -> None:
+    created: list[BroadFakeAdapter] = []
+
+    def adapter_factory(venue: Venue) -> BroadFakeAdapter:
+        adapter = BroadFakeAdapter(venue, 1_000_000_000)
+        created.append(adapter)
+        return adapter
+
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapter_factory,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+
+    await asyncio.gather(
+        engine.initialise(timeout_seconds=1),
+        engine.initialise(timeout_seconds=1),
+    )
+    await engine.close()
+
+    assert len(created) == 3
+    assert all(adapter.probe_calls == 1 for adapter in created)
+    assert all(adapter.discover_calls == 1 for adapter in created)
+    assert all(adapter.closed for adapter in created)
+
+
+@pytest.mark.asyncio
+async def test_partial_adapter_factory_failure_rolls_back_created_adapters(tmp_path: Path) -> None:
+    created: list[BroadFakeAdapter] = []
+
+    def adapter_factory(venue: Venue) -> BroadFakeAdapter:
+        if venue == Venue.OKX:
+            raise RuntimeError("fixture factory failure")
+        adapter = BroadFakeAdapter(venue, 1_000_000_000)
+        created.append(adapter)
+        return adapter
+
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapter_factory,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+
+    with pytest.raises(RuntimeError, match="fixture factory failure"):
+        await engine.initialise(timeout_seconds=1)
+
+    assert len(created) == 2
+    assert all(adapter.closed for adapter in created)
+    assert engine._adapters == {}
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cold_scans_wait_for_one_initialisation(tmp_path: Path) -> None:
+    created: list[BroadFakeAdapter] = []
+
+    def adapter_factory(venue: Venue) -> BroadFakeAdapter:
+        adapter = BroadFakeAdapter(venue, 1_000_000_000)
+        created.append(adapter)
+        return adapter
+
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapter_factory,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+
+    scans = await asyncio.gather(
+        engine.scan_broad_bbo(timeout_seconds=1),
+        engine.scan_broad_bbo(timeout_seconds=1),
+    )
+    await engine.close()
+
+    assert len(created) == 3
+    assert all(adapter.probe_calls == 1 for adapter in created)
+    assert all(adapter.discover_calls == 1 for adapter in created)
+    assert {result.universe_generation for result in scans} == {1}
+    assert all(result.directed_route_count == 600 for result in scans)
+
+
+@pytest.mark.asyncio
 async def test_shutdown_during_initial_probe_closes_all_created_adapters(tmp_path: Path) -> None:
     clock = 1_000_000_000
     adapters: dict[Venue, BroadFakeAdapter] = {
@@ -1001,6 +1100,113 @@ async def test_shutdown_during_initial_probe_closes_all_created_adapters(tmp_pat
     assert str(initialise_result) == "public market engine is closed"
     assert shutdown_result is None
     assert all(adapter.closed for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_late_initial_probe_cannot_mutate_state_after_shutdown_timeout(
+    tmp_path: Path,
+) -> None:
+    clock = 1_000_000_000
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+    }
+    probing = CoordinatedProbeBroadFakeAdapter(Venue.OKX, clock)
+    adapters[Venue.OKX] = probing
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+    )
+
+    initialise = asyncio.create_task(engine.initialise(timeout_seconds=5))
+    await asyncio.wait_for(probing.probe_started.wait(), timeout=1)
+    with pytest.raises(RuntimeError, match=r"shutdown deadline exceeded.*public lifecycle"):
+        await engine.close()
+    capabilities_after_close = dict(engine._capabilities)
+    instruments_after_close = dict(engine._instruments)
+
+    probing.allow_probe.set()
+    with pytest.raises(RuntimeError, match="public market engine is closed"):
+        await initialise
+
+    assert engine._capabilities == capabilities_after_close
+    assert engine._instruments == instruments_after_close
+    assert Venue.OKX not in engine._capabilities
+    assert Venue.OKX not in engine._instruments
+
+
+@pytest.mark.asyncio
+async def test_late_initial_discovery_cannot_mutate_state_after_shutdown_timeout(
+    tmp_path: Path,
+) -> None:
+    clock = 1_000_000_000
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+    }
+    discovering = CoordinatedDiscoveryBroadFakeAdapter(Venue.OKX, clock)
+    adapters[Venue.OKX] = discovering
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+    )
+
+    initialise = asyncio.create_task(engine.initialise(timeout_seconds=5))
+    await asyncio.wait_for(discovering.discovery_started.wait(), timeout=1)
+    with pytest.raises(RuntimeError, match=r"shutdown deadline exceeded.*public lifecycle"):
+        await engine.close()
+    capabilities_after_close = dict(engine._capabilities)
+    instruments_after_close = dict(engine._instruments)
+
+    discovering.allow_discovery.set()
+    with pytest.raises(RuntimeError, match="public market engine is closed"):
+        await initialise
+
+    assert engine._capabilities == capabilities_after_close
+    assert engine._instruments == instruments_after_close
+    assert Venue.OKX not in engine._capabilities
+    assert Venue.OKX not in engine._instruments
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_forced_refresh_and_blocks_late_state_mutation(
+    tmp_path: Path,
+) -> None:
+    clock = 1_000_000_000
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+    }
+    probing = CoordinatedProbeBroadFakeAdapter(Venue.OKX, clock)
+    probing.allow_probe.set()
+    adapters[Venue.OKX] = probing
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+    )
+    await engine.initialise(timeout_seconds=1)
+    probing.probe_started.clear()
+    probing.allow_probe.clear()
+
+    refresh = asyncio.create_task(engine.refresh_universe(timeout_seconds=5, force=True))
+    await asyncio.wait_for(probing.probe_started.wait(), timeout=1)
+    with pytest.raises(RuntimeError, match=r"shutdown deadline exceeded.*public lifecycle"):
+        await engine.close()
+    capabilities_after_close = dict(engine._capabilities)
+    instruments_after_close = dict(engine._instruments)
+
+    probing.allow_probe.set()
+    with pytest.raises(RuntimeError, match="public market engine is closed"):
+        await refresh
+
+    assert engine._capabilities == capabilities_after_close
+    assert engine._instruments == instruments_after_close
 
 
 @pytest.mark.asyncio

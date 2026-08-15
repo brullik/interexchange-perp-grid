@@ -128,6 +128,7 @@ class PublicMarketEngine:
         self._reconnect_attempts: dict[Venue, int] = {}
         self._reconnect_after_ns: dict[Venue, int] = {}
         self._recycle_failure_generations: dict[Venue, int] = {}
+        self._venue_refresh_generations: dict[Venue, int] = {}
         self._books = BookRegistry()
         self._universe = UniverseService(
             InstrumentRegistry(
@@ -146,20 +147,32 @@ class PublicMarketEngine:
         self._retiring_bbo_transports: dict[Venue, asyncio.Task[tuple[BboQuote, ...]]] = {}
         self._retiring_adapter_closers: dict[Venue, asyncio.Task[None]] = {}
         self._adapter_recycle_locks: dict[Venue, asyncio.Lock] = {}
-        self._initialise_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._bbo_changed = asyncio.Event()
         self._bbo_watch_timeout_seconds = settings.market_data.max_bbo_age_ms / 1000
         self._bbo_retirement_grace_seconds = min(
             0.1,
             max(0.01, self._bbo_watch_timeout_seconds),
         )
+        self._initialised = False
         self._closed = False
 
     async def initialise(self, timeout_seconds: int = 30) -> None:
-        async with self._initialise_lock:
+        async with self._lifecycle_lock:
             self._require_open()
-            configured = tuple(Venue(value) for value in self.settings.venues.wave1_public)
-            self._adapters = {venue: self._adapter_factory(venue) for venue in configured}
+            if self._initialised:
+                return
+            if not self._adapters:
+                staged_adapters: dict[Venue, ExchangeAdapter] = {}
+                try:
+                    for value in self.settings.venues.wave1_public:
+                        venue = Venue(value)
+                        staged_adapters[venue] = self._adapter_factory(venue)
+                except Exception:
+                    await self._close_unpublished_adapters(staged_adapters)
+                    raise
+                self._adapters = staged_adapters
+            configured = tuple(self._adapters)
             await asyncio.gather(
                 *(
                     self._initialise_venue_with_timeout(venue, timeout_seconds)
@@ -169,42 +182,90 @@ class PublicMarketEngine:
             self._require_open()
             await self._refresh_universe_snapshot(force=True)
             self._require_open()
+            self._initialised = True
 
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("public market engine is closed")
 
+    async def _close_unpublished_adapters(
+        self,
+        adapters: dict[Venue, ExchangeAdapter],
+    ) -> None:
+        if not adapters:
+            return
+        closers = {
+            venue: asyncio.create_task(adapter.close(), name=f"rollback-close-{venue.value}")
+            for venue, adapter in adapters.items()
+        }
+        done, _pending = await asyncio.wait(tuple(closers.values()), timeout=1)
+        failures: list[str] = []
+        for venue, closer in closers.items():
+            if closer in done:
+                try:
+                    closer.result()
+                except (asyncio.CancelledError, Exception) as error:
+                    failures.append(f"{venue.value}: {type(error).__name__}: {error}")
+                continue
+            closer.cancel()
+            closer.add_done_callback(self._consume_watcher)
+            self._retiring_adapter_closers[venue] = closer
+            failures.append(f"{venue.value}: rollback deadline exceeded")
+        if failures:
+            self._adapters = dict(adapters)
+            self._closed = True
+            raise RuntimeError(f"public adapter factory rollback failed: {'; '.join(failures)}")
+
     async def _initialise_venue_with_timeout(self, venue: Venue, timeout_seconds: int) -> None:
         try:
             await asyncio.wait_for(self._initialise_venue(venue), timeout=timeout_seconds)
         except TimeoutError:
+            if self._closed:
+                return
             self._quarantine(venue, f"capability probe timed out after {timeout_seconds}s")
+            self._record_venue_refresh(venue)
 
     async def _initialise_venue(self, venue: Venue) -> None:
         adapter = self._adapters[venue]
+        report: CapabilityReport | None = None
+        instruments: tuple[Instrument, ...] = ()
+        failure_reason: str | None = None
         try:
             report = await adapter.probe_public_capabilities()
-            self._capabilities[venue] = report
+            if self._closed:
+                return
             if not report.public_ready:
-                self._quarantine(venue, f"missing capabilities: {', '.join(report.missing)}")
+                failure_reason = f"missing capabilities: {', '.join(report.missing)}"
+            elif report.clock_skew_ms is None:
+                failure_reason = "clock skew is unknown"
+            elif abs(report.clock_skew_ms) > self.settings.market_data.max_clock_skew_ms:
+                failure_reason = f"clock skew {report.clock_skew_ms}ms exceeds policy"
+            else:
+                instruments = await adapter.discover_instruments()
+                if self._closed:
+                    return
+                if not instruments:
+                    failure_reason = "no qualified linear USDT perpetual instruments"
+        except Exception as error:
+            if self._closed:
                 return
-            if report.clock_skew_ms is None:
-                self._quarantine(venue, "clock skew is unknown")
-                return
-            if abs(report.clock_skew_ms) > self.settings.market_data.max_clock_skew_ms:
-                self._quarantine(
-                    venue,
-                    f"clock skew {report.clock_skew_ms}ms exceeds policy",
-                )
-                return
-            instruments = await adapter.discover_instruments()
-            if not instruments:
-                self._quarantine(venue, "no qualified linear USDT perpetual instruments")
-                return
+            failure_reason = f"capability probe failed: {type(error).__name__}: {error}"
+
+        if self._closed:
+            return
+        if report is not None:
+            self._capabilities[venue] = report
+        if failure_reason is None:
+            assert report is not None
             self._instruments[venue] = instruments
             self._quarantined.pop(venue, None)
-        except Exception as error:
-            self._quarantine(venue, f"capability probe failed: {type(error).__name__}: {error}")
+            self._record_venue_refresh(venue)
+            return
+        self._quarantine(venue, failure_reason)
+        self._record_venue_refresh(venue)
+
+    def _record_venue_refresh(self, venue: Venue) -> None:
+        self._venue_refresh_generations[venue] = self._venue_refresh_generations.get(venue, 0) + 1
 
     def _quarantine(self, venue: Venue, reason: str) -> None:
         self._quarantined[venue] = QuarantineRecord(venue, reason, self._now_factory())
@@ -522,6 +583,49 @@ class PublicMarketEngine:
         reconnected: tuple[Venue, ...] = (),
     ) -> UniverseSnapshot:
         self._require_open()
+        if not self._initialised:
+            await self.initialise(timeout_seconds)
+        now_ns = self._monotonic_ns()
+        due_reconnects = {
+            venue
+            for venue, retry_at_ns in self._reconnect_after_ns.items()
+            if now_ns >= retry_at_ns
+        }
+        requested_venues = (
+            set(self._adapters)
+            if force
+            else {venue for venue in (*reconnected, *due_reconnects) if venue in self._adapters}
+        )
+        observed_refresh_generations = {
+            venue: self._venue_refresh_generations.get(venue, 0) for venue in requested_venues
+        }
+        observed_failure_generations = {
+            venue: self._recycle_failure_generations.get(venue, 0) for venue in requested_venues
+        }
+        async with self._lifecycle_lock:
+            self._require_open()
+            if requested_venues and all(
+                self._venue_refresh_generations.get(venue, 0) != observed_refresh_generations[venue]
+                or self._recycle_failure_generations.get(venue, 0)
+                != observed_failure_generations[venue]
+                for venue in requested_venues
+            ):
+                current = self._universe.snapshot
+                assert current is not None
+                return current
+            return await self._refresh_universe_locked(
+                timeout_seconds,
+                force=force,
+                reconnected=reconnected,
+            )
+
+    async def _refresh_universe_locked(
+        self,
+        timeout_seconds: int,
+        *,
+        force: bool,
+        reconnected: tuple[Venue, ...],
+    ) -> UniverseSnapshot:
         now_ns = self._monotonic_ns()
         due = self._universe.refresh_due(now_ns)
         due_reconnects = {
@@ -616,7 +720,7 @@ class PublicMarketEngine:
 
     async def scan_broad_bbo(self, timeout_seconds: int) -> BroadBboResult:
         self._require_open()
-        if not self._adapters:
+        if not self._initialised:
             await self.initialise(timeout_seconds)
         universe = await self.refresh_universe(timeout_seconds)
         self._require_open()
@@ -666,7 +770,7 @@ class PublicMarketEngine:
         timeout_seconds: int,
     ) -> ScanResult:
         self._require_open()
-        if not self._adapters:
+        if not self._initialised:
             await self.initialise(timeout_seconds)
         broad = await self.scan_broad_bbo(timeout_seconds)
         universe = self._universe.snapshot
@@ -829,16 +933,16 @@ class PublicMarketEngine:
         self._closed = True
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + 1
-        initialise_lock_acquired = False
-        initialise_lock_blocked = False
+        lifecycle_lock_acquired = False
+        lifecycle_lock_blocked = False
         try:
             await asyncio.wait_for(
-                self._initialise_lock.acquire(),
+                self._lifecycle_lock.acquire(),
                 timeout=max(0, shutdown_deadline - loop.time()),
             )
-            initialise_lock_acquired = True
+            lifecycle_lock_acquired = True
         except TimeoutError:
-            initialise_lock_blocked = True
+            lifecycle_lock_blocked = True
         recycle_locks = tuple(
             (venue, self._adapter_recycle_locks.setdefault(venue, asyncio.Lock()))
             for venue in sorted(self._adapters, key=str)
@@ -859,20 +963,20 @@ class PublicMarketEngine:
             await self._close_with_recycles_blocked(
                 shutdown_deadline,
                 blocked_recycle_venues,
-                initialise_lock_blocked=initialise_lock_blocked,
+                lifecycle_lock_blocked=lifecycle_lock_blocked,
             )
         finally:
             for lock in reversed(acquired_locks):
                 lock.release()
-            if initialise_lock_acquired:
-                self._initialise_lock.release()
+            if lifecycle_lock_acquired:
+                self._lifecycle_lock.release()
 
     async def _close_with_recycles_blocked(
         self,
         shutdown_deadline: float,
         blocked_recycle_venues: set[Venue],
         *,
-        initialise_lock_blocked: bool,
+        lifecycle_lock_blocked: bool,
     ) -> None:
         close_failures: list[str] = []
         timed_out_closer_venues: set[Venue] = set()
@@ -956,8 +1060,8 @@ class PublicMarketEngine:
             )
         )
         shutdown_failures: list[str] = []
-        if initialise_lock_blocked:
-            shutdown_failures.append("shutdown deadline exceeded for: initialisation")
+        if lifecycle_lock_blocked:
+            shutdown_failures.append("shutdown deadline exceeded for: public lifecycle")
         if pending_venues:
             shutdown_failures.append(
                 f"shutdown deadline exceeded for: "
