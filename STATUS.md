@@ -5,7 +5,7 @@ This is the only mutable project-status document.
 ## Current state
 
 - **State:** WAVE1_PRODUCTION_CORE_ADVERSARIAL_REVIEW
-- **Current checkpoint:** Phase 2 Wave 1 data/private core passes local verify; exact-current independent review pending
+- **Current checkpoint:** Phase 2 Wave 1 data/private core is based on exact current `main`; exact-head verification and independent review pending
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -83,6 +83,6 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,
-security evidence, independent exact-head review, and final commit identity remain required before merging this checkpoint.
+security evidence and independent exact-head review remain required before merging this checkpoint.
 No production credentials were used and no real order was submitted.
 ```
