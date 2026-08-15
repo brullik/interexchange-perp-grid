@@ -60,6 +60,7 @@ from interexchange_perp_grid.live_reconciliation import (
     reconcile_private_states,
 )
 from interexchange_perp_grid.market_data import BookRegistry, DataQualityAssessment
+from interexchange_perp_grid.private_cache import Wave1PrivateStateSupervisor
 from interexchange_perp_grid.private_domain import PrivateCapabilityReport, VenueOrderRequest
 from interexchange_perp_grid.private_execution import (
     CanaryAction,
@@ -90,6 +91,33 @@ from interexchange_perp_grid.state import (
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 OWNER_CONFIRMATION = "I_ACCEPT_LIVE_CANARY_RISK"
+
+
+async def _start_private_state_supervisor(
+    adapters: dict[Venue, CcxtPrivateAdapter],
+    state_path: Path,
+) -> tuple[
+    Wave1PrivateStateSupervisor,
+    asyncio.Event,
+    asyncio.Task[None],
+    dict[Venue, CanaryVenueAdapter],
+]:
+    supervisor = Wave1PrivateStateSupervisor(adapters, state_path=state_path)
+    await supervisor.startup()
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(supervisor.run(stop_event))
+    cached = cast(dict[Venue, CanaryVenueAdapter], supervisor.cached_adapters())
+    return supervisor, stop_event, task, cached
+
+
+async def _stop_private_state_supervisor(
+    stop_event: asyncio.Event | None,
+    task: asyncio.Task[None] | None,
+) -> None:
+    if stop_event is None or task is None:
+        return
+    stop_event.set()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 def _flat_barrier_policy(settings: Settings) -> FlatBarrierPolicy:
@@ -324,11 +352,15 @@ class OnDemandLiveControlPlane:
         return cast(LiveControlResult, await self._invoke("kill"))
 
     async def _invoke(self, operation: str) -> object:
-        journal = LiveOrderJournal(Path(self._settings.storage.sqlite_path))
+        state_path = Path(self._settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
         await journal.initialise()
         active = await journal.active()
         venues = {Venue(value) for value in self._settings.venues.wave1_public}
         private: dict[Venue, CcxtPrivateAdapter] = {}
+        private_stop: asyncio.Event | None = None
+        private_task: asyncio.Task[None] | None = None
         try:
             for venue in venues:
                 private[venue] = CcxtPrivateAdapter(
@@ -343,9 +375,12 @@ class OnDemandLiveControlPlane:
                 for batch in discovered
                 for instrument in batch
             }
+            _, private_stop, private_task, cached_private = await _start_private_state_supervisor(
+                private, state_path
+            )
             control = LiveControlService(
                 journal,
-                cast(dict[Venue, CanaryVenueAdapter], private),
+                cached_private,
                 registry,
                 active.route if active is not None else None,
                 active.qualification_hash if active is not None else None,
@@ -363,6 +398,7 @@ class OnDemandLiveControlPlane:
                 return await control.kill()
             raise ValueError(f"unsupported live control operation: {operation}")
         finally:
+            await _stop_private_state_supervisor(private_stop, private_task)
             await asyncio.gather(
                 *(adapter.close() for adapter in private.values()),
                 return_exceptions=True,
@@ -491,6 +527,8 @@ async def _resume_active_canary(
     venues = {active.route.long_venue, active.route.short_venue, emergency_venue}
     public_adapters = {venue: CcxtProAdapter(venue) for venue in venues}
     private_adapters: dict[Venue, CcxtPrivateAdapter] = {}
+    private_stop: asyncio.Event | None = None
+    private_task: asyncio.Task[None] | None = None
     try:
         instruments, _ = await _discover_instruments(active.route.base, public_adapters)
         for venue in venues:
@@ -498,8 +536,15 @@ async def _resume_active_canary(
                 venue,
                 PrivateCredentials.from_environment(venue),
             )
-        typed_adapters = cast(dict[Venue, CanaryVenueAdapter], private_adapters)
-        states = await collect_private_states(typed_adapters, instruments)
+        _, private_stop, private_task, typed_adapters = await _start_private_state_supervisor(
+            private_adapters,
+            Path(settings.storage.sqlite_path),
+        )
+        states = await collect_private_states(
+            typed_adapters,
+            instruments,
+            reconciliation_trigger="RESTART",
+        )
         reconciliation = reconcile_private_states(
             active,
             states,
@@ -580,6 +625,7 @@ async def _resume_active_canary(
             owner_instruction=result.owner_instruction,
         )
     finally:
+        await _stop_private_state_supervisor(private_stop, private_task)
         await asyncio.gather(
             *(adapter.close() for adapter in public_adapters.values()),
             *(adapter.close() for adapter in private_adapters.values()),
@@ -649,6 +695,8 @@ async def run_canary_once(
     required_venues = {route.long_venue, route.short_venue, emergency_venue}
     public_adapters = {venue: CcxtProAdapter(venue) for venue in required_venues}
     private_adapters: dict[Venue, CcxtPrivateAdapter] = {}
+    private_stop: asyncio.Event | None = None
+    private_task: asyncio.Task[None] | None = None
     try:
         instruments, public_reports = await _discover_instruments(
             route.base,
@@ -659,7 +707,9 @@ async def run_canary_once(
             credentials = PrivateCredentials.from_environment(venue)
             private_adapters[venue] = CcxtPrivateAdapter(venue, credentials)
             capabilities[venue] = await private_adapters[venue].probe_private_capabilities()
-        typed_adapters = cast(dict[Venue, CanaryVenueAdapter], private_adapters)
+        _, private_stop, private_task, typed_adapters = await _start_private_state_supervisor(
+            private_adapters, state_path
+        )
         books, quality = await _fresh_books(settings, public_adapters, instruments)
         funding_values = await asyncio.gather(
             *(public_adapters[venue].fetch_funding(instruments[venue]) for venue in required_venues)
@@ -687,7 +737,11 @@ async def run_canary_once(
         if not quote.eligible:
             return _denied(quote.reason, route, quantity)
 
-        states = await collect_private_states(typed_adapters, instruments)
+        states = await collect_private_states(
+            typed_adapters,
+            instruments,
+            reconciliation_trigger="PRE_SUBMIT",
+        )
         reconciliation = reconcile_private_states(
             None,
             states,
@@ -964,6 +1018,7 @@ async def run_canary_once(
             emergency_venue=emergency_assessment,
         )
     finally:
+        await _stop_private_state_supervisor(private_stop, private_task)
         await asyncio.gather(
             *(adapter.close() for adapter in public_adapters.values()),
             *(adapter.close() for adapter in private_adapters.values()),

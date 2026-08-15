@@ -46,12 +46,18 @@ class BookRegistry:
             return DataQualityAssessment(False, ReasonCode.BOOK_SEQUENCE_UNKNOWN, age_ms)
         if book.sequence_end < book.sequence_start:
             return DataQualityAssessment(False, ReasonCode.BOOK_SEQUENCE_GAP, age_ms)
+        if book.sequence_reset and not book.is_snapshot:
+            return DataQualityAssessment(False, ReasonCode.BOOK_SEQUENCE_GAP, age_ms)
         key = (book.venue, book.symbol)
         previous = self._last_sequence.get(key)
-        if previous is not None:
+        if previous is not None and not book.sequence_reset:
             if book.sequence_end <= previous:
                 return DataQualityAssessment(False, ReasonCode.BOOK_SEQUENCE_GAP, age_ms)
-            if not book.is_snapshot and book.sequence_start != previous + 1:
+            if (
+                book.sequence_contiguous
+                and not book.is_snapshot
+                and book.sequence_start != previous + 1
+            ):
                 return DataQualityAssessment(False, ReasonCode.BOOK_SEQUENCE_GAP, age_ms)
         self._last_sequence[key] = book.sequence_end
         self._books[key] = book

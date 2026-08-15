@@ -1,31 +1,37 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T15:19:04Z",
-  "state": "C4_3_ADVERSARIAL_REVIEW",
-  "phase": "Phase 1 — C4.3 adversarial review",
+  "updated_at": "2026-08-15T19:37:32Z",
+  "state": "WAVE1_CORE_P1_REMEDIATION",
+  "phase": "Phase 2 — Production-grade Wave 1 data/private core",
   "repository": "brullik/interexchange-perp-grid",
-  "branch": "codex/fast-track-mvp",
-  "pr": 1,
-  "head_sha": "95a30f9821bae2c7515b07cba1f2ca51af2565de",
-  "ci_run": null,
-  "artifact": null,
+  "branch": "codex/wave1-production-core-v2",
+  "pr": 4,
+  "head_sha": "06379ea12bd2d4d65a5bc1c91b42894cc38dacc4",
+  "ci_run": 31903429499,
+  "artifact": "c4-3-proof-06379ea12bd2d4d65a5bc1c91b42894cc38dacc4",
   "completed_criteria": [
-    "Autonomous normative package imported with exact ZIP entry hashes",
-    "C4.3 atomic watermark-to-FLAT commit and fail-closed UNKNOWN handling implemented",
-    "Local verify equivalent passed: lock, Ruff, strict mypy, 177 tests, and doctor",
-    "Exact SF-001 through SF-008 run passed 8/8 with six public success=false outcomes",
-    "Independent adversarial re-review passed with no P0, P1, or P2 findings"
+    "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
+    "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
+    "PR 1 was squash-merged and annotated prerelease v0.1.0-rc1 plus both GHCR tags were published and independently verified",
+    "Wave 1 private snapshot uses two bounded account-wide calls and fails closed at documented page limits",
+    "Wave 1 latest-value cache enforces persisted and ordered event watermarks, bounded reorder recovery, completeness, two-second age, hard timeouts, and measured 250 ms p95",
+    "Native Bybit V5 u/seq guard is installed in the CCXT Pro factory and handles explicit u=1 reset",
+    "Telegram shadow mode remains healthy without runtime credentials",
+    "Local Phase 2 P1-remediation verify passed: lock, Ruff, strict mypy, 256 tests, and doctor",
+    "Independent adversarial review passed exact checkpoint 76d5f143 with P0/P1/P2 all zero",
+    "Draft PR 4 exact-head run 31903429499 passed all five required checks before the latest cross-channel recovery remediation"
   ],
   "active_work": [
-    "Commit the reviewed C4.3 checkpoint and obtain the exact-head CI proof artifact"
+    "Commit and push the recovery-authoritative REST and private-event stable-FLAT fixes to draft PR 4",
+    "Obtain fresh exact-head required checks and independent adversarial plus release-verification PASS before marking the PR Ready"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Require adversarial PASS, then commit the checkpoint and obtain the exact-head C4.3 CI artifact.",
+  "next_action": "Push the locally verified P1 remediation, keep PR 4 draft until fresh green exact-head CI and independent P0/P1-free adversarial plus release verification, then mark Ready and squash-merge under the standing authorization.",
   "known_limitations": [
-    "The exact-head C4.3 artifact cannot exist until the reviewed checkpoint is committed and pushed.",
-    "The current repository visibility is PUBLIC."
+    "The current repository visibility is PUBLIC.",
+    "Operational evidence and secrets remain forbidden while the repository is PUBLIC."
   ]
 }

@@ -22,7 +22,7 @@ from interexchange_perp_grid.execution import (
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
@@ -149,6 +149,13 @@ SCHEMA_STATEMENTS = (
         observed_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS private_event_watermarks (
+        venue TEXT PRIMARY KEY,
+        event_watermark INTEGER NOT NULL CHECK (event_watermark >= 0),
+        updated_at TEXT NOT NULL
+    )
+    """,
 )
 
 _EPOCH_OBSERVATION_TABLES = (
@@ -226,7 +233,14 @@ def _initialise_state_sync(path: Path) -> None:
         existing = database.execute(
             "SELECT value FROM metadata WHERE key = ?", ("schema_version",)
         ).fetchone()
-        if existing is not None and existing[0] not in {"1", "2", "3", "4", SCHEMA_VERSION}:
+        if existing is not None and existing[0] not in {
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            SCHEMA_VERSION,
+        }:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
         for table in _EPOCH_OBSERVATION_TABLES:
             columns = {str(row[1]) for row in database.execute(f"PRAGMA table_info({table})")}
@@ -255,6 +269,47 @@ def _initialise_state_sync(path: Path) -> None:
 
 async def initialise_state(path: Path) -> None:
     await asyncio.to_thread(_initialise_state_sync, path)
+
+
+def _read_private_event_watermark_sync(path: Path, venue: Venue) -> int:
+    with _connect(path) as database:
+        row = database.execute(
+            "SELECT event_watermark FROM private_event_watermarks WHERE venue = ?",
+            (venue.value,),
+        ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+async def read_private_event_watermark(path: Path, venue: Venue) -> int:
+    return await asyncio.to_thread(_read_private_event_watermark_sync, path, venue)
+
+
+def _save_private_event_watermark_sync(path: Path, venue: Venue, watermark: int) -> None:
+    if watermark < 0:
+        raise ValueError("private event watermark must be non-negative")
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute(
+            "SELECT event_watermark FROM private_event_watermarks WHERE venue = ?",
+            (venue.value,),
+        ).fetchone()
+        if row is not None and watermark < int(row[0]):
+            raise ValueError("private event watermark cannot regress")
+        database.execute(
+            """
+            INSERT INTO private_event_watermarks(venue, event_watermark, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(venue) DO UPDATE SET
+                event_watermark = excluded.event_watermark,
+                updated_at = excluded.updated_at
+            """,
+            (venue.value, watermark, datetime.now(UTC).isoformat()),
+        )
+        database.commit()
+
+
+async def save_private_event_watermark(path: Path, venue: Venue, watermark: int) -> None:
+    await asyncio.to_thread(_save_private_event_watermark_sync, path, venue, watermark)
 
 
 def _route_from_value(value: str) -> DirectedRouteKey:

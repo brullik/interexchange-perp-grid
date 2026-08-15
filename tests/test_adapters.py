@@ -95,3 +95,42 @@ async def test_funding_schedule_falls_back_to_unified_funding_timestamp() -> Non
     assert funding.next_funding_timestamp_ms == 1_700_000_100_000
     assert funding.mark_price == Decimal("100.1")
     assert funding.index_price == Decimal("100.0")
+
+
+class SequenceBookExchange:
+    async def watch_order_book(self, symbol: str, limit: int) -> dict[str, object]:
+        assert (symbol, limit) == ("BTC/USDT:USDT", 50)
+        return {
+            "bids": [["100", "2"]],
+            "asks": [["101", "3"]],
+            "nonce": 105,
+            "timestamp": 1_700_000_000_000,
+            "ipegSequenceReset": False,
+            "ipegSequenceContiguous": False,
+        }
+
+
+@pytest.mark.asyncio
+async def test_ccxt_book_carries_native_non_contiguous_sequence_evidence() -> None:
+    adapter = CcxtProAdapter(Venue.BYBIT, exchange=SequenceBookExchange())
+    selected = Instrument(
+        Venue.BYBIT,
+        "BTC/USDT:USDT",
+        "BTCUSDT",
+        "BTC",
+        "USDT",
+        "USDT",
+        Decimal("0.001"),
+        Decimal("1"),
+        Decimal("0.1"),
+        Decimal("1"),
+        Decimal("5"),
+        Decimal("0.0005"),
+        "fixture",
+    )
+
+    book = await adapter.watch_order_book(selected)
+
+    assert book.sequence_start == book.sequence_end == 105
+    assert book.sequence_contiguous is False
+    assert book.sequence_reset is False

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from interexchange_perp_grid.live_journal import LiveActionState
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import live_confirmation_valid, read_command_audit
-from interexchange_perp_grid.telegram_control import TelegramCommandRouter
+from interexchange_perp_grid.telegram_control import TelegramCommandRouter, run_telegram_bot
 
 CONFIG = Path("config/defaults.yaml")
 
@@ -44,6 +45,23 @@ class FakeLiveControl:
     def _result(self, action: str) -> LiveControlResult:
         self.calls.append(action)
         return LiveControlResult(True, action, 1, 1, LiveActionState.FLAT, None, None)
+
+
+class MissingPrivateCredentialsControl(FakeLiveControl):
+    async def snapshot(self) -> dict[str, object]:
+        raise ValueError("private API key and secret are required")
+
+    async def close_all_live(self) -> LiveControlResult:
+        raise ValueError("private API key and secret are required")
+
+    async def cancel_all_live(self) -> LiveControlResult:
+        raise ValueError("private API key and secret are required")
+
+    async def emergency_flatten(self) -> LiveControlResult:
+        raise ValueError("private API key and secret are required")
+
+    async def kill(self) -> LiveControlResult:
+        raise ValueError("private API key and secret are required")
 
 
 @pytest.mark.asyncio
@@ -130,3 +148,62 @@ async def test_live_commands_use_private_state_and_challenge_protected_workflows
         "EMERGENCY_FLATTEN",
         "KILL_CANCEL_FLATTEN",
     ]
+
+
+@pytest.mark.asyncio
+async def test_shadow_telegram_without_token_stays_fail_closed_and_nonfatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("IPEG_TELEGRAM_BOT_TOKEN", raising=False)
+    settings = load_settings(
+        CONFIG,
+        {
+            "IPEG_STATE_PATH": str(tmp_path / "telegram.sqlite3"),
+            "IPEG_TELEGRAM_ENABLED": "true",
+        },
+    )
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    stop_event = asyncio.Event()
+
+    task = asyncio.create_task(run_telegram_bot(settings, runtime, stop_event))
+    await asyncio.sleep(0)
+
+    assert task.done() is False
+    stop_event.set()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_missing_private_exchange_credentials_fall_back_to_shadow_and_never_crash(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "telegram.sqlite3")})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    router = TelegramCommandRouter(
+        runtime,
+        42,
+        60,
+        token_factory=lambda: "NO_KEYS",
+        live_control=MissingPrivateCredentialsControl(),
+    )
+    now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+
+    for command in ("/status", "/positions", "/pnl", "/balances"):
+        payload = await router.handle(42, command, now)
+        assert "PRIVATE_STATE_UNAVAILABLE" in payload
+        assert "SHADOW_FALLBACK" in payload
+
+    for command in ("/cancel_all_live", "/close_all_live", "/emergency_flatten"):
+        await router.handle(42, "/challenge", now)
+        payload = await router.handle(42, f"{command} NO_KEYS", now)
+        assert '"success": false' in payload
+        assert "PRIVATE_STATE_UNAVAILABLE" in payload
+
+    await router.handle(42, "/challenge", now)
+    killed = await router.handle(42, "/kill NO_KEYS", now)
+    assert '"killed": true' in killed
+    assert '"success": false' in killed
+    assert "PRIVATE_STATE_UNAVAILABLE" in killed

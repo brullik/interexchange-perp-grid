@@ -27,6 +27,7 @@ from interexchange_perp_grid.live_reconciliation import (
     FlatBarrierResult,
     ReconciliationReport,
     collect_private_states,
+    combined_event_watermark,
     flat_barrier_failure_reason,
     reconcile_private_states,
     wait_for_stable_flat,
@@ -165,7 +166,11 @@ class LiveControlService:
 
     async def _cancel_orders(self, *, bot_only: bool) -> LiveControlResult:
         await self._journal.initialise()
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="PRE_CANCEL",
+        )
         cancellable = tuple(
             order
             for state in states.values()
@@ -178,7 +183,11 @@ class LiveControlService:
             return_exceptions=True,
         )
         cancelled = sum(not isinstance(result, BaseException) for result in results)
-        refreshed = await collect_private_states(self._adapters, self._account_instruments)
+        refreshed = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="POST_CANCEL",
+        )
         remaining = sum(
             (not bot_only or is_bot_client_order_id(order.client_order_id))
             for state in refreshed.values()
@@ -218,7 +227,11 @@ class LiveControlService:
 
     async def _flatten(self, action_name: str) -> LiveControlResult:
         cancellation = await self._cancel_orders(bot_only=False)
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="PRE_CLOSE",
+        )
         positions = tuple(position for state in states.values() for position in state.positions)
         active = await self._journal.active()
         if not positions:
@@ -423,7 +436,11 @@ class LiveControlService:
     async def _report(self, active: LiveJournalAction | None) -> ReconciliationReport:
         if active is not None:
             active = await self._journal.load(active.pair_action_id)
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="TERMINAL_FLAT",
+        )
         return reconcile_private_states(
             active,
             states,
@@ -440,7 +457,10 @@ class LiveControlService:
 
         return await wait_for_stable_flat(
             report_factory,
-            self._journal.event_watermark,
+            lambda: combined_event_watermark(
+                self._adapters,
+                self._journal.event_watermark,
+            ),
             self._flat_barrier_policy,
         )
 
@@ -506,20 +526,46 @@ class LiveControlService:
             active = current
             if active.state != LiveActionState.FLAT:
                 active = await self._move_to_recovering(active, action_name)
+        observed_before = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if observed_before != barrier.event_watermark:
+            if active is not None:
+                active = await self._quarantine(active, barrier.report, action_name)
+            return (
+                active,
+                FlatBarrierResult(
+                    False,
+                    barrier.report,
+                    0,
+                    observed_before,
+                    False,
+                    ReasonCode.FLAT_BARRIER_EVENT_RACE,
+                ),
+            )
+        journal_watermark = await self._journal.event_watermark()
         commit = await self._journal.commit_flat_barrier(
             active.pair_action_id if active is not None else None,
-            barrier.event_watermark,
+            journal_watermark,
             {"action": action_name, "verified": True},
         )
-        if commit.committed:
+        observed_after = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if commit.committed and observed_after == barrier.event_watermark:
             return commit.action, barrier
+        failed_action = commit.action
+        if failed_action is not None and failed_action.state != LiveActionState.QUARANTINED:
+            failed_action = await self._quarantine(failed_action, barrier.report, action_name)
         return (
-            commit.action,
+            failed_action,
             FlatBarrierResult(
                 False,
                 barrier.report,
                 0,
-                commit.event_watermark,
+                observed_after,
                 False,
                 ReasonCode.FLAT_BARRIER_EVENT_RACE,
             ),

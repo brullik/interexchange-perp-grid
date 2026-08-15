@@ -146,3 +146,29 @@ async def test_engine_quarantines_failed_venue_and_continues(tmp_path: Path) -> 
     assert adapters[Venue.BINANCE_USDM].book_calls == 2
     assert adapters[Venue.BYBIT].book_calls == 2
     assert all(adapter.closed for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_wave1_public_scan_does_not_require_private_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for venue in Venue:
+        prefix = venue.value.upper()
+        monkeypatch.delenv(f"IPEG_{prefix}_API_KEY", raising=False)
+        monkeypatch.delenv(f"IPEG_{prefix}_API_SECRET", raising=False)
+        monkeypatch.delenv(f"IPEG_{prefix}_API_PASSWORD", raising=False)
+    adapters = {venue: FakeAdapter(venue) for venue in Venue}
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+    )
+
+    result = await engine.scan_once("BTC", Decimal("0.001"), timeout_seconds=1)
+    await engine.close()
+
+    assert len(result.bbo) == 3
+    assert len(result.quotes) == 6
+    assert result.quarantined == ()

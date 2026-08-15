@@ -76,3 +76,23 @@ def test_missing_safety_field_fails_startup() -> None:
     del raw["execution"]["normal_intent"]
     with pytest.raises(ValidationError):
         Settings.model_validate(raw)
+
+
+def test_shadow_allows_telegram_fallback_without_owner_credentials() -> None:
+    settings = load_settings(CONFIG, {"IPEG_TELEGRAM_ENABLED": "true"})
+
+    assert settings.app.mode == "shadow"
+    assert settings.telegram.enabled is True
+    assert settings.telegram.owner_chat_id is None
+
+
+def test_live_telegram_requires_owner_chat_id() -> None:
+    settings = load_settings(CONFIG)
+    raw = settings.model_dump(mode="json")
+    raw["app"]["mode"] = "live"
+    raw["live"]["enabled"] = True
+    raw["telegram"]["enabled"] = True
+    raw["telegram"]["owner_chat_id"] = None
+
+    with pytest.raises(ValidationError, match="live Telegram control requires"):
+        Settings.model_validate(raw)
