@@ -1,0 +1,154 @@
+name: release-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Annotated release tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # Serialize every publisher run so two release tags can never race on one SHA tag.
+  group: release-image-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate release tag input
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ ]]; then
+            echo "release tag does not match the allowed RC format" >&2
+            exit 2
+          fi
+
+      - name: Checkout exact annotated tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Prove annotated tag and target SHA
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+          target_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+          test "$target_sha" = "$(git rev-parse HEAD)"
+          echo "target_sha=$target_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GHCR with the job token
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build immutable candidate by digest
+        id: build
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET_SHA: ${{ steps.release.outputs.target_sha }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$TARGET_SHA" \
+            --label "org.opencontainers.image.version=$TARGET_SHA" \
+            --output "type=registry,name=$image,push-by-digest=true,name-canonical=true" \
+            --metadata-file build-metadata.json \
+            .
+          candidate_digest="$(python -c 'import json; print(json.load(open("build-metadata.json",encoding="utf-8"))["containerimage.digest"])')"
+          if [[ ! "$candidate_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "build returned an invalid immutable digest" >&2
+            exit 3
+          fi
+          echo "candidate_digest=$candidate_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse tag overwrite and promote one exact digest
+        id: publish
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET_SHA: ${{ steps.release.outputs.target_sha }}
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.candidate_digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          release_ref="$image:$RELEASE_TAG"
+          sha_ref="$image:sha-$TARGET_SHA"
+
+          inspect_digest() {
+            local ref="$1" output digest
+            if output="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+              digest="$(awk '$1 == "Digest:" {print $2; exit}' <<< "$output")"
+              if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "registry returned an invalid digest for $ref" >&2
+                return 2
+              fi
+              printf '%s' "$digest"
+              return 0
+            fi
+            if grep -Eqi 'manifest unknown|not found' <<< "$output"; then
+              return 1
+            fi
+            echo "$output" >&2
+            return 2
+          }
+
+          if existing_sha="$(inspect_digest "$sha_ref")"; then
+            test "$existing_sha" = "$CANDIDATE_DIGEST" || {
+              echo "refusing to overwrite immutable SHA tag $sha_ref" >&2
+              exit 4
+            }
+          else
+            status=$?
+            test "$status" = 1 || exit "$status"
+          fi
+          if existing_release="$(inspect_digest "$release_ref")"; then
+            test "$existing_release" = "$CANDIDATE_DIGEST" || {
+              echo "refusing to overwrite release tag $release_ref" >&2
+              exit 5
+            }
+          else
+            status=$?
+            test "$status" = 1 || exit "$status"
+          fi
+
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$release_ref" \
+            --tag "$sha_ref" \
+            "$image@$CANDIDATE_DIGEST"
+          release_digest="$(inspect_digest "$release_ref")"
+          sha_digest="$(inspect_digest "$sha_ref")"
+          test "$release_digest" = "$CANDIDATE_DIGEST"
+          test "$sha_digest" = "$CANDIDATE_DIGEST"
+          test "$release_digest" = "$sha_digest"
+          echo "release_digest=$release_digest" >> "$GITHUB_OUTPUT"
+          echo "sha_digest=$sha_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Create digest-bound release manifest
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET_SHA: ${{ steps.release.outputs.target_sha }}
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.candidate_digest }}
+          RELEASE_DIGEST: ${{ steps.publish.outputs.release_digest }}
+          SHA_DIGEST: ${{ steps.publish.outputs.sha_digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE="$image" python -c 'import json,os,pathlib; pathlib.Path("release-image-manifest.json").write_text(json.dumps({"image":os.environ["IMAGE"],"release_tag":os.environ["RELEASE_TAG"],"sha_tag":"sha-"+os.environ["TARGET_SHA"],"target_sha":os.environ["TARGET_SHA"],"candidate_digest":os.environ["CANDIDATE_DIGEST"],"release_digest":os.environ["RELEASE_DIGEST"],"sha_digest":os.environ["SHA_DIGEST"],"run_id":os.environ["GITHUB_RUN_ID"],"run_attempt":os.environ["GITHUB_RUN_ATTEMPT"]},sort_keys=True)+"\n",encoding="utf-8")'
+
+      - name: Upload immutable image manifest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-image-${{ inputs.release_tag }}-${{ steps.release.outputs.target_sha }}
+          path: release-image-manifest.json
+          if-no-files-found: error
+          retention-days: 90
