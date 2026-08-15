@@ -169,6 +169,8 @@ jobs:
           SMOKE_NAME="ipeg-c4-recovery-${GITHUB_RUN_ID}"
           SMOKE_VOLUME="ipeg-c4-recovery-${GITHUB_RUN_ID}"
           docker volume create "$SMOKE_VOLUME"
+          docker run --rm --user 0:0 --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+            chown ipeg:ipeg /smoke
           docker run --detach --name "$SMOKE_NAME" --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
             interexchange-grid supervisor-recovery-smoke \
             --state /smoke/state.sqlite3 --ready /smoke/ready --hold-after-active
