@@ -52,6 +52,9 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
+      - name: Set up container builder
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
       - name: Build immutable candidate by digest
         id: build
         env:
@@ -148,7 +151,7 @@ jobs:
       - name: Upload immutable image manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-image-${{ inputs.release_tag }}-${{ steps.release.outputs.target_sha }}
+          name: release-image-${{ inputs.release_tag }}-${{ steps.release.outputs.target_sha }}-${{ github.run_attempt }}
           path: release-image-manifest.json
           if-no-files-found: error
           retention-days: 90
