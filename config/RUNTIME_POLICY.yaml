@@ -1,0 +1,75 @@
+schema_version: 1
+immutable_safety:
+  contracts: linear_usdt_perpetual_only
+  paired_only: true
+  withdrawals: false
+  transfers: false
+  normal_unbounded_market: false
+  one_route_per_base: true
+  live_default: false
+  unknown_is_block: true
+universe:
+  live_min_listing_age_days: 14
+  instrument_refresh_seconds: 21600
+  broad_feed: BBO
+  candidate_feed: L2
+  max_dynamic_l2_candidates: 30
+  decision_debounce_ms: 100
+data:
+  max_bbo_age_ms: 1500
+  max_l2_age_ms: 1000
+  max_private_cache_age_ms: 2000
+  private_full_reconcile_seconds: 30
+  flat_barrier_snapshots: 2
+  flat_barrier_quiet_seconds: 2
+  flat_barrier_poll_seconds: 0.25
+  flat_barrier_timeout_seconds: 30
+strategy:
+  stressed_cost_multiplier: '2.0'
+  max_parameter_change_ratio_per_day: '0.20'
+  max_tranches: 5
+  hard_max_hold_seconds: 86400
+risk_stages:
+  canary:
+    routes: 1
+    tranches: 1
+    pair_usdt: '1'
+    portfolio_usdt: '1'
+    leverage: '3'
+  pilot_a:
+    routes: 1
+    tranches: 2
+    pair_usdt: '2'
+    portfolio_usdt: '2'
+    leverage: '2'
+  pilot_b:
+    routes: 2
+    tranches: 3
+    pair_usdt: '3'
+    portfolio_usdt: '6'
+    leverage: '2'
+  wave1_prod:
+    routes: 3
+    tranches: 5
+    pair_usdt: '5'
+    portfolio_usdt: '15'
+    leverage: '3'
+  full:
+    routes: 10
+    tranches: 5
+    pair_usdt: '5'
+    portfolio_usdt: '50'
+    leverage: '3'
+margin:
+  mode: cross
+  free_margin_floor_ratio: '0.20'
+qualification:
+  minimum_duration_seconds: 86400
+  minimum_synchronized_observations_per_route_side: 10000
+  minimum_funding_checkpoints_per_venue: 3
+  positive_simulated_net_pnl_required: true
+  exact_epoch_identity_required: true
+deployment:
+  default_region: Germany
+  japan_migration_p95_improvement_ratio: '0.20'
+  max_single_venue_p99_worsening_ratio: '0.50'

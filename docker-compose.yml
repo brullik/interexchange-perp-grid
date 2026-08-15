@@ -1,0 +1,35 @@
+services:
+  app:
+    image: ${IPEG_IMAGE_REF:-interexchange-perp-grid:local}
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      IPEG_CONFIG_PATH: /app/config/defaults.yaml
+      IPEG_STATE_PATH: /app/state/ipeg.sqlite3
+      IPEG_PARQUET_DIR: /app/data/market
+      IPEG_RELEASE_SHA: ${IPEG_RELEASE_SHA:-}
+      IPEG_CONTAINER_IMAGE_DIGEST: ${IPEG_CONTAINER_IMAGE_DIGEST:-}
+    volumes:
+      - ipeg-state:/app/state
+      - ipeg-data:/app/data
+      - ipeg-logs:/app/logs
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    stop_grace_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  ipeg-state:
+  ipeg-data:
+  ipeg-logs:

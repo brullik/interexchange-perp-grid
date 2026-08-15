@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OwnerAction",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "action_id",
+    "type",
+    "reason",
+    "required_inputs",
+    "steps",
+    "unblock_conditions",
+    "independent_work_remaining"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "action_id": {
+      "type": "string"
+    },
+    "type": {
+      "enum": [
+        "REPOSITORY_MAKE_PRIVATE",
+        "ONE_TIME_ONBOARDING",
+        "LIVE_CANARY_CONSENT",
+        "EXTERNAL_ACCOUNT_REMEDIATION"
+      ]
+    },
+    "reason": {
+      "type": "string"
+    },
+    "required_inputs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "unblock_conditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "forbidden_to_include": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "independent_work_remaining": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

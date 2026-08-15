@@ -1,0 +1,111 @@
+app:
+  name: interexchange-perp-grid
+  mode: shadow
+  log_level: INFO
+  heartbeat_interval_seconds: 5
+  health_max_age_seconds: 20
+
+venues:
+  wave1_public:
+    - binanceusdm
+    - bybit
+    - okx
+  canary_primary:
+    - bybit
+    - okx
+  canary_alternate:
+    - binanceusdm
+  wave2:
+    - bitget
+    - kucoinfutures
+  wave3:
+    - mexc
+    - bingx
+  quarantine_on_unknown_capability: true
+
+products:
+  settlement: USDT
+  linear_only: true
+  perpetual_only: true
+
+risk:
+  reference_capital_usdt: "500"
+  pair_stressed_loss_limit_usdt: "5"
+  portfolio_stressed_loss_limit_usdt: "50"
+  max_active_routes: 10
+  max_routes_per_base: 1
+  max_tranches_per_route: 5
+  local_free_margin_floor_ratio: "0.20"
+  initial_effective_leverage_cap: "3"
+  max_hold_seconds: 86400
+
+strategy:
+  adaptive_grid: true
+  stressed_cost_multiplier: "2.0"
+  minimum_profit_usdt: null
+  grid_parameter_change_limit_ratio: "0.20"
+
+execution:
+  normal_intent: PROTECTED_AGGRESSIVE_TAKER
+  normal_unbounded_market_allowed: false
+  emergency_unbounded_market_allowed: true
+  idempotent_client_order_ids: true
+  third_venue_emergency_hedge: true
+  latency_reserve_bps: "2"
+  partial_fill_reserve_bps: "3"
+  emergency_hedge_reserve_bps: "10"
+  reconciliation_forced_exit_reserve_bps: "10"
+  funding_stress_multiplier: "2"
+
+market_data:
+  broad_feed: bbo
+  candidate_feed: l2
+  max_bbo_age_ms: 1500
+  max_l2_age_ms: 1000
+  max_clock_skew_ms: 1000
+
+storage:
+  sqlite_path: state/ipeg.sqlite3
+  parquet_dir: data/market
+  sqlite_wal: true
+
+live:
+  enabled: false
+  require_local_unlock_secret: true
+  require_telegram_challenge: true
+  require_current_hash_qualification: true
+  canary_max_routes: 1
+  canary_max_tranches: 1
+  canary_pair_stressed_loss_limit_usdt: "1"
+  canary_effective_leverage_cap: "3"
+  canary_free_margin_floor_ratio: "0.20"
+  canary_entry_slippage_cap_bps: "5"
+  canary_close_slippage_cap_bps: "8"
+  canary_timeout_seconds: 300
+  canary_minimum_profit_usdt: "0.01"
+  qualification_max_age_seconds: 86400
+  flat_barrier_consecutive_snapshots: 2
+  flat_barrier_quiet_period_seconds: "1"
+  flat_barrier_poll_interval_seconds: "0.25"
+  flat_barrier_timeout_seconds: "30"
+
+telegram:
+  enabled: false
+  owner_chat_id: null
+  challenge_ttl_seconds: 120
+
+shadow:
+  base: BTC
+  quantity: "0.001"
+  scan_interval_seconds: 5
+  scan_timeout_seconds: 30
+  overload_pending_limit: 100
+  history_retention_days: 30
+  qualification_min_duration_seconds: 86400
+  qualification_min_synchronised_snapshots_per_venue: 10000
+  qualification_min_funding_checkpoints_per_venue: 3
+  qualification_max_inter_snapshot_gap_seconds: 60
+  qualification_max_sequence_gaps: 0
+  qualification_max_stale_snapshots: 0
+  qualification_max_sequence_unknown_snapshots: 0
+  qualification_max_clock_skew_snapshots: 0

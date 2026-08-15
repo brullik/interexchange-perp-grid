@@ -1,0 +1,181 @@
+# Runbook владельца: C4 shadow, qualification epoch и recovery
+
+## Текущий запрет
+
+Допустимый финальный статус C4 — `C4_REWORK_V2_FINAL_HEAD_CI_GREEN_PENDING_INDEPENDENT_REVIEW`. До отдельного независимого принятия всех P0 пунктов C5 и реальные ордера запрещены. Не добавляйте production credentials и не включайте live для проверки C4: CI обязан завершиться с `production_submit_calls=0`.
+
+Fail-closed действует при stale/несинхронизированных данных, sequence gap, неполном raw private snapshot, неизвестном состоянии ордера, недоступном risk engine, несовпадении journal/exchange, нестабильном FLAT или неопределённой возможности emergency venue. Один процесс `app` непрерывно владеет единственным Telegram poller и `LiveSafetySupervisor`; ручной перезапуск или повторный `canary-run` не является способом recovery.
+
+## 1. Точная сборка и локальная проверка
+
+На чистом checkout `codex/fast-track-mvp`:
+
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.lock
+python -m pip install -e . --no-deps --no-build-isolation
+python scripts/check_lock.py --lock requirements.lock --pyproject pyproject.toml --verify-installed
+make verify
+```
+
+Воспроизводимая release-сборка принимает только чистый полный commit SHA, создаёт image, SBOM и machine-readable preflight:
+
+```bash
+scripts/release-build.sh registry.example/interexchange-perp-grid:$(git rev-parse HEAD)
+```
+
+`release-preflight` должен вернуть `passed=true`, точный `release_sha` и image digest; режим должен оставаться `shadow`, `live_enabled=false`, unbounded market execution запрещён. Не публикуйте tag как deployment identity: для VPS используйте только registry reference вида `IMAGE@sha256:<64 hex>`.
+
+## 2. Deploy, upgrade, rollback и backup
+
+Первичное shadow-развёртывание из immutable registry image:
+
+```bash
+cp .env.example .env
+scripts/shadow-deploy.sh \
+  registry.example/interexchange-perp-grid@sha256:<64-hex-digest> \
+  <full-40-char-release-sha>
+docker compose ps
+docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml
+```
+
+Ожидается healthy `app`, `mode=shadow`, `live_orders_allowed=false`, supervisor `IDLE`/`FLAT_NO_ACTIVE_ACTION`. Upgrade сначала делает online SQLite backup и только затем меняет immutable image:
+
+```bash
+scripts/shadow-upgrade.sh <NEW_IMAGE@sha256:DIGEST> <NEW_FULL_SHA>
+```
+
+Rollback использует ранее проверенные digest/SHA и также делает backup текущего состояния:
+
+```bash
+scripts/shadow-rollback.sh <PREVIOUS_IMAGE@sha256:DIGEST> <PREVIOUS_FULL_SHA>
+```
+
+Отдельный backup и проверяемое восстановление:
+
+```bash
+docker compose exec -T app interexchange-grid backup-state \
+  --config /app/config/defaults.yaml \
+  --target /app/state/backups/manual.sqlite3
+docker compose stop app
+docker compose run --rm app interexchange-grid restore-state \
+  --config /app/config/defaults.yaml \
+  --backup /app/state/backups/manual.sqlite3
+docker compose up --detach --wait app
+```
+
+После любого deploy/upgrade/rollback/restore проверьте `health`, supervisor outcome и фактические private orders/positions. При активном journal supervisor автоматически входит в `RECOVERY_ONLY`; не создавайте новый pair action.
+
+## 3. Shadow и immutable qualification epoch
+
+Shadow должен непрерывно работать минимум 24 часа. Для точного направленного маршрута нужны не менее 10 000 уникальных синхронизированных L2-событий с policy continuity и не менее трёх funding checkpoint. Bybit + OKX остаётся лишь предпочтительной парой: выбирается только реально квалифицированный маршрут. `BOOK_SEQUENCE_UNKNOWN` не квалифицируется.
+
+Сначала соберите exact-head replay proof:
+
+```bash
+git status --short
+interexchange-grid replay-proof \
+  --repo-root . \
+  --config config/defaults.yaml \
+  --output state/replay-proof.json
+```
+
+Для каждой комбинации route/release/source/config/image откройте отдельный epoch. Команда идемпотентна только для полностью совпадающей identity; любое изменение закрывает старый epoch и обнуляет длительность/счётчики:
+
+```bash
+docker compose exec -T app interexchange-grid qualification-epoch-start \
+  --route 'BTC:binanceusdm>okx' \
+  --container-image-digest "$IPEG_CONTAINER_IMAGE_DIGEST" \
+  --repo-root /app \
+  --config /app/config/defaults.yaml
+```
+
+Сохраните возвращённый `epoch_id`. Пока epoch имеет статус `RUNNING`, непрерывный shadow сам связывает с ним наблюдения. После достижения policy закройте его; после `FINALIZED` новые наблюдения в него не принимаются:
+
+```bash
+docker compose exec -T app interexchange-grid qualification-epoch-status \
+  --epoch-id <EPOCH_ID> --config /app/config/defaults.yaml
+docker compose exec -T app interexchange-grid qualification-epoch-finalize \
+  --epoch-id <EPOCH_ID> --config /app/config/defaults.yaml
+```
+
+Только для finalized epoch соберите runtime evidence и qualification evidence:
+
+```bash
+docker compose exec -T app interexchange-grid qualification-runtime \
+  --epoch-id <EPOCH_ID> \
+  --route 'BTC:binanceusdm>okx' \
+  --container-image-digest "$IPEG_CONTAINER_IMAGE_DIGEST" \
+  --replay-proof /app/state/replay-proof.json \
+  --output /app/state/qualification-runtime.json \
+  --repo-root /app --config /app/config/defaults.yaml
+
+docker compose exec -T app interexchange-grid qualify \
+  --runtime-evidence /app/state/qualification-runtime.json \
+  --evidence /app/state/qualification.json \
+  --repo-root /app --config /app/config/defaults.yaml
+```
+
+Ожидается `accepted=true`, exact epoch FK и совпадающие route/release/source/config/image/data hashes. Изменение любого identity field, direction или файла immutable Parquet manifest инвалидирует qualification. Все три Wave 1 private preflight, включая фактические amount step/minimum/depth/fee emergency venue, обязаны пройти до записи canary intent.
+
+## 4. Canary после независимого разрешения C5
+
+Этот раздел не является разрешением запускать C5. После отдельного независимого принятия C4 владелец самостоятельно создаёт restricted credentials для выделенных Wave 1 subaccounts: только чтение account/orders/positions и futures trading, IP allowlist; withdrawal, transfer, wallet/address-book и API-key management запрещены. Секреты существуют только в VPS `.env`, никогда в Git/логах/evidence. Это внешнее действие невозможно выполнить средствами Codex. Проверка: `private-probe --venue <venue>` возвращает успешные обязательные capability checks для каждой Wave 1 venue; до этого live остаётся выключенным.
+
+Не останавливайте `app`. В единственном работающем Telegram poller получите challenge и подтвердите owner gate:
+
+```text
+/challenge
+/confirm_live <одноразовый challenge>
+```
+
+В пределах TTL поставьте ровно один intent в durable journal:
+
+```bash
+docker compose exec -T \
+  -e IPEG_MODE=live -e IPEG_LIVE_ENABLED=true \
+  app interexchange-grid canary-run \
+  --confirmation I_ACCEPT_LIVE_CANARY_RISK \
+  --qualification /app/state/qualification.json \
+  --repo-root /app --config /app/config/defaults.yaml
+```
+
+Команда не отправляет ордера: ожидается `orders_sent=0`, `terminal_state=PREPARED`, `recovery_action=QUEUED_FOR_LIVE_SAFETY_SUPERVISOR`. После durable commit единственный supervisor владеет submit, monitoring и recovery. Следите через:
+
+```bash
+docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml
+```
+
+Успех — только exchange-verified стабильный `FLAT`: минимум два последовательных полных raw private snapshot, quiet period и неизменный event watermark. `HEDGED` допустим только после private-confirmed позиций и не является terminal success. При kill/restart supervisor сначала восстанавливает тот же action без повторного owner/qualification entry gate и не разрешает новый.
+
+## 5. Аварийное управление
+
+Telegram live-control обслуживается тем же единственным poller:
+
+```text
+/status
+/positions
+/balances
+/pnl
+/challenge
+/cancel_all_live <challenge>
+/close_all_live <challenge>
+/emergency_flatten <challenge>
+/kill <challenge>
+```
+
+Emergency flatten не зависит от qualification file и отменяет все активные ордера выделенных subaccounts, затем закрывает фактические позиции по их собственным symbol/instrument metadata. Для независимого CLI unlock `IPEG_EMERGENCY_UNLOCK_SECRET` заранее хранится только на VPS, а `IPEG_EMERGENCY_UNLOCK` передаётся на один вызов:
+
+```bash
+read -s IPEG_EMERGENCY_UNLOCK
+export IPEG_EMERGENCY_UNLOCK
+docker compose exec -T -e IPEG_EMERGENCY_UNLOCK app \
+  interexchange-grid emergency-flatten \
+  --confirmation I_CONFIRM_EMERGENCY_FLATTEN_ALL_LIVE_EXPOSURE \
+  --config /app/config/defaults.yaml
+unset IPEG_EMERGENCY_UNLOCK
+```
+
+При `BLOCKED`, `QUARANTINED`, incomplete private state или timeout live остаётся выключенным. Наблюдаемый результат для разблокировки — полные raw private snapshots всех трёх аккаунтов с нулём orders/positions, стабильный FLAT barrier и supervisor `IDLE`. До этого новый pair action запрещён.

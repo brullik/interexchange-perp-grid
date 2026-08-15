@@ -1,0 +1,164 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from enum import StrEnum
+from typing import Any
+
+from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.execution import Side
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateCapabilityReport:
+    venue: Venue
+    order_stream: bool
+    position_stream: bool
+    balance_stream: bool
+    fetch_balance: bool
+    fetch_positions: bool
+    submit_order: bool
+    cancel_order: bool
+    fetch_order: bool
+    fetch_fee: bool
+    checked_at: datetime
+    missing: tuple[str, ...]
+    fetch_open_orders: bool = False
+    fetch_closed_orders: bool = False
+
+    @property
+    def ready(self) -> bool:
+        return not self.missing
+
+
+@dataclass(frozen=True, slots=True)
+class AccountSnapshot:
+    venue: Venue
+    equity_usdt: Decimal
+    free_margin_usdt: Decimal
+    margin_mode: str | None
+    position_mode: str | None
+    trading_enabled: bool | None
+    permissions: tuple[str, ...]
+    observed_at: datetime
+    withdrawal_enabled: bool | None = None
+    transfer_enabled: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.equity_usdt < 0 or self.free_margin_usdt < 0:
+            raise ValueError("account balances must be non-negative")
+        if self.free_margin_usdt > self.equity_usdt:
+            raise ValueError("free margin cannot exceed equity")
+
+
+@dataclass(frozen=True, slots=True)
+class PositionSnapshot:
+    venue: Venue
+    symbol: str
+    side: Side
+    base_quantity: Decimal
+    entry_price: Decimal | None
+    mark_price: Decimal | None
+    observed_at: datetime
+
+
+class PrivateOrderStatus(StrEnum):
+    OPEN = "OPEN"
+    PARTIAL = "PARTIAL"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    UNKNOWN = "UNKNOWN"
+
+
+class SnapshotCompleteness(StrEnum):
+    COMPLETE = "COMPLETE"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class UnknownActiveRecord:
+    venue: Venue
+    kind: str
+    reason: str
+    raw_record: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateActiveSnapshot:
+    venue: Venue
+    raw_open_order_count: int
+    raw_nonzero_position_count: int
+    open_orders: tuple[PrivateOrder, ...]
+    positions: tuple[PositionSnapshot, ...]
+    unknown_active_records: tuple[UnknownActiveRecord, ...]
+    completeness: SnapshotCompleteness
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.raw_open_order_count < 0 or self.raw_nonzero_position_count < 0:
+            raise ValueError("raw active record counts must be non-negative")
+        counts_match = self.raw_open_order_count == len(
+            self.open_orders
+        ) and self.raw_nonzero_position_count == len(self.positions)
+        if self.completeness == SnapshotCompleteness.COMPLETE and (
+            self.unknown_active_records or not counts_match
+        ):
+            raise ValueError("complete private snapshot must account for every raw active record")
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateOrder:
+    venue: Venue
+    order_id: str | None
+    client_order_id: str
+    symbol: str
+    side: Side
+    status: PrivateOrderStatus
+    requested_base_quantity: Decimal
+    filled_base_quantity: Decimal
+    average_price: Decimal | None
+    fee_usdt: Decimal | None
+    observed_at: datetime
+    limit_price: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if not self.client_order_id.strip() or not self.symbol.strip():
+            raise ValueError("order identifiers must be non-empty")
+        if self.requested_base_quantity <= 0:
+            raise ValueError("requested order quantity must be positive")
+        if not 0 <= self.filled_base_quantity <= self.requested_base_quantity:
+            raise ValueError("filled quantity is outside requested quantity")
+        if self.filled_base_quantity > 0 and (
+            self.average_price is None or self.average_price <= 0
+        ):
+            raise ValueError("filled order requires an average price")
+        if (
+            self.status == PrivateOrderStatus.FILLED
+            and self.filled_base_quantity != self.requested_base_quantity
+        ):
+            raise ValueError("filled status requires the full requested quantity")
+        if self.fee_usdt is not None and self.fee_usdt < 0:
+            raise ValueError("order fee must be non-negative")
+        if self.limit_price is not None and self.limit_price <= 0:
+            raise ValueError("limit price must be positive when present")
+
+
+@dataclass(frozen=True, slots=True)
+class VenueOrderRequest:
+    venue: Venue
+    client_order_id: str
+    symbol: str
+    side: Side
+    order_type: str
+    amount_contracts: Decimal
+    price: Decimal | None
+    time_in_force: str | None
+    params: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if self.amount_contracts <= 0:
+            raise ValueError("venue order amount must be positive")
+        if self.order_type == "limit" and (self.price is None or self.price <= 0):
+            raise ValueError("limit order requires a positive price")

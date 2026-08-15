@@ -1,0 +1,65 @@
+schema_version: 1
+policy:
+  unknown_capability: QUARANTINE
+  native_override_trigger:
+  - missing required capability
+  - sequence/checksum cannot be proven
+  - account-wide snapshot completeness cannot be proven
+  - measured p95/p99 violates product target
+  - CCXT translation fails contract tests
+  live_requires:
+  - public orderbook integrity
+  - private account-wide state
+  - orders and positions stream
+  - actual fee rate
+  - protected IOC or safe equivalent
+  - idempotent client ID reconciliation
+  - emergency flatten
+waves:
+- wave: 1
+  venues:
+  - id: binanceusdm
+    public: native/CCXT allowed after sequence contract tests
+    private_state: native account-wide REST snapshot + user data stream cache
+    execution: REST protected limit IOC; private stream reconciliation
+    live_default: true
+  - id: bybit
+    public: native V5 orderbook snapshot/delta with u/seq validation
+    private_state: V5 all-in-one order + position + execution streams; settleCoin
+      REST snapshots
+    execution: V5 protected limit IOC with orderLinkId
+    live_default: true
+  - id: okx
+    public: native books/books5 with checksum and sequence validation
+    private_state: orders + positions + account WS; account-wide pending orders/positions
+      REST
+    execution: protected limit IOC with clOrdId and tdMode=cross
+    live_default: true
+- wave: 2
+  venues:
+  - id: bitget
+    public: Classic futures books/books1 with seq/checksum
+    private_state: orders default + positions default streams; account-wide REST snapshot
+    execution: REST protected IOC by default; WS place-order only when account permission
+      is proven
+    live_default: false
+  - id: kucoinfutures
+    public: Classic Futures orderbook with sequence calibration
+    private_state: Classic Futures order/position streams and REST snapshots
+    execution: Classic Futures production endpoints only
+    forbidden: UTA API in production while official documentation says beta/not production-ready
+    live_default: false
+- wave: 3
+  venues:
+  - id: bingx
+    public: official perpetual-futures market API; native override when needed
+    private_state: capability-gated account/order/position API
+    execution: disabled until exact mainnet contract tests and canary qualification
+      pass
+    live_default: false
+  - id: mexc
+    public: contract WS depth with version continuity
+    private_state: read-only capability probe and state monitoring when available
+    execution: DISABLED while official contract order/cancel endpoints are marked
+      Under maintenance
+    live_default: false
