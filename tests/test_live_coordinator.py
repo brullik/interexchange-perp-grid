@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_coordinator import (
@@ -21,13 +22,18 @@ from interexchange_perp_grid.live_journal import (
     LiveJournalAction,
     LiveOrderJournal,
 )
+from interexchange_perp_grid.live_reconciliation import FlatBarrierPolicy
 from interexchange_perp_grid.live_simulator import (
     DeterministicCanaryMonitor,
     DeterministicPrivateExchange,
     ScriptedOrderOutcome,
     StaticProtectionProvider,
 )
-from interexchange_perp_grid.private_domain import PrivateOrderStatus, VenueOrderRequest
+from interexchange_perp_grid.private_domain import (
+    PrivateOrder,
+    PrivateOrderStatus,
+    VenueOrderRequest,
+)
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
@@ -157,8 +163,16 @@ def _plan() -> CanaryExecutionPlan:
         route=_ROUTE,
         tranche_id="tranche-1",
         quantity=Decimal("0.001"),
-        long_request=_request(Venue.BINANCE_USDM, "ipeg-cycle-long", Side.BUY),
-        short_request=_request(Venue.OKX, "ipeg-cycle-short", Side.SELL),
+        long_request=_request(
+            Venue.BINANCE_USDM,
+            venue_client_order_id("cycle-1", "long"),
+            Side.BUY,
+        ),
+        short_request=_request(
+            Venue.OKX,
+            venue_client_order_id("cycle-1", "short"),
+            Side.SELL,
+        ),
         risk_reservation={"projected_stress_usdt": "0.8"},
         qualification_hash="a" * 64,
         timeout_seconds=30,
@@ -509,6 +523,83 @@ async def test_process_restart_after_durable_transition_resumes_without_duplicat
     assert result.terminal_state == LiveActionState.FLAT
     assert adapters[Venue.BINANCE_USDM].submit_calls == 2
     assert adapters[Venue.OKX].submit_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_journal_balanced_but_exchange_mismatched_positions_are_never_hedged(
+    tmp_path: Path,
+) -> None:
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    adapters = {
+        venue: DeterministicPrivateExchange(venue, instruments[venue], ()) for venue in Venue
+    }
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    plan = _plan()
+    action = await journal.prepare(
+        plan.pair_action_id,
+        plan.route,
+        plan.tranche_id,
+        plan.long_request,
+        plan.short_request,
+        {plan.route.long_venue: plan.quantity, plan.route.short_venue: plan.quantity},
+        {plan.route.long_venue: Decimal("100"), plan.route.short_venue: Decimal("100")},
+        plan.risk_reservation,
+        plan.qualification_hash,
+    )
+    await journal.mark_submit_attempted(
+        action.pair_action_id,
+        (plan.long_request.client_order_id, plan.short_request.client_order_id),
+    )
+    observed = datetime.now(UTC)
+    for request in (plan.long_request, plan.short_request):
+        order = PrivateOrder(
+            venue=request.venue,
+            order_id=f"{request.venue.value}-journal-only",
+            client_order_id=request.client_order_id,
+            symbol=request.symbol,
+            side=request.side,
+            status=PrivateOrderStatus.FILLED,
+            requested_base_quantity=plan.quantity,
+            filled_base_quantity=plan.quantity,
+            average_price=Decimal("100"),
+            fee_usdt=Decimal(0),
+            observed_at=observed,
+            limit_price=request.price,
+        )
+        await journal.record_order_event(action.pair_action_id, order, request.client_order_id)
+    await journal.transition(action.pair_action_id, LiveActionState.FILLED)
+
+    coordinator = LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        StaticProtectionProvider(
+            {
+                (venue, side): Decimal("101") if side == Side.BUY else Decimal("99")
+                for venue in Venue
+                for side in Side
+            }
+        ),
+        DeterministicCanaryMonitor(CloseReason.TARGET_CONVERGENCE),
+        Venue.BYBIT,
+        flat_barrier_policy=FlatBarrierPolicy(
+            consecutive_snapshots=2,
+            quiet_period_seconds=0,
+            poll_interval_seconds=0.01,
+            timeout_seconds=0.05,
+        ),
+    )
+    result = await coordinator.run(plan)
+
+    assert result.success is False
+    assert result.hedged is False
+    assert result.terminal_state == LiveActionState.QUARANTINED
+    assert result.reconciliation is not None
+    assert result.reconciliation.actual_signed_positions != (
+        result.reconciliation.expected_signed_positions
+    )
+    assert sum(adapter.submit_calls for adapter in adapters.values()) == 0
 
 
 @pytest.mark.asyncio

@@ -95,9 +95,39 @@ _TRANSITIONS: dict[LiveActionState, frozenset[LiveActionState]] = {
     LiveActionState.CLOSING: frozenset(
         {LiveActionState.FLAT, LiveActionState.RECOVERING, LiveActionState.QUARANTINED}
     ),
-    LiveActionState.FLAT: frozenset(),
+    LiveActionState.FLAT: frozenset({LiveActionState.QUARANTINED}),
     LiveActionState.QUARANTINED: frozenset({LiveActionState.RECOVERING, LiveActionState.FLAT}),
 }
+
+_ORDER_STATUS_TRANSITIONS: dict[PrivateOrderStatus | None, frozenset[PrivateOrderStatus]] = {
+    None: frozenset(PrivateOrderStatus),
+    PrivateOrderStatus.OPEN: frozenset(
+        {
+            PrivateOrderStatus.OPEN,
+            PrivateOrderStatus.PARTIAL,
+            PrivateOrderStatus.FILLED,
+            PrivateOrderStatus.CANCELLED,
+            PrivateOrderStatus.REJECTED,
+            PrivateOrderStatus.UNKNOWN,
+        }
+    ),
+    PrivateOrderStatus.PARTIAL: frozenset(
+        {
+            PrivateOrderStatus.PARTIAL,
+            PrivateOrderStatus.FILLED,
+            PrivateOrderStatus.CANCELLED,
+            PrivateOrderStatus.UNKNOWN,
+        }
+    ),
+    PrivateOrderStatus.UNKNOWN: frozenset(PrivateOrderStatus),
+    PrivateOrderStatus.FILLED: frozenset({PrivateOrderStatus.FILLED}),
+    PrivateOrderStatus.CANCELLED: frozenset({PrivateOrderStatus.CANCELLED}),
+    PrivateOrderStatus.REJECTED: frozenset({PrivateOrderStatus.REJECTED}),
+}
+
+
+class JournalEventQuarantinedError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,17 +163,6 @@ class LiveJournalAction:
 def request_payload_hash(request: VenueOrderRequest) -> str:
     encoded = json.dumps(asdict(request), default=str, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def venue_client_order_id(action_id: str, role: str, sequence: int = 0) -> str:
-    """Return a globally unique, OKX-compatible alphanumeric ID of at most 32 chars."""
-    if not action_id.strip() or sequence < 0:
-        raise ValueError("client order ID action and sequence are invalid")
-    role_code = "".join(character for character in role.lower() if character.isalnum())[:3]
-    if not role_code:
-        raise ValueError("client order ID role must contain an alphanumeric character")
-    digest = hashlib.sha256(f"{action_id}:{role}:{sequence}".encode()).hexdigest()[:24]
-    return f"ipeg{role_code}{digest}"
 
 
 class LiveOrderJournal:
@@ -198,7 +217,8 @@ class LiveOrderJournal:
                     submit_attempted INTEGER NOT NULL DEFAULT 0,
                     order_id TEXT,
                     status TEXT,
-                    filled_base_quantity TEXT NOT NULL DEFAULT '0'
+                    filled_base_quantity TEXT NOT NULL DEFAULT '0',
+                    last_event_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS live_action_transitions (
                     transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,8 +237,21 @@ class LiveOrderJournal:
                     observed_at TEXT NOT NULL,
                     PRIMARY KEY (client_order_id, event_key)
                 );
+                CREATE TABLE IF NOT EXISTS live_journal_audit_events (
+                    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pair_action_id TEXT NOT NULL REFERENCES live_pair_actions(pair_action_id),
+                    client_order_id TEXT,
+                    code TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    observed_at TEXT NOT NULL
+                );
                 """
             )
+            columns = {
+                str(row[1]) for row in database.execute("PRAGMA table_info(live_order_legs)")
+            }
+            if "last_event_at" not in columns:
+                database.execute("ALTER TABLE live_order_legs ADD COLUMN last_event_at TEXT")
 
     async def prepare(
         self,
@@ -732,18 +765,89 @@ class LiveOrderJournal:
             database.execute("BEGIN IMMEDIATE")
             leg = database.execute(
                 """
-                SELECT intended_base_quantity, filled_base_quantity
-                FROM live_order_legs
-                WHERE pair_action_id = ? AND client_order_id = ?
+                SELECT leg.venue, leg.symbol, leg.side, leg.intended_base_quantity,
+                       leg.filled_base_quantity, leg.order_id, leg.status, leg.last_event_at,
+                       action.state AS action_state
+                FROM live_order_legs AS leg
+                JOIN live_pair_actions AS action
+                  ON action.pair_action_id = leg.pair_action_id
+                WHERE leg.pair_action_id = ? AND leg.client_order_id = ?
                 """,
                 (pair_action_id, order.client_order_id),
             ).fetchone()
             if leg is None:
                 database.rollback()
                 raise KeyError(order.client_order_id)
-            inserted = database.execute(
+            payload_json = json.dumps(asdict(order), default=str, sort_keys=True)
+            existing_event = database.execute(
                 """
-                INSERT OR IGNORE INTO live_order_events (
+                SELECT payload_json FROM live_order_events
+                WHERE client_order_id = ? AND event_key = ?
+                """,
+                (order.client_order_id, event_key),
+            ).fetchone()
+            if existing_event is not None:
+                if str(existing_event["payload_json"]) == payload_json:
+                    database.commit()
+                    return False
+                self._quarantine_event_in_transaction(
+                    database,
+                    pair_action_id,
+                    order.client_order_id,
+                    "EVENT_KEY_PAYLOAD_CONFLICT",
+                    {"event_key": event_key},
+                    order.observed_at,
+                )
+                database.commit()
+                raise JournalEventQuarantinedError("EVENT_KEY_PAYLOAD_CONFLICT")
+
+            previous_status = (
+                PrivateOrderStatus(str(leg["status"])) if leg["status"] is not None else None
+            )
+            previous_filled = Decimal(str(leg["filled_base_quantity"]))
+            intended = Decimal(str(leg["intended_base_quantity"]))
+            violations: list[str] = []
+            if Venue(str(leg["venue"])) != order.venue:
+                violations.append("VENUE_MISMATCH")
+            if str(leg["symbol"]) != order.symbol:
+                violations.append("SYMBOL_MISMATCH")
+            if Side(str(leg["side"])) != order.side:
+                violations.append("SIDE_MISMATCH")
+            if intended != order.requested_base_quantity:
+                violations.append("REQUESTED_QUANTITY_MISMATCH")
+            if (
+                leg["order_id"] is not None
+                and order.order_id is not None
+                and str(leg["order_id"]) != order.order_id
+            ):
+                violations.append("EXCHANGE_ORDER_ID_CONFLICT")
+            if order.filled_base_quantity < previous_filled:
+                violations.append("FILL_REGRESSION")
+            if order.filled_base_quantity > intended:
+                violations.append("FILL_EXCEEDS_INTENT")
+            if order.status not in _ORDER_STATUS_TRANSITIONS[previous_status]:
+                violations.append("STATUS_REGRESSION")
+            if LiveActionState(str(leg["action_state"])) == LiveActionState.FLAT:
+                violations.append("EVENT_AFTER_FLAT")
+            if leg["last_event_at"] is not None and order.observed_at < datetime.fromisoformat(
+                str(leg["last_event_at"])
+            ):
+                violations.append("EVENT_TIME_REGRESSION")
+            if violations:
+                self._quarantine_event_in_transaction(
+                    database,
+                    pair_action_id,
+                    order.client_order_id,
+                    "|".join(violations),
+                    {"event_key": event_key, "order": asdict(order)},
+                    order.observed_at,
+                )
+                database.commit()
+                raise JournalEventQuarantinedError("|".join(violations))
+
+            database.execute(
+                """
+                INSERT INTO live_order_events (
                     client_order_id, event_key, status, filled_base_quantity,
                     payload_json, observed_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
@@ -753,32 +857,98 @@ class LiveOrderJournal:
                     event_key,
                     order.status.value,
                     str(order.filled_base_quantity),
-                    json.dumps(asdict(order), default=str, sort_keys=True),
+                    payload_json,
                     order.observed_at.isoformat(),
                 ),
-            ).rowcount
-            if inserted:
-                previous_filled = Decimal(str(leg["filled_base_quantity"]))
-                next_filled = max(previous_filled, order.filled_base_quantity)
-                intended = Decimal(str(leg["intended_base_quantity"]))
-                if next_filled > intended:
-                    database.rollback()
-                    raise ValueError("exchange-reported fill exceeds journaled intent")
-                database.execute(
-                    """
-                    UPDATE live_order_legs
-                    SET order_id = COALESCE(?, order_id), status = ?, filled_base_quantity = ?
-                    WHERE client_order_id = ?
-                    """,
-                    (
-                        order.order_id,
-                        order.status.value,
-                        str(next_filled),
-                        order.client_order_id,
-                    ),
-                )
+            )
+            database.execute(
+                """
+                UPDATE live_order_legs
+                SET order_id = COALESCE(order_id, ?), status = ?, filled_base_quantity = ?,
+                    last_event_at = ?
+                WHERE client_order_id = ?
+                """,
+                (
+                    order.order_id,
+                    order.status.value,
+                    str(order.filled_base_quantity),
+                    order.observed_at.isoformat(),
+                    order.client_order_id,
+                ),
+            )
             database.commit()
-        return bool(inserted)
+        return True
+
+    def _quarantine_event_in_transaction(
+        self,
+        database: sqlite3.Connection,
+        pair_action_id: str,
+        client_order_id: str,
+        code: str,
+        payload: dict[str, Any],
+        observed_at: datetime,
+    ) -> None:
+        observed = observed_at.isoformat()
+        database.execute(
+            """
+            INSERT INTO live_journal_audit_events (
+                pair_action_id, client_order_id, code, payload_json, observed_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                pair_action_id,
+                client_order_id,
+                code,
+                json.dumps(payload, default=str, sort_keys=True),
+                observed,
+            ),
+        )
+        row = database.execute(
+            "SELECT state FROM live_pair_actions WHERE pair_action_id = ?",
+            (pair_action_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(pair_action_id)
+        previous = LiveActionState(str(row["state"]))
+        if previous != LiveActionState.QUARANTINED:
+            database.execute(
+                """
+                UPDATE live_pair_actions
+                SET state = ?, recovery_action = ?, updated_at = ?
+                WHERE pair_action_id = ?
+                """,
+                (
+                    LiveActionState.QUARANTINED.value,
+                    "JOURNAL_EVENT_IDENTITY_FAILURE",
+                    observed,
+                    pair_action_id,
+                ),
+            )
+            database.execute(
+                """
+                INSERT INTO live_action_transitions (
+                    pair_action_id, from_state, to_state, details_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    pair_action_id,
+                    previous.value,
+                    LiveActionState.QUARANTINED.value,
+                    json.dumps({"code": code, "client_order_id": client_order_id}),
+                    observed,
+                ),
+            )
+
+    async def event_watermark(self) -> int:
+        return await asyncio.to_thread(self._event_watermark_sync)
+
+    def _event_watermark_sync(self) -> int:
+        with self._connect() as database:
+            order_events = database.execute("SELECT count(*) FROM live_order_events").fetchone()
+            audit_events = database.execute(
+                "SELECT count(*) FROM live_journal_audit_events"
+            ).fetchone()
+        return int(order_events[0]) + int(audit_events[0])
 
     async def load(self, pair_action_id: str) -> LiveJournalAction | None:
         return await asyncio.to_thread(self._load_sync, pair_action_id)

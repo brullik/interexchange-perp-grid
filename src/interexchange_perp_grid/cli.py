@@ -5,7 +5,6 @@ import contextlib
 import hashlib
 import json
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
@@ -14,6 +13,7 @@ import typer
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Venue
@@ -37,11 +37,22 @@ from interexchange_perp_grid.qualification import (
     write_runtime_evidence,
 )
 from interexchange_perp_grid.release_evidence import REPLAY_TEST_FILES, run_replay_proof
+from interexchange_perp_grid.release_preflight import evaluate_release_preflight
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.service import run_until_signal
 from interexchange_perp_grid.shadow import ShadowRuntime
-from interexchange_perp_grid.state import initialise_state, read_service_health
+from interexchange_perp_grid.state import (
+    QualificationEpoch,
+    ServiceHealth,
+    finalize_qualification_epoch,
+    initialise_state,
+    read_qualification_epoch,
+    read_service_health,
+    start_qualification_epoch,
+)
 from interexchange_perp_grid.strategy import DirectedRouteKey
+from interexchange_perp_grid.supervisor import SupervisorHealth, read_supervisor_health
+from interexchange_perp_grid.supervisor_smoke import run_supervisor_recovery_smoke
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 ConfigPath = Annotated[
@@ -112,12 +123,15 @@ def doctor(config: ConfigPath = Path("config/defaults.yaml")) -> None:
 def health(config: ConfigPath = Path("config/defaults.yaml")) -> None:
     """Fail unless the persisted service heartbeat is current."""
     settings = _load(config)
-    result = asyncio.run(
-        read_service_health(
-            Path(settings.storage.sqlite_path),
-            settings.app.health_max_age_seconds,
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def read_health() -> tuple[ServiceHealth, SupervisorHealth | None]:
+        return (
+            await read_service_health(state_path, settings.app.health_max_age_seconds),
+            await read_supervisor_health(state_path),
         )
-    )
+
+    result, supervisor = asyncio.run(read_health())
     typer.echo(
         json.dumps(
             {
@@ -126,6 +140,18 @@ def health(config: ConfigPath = Path("config/defaults.yaml")) -> None:
                 "service_status": result.status,
                 "heartbeat_at": result.heartbeat_at,
                 "starts": result.starts,
+                "supervisor_mode": supervisor.mode if supervisor is not None else None,
+                "active_pair_action_id": (
+                    supervisor.active_pair_action_id if supervisor is not None else None
+                ),
+                "terminal_or_action_state": (
+                    supervisor.action_state if supervisor is not None else None
+                ),
+                "recovery_required": (
+                    supervisor.recovery_required if supervisor is not None else None
+                ),
+                "recovery_outcome": supervisor.outcome if supervisor is not None else None,
+                "supervisor_failure": supervisor.failure if supervisor is not None else None,
             },
             default=str,
             sort_keys=True,
@@ -262,8 +288,76 @@ def qualify(
         raise typer.Exit(code=4)
 
 
+@app.command("qualification-epoch-start")
+def qualification_epoch_start(
+    route: Annotated[str, typer.Option("--route")],
+    container_image_digest: Annotated[
+        str,
+        typer.Option("--container-image-digest", envvar="IPEG_CONTAINER_IMAGE_DIGEST"),
+    ],
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Idempotently start one exact release/config/image/route observation epoch."""
+    settings = _load(config)
+    selected_route = _parse_route(route)
+    release_sha = current_code_commit_sha(repo_root.resolve())
+    if release_sha is None:
+        raise typer.BadParameter("exact release commit SHA is unavailable")
+
+    async def start() -> QualificationEpoch:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        return await start_qualification_epoch(
+            state_path,
+            selected_route,
+            release_sha,
+            code_hash(repo_root.resolve()),
+            config_hash(config.resolve()),
+            container_image_digest.lower(),
+        )
+
+    typer.echo(json.dumps(asdict(asyncio.run(start())), default=str, sort_keys=True))
+
+
+@app.command("qualification-epoch-status")
+def qualification_epoch_status(
+    epoch_id: Annotated[str | None, typer.Option("--epoch-id")] = None,
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Print the current or selected immutable qualification epoch as JSON."""
+    settings = _load(config)
+
+    async def status() -> QualificationEpoch | None:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        return await read_qualification_epoch(state_path, epoch_id)
+
+    epoch = asyncio.run(status())
+    if epoch is None:
+        raise typer.Exit(code=4)
+    typer.echo(json.dumps(asdict(epoch), default=str, sort_keys=True))
+
+
+@app.command("qualification-epoch-finalize")
+def qualification_epoch_finalize(
+    epoch_id: Annotated[str, typer.Option("--epoch-id")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Idempotently close an exact epoch to further observations."""
+    settings = _load(config)
+
+    async def finalize() -> QualificationEpoch:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        return await finalize_qualification_epoch(state_path, epoch_id)
+
+    typer.echo(json.dumps(asdict(asyncio.run(finalize())), default=str, sort_keys=True))
+
+
 @app.command("qualification-runtime")
 def qualification_runtime(
+    epoch_id: Annotated[str, typer.Option("--epoch-id")],
     route: Annotated[str, typer.Option("--route")],
     container_image_digest: Annotated[
         str,
@@ -326,15 +420,21 @@ def qualification_runtime(
         return fees
 
     async def build() -> QualificationRuntimeEvidence:
+        epoch = await read_qualification_epoch(Path(settings.storage.sqlite_path), epoch_id)
+        if (
+            epoch is None
+            or epoch.route != selected_route
+            or epoch.release_sha != release_sha
+            or epoch.source_sha256 != code_hash(repo_root.resolve())
+            or epoch.config_sha256 != config_hash(config.resolve())
+            or epoch.container_image_digest != container_image_digest.lower()
+        ):
+            raise ValueError("qualification epoch identity does not match the exact release")
         fees = await collect()
         return await build_runtime_evidence_from_state(
             Path(settings.storage.sqlite_path),
-            selected_route,
-            release_sha,
-            container_image_digest,
+            epoch_id,
             fees,
-            datetime.now(UTC)
-            - timedelta(seconds=settings.shadow.qualification_min_duration_seconds),
             replay_completed=True,
         )
 
@@ -354,6 +454,70 @@ def replay_proof(
     typer.echo(json.dumps(asdict(proof), default=str, sort_keys=True))
     if not proof.passed:
         raise typer.Exit(code=5)
+
+
+@app.command("c4-proof")
+def c4_proof(
+    image_digest: Annotated[
+        str,
+        typer.Option("--image-digest", envvar="IPEG_CONTAINER_IMAGE_DIGEST"),
+    ],
+    output_root: Annotated[Path, typer.Option("--output-root")] = Path("artifacts"),
+    baseline: Annotated[Path, typer.Option("--baseline")] = Path(
+        "config/c4-critical-test-manifest.json"
+    ),
+    nodeids: Annotated[Path, typer.Option("--nodeids")] = Path("config/c4-scenario-nodeids.json"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create exact-head C4 critical proof with zero production submit calls."""
+    result = run_c4_proof(
+        repo_root.resolve(),
+        config.resolve(),
+        baseline.resolve(),
+        nodeids.resolve(),
+        output_root.resolve(),
+        image_digest,
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+
+
+@app.command("supervisor-recovery-smoke")
+def supervisor_recovery_smoke(
+    state: Annotated[Path, typer.Option("--state")],
+    hold_after_active: Annotated[bool, typer.Option("--hold-after-active")] = False,
+    ready: Annotated[Path | None, typer.Option("--ready")] = None,
+) -> None:
+    """Run deterministic Docker process-kill/restart recovery proof without exchange I/O."""
+    result = asyncio.run(
+        run_supervisor_recovery_smoke(
+            state.resolve(),
+            hold_after_active=hold_after_active,
+            ready_path=ready.resolve() if ready is not None else None,
+        )
+    )
+    typer.echo(json.dumps(result, default=str, sort_keys=True))
+
+
+@app.command("release-preflight")
+def release_preflight(
+    image_digest: Annotated[
+        str,
+        typer.Option("--image-digest", envvar="IPEG_CONTAINER_IMAGE_DIGEST"),
+    ],
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Print machine-readable exact-release shadow deployment admission."""
+    result = evaluate_release_preflight(
+        _load(config),
+        repo_root.resolve(),
+        config.resolve(),
+        image_digest,
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+    if not result.passed:
+        raise typer.Exit(code=7)
 
 
 @app.command("backup-state")

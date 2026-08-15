@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
+import interexchange_perp_grid.service as service_module
 from interexchange_perp_grid.config import load_settings
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.service import BootstrapService
+from interexchange_perp_grid.shadow import ContinuousShadowEvaluator
 from interexchange_perp_grid.state import read_service_health
 
 CONFIG = Path("config/defaults.yaml")
@@ -45,3 +47,53 @@ async def test_service_heartbeat_survives_restart(tmp_path: Path) -> None:
     restarted = await read_service_health(state_path, max_age_seconds=5)
     assert restarted.starts == 2
     assert restarted.status == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_service_owns_exactly_one_telegram_poller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "service.sqlite3"
+    settings = load_settings(
+        CONFIG,
+        {
+            "IPEG_STATE_PATH": str(state_path),
+            "IPEG_TELEGRAM_ENABLED": "true",
+            "IPEG_TELEGRAM_OWNER_CHAT_ID": "123",
+        },
+    )
+    telegram_started = asyncio.Event()
+    poller_calls = 0
+
+    async def fake_telegram(*args: object, **kwargs: object) -> None:
+        nonlocal poller_calls
+        del kwargs
+        poller_calls += 1
+        telegram_started.set()
+        stop_event = args[2]
+        assert isinstance(stop_event, asyncio.Event)
+        await stop_event.wait()
+
+    async def fake_shadow_run(self: object, stop_event: asyncio.Event) -> None:
+        del self
+        await stop_event.wait()
+
+    monkeypatch.setattr(service_module, "run_telegram_bot", fake_telegram)
+    monkeypatch.setattr(ContinuousShadowEvaluator, "run", fake_shadow_run)
+    service = BootstrapService(
+        settings,
+        heartbeat_interval_seconds=0.01,
+        supervisor_poll_interval_seconds=0.01,
+    )
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(service.run(stop_event))
+    try:
+        await asyncio.wait_for(telegram_started.wait(), timeout=2)
+        await wait_for_health(state_path, 1)
+        assert poller_calls == 1
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    assert poller_calls == 1

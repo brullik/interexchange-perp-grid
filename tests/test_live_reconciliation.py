@@ -6,20 +6,26 @@ from pathlib import Path
 
 import pytest
 
+from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.live_reconciliation import (
+    FlatBarrierPolicy,
+    ReconciliationReport,
     ReconciliationStatus,
     VenuePrivateState,
     evaluate_canary_risk_from_private_state,
     reconcile_private_states,
+    wait_for_stable_flat,
 )
 from interexchange_perp_grid.private_domain import (
     AccountSnapshot,
     PositionSnapshot,
     PrivateOrder,
     PrivateOrderStatus,
+    SnapshotCompleteness,
+    UnknownActiveRecord,
     VenueOrderRequest,
 )
 from interexchange_perp_grid.reason_codes import ReasonCode
@@ -27,6 +33,8 @@ from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _ROUTE = DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX)
 _REQUIRED = {Venue.BINANCE_USDM, Venue.OKX, Venue.BYBIT}
+_LONG_ID = venue_client_order_id("pair-1", "long")
+_SHORT_ID = venue_client_order_id("pair-1", "short")
 
 
 def _account(venue: Venue) -> AccountSnapshot:
@@ -60,6 +68,10 @@ def _state(
         positions,
         None if error else Decimal("0.0005"),
         error,
+        len(orders),
+        len(positions),
+        (),
+        SnapshotCompleteness.UNKNOWN if error else SnapshotCompleteness.COMPLETE,
     )
 
 
@@ -139,13 +151,96 @@ def test_offsetting_nonzero_positions_can_never_be_reported_as_flat() -> None:
     assert report.flat_verified is False
 
 
+def test_unknown_raw_active_record_and_count_mismatch_deny_entry_and_flat() -> None:
+    states = _empty_states()
+    states[Venue.OKX] = VenuePrivateState(
+        Venue.OKX,
+        _account(Venue.OKX),
+        (),
+        (),
+        (),
+        Decimal("0.0005"),
+        None,
+        1,
+        0,
+        (
+            UnknownActiveRecord(
+                Venue.OKX,
+                "OPEN_ORDER",
+                "UNKNOWN_SYMBOL",
+                {"symbol": "UNKNOWN", "id": "active-1"},
+            ),
+        ),
+        SnapshotCompleteness.UNKNOWN,
+    )
+    report = reconcile_private_states(None, states, set(), _REQUIRED)
+    assert report.status == ReconciliationStatus.UNKNOWN
+    assert report.raw_open_order_count == 1
+    assert report.unknown_active_record_count == 1
+    assert report.snapshots_complete is False
+    assert report.flat_verified is False
+
+
+@pytest.mark.asyncio
+async def test_late_fill_after_first_empty_snapshot_resets_flat_barrier() -> None:
+    flat = reconcile_private_states(None, _empty_states(), set(), _REQUIRED)
+    exposed_states = _empty_states()
+    exposed_states[Venue.OKX] = _state(
+        Venue.OKX,
+        positions=(_position(Venue.OKX, Side.BUY, "0.001"),),
+    )
+    late_fill = reconcile_private_states(None, exposed_states, set(), _REQUIRED)
+    reports = [flat, late_fill, flat, flat]
+    calls = 0
+
+    async def report_factory() -> ReconciliationReport:
+        nonlocal calls
+        selected = reports[min(calls, len(reports) - 1)]
+        calls += 1
+        return selected
+
+    async def watermark() -> int:
+        return 1 if calls >= 2 else 0
+
+    result = await wait_for_stable_flat(
+        report_factory,
+        watermark,
+        FlatBarrierPolicy(2, 0, 0.001, 0.1),
+    )
+    assert result.verified is True
+    assert calls >= 4
+    assert result.consecutive_snapshots >= 2
+
+
+@pytest.mark.asyncio
+async def test_incomplete_private_state_times_out_without_flat_success() -> None:
+    states = _empty_states()
+    states[Venue.BYBIT] = _state(Venue.BYBIT, error="timeout")
+    unknown = reconcile_private_states(None, states, set(), _REQUIRED)
+
+    async def report_factory() -> ReconciliationReport:
+        return unknown
+
+    async def watermark() -> int:
+        return 0
+
+    result = await wait_for_stable_flat(
+        report_factory,
+        watermark,
+        FlatBarrierPolicy(2, 0, 0.001, 0.01),
+    )
+    assert result.verified is False
+    assert result.timed_out is True
+    assert result.report.flat_verified is False
+
+
 @pytest.mark.asyncio
 async def test_active_journal_is_matched_to_orders_and_actual_positions(tmp_path: Path) -> None:
     journal = LiveOrderJournal(tmp_path / "state.sqlite3")
     await journal.initialise()
     long_request = VenueOrderRequest(
         Venue.BINANCE_USDM,
-        "ipeg-pair-long",
+        _LONG_ID,
         "BTC/USDT:USDT",
         Side.BUY,
         "limit",
@@ -156,7 +251,7 @@ async def test_active_journal_is_matched_to_orders_and_actual_positions(tmp_path
     )
     short_request = VenueOrderRequest(
         Venue.OKX,
-        "ipeg-pair-short",
+        _SHORT_ID,
         "BTC/USDT:USDT",
         Side.SELL,
         "limit",
@@ -176,9 +271,9 @@ async def test_active_journal_is_matched_to_orders_and_actual_positions(tmp_path
         {"stress": "0.8"},
         "a" * 64,
     )
-    await journal.mark_submit_attempted("pair-1", ("ipeg-pair-long", "ipeg-pair-short"))
-    long_order = _order(Venue.BINANCE_USDM, "ipeg-pair-long", Side.BUY, "0.001")
-    short_order = _order(Venue.OKX, "ipeg-pair-short", Side.SELL, "0.001")
+    await journal.mark_submit_attempted("pair-1", (_LONG_ID, _SHORT_ID))
+    long_order = _order(Venue.BINANCE_USDM, _LONG_ID, Side.BUY, "0.001")
+    short_order = _order(Venue.OKX, _SHORT_ID, Side.SELL, "0.001")
     await journal.record_order_event("pair-1", long_order, "long-filled")
     await journal.record_order_event("pair-1", short_order, "short-filled")
     action = await journal.load("pair-1")
@@ -216,7 +311,7 @@ async def test_active_journal_is_matched_to_orders_and_actual_positions(tmp_path
         _REQUIRED,
     )
     assert missing_order.status == ReconciliationStatus.UNKNOWN
-    assert "ipeg-pair-short" in missing_order.unknown_client_order_ids
+    assert _SHORT_ID in missing_order.unknown_client_order_ids
 
 
 def test_canary_risk_bootstraps_from_exchange_positions_and_one_dollar_limit() -> None:

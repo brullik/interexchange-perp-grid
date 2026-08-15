@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -11,9 +12,11 @@ from interexchange_perp_grid.domain import (
     Venue,
 )
 from interexchange_perp_grid.live_economics import (
+    EmergencyVenueAssessment,
     LiveEconomicDecision,
     LiveEconomicPolicy,
     _funding_cost,
+    evaluate_emergency_venue,
     evaluate_live_entry,
 )
 from interexchange_perp_grid.market_data import DataQualityAssessment
@@ -101,6 +104,7 @@ def _decision(
     strategy: QualifiedStrategyParameters | None = None,
     fees: dict[Venue, Decimal] | None = None,
     long_book: OrderBookSnapshot | None = None,
+    emergency: EmergencyVenueAssessment | None = None,
 ) -> LiveEconomicDecision:
     long_instrument = _instrument(Venue.BINANCE_USDM)
     short_instrument = _instrument(Venue.OKX)
@@ -136,6 +140,7 @@ def _decision(
         strategy or _strategy(),
         _policy(),
         RiskDecision(True, ReasonCode.RISK_RESERVED, {"stress": Decimal("0.5")}),
+        emergency_assessment=emergency,
     )
 
 
@@ -217,3 +222,81 @@ def test_funding_cost_counts_the_actual_next_checkpoint_not_a_fractional_interva
         stress=True,
         multiplier=Decimal(2),
     ) == Decimal("0.30000")
+
+
+def _emergency_assessment(
+    *,
+    instrument: Instrument | None = None,
+    book: OrderBookSnapshot | None = None,
+    fee: Decimal | None = Decimal("0.0006"),
+) -> EmergencyVenueAssessment:
+    return evaluate_emergency_venue(
+        _instrument(Venue.BINANCE_USDM),
+        _instrument(Venue.OKX),
+        instrument or _instrument(Venue.BYBIT),
+        book
+        or _book(
+            Venue.BYBIT,
+            ("99.9", "99.8"),
+            ("100", "100.2"),
+        ),
+        fee,
+        Decimal("0.002"),
+        capability_ready=True,
+        account_ready=True,
+        data_quality_ready=True,
+        slippage_cap_bps=Decimal("8"),
+    )
+
+
+def test_third_venue_exact_fee_depth_and_round_trip_cost_are_in_stress() -> None:
+    assessment = _emergency_assessment()
+    assert assessment.passed is True
+    assert assessment.residual_quantities == (Decimal("0.001"), Decimal("0.002"))
+    assert assessment.fee_rate == Decimal("0.0006")
+    assert assessment.worst_hedge_and_flatten_cost_usdt > 0
+    assert assessment.buy_protected_price is not None
+    assert assessment.sell_protected_price is not None
+
+    decision = _decision(emergency=assessment)
+    baseline = _decision()
+    assert decision.signal is not None
+    assert baseline.signal is not None
+    assert (
+        decision.signal.cost.emergency_hedge_reserve_usdt
+        == baseline.signal.cost.emergency_hedge_reserve_usdt
+        + assessment.worst_hedge_and_flatten_cost_usdt
+    )
+
+
+def test_third_venue_blocks_when_any_quantized_residual_is_not_executable() -> None:
+    third = replace(
+        _instrument(Venue.BYBIT),
+        contract_size_base=Decimal("0.002"),
+    )
+    assessment = _emergency_assessment(instrument=third)
+    assert assessment.passed is False
+    assert assessment.reason == ReasonCode.RESIDUAL_NOT_EXECUTABLE
+    assert assessment.checks["all_residual_steps"] is False
+    assert _decision(emergency=assessment).accepted is False
+
+
+def test_third_venue_blocks_when_either_side_depth_cannot_cover_maximum_residual() -> None:
+    shallow = OrderBookSnapshot(
+        venue=Venue.BYBIT,
+        symbol="BTC/USDT:USDT",
+        bids=_book(Venue.BYBIT, ("99.9",), ("100",)).bids,
+        asks=_book(Venue.BYBIT, ("99.9",), ("100",)).asks,
+        exchange_timestamp_ms=1_700_000_000_000,
+        received_at=datetime.now(UTC),
+        received_monotonic_ns=1,
+        sequence_start=1,
+        sequence_end=1,
+        is_snapshot=True,
+        synchronised=True,
+        clock_skew_ms=0,
+    )
+    assessment = _emergency_assessment(book=shallow)
+    assert assessment.passed is False
+    assert assessment.reason == ReasonCode.EMERGENCY_VENUE_PREFLIGHT_FAILED
+    assert assessment.checks["both_side_depth"] is False

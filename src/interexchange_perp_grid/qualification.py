@@ -17,6 +17,7 @@ import duckdb
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import PairActionState
 from interexchange_perp_grid.reason_codes import ReasonCode
+from interexchange_perp_grid.state import QualificationEpochStatus
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -93,8 +94,14 @@ class QualifiedStrategyParameters:
 
 @dataclass(frozen=True, slots=True)
 class QualificationRuntimeEvidence:
+    epoch_id: str
+    epoch_started_at: datetime
+    epoch_ended_at: datetime
+    epoch_status: QualificationEpochStatus
     route: DirectedRouteKey
     release_code_sha: str
+    source_sha256: str
+    config_sha256: str
     container_image_digest: str
     private_taker_fee_rates: dict[Venue, Decimal]
     funding_checkpoints: tuple[FundingCheckpoint, ...]
@@ -102,8 +109,18 @@ class QualificationRuntimeEvidence:
     strategy: QualifiedStrategyParameters
 
     def __post_init__(self) -> None:
+        if not self.epoch_id.strip():
+            raise ValueError("qualification epoch ID must be non-empty")
+        if self.epoch_status != QualificationEpochStatus.FINALIZED:
+            raise ValueError("qualification runtime evidence requires a finalized epoch")
+        if self.epoch_ended_at < self.epoch_started_at:
+            raise ValueError("qualification epoch end precedes start")
         if not _COMMIT_SHA.fullmatch(self.release_code_sha):
             raise ValueError("release code SHA must be an exact 40-character commit SHA")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.source_sha256):
+            raise ValueError("qualification source hash must be SHA-256")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.config_sha256):
+            raise ValueError("qualification config hash must be SHA-256")
         if not _IMAGE_DIGEST.fullmatch(self.container_image_digest):
             raise ValueError("container image digest must be sha256:<64 lowercase hex>")
         route_venues = {self.route.long_venue, self.route.short_venue}
@@ -169,6 +186,10 @@ class VenueBookStatistics:
 class QualificationEvidence:
     schema_version: int
     generated_at: datetime
+    epoch_id: str
+    epoch_started_at: datetime
+    epoch_ended_at: datetime
+    epoch_status: QualificationEpochStatus
     route: DirectedRouteKey | None
     code_commit_sha: str
     code_sha256: str
@@ -285,8 +306,14 @@ def load_runtime_evidence(path: Path) -> QualificationRuntimeEvidence:
         raise ValueError("funding_checkpoints must be a list")
     replay_payload = _require_mapping(payload, "replay_shadow")
     return QualificationRuntimeEvidence(
+        epoch_id=str(payload["epoch_id"]),
+        epoch_started_at=datetime.fromisoformat(str(payload["epoch_started_at"])),
+        epoch_ended_at=datetime.fromisoformat(str(payload["epoch_ended_at"])),
+        epoch_status=QualificationEpochStatus(str(payload["epoch_status"])),
         route=route,
         release_code_sha=str(payload["release_code_sha"]).lower(),
+        source_sha256=str(payload["source_sha256"]).lower(),
+        config_sha256=str(payload["config_sha256"]).lower(),
         container_image_digest=str(payload["container_image_digest"]).lower(),
         private_taker_fee_rates={
             Venue(str(venue)): Decimal(str(rate)) for venue, rate in fees_payload.items()
@@ -385,10 +412,17 @@ def run_qualification(
     route = runtime_evidence.route if runtime_evidence is not None else None
     statistics = (
         tuple(
-            _venue_book_statistics(data_root, venue, route.base, selected_policy)
+            _venue_book_statistics(
+                data_root,
+                venue,
+                route.base,
+                selected_policy,
+                runtime_evidence.epoch_started_at,
+                runtime_evidence.epoch_ended_at,
+            )
             for venue in (route.long_venue, route.short_venue)
         )
-        if route is not None
+        if runtime_evidence is not None and route is not None
         else ()
     )
     route_period = _route_observation_period(statistics)
@@ -417,12 +451,20 @@ def run_qualification(
         checkpoint_counts,
         selected_policy,
         current_code_commit_sha(repo_root),
+        code_hash(repo_root),
+        config_hash(config_path),
     )
     accepted = not blockers
     manifest = _data_manifest(data_root)
     unsigned = QualificationEvidence(
-        schema_version=3,
+        schema_version=4,
         generated_at=observed_at,
+        epoch_id=runtime_evidence.epoch_id if runtime_evidence else "UNAVAILABLE",
+        epoch_started_at=(runtime_evidence.epoch_started_at if runtime_evidence else observed_at),
+        epoch_ended_at=(runtime_evidence.epoch_ended_at if runtime_evidence else observed_at),
+        epoch_status=(
+            runtime_evidence.epoch_status if runtime_evidence else QualificationEpochStatus.CLOSED
+        ),
         route=route,
         code_commit_sha=(runtime_evidence.release_code_sha if runtime_evidence else "UNAVAILABLE"),
         code_sha256=code_hash(repo_root),
@@ -460,7 +502,13 @@ def run_qualification(
     return evidence
 
 
-def _read_book_events(data_root: Path, venue: Venue, base: str) -> tuple[_BookEvent, ...]:
+def _read_book_events(
+    data_root: Path,
+    venue: Venue,
+    base: str,
+    started_at: datetime,
+    ended_at: datetime,
+) -> tuple[_BookEvent, ...]:
     files = tuple(data_root.rglob("*.parquet")) if data_root.is_dir() else ()
     if not files:
         return ()
@@ -478,10 +526,11 @@ def _read_book_events(data_root: Path, venue: Venue, base: str) -> tuple[_BookEv
                    max(clock_skew_ms) AS clock_skew_ms
             FROM read_parquet(?, hive_partitioning = true, union_by_name = true)
             WHERE venue = ? AND upper(split_part(symbol, '/', 1)) = ?
+              AND received_at >= ? AND received_at <= ?
             GROUP BY event_id
             ORDER BY received_at, event_id
             """,
-            [parquet_glob, venue.value, base.upper()],
+            [parquet_glob, venue.value, base.upper(), started_at.isoformat(), ended_at.isoformat()],
         ).fetchall()
     return tuple(
         _BookEvent(
@@ -503,8 +552,10 @@ def _venue_book_statistics(
     venue: Venue,
     base: str,
     policy: QualificationPolicy,
+    started_at: datetime,
+    ended_at: datetime,
 ) -> VenueBookStatistics:
-    events = _read_book_events(data_root, venue, base)
+    events = _read_book_events(data_root, venue, base, started_at, ended_at)
     if not events:
         return VenueBookStatistics(
             venue, 0, 0, None, None, Decimal(0), 0, 0, Decimal(0), 0, 0, 0, 0, 0
@@ -580,12 +631,22 @@ def _qualification_blockers(
     checkpoint_counts: dict[Venue, int],
     policy: QualificationPolicy,
     observed_code_sha: str | None,
+    observed_source_sha256: str,
+    observed_config_sha256: str,
 ) -> tuple[str, ...]:
     blockers: list[str] = []
     if runtime is None:
         return ("RUNTIME_EVIDENCE_MISSING",)
     if observed_code_sha is None or observed_code_sha != runtime.release_code_sha:
         blockers.append("RELEASE_CODE_SHA_MISMATCH")
+    if runtime.source_sha256 != observed_source_sha256:
+        blockers.append("SOURCE_SHA256_MISMATCH")
+    if runtime.config_sha256 != observed_config_sha256:
+        blockers.append("CONFIG_SHA256_MISMATCH")
+    if runtime.epoch_status != QualificationEpochStatus.FINALIZED:
+        blockers.append("QUALIFICATION_EPOCH_NOT_FINALIZED")
+    if runtime.epoch_ended_at < runtime.epoch_started_at:
+        blockers.append("QUALIFICATION_EPOCH_INVALID")
     if route_period < policy.minimum_duration_seconds:
         blockers.append("OBSERVATION_PERIOD_INSUFFICIENT")
     for item in statistics:
@@ -647,6 +708,10 @@ def load_qualification(path: Path) -> QualificationEvidence:
     evidence = QualificationEvidence(
         schema_version=int(payload["schema_version"]),
         generated_at=datetime.fromisoformat(str(payload["generated_at"])),
+        epoch_id=str(payload["epoch_id"]),
+        epoch_started_at=datetime.fromisoformat(str(payload["epoch_started_at"])),
+        epoch_ended_at=datetime.fromisoformat(str(payload["epoch_ended_at"])),
+        epoch_status=QualificationEpochStatus(str(payload["epoch_status"])),
         route=route,
         code_commit_sha=str(payload["code_commit_sha"]),
         code_sha256=str(payload["code_sha256"]),
@@ -760,7 +825,9 @@ def qualification_is_current(
     observed_at = now or datetime.now(UTC)
     release_sha = current_release_code_sha or current_code_commit_sha(repo_root)
     hashes_match = (
-        evidence.schema_version == 3
+        evidence.schema_version == 4
+        and evidence.epoch_status == QualificationEpochStatus.FINALIZED
+        and evidence.epoch_ended_at >= evidence.epoch_started_at
         and evidence.code_commit_sha == release_sha
         and evidence.code_sha256 == code_hash(repo_root)
         and evidence.config_sha256 == config_hash(config_path)
@@ -779,20 +846,26 @@ def qualification_is_current(
 
 async def build_runtime_evidence_from_state(
     state_path: Path,
-    route: DirectedRouteKey,
-    release_code_sha: str,
-    container_image_digest: str,
+    epoch_id: str,
     private_taker_fee_rates: dict[Venue, Decimal],
-    since: datetime,
     *,
     replay_completed: bool,
 ) -> QualificationRuntimeEvidence:
     from interexchange_perp_grid.state import (  # local import avoids state startup coupling
         load_tranches,
+        read_qualification_epoch,
         read_qualification_statistics,
     )
 
-    stored = await read_qualification_statistics(state_path, route, since)
+    epoch = await read_qualification_epoch(state_path, epoch_id)
+    if (
+        epoch is None
+        or epoch.status != QualificationEpochStatus.FINALIZED
+        or epoch.ended_at is None
+    ):
+        raise ValueError("runtime evidence requires one finalized exact qualification epoch")
+    route = epoch.route
+    stored = await read_qualification_statistics(state_path, epoch_id)
     if stored.strategy is None:
         raise ValueError("route-specific shadow strategy evidence is missing")
     strategy = stored.strategy
@@ -811,9 +884,15 @@ async def build_runtime_evidence_from_state(
         for tranche in route_tranches
     )
     return QualificationRuntimeEvidence(
+        epoch_id=epoch.epoch_id,
+        epoch_started_at=epoch.started_at,
+        epoch_ended_at=epoch.ended_at,
+        epoch_status=epoch.status,
         route=route,
-        release_code_sha=release_code_sha,
-        container_image_digest=container_image_digest,
+        release_code_sha=epoch.release_sha,
+        source_sha256=epoch.source_sha256,
+        config_sha256=epoch.config_sha256,
+        container_image_digest=epoch.container_image_digest,
         private_taker_fee_rates=private_taker_fee_rates,
         funding_checkpoints=tuple(
             FundingCheckpoint(

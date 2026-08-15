@@ -8,14 +8,15 @@ from pathlib import Path
 
 import pytest
 
+from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_journal import (
+    JournalEventQuarantinedError,
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
     request_payload_hash,
-    venue_client_order_id,
 )
 from interexchange_perp_grid.private_domain import (
     PrivateOrder,
@@ -130,6 +131,21 @@ async def test_every_transition_survives_restart_and_duplicate_events_are_idempo
     await journal.initialise()
     await _prepare(journal)
     await journal.mark_submit_attempted("pair-1", ("pair-1-long", "pair-1-short"))
+    order = PrivateOrder(
+        venue=Venue.BINANCE_USDM,
+        order_id="exchange-1",
+        client_order_id="pair-1-long",
+        symbol="BTC/USDT:USDT",
+        side=Side.BUY,
+        status=PrivateOrderStatus.PARTIAL,
+        requested_base_quantity=Decimal("0.001"),
+        filled_base_quantity=Decimal("0.0005"),
+        average_price=Decimal("100"),
+        fee_usdt=Decimal("0.001"),
+        observed_at=datetime.now(UTC),
+    )
+    assert await journal.record_order_event("pair-1", order, "event-1") is True
+    assert await journal.record_order_event("pair-1", order, "event-1") is False
     for state in (
         LiveActionState.ACKNOWLEDGED,
         LiveActionState.PARTIAL,
@@ -152,21 +168,6 @@ async def test_every_transition_survives_restart_and_duplicate_events_are_idempo
         assert observed is not None
         assert observed.state == state
 
-    order = PrivateOrder(
-        venue=Venue.BINANCE_USDM,
-        order_id="exchange-1",
-        client_order_id="pair-1-long",
-        symbol="BTC/USDT:USDT",
-        side=Side.BUY,
-        status=PrivateOrderStatus.PARTIAL,
-        requested_base_quantity=Decimal("0.001"),
-        filled_base_quantity=Decimal("0.0005"),
-        average_price=Decimal("100"),
-        fee_usdt=Decimal("0.001"),
-        observed_at=datetime.now(UTC),
-    )
-    assert await journal.record_order_event("pair-1", order, "event-1") is True
-    assert await journal.record_order_event("pair-1", order, "event-1") is False
     loaded = await journal.load("pair-1")
     assert loaded is not None
     long_leg = next(leg for leg in loaded.legs if leg.client_order_id == "pair-1-long")
@@ -194,3 +195,91 @@ def test_request_hash_changes_with_exact_payload() -> None:
     first = _request(Venue.BINANCE_USDM, "client-1", Side.BUY)
     second = replace(first, price=Decimal("100.1"))
     assert request_payload_hash(first) != request_payload_hash(second)
+
+
+def _event(
+    *,
+    venue: Venue = Venue.BINANCE_USDM,
+    symbol: str = "BTC/USDT:USDT",
+    side: Side = Side.BUY,
+    order_id: str = "exchange-1",
+    status: PrivateOrderStatus = PrivateOrderStatus.PARTIAL,
+    filled: str = "0.0005",
+    observed_at: datetime | None = None,
+) -> PrivateOrder:
+    quantity = Decimal(filled)
+    return PrivateOrder(
+        venue=venue,
+        order_id=order_id,
+        client_order_id="pair-1-long",
+        symbol=symbol,
+        side=side,
+        status=status,
+        requested_base_quantity=Decimal("0.001"),
+        filled_base_quantity=quantity,
+        average_price=Decimal("100") if quantity else None,
+        fee_usdt=Decimal("0.001") if quantity else None,
+        observed_at=observed_at or datetime.now(UTC),
+    )
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        _event(venue=Venue.OKX),
+        _event(symbol="ETH/USDT:USDT"),
+        _event(side=Side.SELL),
+    ],
+    ids=["wrong-venue", "wrong-symbol", "wrong-side"],
+)
+@pytest.mark.asyncio
+async def test_journal_identity_mismatch_quarantines_without_mutating_leg(
+    tmp_path: Path,
+    order: PrivateOrder,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal)
+    await journal.mark_submit_attempted("pair-1", ("pair-1-long", "pair-1-short"))
+    with pytest.raises(JournalEventQuarantinedError):
+        await journal.record_order_event("pair-1", order, "bad-identity")
+    action = await journal.load("pair-1")
+    assert action is not None and action.state == LiveActionState.QUARANTINED
+    leg = next(item for item in action.legs if item.client_order_id == "pair-1-long")
+    assert leg.status is None
+    assert leg.filled_base_quantity == 0
+    assert leg.order_id is None
+    assert await journal.event_watermark() == 1
+
+
+@pytest.mark.asyncio
+async def test_fill_status_and_exchange_order_identity_cannot_regress(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal)
+    await journal.mark_submit_attempted("pair-1", ("pair-1-long", "pair-1-short"))
+    first = _event()
+    await journal.record_order_event("pair-1", first, "first")
+    conflict = _event(order_id="exchange-2", filled="0.0006")
+    with pytest.raises(JournalEventQuarantinedError, match="EXCHANGE_ORDER_ID_CONFLICT"):
+        await journal.record_order_event("pair-1", conflict, "conflict")
+    action = await journal.load("pair-1")
+    assert action is not None and action.state == LiveActionState.QUARANTINED
+    leg = next(item for item in action.legs if item.client_order_id == "pair-1-long")
+    assert leg.order_id == "exchange-1"
+    assert leg.filled_base_quantity == Decimal("0.0005")
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_and_fill_regression_quarantine_action(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal)
+    await journal.mark_submit_attempted("pair-1", ("pair-1-long", "pair-1-short"))
+    filled = _event(status=PrivateOrderStatus.FILLED, filled="0.001")
+    await journal.record_order_event("pair-1", filled, "filled")
+    regressed = _event(status=PrivateOrderStatus.PARTIAL, filled="0.0005")
+    with pytest.raises(JournalEventQuarantinedError) as raised:
+        await journal.record_order_event("pair-1", regressed, "regressed")
+    assert "FILL_REGRESSION" in str(raised.value)
+    assert "STATUS_REGRESSION" in str(raised.value)

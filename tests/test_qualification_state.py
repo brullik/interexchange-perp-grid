@@ -11,10 +11,12 @@ from interexchange_perp_grid.execution import PairActionState, Tranche
 from interexchange_perp_grid.qualification import build_runtime_evidence_from_state
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.state import (
+    finalize_qualification_epoch,
     initialise_state,
     record_qualification_exception,
     record_qualification_scan,
     save_tranche,
+    start_qualification_epoch,
 )
 from interexchange_perp_grid.strategy import (
     CostBreakdown,
@@ -63,6 +65,15 @@ async def test_runtime_qualification_evidence_comes_from_persisted_route_state(
     await initialise_state(path)
     route = DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX)
     start = datetime(2026, 8, 14, 12, tzinfo=UTC)
+    epoch = await start_qualification_epoch(
+        path,
+        route,
+        "a" * 40,
+        "c" * 64,
+        "d" * 64,
+        "sha256:" + "b" * 64,
+        start,
+    )
     for index in range(3):
         observed = start + timedelta(hours=index * 8)
         funding = tuple(
@@ -80,6 +91,7 @@ async def test_runtime_qualification_evidence_comes_from_persisted_route_state(
         )
         await record_qualification_scan(
             path,
+            epoch.epoch_id,
             "BTC",
             funding,
             (_decision(route),),
@@ -89,7 +101,12 @@ async def test_runtime_qualification_evidence_comes_from_persisted_route_state(
             3600,
             observed,
         )
-    await record_qualification_exception(path, "InjectedReplayFailure", start + timedelta(hours=20))
+    await record_qualification_exception(
+        path,
+        epoch.epoch_id,
+        "InjectedReplayFailure",
+        start + timedelta(hours=20),
+    )
     await save_tranche(
         path,
         Tranche(
@@ -103,13 +120,11 @@ async def test_runtime_qualification_evidence_comes_from_persisted_route_state(
         ),
     )
 
+    await finalize_qualification_epoch(path, epoch.epoch_id, start + timedelta(hours=24))
     evidence = await build_runtime_evidence_from_state(
         path,
-        route,
-        "a" * 40,
-        "sha256:" + "b" * 64,
+        epoch.epoch_id,
         {route.long_venue: Decimal("0.0004"), route.short_venue: Decimal("0.0005")},
-        start,
         replay_completed=True,
     )
 

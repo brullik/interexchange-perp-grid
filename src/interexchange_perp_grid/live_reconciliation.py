@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
 
+from interexchange_perp_grid.client_ids import is_bot_client_order_id
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_journal import LiveJournalAction
-from interexchange_perp_grid.private_domain import AccountSnapshot, PositionSnapshot, PrivateOrder
+from interexchange_perp_grid.private_domain import (
+    AccountSnapshot,
+    PositionSnapshot,
+    PrivateActiveSnapshot,
+    PrivateOrder,
+    SnapshotCompleteness,
+    UnknownActiveRecord,
+)
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import (
     RiskBook,
@@ -37,6 +45,8 @@ class PrivateStateAdapter(Protocol):
 
     async def fetch_all_positions(self) -> tuple[PositionSnapshot, ...]: ...
 
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot: ...
+
     async def fetch_trading_fee(self, instrument: Instrument) -> Decimal | None: ...
 
 
@@ -49,6 +59,10 @@ class VenuePrivateState:
     positions: tuple[PositionSnapshot, ...]
     taker_fee_rate: Decimal | None
     error: str | None = None
+    raw_open_order_count: int = 0
+    raw_nonzero_position_count: int = 0
+    unknown_active_records: tuple[UnknownActiveRecord, ...] = ()
+    completeness: SnapshotCompleteness = SnapshotCompleteness.COMPLETE
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,10 +77,102 @@ class ReconciliationReport:
     expected_signed_positions: dict[Venue, Decimal]
     residual_delta: Decimal
     flat_verified: bool
+    raw_open_order_count: int
+    raw_nonzero_position_count: int
+    unknown_active_record_count: int
+    snapshots_complete: bool
 
     @property
     def consistent(self) -> bool:
         return self.status == ReconciliationStatus.CONSISTENT
+
+
+@dataclass(frozen=True, slots=True)
+class FlatBarrierPolicy:
+    consecutive_snapshots: int = 2
+    quiet_period_seconds: float = 0.05
+    poll_interval_seconds: float = 0.01
+    timeout_seconds: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.consecutive_snapshots < 2:
+            raise ValueError("flat barrier requires at least two snapshots")
+        if self.quiet_period_seconds < 0 or self.poll_interval_seconds <= 0:
+            raise ValueError("invalid flat barrier timing")
+        if self.timeout_seconds <= 0 or self.timeout_seconds < self.quiet_period_seconds:
+            raise ValueError("flat barrier timeout must cover the quiet period")
+
+
+@dataclass(frozen=True, slots=True)
+class FlatBarrierResult:
+    verified: bool
+    report: ReconciliationReport
+    consecutive_snapshots: int
+    event_watermark: int
+    timed_out: bool
+
+
+def _flat_signature(report: ReconciliationReport, watermark: int) -> tuple[object, ...]:
+    return (
+        watermark,
+        report.status.value,
+        report.raw_open_order_count,
+        report.raw_nonzero_position_count,
+        report.unknown_active_record_count,
+        report.open_bot_order_count,
+        report.open_position_count,
+        tuple(
+            sorted(
+                (venue.value, str(value)) for venue, value in report.actual_signed_positions.items()
+            )
+        ),
+        report.discrepancies,
+        report.unknown_client_order_ids,
+    )
+
+
+async def wait_for_stable_flat(
+    report_factory: Callable[[], Awaitable[ReconciliationReport]],
+    watermark_factory: Callable[[], Awaitable[int]],
+    policy: FlatBarrierPolicy,
+) -> FlatBarrierResult:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + policy.timeout_seconds
+    stable_since: float | None = None
+    previous_signature: tuple[object, ...] | None = None
+    consecutive = 0
+    last_report: ReconciliationReport | None = None
+    last_watermark = -1
+    while True:
+        before = await watermark_factory()
+        report = await report_factory()
+        after = await watermark_factory()
+        last_report = report
+        last_watermark = after
+        now = loop.time()
+        signature = _flat_signature(report, after)
+        if report.flat_verified and before == after:
+            if signature == previous_signature:
+                consecutive += 1
+            else:
+                previous_signature = signature
+                consecutive = 1
+                stable_since = now
+            if (
+                consecutive >= policy.consecutive_snapshots
+                and stable_since is not None
+                and now - stable_since >= policy.quiet_period_seconds
+                and await watermark_factory() == after
+            ):
+                return FlatBarrierResult(True, report, consecutive, after, False)
+        else:
+            previous_signature = None
+            stable_since = None
+            consecutive = 0
+        if now >= deadline:
+            assert last_report is not None
+            return FlatBarrierResult(False, last_report, consecutive, last_watermark, True)
+        await asyncio.sleep(min(policy.poll_interval_seconds, max(0, deadline - now)))
 
 
 async def collect_private_states(
@@ -77,20 +183,24 @@ async def collect_private_states(
         adapter = adapters[venue]
         instrument = instruments[venue]
         try:
-            account, open_orders, recent_orders, positions, fee = await asyncio.gather(
+            account, active, recent_orders, fee = await asyncio.gather(
                 adapter.fetch_account(instrument),
-                adapter.fetch_all_open_orders(),
+                adapter.fetch_active_snapshot(),
                 adapter.fetch_closed_orders(instrument),
-                adapter.fetch_all_positions(),
                 adapter.fetch_trading_fee(instrument),
             )
             return VenuePrivateState(
                 venue,
                 account,
-                open_orders,
+                active.open_orders,
                 recent_orders,
-                positions,
+                active.positions,
                 fee,
+                None,
+                active.raw_open_order_count,
+                active.raw_nonzero_position_count,
+                active.unknown_active_records,
+                active.completeness,
             )
         except Exception as error:
             return VenuePrivateState(
@@ -101,6 +211,10 @@ async def collect_private_states(
                 (),
                 None,
                 f"{type(error).__name__}:{error}",
+                0,
+                0,
+                (),
+                SnapshotCompleteness.UNKNOWN,
             )
 
     results = await asyncio.gather(*(collect(venue) for venue in adapters))
@@ -112,8 +226,6 @@ def reconcile_private_states(
     states: dict[Venue, VenuePrivateState],
     known_client_order_ids: set[str],
     required_venues: set[Venue],
-    *,
-    bot_client_prefix: str = "ipeg-",
 ) -> ReconciliationReport:
     discrepancies: list[str] = []
     unknown: list[str] = []
@@ -131,11 +243,21 @@ def reconcile_private_states(
             unknown.append(f"{venue.value}:ACCOUNT_UNKNOWN")
         if state.taker_fee_rate is None:
             unknown.append(f"{venue.value}:FEE_UNKNOWN")
+        if (
+            state.completeness != SnapshotCompleteness.COMPLETE
+            or state.raw_open_order_count != len(state.open_orders)
+            or state.raw_nonzero_position_count != len(state.positions)
+        ):
+            unknown.append(f"{venue.value}:PRIVATE_SNAPSHOT_INCOMPLETE")
+        unknown.extend(
+            f"{venue.value}:UNKNOWN_ACTIVE_RECORD:{record.kind}:{record.reason}"
+            for record in state.unknown_active_records
+        )
 
     all_open = tuple(order for state in states.values() for order in state.open_orders)
     all_recent = tuple(order for state in states.values() for order in state.recent_orders)
     for order in all_open:
-        if not order.client_order_id.startswith(bot_client_prefix):
+        if not is_bot_client_order_id(order.client_order_id):
             discrepancies.append(f"{order.venue.value}:NON_BOT_OPEN_ORDER")
         elif order.client_order_id not in known_client_order_ids:
             unknown.append(order.client_order_id)
@@ -168,11 +290,19 @@ def reconcile_private_states(
                 unknown.append(leg.client_order_id)
             if latest.filled_base_quantity != leg.filled_base_quantity:
                 discrepancies.append(f"{leg.client_order_id}:FILL_MISMATCH")
-    elif any(order.client_order_id.startswith(bot_client_prefix) for order in all_open):
+    elif any(is_bot_client_order_id(order.client_order_id) for order in all_open):
         unknown.append("OPEN_BOT_ORDER_WITHOUT_ACTIVE_JOURNAL")
 
     actual_positions = {venue: Decimal(0) for venue in required_venues}
-    open_position_count = sum(len(state.positions) for state in states.values())
+    raw_open_order_count = sum(state.raw_open_order_count for state in states.values())
+    open_position_count = sum(state.raw_nonzero_position_count for state in states.values())
+    unknown_active_count = sum(len(state.unknown_active_records) for state in states.values())
+    snapshots_complete = all(
+        state.completeness == SnapshotCompleteness.COMPLETE
+        and state.raw_open_order_count == len(state.open_orders)
+        and state.raw_nonzero_position_count == len(state.positions)
+        for state in states.values()
+    )
     allowed_symbols: dict[Venue, set[str]] = {}
     if action is not None:
         for leg in action.legs:
@@ -194,7 +324,7 @@ def reconcile_private_states(
             discrepancies.append(f"{venue.value}:POSITION_MISMATCH")
 
     residual = abs(sum(actual_positions.values(), Decimal(0)))
-    open_bot_count = sum(order.client_order_id.startswith(bot_client_prefix) for order in all_open)
+    open_bot_count = sum(is_bot_client_order_id(order.client_order_id) for order in all_open)
     if unknown:
         status = ReconciliationStatus.UNKNOWN
     elif discrepancies:
@@ -204,7 +334,10 @@ def reconcile_private_states(
     flat = (
         status == ReconciliationStatus.CONSISTENT
         and open_bot_count == 0
+        and raw_open_order_count == 0
         and open_position_count == 0
+        and unknown_active_count == 0
+        and snapshots_complete
         and not unknown
         and all(value == 0 for value in actual_positions.values())
         and residual == 0
@@ -220,6 +353,10 @@ def reconcile_private_states(
         expected_signed_positions=expected_positions,
         residual_delta=residual,
         flat_verified=flat,
+        raw_open_order_count=raw_open_order_count,
+        raw_nonzero_position_count=open_position_count,
+        unknown_active_record_count=unknown_active_count,
+        snapshots_complete=snapshots_complete,
     )
 
 

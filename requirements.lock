@@ -15,7 +15,9 @@ coincurve==21.0.0
 colorama==0.4.6
 cryptography==50.0.0
 duckdb==1.5.5
+editables==0.5
 frozenlist==1.8.0
+hatchling==1.27.0
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
@@ -34,14 +36,14 @@ pathspec==1.1.1
 pluggy==1.6.0
 prometheus_client==0.26.0
 propcache==0.5.2
-pyarrow==22.0.0
+pyarrow==23.0.1
 pycares==5.0.1
 pycparser==3.0
 pydantic==2.13.4
 pydantic-settings==2.15.0
 pydantic_core==2.46.4
 Pygments==2.20.0
-pytest==8.4.2
+pytest==9.0.3
 pytest-asyncio==1.4.0
 python-dotenv==1.2.2
 python-telegram-bot==22.8
@@ -55,6 +57,7 @@ sortedcontainers==2.4.0
 structlog==25.5.0
 tenacity==9.1.4
 typer==0.27.1
+trove-classifiers==2026.6.1.19
 types-PyYAML==6.0.12.20260724
 typing-inspection==0.4.4
 typing_extensions==4.16.0

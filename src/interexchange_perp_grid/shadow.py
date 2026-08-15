@@ -22,6 +22,7 @@ from interexchange_perp_grid.execution import (
     SimulatedOrderStatus,
     Tranche,
 )
+from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.observability import get_logger
 from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
 from interexchange_perp_grid.reason_codes import ReasonCode
@@ -36,6 +37,7 @@ from interexchange_perp_grid.state import (
     RuntimeControls,
     initialise_state,
     load_tranches,
+    read_active_qualification_epoch,
     read_runtime_controls,
     read_shadow_snapshot,
     record_qualification_exception,
@@ -655,9 +657,24 @@ class ContinuousShadowEvaluator:
             if tranche.state in ACTIVE_STATES
         }
         await self.runtime.reconcile(active_ids)
+        live_journal = LiveOrderJournal(self.runtime.state_path)
+        await live_journal.initialise()
         try:
             while not stop_event.is_set():
                 try:
+                    active_live_action = await live_journal.active()
+                    if active_live_action is not None:
+                        logger.info(
+                            "shadow_suspended_for_live_recovery",
+                            pair_action_id=active_live_action.pair_action_id,
+                            state=active_live_action.state.value,
+                        )
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                stop_event.wait(),
+                                timeout=self.settings.shadow.scan_interval_seconds,
+                            )
+                        continue
                     result = await self._engine.scan_once(
                         self.settings.shadow.base,
                         self.settings.shadow.quantity,
@@ -668,16 +685,19 @@ class ContinuousShadowEvaluator:
                         self.runtime.state_path,
                         _scan_payload(result, decisions),
                     )
-                    await record_qualification_scan(
-                        self.runtime.state_path,
-                        result.base,
-                        result.funding,
-                        decisions,
-                        tuple(self.runtime.tranches.values()),
-                        self.settings.strategy.stressed_cost_multiplier,
-                        min(3600, self.settings.risk.max_hold_seconds),
-                        self.settings.risk.max_hold_seconds,
-                    )
+                    epoch = await read_active_qualification_epoch(self.runtime.state_path)
+                    if epoch is not None:
+                        await record_qualification_scan(
+                            self.runtime.state_path,
+                            epoch.epoch_id,
+                            result.base,
+                            result.funding,
+                            decisions,
+                            tuple(self.runtime.tranches.values()),
+                            self.settings.strategy.stressed_cost_multiplier,
+                            min(3600, self.settings.risk.max_hold_seconds),
+                            self.settings.risk.max_hold_seconds,
+                        )
                     logger.info(
                         "shadow_evaluated",
                         base=result.base,
@@ -688,10 +708,13 @@ class ContinuousShadowEvaluator:
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
-                    await record_qualification_exception(
-                        self.runtime.state_path,
-                        type(error).__name__,
-                    )
+                    epoch = await read_active_qualification_epoch(self.runtime.state_path)
+                    if epoch is not None:
+                        await record_qualification_exception(
+                            self.runtime.state_path,
+                            epoch.epoch_id,
+                            type(error).__name__,
+                        )
                     logger.error(
                         "shadow_evaluation_failed",
                         reason=type(error).__name__,

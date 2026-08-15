@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -9,6 +10,10 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 
+from interexchange_perp_grid.client_ids import (
+    is_bot_client_order_id,
+    venue_client_order_id,
+)
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import ExecutionIntent, OrderPurpose, Side
 from interexchange_perp_grid.live_coordinator import CanaryVenueAdapter
@@ -16,17 +21,19 @@ from interexchange_perp_grid.live_journal import (
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
-    venue_client_order_id,
 )
 from interexchange_perp_grid.live_reconciliation import (
+    FlatBarrierPolicy,
     ReconciliationReport,
     collect_private_states,
     reconcile_private_states,
+    wait_for_stable_flat,
 )
 from interexchange_perp_grid.private_domain import (
     PositionSnapshot,
     PrivateOrder,
     PrivateOrderStatus,
+    SnapshotCompleteness,
     VenueOrderRequest,
 )
 from interexchange_perp_grid.private_execution import translate_protected_order
@@ -51,19 +58,34 @@ class LiveControlService:
         self,
         journal: LiveOrderJournal,
         adapters: Mapping[Venue, CanaryVenueAdapter],
-        instruments: Mapping[Venue, Instrument],
-        qualified_route: DirectedRouteKey,
-        qualification_hash: str,
+        instruments: Mapping[Venue, Instrument] | Mapping[tuple[Venue, str], Instrument],
+        qualified_route: DirectedRouteKey | None = None,
+        qualification_hash: str | None = None,
+        flat_barrier_policy: FlatBarrierPolicy | None = None,
     ) -> None:
         self._journal = journal
         self._adapters = dict(adapters)
-        self._instruments = dict(instruments)
+        self._instruments = {
+            (instrument.venue, instrument.symbol): instrument for instrument in instruments.values()
+        }
+        self._account_instruments = {
+            venue: next(
+                instrument
+                for (instrument_venue, _), instrument in self._instruments.items()
+                if instrument_venue == venue
+            )
+            for venue in self._adapters
+        }
         self._route = qualified_route
-        self._qualification_hash = qualification_hash
+        self._qualification_hash = (
+            qualification_hash
+            or hashlib.sha256(b"EMERGENCY_RISK_REDUCTION_WITHOUT_QUALIFICATION").hexdigest()
+        )
+        self._flat_barrier_policy = flat_barrier_policy or FlatBarrierPolicy()
 
     async def snapshot(self) -> dict[str, object]:
         await self._journal.initialise()
-        states = await collect_private_states(self._adapters, self._instruments)
+        states = await collect_private_states(self._adapters, self._account_instruments)
         active = await self._journal.active()
         positions = [
             {
@@ -102,9 +124,16 @@ class LiveControlService:
                     if state.error is not None
                 },
                 "open_bot_orders": sum(
-                    order.client_order_id.startswith("ipeg-")
+                    is_bot_client_order_id(order.client_order_id)
                     for state in states.values()
                     for order in state.open_orders
+                ),
+                "raw_open_orders": sum(state.raw_open_order_count for state in states.values()),
+                "raw_nonzero_positions": sum(
+                    state.raw_nonzero_position_count for state in states.values()
+                ),
+                "unknown_active_records": sum(
+                    len(state.unknown_active_records) for state in states.values()
                 ),
             },
             "positions": positions,
@@ -124,30 +153,43 @@ class LiveControlService:
         }
 
     async def cancel_all_live(self) -> LiveControlResult:
+        return await self._cancel_orders(bot_only=True)
+
+    async def _cancel_orders(self, *, bot_only: bool) -> LiveControlResult:
         await self._journal.initialise()
-        states = await collect_private_states(self._adapters, self._instruments)
+        states = await collect_private_states(self._adapters, self._account_instruments)
         cancellable = tuple(
             order
             for state in states.values()
             for order in state.open_orders
-            if order.client_order_id.startswith("ipeg-") and order.order_id is not None
+            if (not bot_only or is_bot_client_order_id(order.client_order_id))
+            and order.order_id is not None
         )
         results = await asyncio.gather(
             *(self._cancel(order) for order in cancellable),
             return_exceptions=True,
         )
         cancelled = sum(not isinstance(result, BaseException) for result in results)
-        refreshed = await collect_private_states(self._adapters, self._instruments)
+        refreshed = await collect_private_states(self._adapters, self._account_instruments)
         remaining = sum(
-            order.client_order_id.startswith("ipeg-")
+            (not bot_only or is_bot_client_order_id(order.client_order_id))
             for state in refreshed.values()
             for order in state.open_orders
         )
-        success = remaining == 0 and all(state.error is None for state in refreshed.values())
+        success = (
+            remaining == 0
+            and all(state.error is None for state in refreshed.values())
+            and all(not state.unknown_active_records for state in refreshed.values())
+            and all(
+                state.completeness == SnapshotCompleteness.COMPLETE
+                and state.raw_open_order_count == len(state.open_orders)
+                for state in refreshed.values()
+            )
+        )
         active = await self._journal.active()
         return LiveControlResult(
             success,
-            "CANCEL_ALL_LIVE",
+            "CANCEL_ALL_LIVE" if bot_only else "CANCEL_ALL_ACCOUNT_ORDERS",
             0,
             cancelled,
             active.state if active else None,
@@ -167,12 +209,12 @@ class LiveControlService:
         return await self._flatten("KILL_CANCEL_FLATTEN")
 
     async def _flatten(self, action_name: str) -> LiveControlResult:
-        cancellation = await self.cancel_all_live()
-        states = await collect_private_states(self._adapters, self._instruments)
+        cancellation = await self._cancel_orders(bot_only=False)
+        states = await collect_private_states(self._adapters, self._account_instruments)
         positions = tuple(position for state in states.values() for position in state.positions)
         active = await self._journal.active()
         if not positions:
-            report = await self._report(active)
+            report = await self._stable_report(active)
             if report.flat_verified:
                 active = await self._mark_flat_if_needed(active, action_name)
                 return LiveControlResult(
@@ -199,14 +241,14 @@ class LiveControlService:
                     worst_acceptable_price=None,
                     unbounded_market=True,
                 ),
-                self._instruments[position.venue],
+                self._instrument(position.venue, position.symbol),
             )
             for index, position in enumerate(positions)
         )
         if active is None and requests:
             active = await self._journal.prepare_emergency(
                 pair_action_id=f"emergency-{time.time_ns()}",
-                route=self._route,
+                route=self._emergency_route(),
                 tranche_id="emergency-flatten",
                 requests=requests,
                 intended_base_quantities={
@@ -215,6 +257,7 @@ class LiveControlService:
                 },
                 risk_reservation={
                     "action": action_name,
+                    "qualification_bypassed_for_risk_reduction": True,
                     "initial_signed_positions": {
                         venue.value: str(
                             sum(
@@ -276,7 +319,7 @@ class LiveControlService:
                 None,
                 "Private state did not verify flat and no durable emergency action exists.",
             )
-        report = await self._report(active)
+        report = await self._stable_report(active)
         if report.flat_verified:
             active = await self._mark_flat_if_needed(active, action_name)
             assert active is not None
@@ -312,7 +355,7 @@ class LiveControlService:
         try:
             order = await self._adapters[venue].submit_order(
                 request,
-                self._instruments[venue],
+                self._instrument(venue, request.symbol),
             )
         except (TimeoutError, ConnectionError):
             raise
@@ -336,7 +379,7 @@ class LiveControlService:
     async def _report(self, active: LiveJournalAction | None) -> ReconciliationReport:
         if active is not None:
             active = await self._journal.load(active.pair_action_id)
-        states = await collect_private_states(self._adapters, self._instruments)
+        states = await collect_private_states(self._adapters, self._account_instruments)
         return reconcile_private_states(
             active,
             states,
@@ -344,12 +387,40 @@ class LiveControlService:
             set(self._adapters),
         )
 
+    async def _stable_report(self, active: LiveJournalAction | None) -> ReconciliationReport:
+        async def report_factory() -> ReconciliationReport:
+            current = active
+            if current is not None:
+                current = await self._journal.load(current.pair_action_id)
+            return await self._report(current)
+
+        result = await wait_for_stable_flat(
+            report_factory,
+            self._journal.event_watermark,
+            self._flat_barrier_policy,
+        )
+        return result.report
+
     async def _cancel(self, order: PrivateOrder) -> PrivateOrder:
         assert order.order_id is not None
         return await self._adapters[order.venue].cancel_order(
             order.order_id,
-            self._instruments[order.venue],
+            self._instrument(order.venue, order.symbol),
         )
+
+    def _instrument(self, venue: Venue, symbol: str) -> Instrument:
+        instrument = self._instruments.get((venue, symbol))
+        if instrument is None:
+            raise RuntimeError(f"instrument registry has no {venue.value}:{symbol}")
+        return instrument
+
+    def _emergency_route(self) -> DirectedRouteKey:
+        if self._route is not None:
+            return self._route
+        venues = tuple(sorted(self._adapters, key=lambda venue: venue.value))
+        if len(venues) < 2:
+            raise RuntimeError("emergency journal requires at least two dedicated venues")
+        return DirectedRouteKey("EMERGENCY", venues[0], venues[1])
 
     async def _move_to_recovering(
         self,

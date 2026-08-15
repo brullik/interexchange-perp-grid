@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from interexchange_perp_grid.adapters.ccxt_pro import (
@@ -20,11 +21,29 @@ from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.private_domain import (
     AccountSnapshot,
     PositionSnapshot,
+    PrivateActiveSnapshot,
     PrivateCapabilityReport,
     PrivateOrder,
     PrivateOrderStatus,
+    SnapshotCompleteness,
+    UnknownActiveRecord,
     VenueOrderRequest,
 )
+
+
+def production_submit_guard_active(environ: Mapping[str, str] | None = None) -> bool:
+    source = os.environ if environ is None else environ
+    return source.get("IPEG_CI_PRODUCTION_SUBMIT_GUARD", "").lower() in {"1", "true"}
+
+
+def _enforce_production_submit_guard() -> None:
+    if not production_submit_guard_active():
+        return
+    counter_path = os.environ.get("IPEG_PRODUCTION_SUBMIT_COUNTER_FILE", "")
+    if counter_path:
+        with Path(counter_path).open("a", encoding="utf-8") as counter:
+            counter.write("1\n")
+    raise RuntimeError("production submit transport is disabled by the C4 CI guard")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +80,7 @@ class CcxtPrivateAdapter:
         exchange: Any | None = None,
     ) -> None:
         self.venue = venue
+        self._production_transport = exchange is None
         self._exchange: Any = exchange or CcxtProAdapter._build_exchange(venue)
         if credentials is not None:
             self._exchange.apiKey = credentials.api_key
@@ -189,11 +209,7 @@ class CcxtPrivateAdapter:
         return _normalise_orders(self.venue, raw, instrument)
 
     async def fetch_all_open_orders(self) -> tuple[PrivateOrder, ...]:
-        if not self._has("fetchOpenOrders"):
-            raise RuntimeError("fetchOpenOrders is unavailable")
-        instruments = await self._linear_instruments()
-        raw = await self._exchange.fetch_open_orders()
-        return _normalise_multi_instrument_orders(self.venue, raw, instruments)
+        return (await self.fetch_active_snapshot()).open_orders
 
     async def fetch_closed_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
         if not self._has("fetchClosedOrders"):
@@ -202,21 +218,41 @@ class CcxtPrivateAdapter:
         return _normalise_orders(self.venue, raw, instrument)
 
     async def fetch_all_positions(self) -> tuple[PositionSnapshot, ...]:
+        return (await self.fetch_active_snapshot()).positions
+
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
+        if not self._has("fetchOpenOrders") or not self._has("fetchPositions"):
+            raise RuntimeError("complete private active snapshot capability is unavailable")
         instruments = await self._linear_instruments()
-        raw = await self._exchange.fetch_positions()
-        if not isinstance(raw, Sequence):
-            raise TypeError("CCXT fetch_positions must return a sequence")
-        positions: list[PositionSnapshot] = []
-        for value in raw:
-            if not isinstance(value, Mapping):
-                continue
-            instrument = instruments.get(str(value.get("symbol")))
-            if instrument is None:
-                continue
-            position = _normalise_position(self.venue, value, instrument)
-            if position is not None:
-                positions.append(position)
-        return tuple(positions)
+        semaphore = asyncio.Semaphore(4)
+
+        async def open_orders(instrument: Instrument) -> tuple[object, ...]:
+            async with semaphore:
+                raw = await self._exchange.fetch_open_orders(instrument.symbol)
+            return _require_sequence(raw, "fetch_open_orders")
+
+        async def positions(instrument: Instrument) -> tuple[object, ...]:
+            async with semaphore:
+                raw = await self._exchange.fetch_positions([instrument.symbol])
+            return _require_sequence(raw, "fetch_positions")
+
+        ordered = tuple(instruments.values())
+        order_batches, position_batches = await asyncio.gather(
+            asyncio.gather(*(open_orders(instrument) for instrument in ordered)),
+            asyncio.gather(*(positions(instrument) for instrument in ordered)),
+        )
+        return _normalise_active_snapshot(
+            self.venue,
+            tuple(value for batch in order_batches for value in batch),
+            tuple(value for batch in position_batches for value in batch),
+            instruments,
+        )
+
+    async def resolve_instrument(self, symbol: str) -> Instrument | None:
+        return (await self._linear_instruments()).get(symbol)
+
+    async def list_instruments(self) -> tuple[Instrument, ...]:
+        return tuple((await self._linear_instruments()).values())
 
     async def _linear_instruments(self) -> dict[str, Instrument]:
         raw_markets = await self._exchange.load_markets()
@@ -235,6 +271,8 @@ class CcxtPrivateAdapter:
         request: VenueOrderRequest,
         instrument: Instrument,
     ) -> PrivateOrder:
+        if self._production_transport:
+            _enforce_production_submit_guard()
         raw = await self._exchange.create_order(
             request.symbol,
             request.order_type,
@@ -376,6 +414,96 @@ def _normalise_multi_instrument_orders(
         if instrument is not None:
             orders.append(_normalise_order(venue, value, instrument, "unknown-client-id"))
     return tuple(orders)
+
+
+def _require_sequence(raw: object, operation: str) -> tuple[object, ...]:
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise TypeError(f"CCXT {operation} must return a sequence")
+    return tuple(raw)
+
+
+def _raw_payload(value: object) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return {str(key): item for key, item in value.items()}
+    return {"unparsed_value": repr(value)}
+
+
+def _normalise_active_snapshot(
+    venue: Venue,
+    raw_orders: tuple[object, ...],
+    raw_positions: tuple[object, ...],
+    instruments: Mapping[str, Instrument],
+) -> PrivateActiveSnapshot:
+    orders: list[PrivateOrder] = []
+    positions: list[PositionSnapshot] = []
+    unknown: list[UnknownActiveRecord] = []
+    for value in raw_orders:
+        if not isinstance(value, Mapping):
+            unknown.append(
+                UnknownActiveRecord(venue, "OPEN_ORDER", "NOT_A_MAPPING", _raw_payload(value))
+            )
+            continue
+        instrument = instruments.get(str(value.get("symbol")))
+        if instrument is None:
+            unknown.append(
+                UnknownActiveRecord(venue, "OPEN_ORDER", "UNKNOWN_SYMBOL", _raw_payload(value))
+            )
+            continue
+        try:
+            orders.append(_normalise_order(venue, value, instrument, "unknown-client-id"))
+        except (TypeError, ValueError) as error:
+            unknown.append(
+                UnknownActiveRecord(
+                    venue,
+                    "OPEN_ORDER",
+                    f"{type(error).__name__}:{error}",
+                    _raw_payload(value),
+                )
+            )
+
+    raw_nonzero_positions = 0
+    for value in raw_positions:
+        if not isinstance(value, Mapping):
+            raw_nonzero_positions += 1
+            unknown.append(
+                UnknownActiveRecord(venue, "POSITION", "NOT_A_MAPPING", _raw_payload(value))
+            )
+            continue
+        contracts = _decimal(value.get("contracts"))
+        if contracts == 0:
+            continue
+        raw_nonzero_positions += 1
+        instrument = instruments.get(str(value.get("symbol")))
+        if instrument is None:
+            unknown.append(
+                UnknownActiveRecord(venue, "POSITION", "UNKNOWN_SYMBOL", _raw_payload(value))
+            )
+            continue
+        try:
+            position = _normalise_position(venue, value, instrument)
+        except (TypeError, ValueError) as error:
+            position = None
+            reason = f"{type(error).__name__}:{error}"
+        else:
+            reason = "MALFORMED_OR_UNKNOWN_SIDE"
+        if position is None:
+            unknown.append(UnknownActiveRecord(venue, "POSITION", reason, _raw_payload(value)))
+        else:
+            positions.append(position)
+
+    complete = (
+        not unknown and len(raw_orders) == len(orders) and raw_nonzero_positions == len(positions)
+    )
+    return PrivateActiveSnapshot(
+        venue=venue,
+        raw_open_order_count=len(raw_orders),
+        raw_nonzero_position_count=raw_nonzero_positions,
+        open_orders=tuple(orders),
+        positions=tuple(positions),
+        unknown_active_records=tuple(unknown),
+        completeness=(SnapshotCompleteness.COMPLETE if complete else SnapshotCompleteness.UNKNOWN),
+        observed_at=datetime.now(UTC),
+    )
 
 
 def _normalise_order(

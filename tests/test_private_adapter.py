@@ -7,7 +7,7 @@ import pytest
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
-from interexchange_perp_grid.private_domain import VenueOrderRequest
+from interexchange_perp_grid.private_domain import SnapshotCompleteness, VenueOrderRequest
 
 
 def instrument(venue: Venue) -> Instrument:
@@ -224,3 +224,57 @@ async def test_private_submit_fetch_and_cancel_remain_normalised() -> None:
     assert fetched.status.value == "FILLED"
     assert cancelled.status.value == "CANCELLED"
     assert exchange.create_calls == 1
+
+
+def _linear_market(symbol: str = "BTC/USDT:USDT") -> dict[str, object]:
+    base = symbol.split("/", 1)[0]
+    return {
+        "symbol": symbol,
+        "id": f"{base}USDT",
+        "base": base,
+        "quote": "USDT",
+        "settle": "USDT",
+        "contract": True,
+        "swap": True,
+        "linear": True,
+        "inverse": False,
+        "expiry": None,
+        "contractSize": "0.01",
+        "taker": "0.0005",
+        "precision": {"amount": "1", "price": "0.1"},
+        "limits": {"amount": {"min": "1"}, "cost": {"min": "5"}},
+    }
+
+
+class MalformedActiveExchange(FakePrivateExchange):
+    async def load_markets(self) -> dict[str, object]:
+        return {"BTC/USDT:USDT": _linear_market()}
+
+    async def fetch_open_orders(self, symbol: str) -> list[dict[str, object]]:
+        assert symbol == "BTC/USDT:USDT"
+        return [self.order("unknown-order", symbol="ETH/USDT:USDT")]
+
+    async def fetch_positions(self, symbols: list[str]) -> list[dict[str, object]]:
+        assert symbols == ["BTC/USDT:USDT"]
+        return [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "side": "unexpected",
+                "contracts": "2",
+                "entryPrice": "100",
+                "markPrice": "101",
+            }
+        ]
+
+
+@pytest.mark.parametrize("venue", [Venue.BYBIT, Venue.OKX, Venue.BINANCE_USDM])
+@pytest.mark.asyncio
+async def test_wave1_active_snapshot_never_drops_malformed_raw_records(venue: Venue) -> None:
+    adapter = CcxtPrivateAdapter(venue, exchange=MalformedActiveExchange())
+    snapshot = await adapter.fetch_active_snapshot()
+    assert snapshot.raw_open_order_count == 1
+    assert snapshot.raw_nonzero_position_count == 1
+    assert snapshot.open_orders == ()
+    assert snapshot.positions == ()
+    assert len(snapshot.unknown_active_records) == 2
+    assert snapshot.completeness == SnapshotCompleteness.UNKNOWN

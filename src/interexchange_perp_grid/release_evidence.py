@@ -39,7 +39,7 @@ class ReplayProof:
 
 
 def _junit_counts(path: Path) -> tuple[int, int, int, int]:
-    root = ET.parse(path).getroot()
+    root = ET.parse(path).getroot()  # nosec B314
     if root.tag not in {"testsuite", "testsuites"}:
         raise ValueError("unexpected JUnit root element")
     suites = tuple(root.findall("testsuite")) if root.tag == "testsuites" else ()

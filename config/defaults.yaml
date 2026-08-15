@@ -84,6 +84,10 @@ live:
   canary_timeout_seconds: 300
   canary_minimum_profit_usdt: "0.01"
   qualification_max_age_seconds: 86400
+  flat_barrier_consecutive_snapshots: 2
+  flat_barrier_quiet_period_seconds: "1"
+  flat_barrier_poll_interval_seconds: "0.25"
+  flat_barrier_timeout_seconds: "30"
 
 telegram:
   enabled: false

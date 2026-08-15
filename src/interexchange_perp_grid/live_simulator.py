@@ -11,8 +11,10 @@ from interexchange_perp_grid.live_coordinator import CloseReason
 from interexchange_perp_grid.private_domain import (
     AccountSnapshot,
     PositionSnapshot,
+    PrivateActiveSnapshot,
     PrivateOrder,
     PrivateOrderStatus,
+    SnapshotCompleteness,
     VenueOrderRequest,
 )
 
@@ -194,6 +196,26 @@ class DeterministicPrivateExchange:
                 observed_at=datetime.now(UTC),
             ),
         )
+
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
+        open_orders = await self.fetch_all_open_orders()
+        positions = await self.fetch_all_positions()
+        return PrivateActiveSnapshot(
+            venue=self.venue,
+            raw_open_order_count=len(open_orders),
+            raw_nonzero_position_count=len(positions),
+            open_orders=open_orders,
+            positions=positions,
+            unknown_active_records=(),
+            completeness=SnapshotCompleteness.COMPLETE,
+            observed_at=datetime.now(UTC),
+        )
+
+    async def resolve_instrument(self, symbol: str) -> Instrument | None:
+        return self.instrument if symbol == self.instrument.symbol else None
+
+    async def list_instruments(self) -> tuple[Instrument, ...]:
+        return (self.instrument,)
 
     async def fetch_positions(
         self,

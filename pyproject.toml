@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27,<2"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -14,7 +14,7 @@ dependencies = [
   "duckdb>=1.1,<2",
   "orjson>=3.10,<4",
   "prometheus-client>=0.21,<1",
-  "pyarrow>=17,<23",
+  "pyarrow>=17,<24",
   "pydantic>=2.9,<3",
   "pydantic-settings>=2.5,<3",
   "python-telegram-bot>=21,<23",
@@ -28,7 +28,7 @@ dependencies = [
 dev = [
   "hypothesis>=6.120,<7",
   "mypy>=1.13,<2",
-  "pytest>=8.3,<9",
+  "pytest>=8.3,<10",
   "pytest-asyncio>=0.24,<2",
   "ruff==0.16.2",
   "types-PyYAML>=6.0.12,<7",

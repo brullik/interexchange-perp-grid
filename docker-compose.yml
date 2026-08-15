@@ -1,5 +1,6 @@
 services:
   app:
+    image: ${IPEG_IMAGE_REF:-interexchange-perp-grid:local}
     build: .
     restart: unless-stopped
     env_file:
@@ -8,6 +9,8 @@ services:
       IPEG_CONFIG_PATH: /app/config/defaults.yaml
       IPEG_STATE_PATH: /app/state/ipeg.sqlite3
       IPEG_PARQUET_DIR: /app/data/market
+      IPEG_RELEASE_SHA: ${IPEG_RELEASE_SHA:-}
+      IPEG_CONTAINER_IMAGE_DIGEST: ${IPEG_CONTAINER_IMAGE_DIGEST:-}
     volumes:
       - ipeg-state:/app/state
       - ipeg-data:/app/data

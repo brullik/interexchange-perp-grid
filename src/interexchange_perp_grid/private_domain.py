@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any
 
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import Side
@@ -69,6 +70,42 @@ class PrivateOrderStatus(StrEnum):
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
     UNKNOWN = "UNKNOWN"
+
+
+class SnapshotCompleteness(StrEnum):
+    COMPLETE = "COMPLETE"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True, slots=True)
+class UnknownActiveRecord:
+    venue: Venue
+    kind: str
+    reason: str
+    raw_record: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateActiveSnapshot:
+    venue: Venue
+    raw_open_order_count: int
+    raw_nonzero_position_count: int
+    open_orders: tuple[PrivateOrder, ...]
+    positions: tuple[PositionSnapshot, ...]
+    unknown_active_records: tuple[UnknownActiveRecord, ...]
+    completeness: SnapshotCompleteness
+    observed_at: datetime
+
+    def __post_init__(self) -> None:
+        if self.raw_open_order_count < 0 or self.raw_nonzero_position_count < 0:
+            raise ValueError("raw active record counts must be non-negative")
+        counts_match = self.raw_open_order_count == len(
+            self.open_orders
+        ) and self.raw_nonzero_position_count == len(self.positions)
+        if self.completeness == SnapshotCompleteness.COMPLETE and (
+            self.unknown_active_records or not counts_match
+        ):
+            raise ValueError("complete private snapshot must account for every raw active record")
 
 
 @dataclass(frozen=True, slots=True)

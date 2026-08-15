@@ -28,7 +28,10 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install
-        run: python -m pip install -e '.[dev]'
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps --no-build-isolation
+          python scripts/check_lock.py --lock requirements.lock --pyproject pyproject.toml --verify-installed
       - name: Verify
         run: make verify
       - name: Build exact replay/fault/restart evidence
@@ -44,6 +47,99 @@ jobs:
           path: |
             state/replay-proof.json
             state/replay-proof.junit.xml
+          if-no-files-found: error
+          retention-days: 30
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact application lock
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps --no-build-isolation
+          python scripts/check_lock.py --lock requirements.lock --pyproject pyproject.toml --verify-installed
+      - name: Install exact security tooling lock
+        run: |
+          python -m pip install -r requirements-security.lock
+          python scripts/check_lock.py --lock requirements-security.lock --verify-installed \
+            --required pip-audit bandit detect-secrets cyclonedx-bom
+      - name: Dependency audit
+        run: |
+          mkdir -p state/pip-audit-cache
+          pip-audit --cache-dir state/pip-audit-cache --disable-pip --no-deps --progress-spinner off \
+            --requirement requirements.lock --format json --output state/dependency-audit.json
+      - name: Secret scan
+        run: |
+          detect-secrets scan --no-verify \
+            --disable-plugin Base64HighEntropyString \
+            --disable-plugin HexHighEntropyString \
+            --disable-plugin KeywordDetector . > state/secret-scan.json
+          python scripts/check_secret_scan.py state/secret-scan.json
+      - name: Lightweight static security scan
+        run: bandit -q -r src -ll
+      - name: Reproducible dependency SBOM
+        run: >-
+          cyclonedx-py requirements requirements.lock
+          --pyproject pyproject.toml
+          --output-reproducible
+          --output-format JSON
+          --output-file state/release-sbom.json
+      - name: Upload security evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-evidence-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            state/dependency-audit.json
+            state/secret-scan.json
+            state/release-sbom.json
+          if-no-files-found: error
+          retention-days: 30
+
+  c4-critical-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact lock
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps --no-build-isolation
+          python scripts/check_lock.py --lock requirements.lock --pyproject pyproject.toml --verify-installed
+      - name: Build exact release image
+        run: docker build --tag interexchange-perp-grid:c4-proof .
+      - name: Build exact C4 critical proof
+        run: |
+          IMAGE_DIGEST="$(docker image inspect interexchange-perp-grid:c4-proof --format '{{.Id}}')"
+          interexchange-grid c4-proof \
+            --repo-root . \
+            --config config/defaults.yaml \
+            --baseline config/c4-critical-test-manifest.json \
+            --nodeids config/c4-scenario-nodeids.json \
+            --output-root artifacts \
+            --image-digest "$IMAGE_DIGEST"
+      - name: Upload exact C4 artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: c4-critical-proof-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/c4-critical-proof-${{ github.event.pull_request.head.sha || github.sha }}/
           if-no-files-found: error
           retention-days: 30
 
@@ -67,6 +163,28 @@ jobs:
           docker compose up --detach --wait --wait-timeout 120
           docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml \
             | python -c 'import json, sys; payload = json.load(sys.stdin); assert payload["starts"] >= 2, payload'
+      - name: Kill process and prove automatic supervisor recovery in simulator
+        run: |
+          IMAGE_ID="$(docker compose images -q app)"
+          SMOKE_NAME="ipeg-c4-recovery-${GITHUB_RUN_ID}"
+          SMOKE_VOLUME="ipeg-c4-recovery-${GITHUB_RUN_ID}"
+          docker volume create "$SMOKE_VOLUME"
+          docker run --detach --name "$SMOKE_NAME" --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+            interexchange-grid supervisor-recovery-smoke \
+            --state /smoke/state.sqlite3 --ready /smoke/ready --hold-after-active
+          for attempt in $(seq 1 60); do
+            docker exec "$SMOKE_NAME" test -f /smoke/ready && break
+            sleep 1
+          done
+          docker exec "$SMOKE_NAME" test -f /smoke/ready
+          docker kill "$SMOKE_NAME"
+          docker rm "$SMOKE_NAME"
+          docker run --rm --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+            interexchange-grid supervisor-recovery-smoke --state /smoke/state.sqlite3 \
+            | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["production_exchange_transports_opened"] == 0'
+          docker volume rm "$SMOKE_VOLUME"
+      - name: Validate deployment scripts
+        run: bash -n scripts/release-build.sh scripts/shadow-deploy.sh scripts/shadow-upgrade.sh scripts/shadow-rollback.sh
       - name: Show logs on failure
         if: failure()
         run: docker compose logs --no-color

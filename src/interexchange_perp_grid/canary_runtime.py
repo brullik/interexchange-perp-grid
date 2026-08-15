@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import (
     CapabilityReport,
@@ -37,8 +38,10 @@ from interexchange_perp_grid.live_coordinator import (
     first_close_reason,
 )
 from interexchange_perp_grid.live_economics import (
+    EmergencyVenueAssessment,
     LiveEconomicDecision,
     LiveEconomicPolicy,
+    evaluate_emergency_venue,
     evaluate_live_entry,
 )
 from interexchange_perp_grid.live_journal import (
@@ -47,9 +50,9 @@ from interexchange_perp_grid.live_journal import (
     LiveJournalAction,
     LiveOrderJournal,
     request_payload_hash,
-    venue_client_order_id,
 )
 from interexchange_perp_grid.live_reconciliation import (
+    FlatBarrierPolicy,
     ReconciliationReport,
     VenuePrivateState,
     collect_private_states,
@@ -79,16 +82,23 @@ from interexchange_perp_grid.routes import (
     minimum_common_base_quantity,
 )
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
-from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import (
     initialise_state,
     live_confirmation_valid,
     read_runtime_controls,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
-from interexchange_perp_grid.telegram_control import run_telegram_bot
 
 OWNER_CONFIRMATION = "I_ACCEPT_LIVE_CANARY_RISK"
+
+
+def _flat_barrier_policy(settings: Settings) -> FlatBarrierPolicy:
+    return FlatBarrierPolicy(
+        consecutive_snapshots=settings.live.flat_barrier_consecutive_snapshots,
+        quiet_period_seconds=float(settings.live.flat_barrier_quiet_period_seconds),
+        poll_interval_seconds=float(settings.live.flat_barrier_poll_interval_seconds),
+        timeout_seconds=float(settings.live.flat_barrier_timeout_seconds),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +117,7 @@ class CanaryRunEvidence:
     preflights: tuple[PrivatePreflightReport, ...]
     reconciliation: ReconciliationReport | None
     owner_instruction: str | None
+    emergency_venue: EmergencyVenueAssessment | None = None
 
 
 class PublicProtectionProvider(ProtectionProvider):
@@ -291,6 +302,73 @@ class ImmediateRecoveryCloseMonitor(CanaryMonitor):
         return CloseReason.EMERGENCY
 
 
+class OnDemandLiveControlPlane:
+    """Account-wide Telegram live control that opens private transports only per command."""
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    async def snapshot(self) -> dict[str, object]:
+        return cast(dict[str, object], await self._invoke("snapshot"))
+
+    async def close_all_live(self) -> LiveControlResult:
+        return cast(LiveControlResult, await self._invoke("close_all_live"))
+
+    async def cancel_all_live(self) -> LiveControlResult:
+        return cast(LiveControlResult, await self._invoke("cancel_all_live"))
+
+    async def emergency_flatten(self) -> LiveControlResult:
+        return cast(LiveControlResult, await self._invoke("emergency_flatten"))
+
+    async def kill(self) -> LiveControlResult:
+        return cast(LiveControlResult, await self._invoke("kill"))
+
+    async def _invoke(self, operation: str) -> object:
+        journal = LiveOrderJournal(Path(self._settings.storage.sqlite_path))
+        await journal.initialise()
+        active = await journal.active()
+        venues = {Venue(value) for value in self._settings.venues.wave1_public}
+        private: dict[Venue, CcxtPrivateAdapter] = {}
+        try:
+            for venue in venues:
+                private[venue] = CcxtPrivateAdapter(
+                    venue,
+                    PrivateCredentials.from_environment(venue),
+                )
+            discovered = await asyncio.gather(
+                *(adapter.list_instruments() for adapter in private.values())
+            )
+            registry = {
+                (instrument.venue, instrument.symbol): instrument
+                for batch in discovered
+                for instrument in batch
+            }
+            control = LiveControlService(
+                journal,
+                cast(dict[Venue, CanaryVenueAdapter], private),
+                registry,
+                active.route if active is not None else None,
+                active.qualification_hash if active is not None else None,
+                _flat_barrier_policy(self._settings),
+            )
+            if operation == "snapshot":
+                return await control.snapshot()
+            if operation == "close_all_live":
+                return await control.close_all_live()
+            if operation == "cancel_all_live":
+                return await control.cancel_all_live()
+            if operation == "emergency_flatten":
+                return await control.emergency_flatten()
+            if operation == "kill":
+                return await control.kill()
+            raise ValueError(f"unsupported live control operation: {operation}")
+        finally:
+            await asyncio.gather(
+                *(adapter.close() for adapter in private.values()),
+                return_exceptions=True,
+            )
+
+
 def _wave1_emergency_venue(settings: Settings, route: DirectedRouteKey) -> Venue:
     candidates = {
         Venue(value)
@@ -375,37 +453,15 @@ async def _coordinate_live_action(
     monitor: CanaryMonitor,
     emergency_venue: Venue,
 ) -> CanaryCycleResult:
-    live_control = LiveControlService(
+    return await LiveCanaryCoordinator(
         journal,
         adapters,
         instruments,
-        plan.route,
-        plan.qualification_hash,
-    )
-    telegram_stop = asyncio.Event()
-    telegram_task: asyncio.Task[None] | None = None
-    if settings.telegram.enabled:
-        telegram_runtime = ShadowRuntime(settings)
-        await telegram_runtime.start()
-        telegram_task = asyncio.create_task(
-            run_telegram_bot(settings, telegram_runtime, telegram_stop, live_control)
-        )
-        await asyncio.sleep(0)
-        if telegram_task.done():
-            await telegram_task
-    try:
-        return await LiveCanaryCoordinator(
-            journal,
-            adapters,
-            instruments,
-            PublicProtectionProvider(settings, public_adapters, instruments),
-            monitor,
-            emergency_venue,
-        ).run(plan)
-    finally:
-        if telegram_task is not None:
-            telegram_stop.set()
-            await telegram_task
+        PublicProtectionProvider(settings, public_adapters, instruments),
+        monitor,
+        emergency_venue,
+        flat_barrier_policy=_flat_barrier_policy(settings),
+    ).run(plan)
 
 
 async def _resume_active_canary(
@@ -476,6 +532,27 @@ async def _resume_active_canary(
                     f"automatic restart validation failed: {error}"
                 ),
             )
+        monitor: CanaryMonitor = ImmediateRecoveryCloseMonitor()
+        if (
+            active.state == LiveActionState.PREPARED
+            and active.risk_reservation.get("supervisor_intent") == "LIVE_CANARY"
+            and active.risk_reservation.get("supervisor_queued") is True
+        ):
+            funding_values = await asyncio.gather(
+                *(public_adapters[venue].fetch_funding(instruments[venue]) for venue in venues)
+            )
+            initial_funding = {snapshot.venue: snapshot for snapshot in funding_values}
+            monitor = RuntimeCanaryMonitor(
+                settings,
+                active.route,
+                plan.quantity,
+                Decimal(str(active.risk_reservation["target_exit_spread_bps"])),
+                public_adapters,
+                typed_adapters,
+                instruments,
+                initial_funding,
+                Path(settings.storage.sqlite_path),
+            )
         result = await _coordinate_live_action(
             settings,
             journal,
@@ -483,7 +560,7 @@ async def _resume_active_canary(
             instruments,
             public_adapters,
             plan,
-            ImmediateRecoveryCloseMonitor(),
+            monitor,
             emergency_venue,
         )
         return CanaryRunEvidence(
@@ -508,6 +585,23 @@ async def _resume_active_canary(
             *(adapter.close() for adapter in private_adapters.values()),
             return_exceptions=True,
         )
+
+
+async def recover_active_canary(
+    settings: Settings,
+    journal: LiveOrderJournal,
+    active: LiveJournalAction,
+) -> CanaryRunEvidence | LiveControlResult:
+    """Supervisor recovery entry point; deliberately has no owner or qualification gates."""
+    if active.risk_reservation.get(
+        "qualification_bypassed_for_risk_reduction"
+    ) is True or active.recovery_action in {
+        "EMERGENCY_FLATTEN",
+        "KILL_CANCEL_FLATTEN",
+        "CLOSE_ALL_LIVE",
+    }:
+        return await OnDemandLiveControlPlane(settings).emergency_flatten()
+    return await _resume_active_canary(settings, journal, active)
 
 
 async def run_canary_once(
@@ -612,6 +706,39 @@ async def run_canary_once(
         if not route_fees_match:
             qualification_valid = False
 
+        emergency_state = states[emergency_venue]
+        emergency_account = emergency_state.account
+        emergency_assessment = evaluate_emergency_venue(
+            instruments[route.long_venue],
+            instruments[route.short_venue],
+            instruments[emergency_venue],
+            books[emergency_venue],
+            fee_rates.get(emergency_venue),
+            quantity,
+            capability_ready=capabilities[emergency_venue].ready,
+            account_ready=(
+                emergency_state.error is None
+                and emergency_account is not None
+                and emergency_account.margin_mode == "cross"
+                and emergency_account.position_mode == "oneway"
+                and emergency_account.trading_enabled is True
+                and emergency_account.withdrawal_enabled is False
+                and emergency_account.transfer_enabled is False
+            ),
+            data_quality_ready=(
+                quality[emergency_venue].accepted and public_reports[emergency_venue].public_ready
+            ),
+            slippage_cap_bps=settings.live.canary_close_slippage_cap_bps,
+        )
+        if not emergency_assessment.passed:
+            return _denied(
+                emergency_assessment.reason,
+                route,
+                quantity,
+                emergency_assessment=emergency_assessment,
+                reconciliation=reconciliation,
+            )
+
         provisional_risk = RiskDecision(
             True,
             ReasonCode.RISK_RESERVED,
@@ -641,6 +768,7 @@ async def run_canary_once(
             evidence.strategy,
             economic_policy,
             provisional_risk,
+            emergency_assessment=emergency_assessment,
         )
         if economic.signal is None:
             return _denied(economic.reason, route, quantity, economic=economic)
@@ -661,7 +789,7 @@ async def run_canary_once(
             portfolio_stress_limit_usdt=settings.risk.portfolio_stressed_loss_limit_usdt,
             free_margin_floor_ratio=settings.live.canary_free_margin_floor_ratio,
             effective_leverage_cap=settings.live.canary_effective_leverage_cap,
-            exit_depth_sufficient=True,
+            exit_depth_sufficient=emergency_assessment.passed,
         )
         economic = evaluate_live_entry(
             quote,
@@ -678,6 +806,7 @@ async def run_canary_once(
             evidence.strategy,
             economic_policy,
             risk,
+            emergency_assessment=emergency_assessment,
         )
         existing_positions = sum(len(state.positions) for state in states.values())
         existing_orders = sum(len(state.open_orders) for state in states.values())
@@ -791,6 +920,12 @@ async def run_canary_once(
                 "risk": risk.breakdown,
                 "projected_stress_usdt": projected_stress,
                 "qualification_hash": evidence.qualification_hash,
+                "supervisor_intent": "LIVE_CANARY",
+                "supervisor_queued": True,
+                "target_exit_spread_bps": evidence.strategy.target_exit_spread_bps,
+                "initial_funding_rates": {
+                    venue.value: funding[venue].rate for venue in required_venues
+                },
                 "opening_client_order_ids": {
                     "long": long_client_id,
                     "short": short_client_id,
@@ -799,42 +934,34 @@ async def run_canary_once(
             qualification_hash=evidence.qualification_hash,
             timeout_seconds=settings.live.canary_timeout_seconds,
         )
-        monitor = RuntimeCanaryMonitor(
-            settings,
-            route,
-            quantity,
-            evidence.strategy.target_exit_spread_bps,
-            public_adapters,
-            typed_adapters,
-            instruments,
-            funding,
-            state_path,
-        )
-        result = await _coordinate_live_action(
-            settings,
+        queued_action = await LiveCanaryCoordinator(
             journal,
             typed_adapters,
             instruments,
-            public_adapters,
-            plan,
-            monitor,
+            PublicProtectionProvider(settings, public_adapters, instruments),
+            ImmediateRecoveryCloseMonitor(),
             emergency_venue,
-        )
+            flat_barrier_policy=_flat_barrier_policy(settings),
+        ).prepare(plan)
         return CanaryRunEvidence(
-            submitted=result.orders_sent > 0,
-            success=result.success,
-            reason=result.reason,
+            submitted=False,
+            success=True,
+            reason=None,
             route=route.value,
             quantity=quantity,
-            orders_sent=result.orders_sent,
-            hedged=result.hedged,
-            residual_delta=result.residual_delta,
-            recovery_action=result.recovery_action,
-            terminal_state=result.terminal_state,
+            orders_sent=0,
+            hedged=False,
+            residual_delta=queued_action.residual_delta,
+            recovery_action="QUEUED_FOR_LIVE_SAFETY_SUPERVISOR",
+            terminal_state=queued_action.state,
             economic_decision=economic,
             preflights=preflights,
-            reconciliation=result.reconciliation,
-            owner_instruction=result.owner_instruction,
+            reconciliation=reconciliation,
+            owner_instruction=(
+                "Intent durably queued; the long-running live safety supervisor owns submission, "
+                "monitoring, and recovery."
+            ),
+            emergency_venue=emergency_assessment,
         )
     finally:
         await asyncio.gather(
@@ -851,45 +978,38 @@ async def run_emergency_flatten(
     repo_root: Path,
     confirmation: str,
 ) -> LiveControlResult | None:
-    del config_path, repo_root
+    del config_path, qualification_path, repo_root
     if not emergency_unlock_valid(confirmation):
         return None
     journal = LiveOrderJournal(Path(settings.storage.sqlite_path))
     await journal.initialise()
     active = await journal.active()
-    try:
-        evidence = load_qualification(qualification_path)
-    except (OSError, ValueError, KeyError):
-        evidence = None
-    route = active.route if active is not None else (evidence.route if evidence else None)
-    qualification_hash = (
-        active.qualification_hash
-        if active is not None
-        else (evidence.qualification_hash if evidence else None)
-    )
-    if route is None or qualification_hash is None:
-        return None
-    emergency = _wave1_emergency_venue(settings, route)
-    venues = {route.long_venue, route.short_venue, emergency}
-    public = {venue: CcxtProAdapter(venue) for venue in venues}
+    venues = {Venue(value) for value in settings.venues.wave1_public}
     private: dict[Venue, CcxtPrivateAdapter] = {}
     try:
-        instruments, _ = await _discover_instruments(route.base, public)
         for venue in venues:
             private[venue] = CcxtPrivateAdapter(
                 venue,
                 PrivateCredentials.from_environment(venue),
             )
+        discovered = await asyncio.gather(
+            *(adapter.list_instruments() for adapter in private.values())
+        )
+        registry = {
+            (instrument.venue, instrument.symbol): instrument
+            for batch in discovered
+            for instrument in batch
+        }
         return await LiveControlService(
             journal,
             cast(dict[Venue, CanaryVenueAdapter], private),
-            instruments,
-            route,
-            qualification_hash,
+            registry,
+            active.route if active is not None else None,
+            active.qualification_hash if active is not None else None,
+            _flat_barrier_policy(settings),
         ).emergency_flatten()
     finally:
         await asyncio.gather(
-            *(adapter.close() for adapter in public.values()),
             *(adapter.close() for adapter in private.values()),
             return_exceptions=True,
         )
@@ -1013,6 +1133,7 @@ def _denied(
     economic: LiveEconomicDecision | None = None,
     preflights: tuple[PrivatePreflightReport, ...] = (),
     reconciliation: ReconciliationReport | None = None,
+    emergency_assessment: EmergencyVenueAssessment | None = None,
 ) -> CanaryRunEvidence:
     return CanaryRunEvidence(
         submitted=False,
@@ -1029,6 +1150,7 @@ def _denied(
         preflights=preflights,
         reconciliation=reconciliation,
         owner_instruction=None,
+        emergency_venue=emergency_assessment,
     )
 
 

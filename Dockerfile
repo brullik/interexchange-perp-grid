@@ -8,9 +8,10 @@ WORKDIR /app
 
 RUN groupadd --system ipeg && useradd --system --gid ipeg --home /app ipeg
 
-COPY pyproject.toml README.md /app/
+COPY pyproject.toml README.md requirements.lock /app/
 COPY src /app/src
-RUN python -m pip install --upgrade pip && python -m pip install .
+RUN python -m pip install -r requirements.lock \
+    && python -m pip install . --no-deps --no-build-isolation
 
 COPY config /app/config
 RUN mkdir -p /app/state /app/data /app/logs && chown -R ipeg:ipeg /app

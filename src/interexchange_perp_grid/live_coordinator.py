@@ -9,19 +9,25 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
 
+from interexchange_perp_grid.client_ids import (
+    is_bot_client_order_id,
+    venue_client_order_id,
+)
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import ExecutionIntent, OrderPurpose, Side
 from interexchange_perp_grid.live_journal import (
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
-    venue_client_order_id,
 )
 from interexchange_perp_grid.live_reconciliation import (
+    FlatBarrierPolicy,
     PrivateStateAdapter,
     ReconciliationReport,
+    ReconciliationStatus,
     collect_private_states,
     reconcile_private_states,
+    wait_for_stable_flat,
 )
 from interexchange_perp_grid.private_domain import (
     PrivateOrder,
@@ -100,6 +106,10 @@ class CanaryVenueAdapter(PrivateStateAdapter, Protocol):
         instrument: Instrument,
     ) -> PrivateOrder: ...
 
+    async def resolve_instrument(self, symbol: str) -> Instrument | None: ...
+
+    async def list_instruments(self) -> tuple[Instrument, ...]: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CanaryExecutionPlan:
@@ -135,29 +145,73 @@ class LiveCanaryCoordinator:
         self,
         journal: LiveOrderJournal,
         adapters: Mapping[Venue, CanaryVenueAdapter],
-        instruments: Mapping[Venue, Instrument],
+        instruments: Mapping[Venue, Instrument] | Mapping[tuple[Venue, str], Instrument],
         protection: ProtectionProvider,
         monitor: CanaryMonitor,
         emergency_venue: Venue,
         *,
         terminal_timeout_seconds: Decimal = Decimal("2"),
+        flat_barrier_policy: FlatBarrierPolicy | None = None,
     ) -> None:
         self._journal = journal
         self._adapters = dict(adapters)
-        self._instruments = dict(instruments)
+        self._instruments = {
+            (instrument.venue, instrument.symbol): instrument for instrument in instruments.values()
+        }
+        self._account_instruments = {
+            venue: next(
+                instrument
+                for (instrument_venue, _), instrument in self._instruments.items()
+                if instrument_venue == venue
+            )
+            for venue in self._adapters
+        }
         self._protection = protection
         self._monitor = monitor
         self._emergency_venue = emergency_venue
         self._terminal_timeout_seconds = terminal_timeout_seconds
+        self._flat_barrier_policy = flat_barrier_policy or FlatBarrierPolicy()
         self._orders_sent = 0
         self._sequence = 0
+
+    async def prepare(self, plan: CanaryExecutionPlan) -> LiveJournalAction:
+        """Persist an exact pair intent without performing any network submission."""
+        await self._journal.initialise()
+        active = await self._journal.active()
+        if active is not None:
+            if active.pair_action_id != plan.pair_action_id:
+                raise RuntimeError(
+                    "unreconciled live action blocks entry: "
+                    f"{active.pair_action_id}:{active.state.value}"
+                )
+            return active
+        completed = await self._journal.load(plan.pair_action_id)
+        if completed is not None:
+            return completed
+        return await self._journal.prepare(
+            plan.pair_action_id,
+            plan.route,
+            plan.tranche_id,
+            plan.long_request,
+            plan.short_request,
+            {
+                plan.route.long_venue: plan.quantity,
+                plan.route.short_venue: plan.quantity,
+            },
+            {
+                plan.route.long_venue: _required_price(plan.long_request),
+                plan.route.short_venue: _required_price(plan.short_request),
+            },
+            plan.risk_reservation,
+            plan.qualification_hash,
+        )
 
     async def run(self, plan: CanaryExecutionPlan) -> CanaryCycleResult:
         await self._journal.initialise()
         active = await self._journal.active()
         completed = await self._journal.load(plan.pair_action_id)
         if active is None and completed is not None and completed.state == LiveActionState.FLAT:
-            report = await self._verify(completed)
+            report = await self._verify_stable_flat(completed)
             return CanaryCycleResult(
                 report.flat_verified,
                 None if report.flat_verified else ReasonCode.RECONCILIATION_FAILED,
@@ -177,23 +231,7 @@ class LiveCanaryCoordinator:
                 recovery_action="BLOCKED_BY_ACTIVE_ACTION",
             )
         if active is None:
-            action = await self._journal.prepare(
-                plan.pair_action_id,
-                plan.route,
-                plan.tranche_id,
-                plan.long_request,
-                plan.short_request,
-                {
-                    plan.route.long_venue: plan.quantity,
-                    plan.route.short_venue: plan.quantity,
-                },
-                {
-                    plan.route.long_venue: _required_price(plan.long_request),
-                    plan.route.short_venue: _required_price(plan.short_request),
-                },
-                plan.risk_reservation,
-                plan.qualification_hash,
-            )
+            action = await self.prepare(plan)
         else:
             action = active
         if action.state == LiveActionState.PREPARED:
@@ -206,12 +244,12 @@ class LiveCanaryCoordinator:
                 self._submit_and_resolve(
                     action.pair_action_id,
                     plan.long_request,
-                    self._instruments[plan.route.long_venue],
+                    self._instrument(plan.route.long_venue, plan.long_request.symbol),
                 ),
                 self._submit_and_resolve(
                     action.pair_action_id,
                     plan.short_request,
-                    self._instruments[plan.route.short_venue],
+                    self._instrument(plan.route.short_venue, plan.short_request.symbol),
                 ),
             )
             action = await self._classify_open_pair(action.pair_action_id, long_order, short_order)
@@ -225,7 +263,7 @@ class LiveCanaryCoordinator:
             action, opening_recovery = await self._recover_opening(action)
             hedged = await self._is_hedged(action)
             if not hedged:
-                report = await self._verify(action)
+                report = await self._verify_stable_flat(action)
                 if report.flat_verified:
                     action = await self._to_flat(action, "OPEN_RECOVERY_FLATTENED")
                     return CanaryCycleResult(
@@ -272,7 +310,7 @@ class LiveCanaryCoordinator:
                 raise RuntimeError(f"unexpected live-control state {action.state.value}")
         await self._close_exchange_positions(action, emergency=False)
         action = await self._require_action(action.pair_action_id)
-        report = await self._verify(action)
+        report = await self._verify_stable_flat(action)
         recovery_action: str | None = opening_recovery
         if not report.flat_verified:
             action = await self._journal.transition(
@@ -286,7 +324,7 @@ class LiveCanaryCoordinator:
             await self._cancel_all_bot_orders()
             await self._close_exchange_positions(action, emergency=True)
             action = await self._require_action(action.pair_action_id)
-            report = await self._verify(action)
+            report = await self._verify_stable_flat(action)
         if not report.flat_verified:
             action = await self._quarantine(action, report, recovery_action)
             return self._failed(
@@ -353,9 +391,10 @@ class LiveCanaryCoordinator:
         try:
             order = await adapter.submit_order(request, instrument)
         except Exception:
-            order = _unknown_order(request, instrument)
-        await self._record(pair_action_id, order)
-        if order.status in {
+            order = None
+        if order is not None:
+            await self._record(pair_action_id, order)
+        if order is not None and order.status in {
             PrivateOrderStatus.FILLED,
             PrivateOrderStatus.PARTIAL,
             PrivateOrderStatus.REJECTED,
@@ -379,7 +418,9 @@ class LiveCanaryCoordinator:
         except Exception:
             resolved = None
         if resolved is None:
-            return _unknown_order(request, instrument)
+            unknown = _unknown_order(request, instrument)
+            await self._record(pair_action_id, unknown)
+            return unknown
         order = resolved
         await self._record(pair_action_id, order)
         if order.status == PrivateOrderStatus.OPEN and order.order_id is not None:
@@ -405,7 +446,7 @@ class LiveCanaryCoordinator:
         await self._journal.record_order_event(pair_action_id, order, key)
 
     async def _refresh_action(self, action: LiveJournalAction) -> LiveJournalAction:
-        states = await collect_private_states(self._adapters, self._instruments)
+        states = await collect_private_states(self._adapters, self._account_instruments)
         known = {leg.client_order_id for leg in action.legs}
         for state in states.values():
             for order in (*state.open_orders, *state.recent_orders):
@@ -414,10 +455,17 @@ class LiveCanaryCoordinator:
         return await self._require_action(action.pair_action_id)
 
     async def _is_hedged(self, action: LiveJournalAction) -> bool:
-        refreshed = await self._refresh_action(action)
-        signed = _journal_signed_positions(refreshed)
-        gross = sum((abs(value) for value in signed.values()), Decimal(0))
-        return gross > 0 and sum(signed.values(), Decimal(0)) == 0
+        report = await self._verify(action)
+        gross = sum((abs(value) for value in report.actual_signed_positions.values()), Decimal(0))
+        return (
+            report.status == ReconciliationStatus.CONSISTENT
+            and report.snapshots_complete
+            and not report.unknown_client_order_ids
+            and report.open_position_count > 0
+            and gross > 0
+            and report.residual_delta == 0
+            and report.actual_signed_positions == report.expected_signed_positions
+        )
 
     async def _recover_opening(
         self,
@@ -518,8 +566,13 @@ class LiveCanaryCoordinator:
         label: str,
         *,
         emergency: bool,
+        symbol: str | None = None,
     ) -> PrivateOrder:
-        instrument = self._instruments[venue]
+        instrument = (
+            self._instrument(venue, symbol)
+            if symbol is not None
+            else self._base_instrument(venue, action.route.base)
+        )
         self._sequence += 1
         client_id = venue_client_order_id(
             action.pair_action_id,
@@ -555,7 +608,7 @@ class LiveCanaryCoordinator:
         *,
         emergency: bool,
     ) -> None:
-        states = await collect_private_states(self._adapters, self._instruments)
+        states = await collect_private_states(self._adapters, self._account_instruments)
         positions = tuple(position for state in states.values() for position in state.positions)
         await asyncio.gather(
             *(
@@ -567,6 +620,7 @@ class LiveCanaryCoordinator:
                     (OrderPurpose.EMERGENCY_CLOSE if emergency else OrderPurpose.NORMAL_CLOSE),
                     "EMERGENCY_FLATTEN" if emergency else "CLOSE",
                     emergency=emergency,
+                    symbol=position.symbol,
                 )
                 for position in positions
             ),
@@ -574,13 +628,13 @@ class LiveCanaryCoordinator:
         )
 
     async def _cancel_all_bot_orders(self) -> None:
-        states = await collect_private_states(self._adapters, self._instruments)
+        states = await collect_private_states(self._adapters, self._account_instruments)
         await asyncio.gather(
             *(
                 self._cancel_one(order)
                 for state in states.values()
                 for order in state.open_orders
-                if order.client_order_id.startswith("ipeg-") and order.order_id is not None
+                if is_bot_client_order_id(order.client_order_id) and order.order_id is not None
             ),
             return_exceptions=True,
         )
@@ -589,12 +643,12 @@ class LiveCanaryCoordinator:
         assert order.order_id is not None
         await self._adapters[order.venue].cancel_order(
             order.order_id,
-            self._instruments[order.venue],
+            self._instrument(order.venue, order.symbol),
         )
 
     async def _verify(self, action: LiveJournalAction) -> ReconciliationReport:
         refreshed = await self._refresh_action(action)
-        states = await collect_private_states(self._adapters, self._instruments)
+        states = await collect_private_states(self._adapters, self._account_instruments)
         return reconcile_private_states(
             refreshed,
             states,
@@ -602,7 +656,22 @@ class LiveCanaryCoordinator:
             set(self._adapters),
         )
 
+    async def _verify_stable_flat(self, action: LiveJournalAction) -> ReconciliationReport:
+        async def report_factory() -> ReconciliationReport:
+            current = await self._require_action(action.pair_action_id)
+            return await self._verify(current)
+
+        result = await wait_for_stable_flat(
+            report_factory,
+            self._journal.event_watermark,
+            self._flat_barrier_policy,
+        )
+        return result.report
+
     async def _advance_to_hedged(self, action: LiveJournalAction) -> LiveJournalAction:
+        if not await self._is_hedged(action):
+            report = await self._verify(action)
+            return await self._quarantine(action, report, "EXCHANGE_HEDGE_MISMATCH")
         if action.state == LiveActionState.RECOVERING:
             return await self._journal.transition(
                 action.pair_action_id,
@@ -679,6 +748,22 @@ class LiveCanaryCoordinator:
         if action is None:
             raise RuntimeError("live action journal record is missing")
         return action
+
+    def _instrument(self, venue: Venue, symbol: str) -> Instrument:
+        instrument = self._instruments.get((venue, symbol))
+        if instrument is None:
+            raise RuntimeError(f"instrument registry has no {venue.value}:{symbol}")
+        return instrument
+
+    def _base_instrument(self, venue: Venue, base: str) -> Instrument:
+        matches = tuple(
+            instrument
+            for (instrument_venue, _), instrument in self._instruments.items()
+            if instrument_venue == venue and instrument.base == base
+        )
+        if len(matches) != 1:
+            raise RuntimeError(f"instrument registry has no unique {venue.value}:{base}")
+        return matches[0]
 
     def _failed(
         self,

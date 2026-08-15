@@ -6,8 +6,10 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from interexchange_perp_grid.domain import FundingSnapshot, Venue
 from interexchange_perp_grid.execution import (
@@ -20,7 +22,7 @@ from interexchange_perp_grid.execution import (
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
@@ -79,19 +81,34 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS qualification_epochs (
+        epoch_id TEXT PRIMARY KEY,
+        route TEXT NOT NULL,
+        release_sha TEXT NOT NULL,
+        source_sha256 TEXT NOT NULL,
+        config_sha256 TEXT NOT NULL,
+        container_image_digest TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        ended_at TEXT,
+        status TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS qualification_funding_observations (
+        epoch_id TEXT NOT NULL REFERENCES qualification_epochs(epoch_id),
         base TEXT NOT NULL,
         venue TEXT NOT NULL,
         observed_at TEXT NOT NULL,
         rate TEXT NOT NULL,
         next_funding_timestamp_ms INTEGER NOT NULL,
         interval TEXT NOT NULL,
-        PRIMARY KEY (base, venue, next_funding_timestamp_ms, observed_at)
+        PRIMARY KEY (epoch_id, base, venue, next_funding_timestamp_ms, observed_at)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS qualification_signal_observations (
         observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        epoch_id TEXT NOT NULL REFERENCES qualification_epochs(epoch_id),
         route TEXT NOT NULL,
         accepted INTEGER NOT NULL CHECK (accepted IN (0, 1)),
         reason TEXT NOT NULL,
@@ -102,6 +119,7 @@ SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS qualification_strategy_parameters (
         observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        epoch_id TEXT NOT NULL REFERENCES qualification_epochs(epoch_id),
         route TEXT NOT NULL,
         size_bucket_base_quantity TEXT NOT NULL,
         calibration_version INTEGER NOT NULL,
@@ -117,6 +135,7 @@ SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS qualification_pnl_observations (
         observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        epoch_id TEXT NOT NULL REFERENCES qualification_epochs(epoch_id),
         route TEXT NOT NULL,
         simulated_net_pnl_usdt TEXT NOT NULL,
         observed_at TEXT NOT NULL
@@ -125,11 +144,39 @@ SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS qualification_runtime_errors (
         error_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        epoch_id TEXT NOT NULL REFERENCES qualification_epochs(epoch_id),
         error_type TEXT NOT NULL,
         observed_at TEXT NOT NULL
     )
     """,
 )
+
+_EPOCH_OBSERVATION_TABLES = (
+    "qualification_funding_observations",
+    "qualification_signal_observations",
+    "qualification_strategy_parameters",
+    "qualification_pnl_observations",
+    "qualification_runtime_errors",
+)
+
+
+class QualificationEpochStatus(StrEnum):
+    RUNNING = "RUNNING"
+    FINALIZED = "FINALIZED"
+    CLOSED = "CLOSED"
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationEpoch:
+    epoch_id: str
+    route: DirectedRouteKey
+    release_sha: str
+    source_sha256: str
+    config_sha256: str
+    container_image_digest: str
+    started_at: datetime
+    ended_at: datetime | None
+    status: QualificationEpochStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,8 +226,15 @@ def _initialise_state_sync(path: Path) -> None:
         existing = database.execute(
             "SELECT value FROM metadata WHERE key = ?", ("schema_version",)
         ).fetchone()
-        if existing is not None and existing[0] not in {"1", "2", "3", SCHEMA_VERSION}:
+        if existing is not None and existing[0] not in {"1", "2", "3", "4", SCHEMA_VERSION}:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
+        for table in _EPOCH_OBSERVATION_TABLES:
+            columns = {str(row[1]) for row in database.execute(f"PRAGMA table_info({table})")}
+            if "epoch_id" not in columns:
+                database.execute(
+                    f"ALTER TABLE {table} ADD COLUMN epoch_id TEXT "
+                    "REFERENCES qualification_epochs(epoch_id)"
+                )
         database.execute(
             """
             INSERT INTO metadata(key, value) VALUES (?, ?)
@@ -201,6 +255,238 @@ def _initialise_state_sync(path: Path) -> None:
 
 async def initialise_state(path: Path) -> None:
     await asyncio.to_thread(_initialise_state_sync, path)
+
+
+def _route_from_value(value: str) -> DirectedRouteKey:
+    base, venues = value.split(":", 1)
+    long_venue, short_venue = venues.split(">", 1)
+    return DirectedRouteKey(base, Venue(long_venue), Venue(short_venue))
+
+
+def _epoch_from_row(row: tuple[object, ...]) -> QualificationEpoch:
+    return QualificationEpoch(
+        epoch_id=str(row[0]),
+        route=_route_from_value(str(row[1])),
+        release_sha=str(row[2]),
+        source_sha256=str(row[3]),
+        config_sha256=str(row[4]),
+        container_image_digest=str(row[5]),
+        started_at=datetime.fromisoformat(str(row[6])),
+        ended_at=datetime.fromisoformat(str(row[7])) if row[7] is not None else None,
+        status=QualificationEpochStatus(str(row[8])),
+    )
+
+
+def _validate_epoch_identity(
+    release_sha: str,
+    source_sha256: str,
+    config_sha256: str,
+    container_image_digest: str,
+) -> None:
+    if len(release_sha) != 40 or any(value not in "0123456789abcdef" for value in release_sha):
+        raise ValueError("qualification epoch release SHA is invalid")
+    for name, value in (("source", source_sha256), ("config", config_sha256)):
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"qualification epoch {name} SHA-256 is invalid")
+    if not container_image_digest.startswith("sha256:") or len(container_image_digest) != 71:
+        raise ValueError("qualification epoch image digest is invalid")
+
+
+def _start_qualification_epoch_sync(
+    path: Path,
+    route: DirectedRouteKey,
+    release_sha: str,
+    source_sha256: str,
+    config_sha256: str,
+    container_image_digest: str,
+    now: datetime,
+) -> QualificationEpoch:
+    _validate_epoch_identity(
+        release_sha,
+        source_sha256,
+        config_sha256,
+        container_image_digest,
+    )
+    identity = (
+        route.value,
+        release_sha,
+        source_sha256,
+        config_sha256,
+        container_image_digest,
+    )
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        active = database.execute(
+            """
+            SELECT epoch_id, route, release_sha, source_sha256, config_sha256,
+                   container_image_digest, started_at, ended_at, status
+            FROM qualification_epochs WHERE status = ? ORDER BY started_at DESC LIMIT 1
+            """,
+            (QualificationEpochStatus.RUNNING.value,),
+        ).fetchone()
+        if active is not None:
+            parsed = _epoch_from_row(active)
+            observed_identity = (
+                parsed.route.value,
+                parsed.release_sha,
+                parsed.source_sha256,
+                parsed.config_sha256,
+                parsed.container_image_digest,
+            )
+            if observed_identity == identity:
+                database.commit()
+                return parsed
+            database.execute(
+                "UPDATE qualification_epochs SET status = ?, ended_at = ? WHERE epoch_id = ?",
+                (QualificationEpochStatus.CLOSED.value, now.isoformat(), parsed.epoch_id),
+            )
+        finalized = database.execute(
+            """
+            SELECT epoch_id, route, release_sha, source_sha256, config_sha256,
+                   container_image_digest, started_at, ended_at, status
+            FROM qualification_epochs
+            WHERE route = ? AND release_sha = ? AND source_sha256 = ? AND config_sha256 = ?
+              AND container_image_digest = ? AND status = ?
+            ORDER BY started_at DESC LIMIT 1
+            """,
+            (*identity, QualificationEpochStatus.FINALIZED.value),
+        ).fetchone()
+        if finalized is not None:
+            database.commit()
+            return _epoch_from_row(finalized)
+        epoch_id = uuid4().hex
+        database.execute(
+            """
+            INSERT INTO qualification_epochs (
+                epoch_id, route, release_sha, source_sha256, config_sha256,
+                container_image_digest, started_at, ended_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                epoch_id,
+                *identity,
+                now.isoformat(),
+                QualificationEpochStatus.RUNNING.value,
+            ),
+        )
+        database.commit()
+    result = _read_qualification_epoch_sync(path, epoch_id)
+    if result is None:
+        raise RuntimeError("qualification epoch disappeared after start")
+    return result
+
+
+async def start_qualification_epoch(
+    path: Path,
+    route: DirectedRouteKey,
+    release_sha: str,
+    source_sha256: str,
+    config_sha256: str,
+    container_image_digest: str,
+    now: datetime | None = None,
+) -> QualificationEpoch:
+    return await asyncio.to_thread(
+        _start_qualification_epoch_sync,
+        path,
+        route,
+        release_sha,
+        source_sha256,
+        config_sha256,
+        container_image_digest,
+        now or datetime.now(UTC),
+    )
+
+
+def _read_qualification_epoch_sync(
+    path: Path,
+    epoch_id: str | None = None,
+) -> QualificationEpoch | None:
+    with _connect(path) as database:
+        if epoch_id is None:
+            row = database.execute(
+                """
+                SELECT epoch_id, route, release_sha, source_sha256, config_sha256,
+                       container_image_digest, started_at, ended_at, status
+                FROM qualification_epochs ORDER BY started_at DESC LIMIT 1
+                """
+            ).fetchone()
+        else:
+            row = database.execute(
+                """
+                SELECT epoch_id, route, release_sha, source_sha256, config_sha256,
+                       container_image_digest, started_at, ended_at, status
+                FROM qualification_epochs WHERE epoch_id = ?
+                """,
+                (epoch_id,),
+            ).fetchone()
+    return _epoch_from_row(row) if row is not None else None
+
+
+async def read_qualification_epoch(
+    path: Path,
+    epoch_id: str | None = None,
+) -> QualificationEpoch | None:
+    return await asyncio.to_thread(_read_qualification_epoch_sync, path, epoch_id)
+
+
+def _read_active_qualification_epoch_sync(path: Path) -> QualificationEpoch | None:
+    with _connect(path) as database:
+        row = database.execute(
+            """
+            SELECT epoch_id, route, release_sha, source_sha256, config_sha256,
+                   container_image_digest, started_at, ended_at, status
+            FROM qualification_epochs WHERE status = ? ORDER BY started_at DESC LIMIT 1
+            """,
+            (QualificationEpochStatus.RUNNING.value,),
+        ).fetchone()
+    return _epoch_from_row(row) if row is not None else None
+
+
+async def read_active_qualification_epoch(path: Path) -> QualificationEpoch | None:
+    return await asyncio.to_thread(_read_active_qualification_epoch_sync, path)
+
+
+def _finalize_qualification_epoch_sync(
+    path: Path,
+    epoch_id: str,
+    now: datetime,
+) -> QualificationEpoch:
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute(
+            "SELECT status FROM qualification_epochs WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        if row is None:
+            database.rollback()
+            raise KeyError(epoch_id)
+        status = QualificationEpochStatus(str(row[0]))
+        if status == QualificationEpochStatus.CLOSED:
+            database.rollback()
+            raise RuntimeError("closed qualification epoch cannot be finalized")
+        if status == QualificationEpochStatus.RUNNING:
+            database.execute(
+                "UPDATE qualification_epochs SET status = ?, ended_at = ? WHERE epoch_id = ?",
+                (QualificationEpochStatus.FINALIZED.value, now.isoformat(), epoch_id),
+            )
+        database.commit()
+    result = _read_qualification_epoch_sync(path, epoch_id)
+    if result is None:
+        raise RuntimeError("qualification epoch disappeared after finalize")
+    return result
+
+
+async def finalize_qualification_epoch(
+    path: Path,
+    epoch_id: str,
+    now: datetime | None = None,
+) -> QualificationEpoch:
+    return await asyncio.to_thread(
+        _finalize_qualification_epoch_sync,
+        path,
+        epoch_id,
+        now or datetime.now(UTC),
+    )
 
 
 def _record_service_started_sync(path: Path, now: datetime) -> None:
@@ -655,6 +941,7 @@ class StoredQualificationStatistics:
 
 def _record_qualification_scan_sync(
     path: Path,
+    epoch_id: str,
     base: str,
     funding: tuple[FundingSnapshot, ...],
     decisions: tuple[SignalDecision, ...],
@@ -666,20 +953,38 @@ def _record_qualification_scan_sync(
 ) -> None:
     with _connect(path) as database:
         database.execute("BEGIN IMMEDIATE")
+        epoch_row = database.execute(
+            "SELECT route, status FROM qualification_epochs WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        if (
+            epoch_row is None
+            or QualificationEpochStatus(str(epoch_row[1])) != QualificationEpochStatus.RUNNING
+        ):
+            database.rollback()
+            raise RuntimeError("qualification observations require a running exact epoch")
+        epoch_route = _route_from_value(str(epoch_row[0]))
+        if base.upper() != epoch_route.base.upper():
+            database.rollback()
+            raise ValueError("qualification scan base does not match epoch route")
+        allowed_venues = {epoch_route.long_venue, epoch_route.short_venue}
         for snapshot in funding:
             if (
                 snapshot.rate is None
                 or snapshot.next_funding_timestamp_ms is None
                 or snapshot.interval is None
+                or snapshot.venue not in allowed_venues
             ):
                 continue
             database.execute(
                 """
                 INSERT OR IGNORE INTO qualification_funding_observations (
-                    base, venue, observed_at, rate, next_funding_timestamp_ms, interval
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    epoch_id, base, venue, observed_at, rate,
+                    next_funding_timestamp_ms, interval
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    epoch_id,
                     base.upper(),
                     snapshot.venue.value,
                     now.isoformat(),
@@ -689,13 +994,16 @@ def _record_qualification_scan_sync(
                 ),
             )
         for decision in decisions:
+            if decision.route != epoch_route:
+                continue
             database.execute(
                 """
                 INSERT INTO qualification_signal_observations (
-                    route, accepted, reason, expected_net_pnl_usdt, observed_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    epoch_id, route, accepted, reason, expected_net_pnl_usdt, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    epoch_id,
                     decision.route.value,
                     int(decision.accepted),
                     decision.reason.value,
@@ -706,13 +1014,14 @@ def _record_qualification_scan_sync(
             database.execute(
                 """
                 INSERT INTO qualification_strategy_parameters (
-                    route, size_bucket_base_quantity, calibration_version,
+                    epoch_id, route, size_bucket_base_quantity, calibration_version,
                     adaptive_entry_threshold_bps, target_exit_spread_bps,
                     minimum_profit_usdt, stressed_cost_multiplier,
                     expected_holding_seconds, maximum_holding_seconds, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    epoch_id,
                     decision.route.value,
                     str(decision.inputs["size_bucket_base_quantity"]),
                     decision.calibration_version,
@@ -725,27 +1034,24 @@ def _record_qualification_scan_sync(
                     now.isoformat(),
                 ),
             )
-        routes = {decision.route for decision in decisions} | {
-            tranche.route for tranche in tranches
-        }
-        for route in routes:
-            pnl = sum(
-                (tranche.pnl().net_pnl_usdt for tranche in tranches if tranche.route == route),
-                Decimal(0),
-            )
-            database.execute(
-                """
-                INSERT INTO qualification_pnl_observations (
-                    route, simulated_net_pnl_usdt, observed_at
-                ) VALUES (?, ?, ?)
-                """,
-                (route.value, str(pnl), now.isoformat()),
-            )
+        pnl = sum(
+            (tranche.pnl().net_pnl_usdt for tranche in tranches if tranche.route == epoch_route),
+            Decimal(0),
+        )
+        database.execute(
+            """
+            INSERT INTO qualification_pnl_observations (
+                epoch_id, route, simulated_net_pnl_usdt, observed_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (epoch_id, epoch_route.value, str(pnl), now.isoformat()),
+        )
         database.commit()
 
 
 async def record_qualification_scan(
     path: Path,
+    epoch_id: str,
     base: str,
     funding: tuple[FundingSnapshot, ...],
     decisions: tuple[SignalDecision, ...],
@@ -758,6 +1064,7 @@ async def record_qualification_scan(
     await asyncio.to_thread(
         _record_qualification_scan_sync,
         path,
+        epoch_id,
         base,
         funding,
         decisions,
@@ -771,22 +1078,33 @@ async def record_qualification_scan(
 
 def _record_qualification_exception_sync(
     path: Path,
+    epoch_id: str,
     error_type: str,
     now: datetime,
 ) -> None:
     with _connect(path) as database:
+        epoch = database.execute(
+            "SELECT status FROM qualification_epochs WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        if (
+            epoch is None
+            or QualificationEpochStatus(str(epoch[0])) != QualificationEpochStatus.RUNNING
+        ):
+            raise RuntimeError("qualification exception requires a running exact epoch")
         database.execute(
             """
-            INSERT INTO qualification_runtime_errors(error_type, observed_at)
-            VALUES (?, ?)
+            INSERT INTO qualification_runtime_errors(epoch_id, error_type, observed_at)
+            VALUES (?, ?, ?)
             """,
-            (error_type, now.isoformat()),
+            (epoch_id, error_type, now.isoformat()),
         )
         database.commit()
 
 
 async def record_qualification_exception(
     path: Path,
+    epoch_id: str,
     error_type: str,
     now: datetime | None = None,
 ) -> None:
@@ -795,6 +1113,7 @@ async def record_qualification_exception(
     await asyncio.to_thread(
         _record_qualification_exception_sync,
         path,
+        epoch_id,
         error_type,
         now or datetime.now(UTC),
     )
@@ -802,22 +1121,28 @@ async def record_qualification_exception(
 
 def _read_qualification_statistics_sync(
     path: Path,
-    route: DirectedRouteKey,
-    since: datetime,
+    epoch_id: str,
 ) -> StoredQualificationStatistics:
     with _connect(path) as database:
+        epoch_row = database.execute(
+            "SELECT route FROM qualification_epochs WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        if epoch_row is None:
+            raise KeyError(epoch_id)
+        route = _route_from_value(str(epoch_row[0]))
         funding_rows = database.execute(
             """
             SELECT venue, observed_at, rate, next_funding_timestamp_ms, interval
             FROM qualification_funding_observations
-            WHERE base = ? AND venue IN (?, ?) AND observed_at >= ?
+            WHERE epoch_id = ? AND base = ? AND venue IN (?, ?)
             ORDER BY observed_at, venue
             """,
             (
+                epoch_id,
                 route.base.upper(),
                 route.long_venue.value,
                 route.short_venue.value,
-                since.isoformat(),
             ),
         ).fetchall()
         signal_row = database.execute(
@@ -826,25 +1151,25 @@ def _read_qualification_statistics_sync(
                 coalesce(sum(CASE WHEN accepted = 1 THEN 1 ELSE 0 END), 0),
                 coalesce(sum(CASE WHEN accepted = 0 THEN 1 ELSE 0 END), 0)
             FROM qualification_signal_observations
-            WHERE route = ? AND observed_at >= ?
+            WHERE epoch_id = ? AND route = ?
             """,
-            (route.value, since.isoformat()),
+            (epoch_id, route.value),
         ).fetchone()
         pnl_rows = database.execute(
             """
             SELECT simulated_net_pnl_usdt
             FROM qualification_pnl_observations
-            WHERE route = ? AND observed_at >= ?
+            WHERE epoch_id = ? AND route = ?
             ORDER BY observed_at
             """,
-            (route.value, since.isoformat()),
+            (epoch_id, route.value),
         ).fetchall()
         error_row = database.execute(
             """
             SELECT count(*) FROM qualification_runtime_errors
-            WHERE observed_at >= ?
+            WHERE epoch_id = ?
             """,
-            (since.isoformat(),),
+            (epoch_id,),
         ).fetchone()
         strategy_row = database.execute(
             """
@@ -853,10 +1178,10 @@ def _read_qualification_statistics_sync(
                    minimum_profit_usdt, stressed_cost_multiplier,
                    expected_holding_seconds, maximum_holding_seconds
             FROM qualification_strategy_parameters
-            WHERE route = ? AND observed_at >= ?
+            WHERE epoch_id = ? AND route = ?
             ORDER BY observation_id DESC LIMIT 1
             """,
-            (route.value, since.isoformat()),
+            (epoch_id, route.value),
         ).fetchone()
     pnl_values = tuple(Decimal(str(row[0])) for row in pnl_rows)
     latest_pnl = pnl_values[-1] if pnl_values else Decimal(0)
@@ -897,12 +1222,10 @@ def _read_qualification_statistics_sync(
 
 async def read_qualification_statistics(
     path: Path,
-    route: DirectedRouteKey,
-    since: datetime,
+    epoch_id: str,
 ) -> StoredQualificationStatistics:
     return await asyncio.to_thread(
         _read_qualification_statistics_sync,
         path,
-        route,
-        since,
+        epoch_id,
     )

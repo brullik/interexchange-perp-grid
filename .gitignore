@@ -25,6 +25,7 @@ data/
 state/
 logs/
 artifacts/runtime/
+artifacts/c4-critical-proof-*/
 *.sqlite
 *.sqlite3
 *.db

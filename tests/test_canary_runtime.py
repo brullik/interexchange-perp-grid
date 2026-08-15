@@ -6,11 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from interexchange_perp_grid.canary_runtime import _rebuild_active_plan
+from interexchange_perp_grid.canary_runtime import _rebuild_active_plan, run_canary_once
+from interexchange_perp_grid.config import load_settings
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import ExecutionIntent, OrderPurpose, Side
 from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.private_execution import translate_protected_order
+from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 
@@ -30,6 +32,41 @@ def _instrument(venue: Venue) -> Instrument:
         Decimal("0.001"),
         "private",
     )
+
+
+@pytest.mark.asyncio
+async def test_owner_gate_denial_performs_no_network_or_adapter_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import interexchange_perp_grid.canary_runtime as runtime_module
+
+    constructed = 0
+
+    class ForbiddenAdapter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            nonlocal constructed
+            del args, kwargs
+            constructed += 1
+            raise AssertionError("network adapter constructed before owner gate")
+
+    monkeypatch.setattr(runtime_module, "CcxtProAdapter", ForbiddenAdapter)
+    monkeypatch.setattr(runtime_module, "CcxtPrivateAdapter", ForbiddenAdapter)
+    settings = load_settings(
+        Path("config/defaults.yaml"),
+        {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")},
+    )
+    result = await run_canary_once(
+        settings,
+        Path("config/defaults.yaml"),
+        tmp_path / "missing-qualification.json",
+        Path("."),
+        "WRONG_OWNER_CONFIRMATION",
+    )
+
+    assert result.reason == ReasonCode.OWNER_CONFIRMATION_MISSING
+    assert result.orders_sent == 0
+    assert constructed == 0
 
 
 @pytest.mark.asyncio

@@ -139,6 +139,10 @@ class LiveConfig(StrictModel):
     canary_timeout_seconds: int = Field(gt=0, le=3600)
     canary_minimum_profit_usdt: Decimal = Field(gt=0)
     qualification_max_age_seconds: int = Field(gt=0, le=604800)
+    flat_barrier_consecutive_snapshots: int = Field(ge=2, le=10)
+    flat_barrier_quiet_period_seconds: Decimal = Field(gt=0, le=Decimal("30"))
+    flat_barrier_poll_interval_seconds: Decimal = Field(gt=0, le=Decimal("5"))
+    flat_barrier_timeout_seconds: Decimal = Field(gt=0, le=Decimal("120"))
 
 
 class TelegramConfig(StrictModel):

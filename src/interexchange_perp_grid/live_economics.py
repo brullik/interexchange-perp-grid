@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import Decimal
+from math import gcd
 
 from interexchange_perp_grid.domain import (
     FundingSnapshot,
@@ -15,7 +16,7 @@ from interexchange_perp_grid.private_execution import protected_ioc_price
 from interexchange_perp_grid.qualification import QualifiedStrategyParameters
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import RiskDecision
-from interexchange_perp_grid.routes import DirectedRouteQuote
+from interexchange_perp_grid.routes import DirectedRouteQuote, executable_vwap
 from interexchange_perp_grid.strategy import (
     CostInputs,
     DirectedRouteKey,
@@ -63,6 +64,153 @@ class LiveEconomicDecision:
     short_protected_price: Decimal | None
     long_marginal_price: Decimal | None
     short_marginal_price: Decimal | None
+    emergency_venue: EmergencyVenueAssessment | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EmergencyVenueAssessment:
+    passed: bool
+    reason: ReasonCode
+    venue: Venue
+    fee_rate: Decimal | None
+    residual_quantum: Decimal
+    residual_quantities: tuple[Decimal, ...]
+    maximum_residual_quantity: Decimal
+    buy_marginal_price: Decimal | None
+    sell_marginal_price: Decimal | None
+    buy_protected_price: Decimal | None
+    sell_protected_price: Decimal | None
+    worst_hedge_and_flatten_cost_usdt: Decimal
+    rounding_loss_base_quantity: Decimal
+    checks: dict[str, bool]
+
+
+def evaluate_emergency_venue(
+    long_instrument: Instrument,
+    short_instrument: Instrument,
+    emergency_instrument: Instrument,
+    emergency_book: OrderBookSnapshot,
+    private_taker_fee_rate: Decimal | None,
+    quantity: Decimal,
+    *,
+    capability_ready: bool,
+    account_ready: bool,
+    data_quality_ready: bool,
+    slippage_cap_bps: Decimal,
+) -> EmergencyVenueAssessment:
+    """Prove every possible main-leg residual is executable on the third venue."""
+    main_quantum = _decimal_gcd(
+        long_instrument.base_amount_step,
+        short_instrument.base_amount_step,
+    )
+    residual_count = int(quantity / main_quantum)
+    residuals = tuple(main_quantum * index for index in range(1, residual_count + 1))
+    metadata_ready = (
+        quantity > 0
+        and residual_count > 0
+        and residual_count <= 10_000
+        and long_instrument.base == short_instrument.base == emergency_instrument.base
+        and long_instrument.settle
+        == short_instrument.settle
+        == emergency_instrument.settle
+        == "USDT"
+        and emergency_book.venue == emergency_instrument.venue
+        and emergency_book.symbol == emergency_instrument.symbol
+    )
+    fee_ready = (
+        private_taker_fee_rate is not None
+        and private_taker_fee_rate.is_finite()
+        and private_taker_fee_rate >= 0
+    )
+    step_ready = bool(residuals) and all(
+        _quantity_is_executable(residual, emergency_instrument, emergency_book)
+        for residual in residuals
+    )
+    depth_ready = metadata_ready and bool(emergency_book.bids) and bool(emergency_book.asks)
+    costs: list[Decimal] = []
+    buy_marginal: Decimal | None = None
+    sell_marginal: Decimal | None = None
+    if depth_ready and step_ready and fee_ready:
+        assert private_taker_fee_rate is not None
+        for residual in residuals:
+            buy = executable_vwap(emergency_book.asks, residual)
+            sell = executable_vwap(emergency_book.bids, residual)
+            if buy is None or sell is None:
+                depth_ready = False
+                break
+            buy_cap = protected_ioc_price(
+                Side.BUY,
+                buy.marginal_price,
+                emergency_instrument.price_tick,
+                slippage_cap_bps,
+            )
+            sell_cap = protected_ioc_price(
+                Side.SELL,
+                sell.marginal_price,
+                emergency_instrument.price_tick,
+                slippage_cap_bps,
+            )
+            round_trip_cost = residual * (
+                max(Decimal(0), buy_cap - sell_cap) + private_taker_fee_rate * (buy_cap + sell_cap)
+            )
+            costs.append(round_trip_cost)
+            buy_marginal = buy.marginal_price
+            sell_marginal = sell.marginal_price
+    checks = {
+        "capability": capability_ready,
+        "account": account_ready,
+        "data_quality": data_quality_ready,
+        "instrument_metadata": metadata_ready,
+        "private_fee": fee_ready,
+        "all_residual_steps": step_ready,
+        "both_side_depth": depth_ready and len(costs) == len(residuals),
+    }
+    passed = all(checks.values())
+    reason = (
+        ReasonCode.ENTRY_ACCEPTED
+        if passed
+        else (
+            ReasonCode.RESIDUAL_NOT_EXECUTABLE
+            if not step_ready
+            else ReasonCode.EMERGENCY_VENUE_PREFLIGHT_FAILED
+        )
+    )
+    buy_protected = (
+        protected_ioc_price(
+            Side.BUY,
+            buy_marginal,
+            emergency_instrument.price_tick,
+            slippage_cap_bps,
+        )
+        if passed and buy_marginal is not None
+        else None
+    )
+    sell_protected = (
+        protected_ioc_price(
+            Side.SELL,
+            sell_marginal,
+            emergency_instrument.price_tick,
+            slippage_cap_bps,
+        )
+        if passed and sell_marginal is not None
+        else None
+    )
+    return EmergencyVenueAssessment(
+        passed=passed,
+        reason=reason,
+        venue=emergency_instrument.venue,
+        fee_rate=private_taker_fee_rate,
+        residual_quantum=main_quantum,
+        residual_quantities=residuals,
+        maximum_residual_quantity=max(residuals, default=Decimal(0)),
+        buy_marginal_price=buy_marginal,
+        sell_marginal_price=sell_marginal,
+        buy_protected_price=buy_protected,
+        sell_protected_price=sell_protected,
+        worst_hedge_and_flatten_cost_usdt=max(costs, default=Decimal(0)),
+        rounding_loss_base_quantity=Decimal(0) if step_ready else main_quantum,
+        checks=checks,
+    )
 
 
 def evaluate_live_entry(
@@ -77,6 +225,8 @@ def evaluate_live_entry(
     qualified: QualifiedStrategyParameters,
     policy: LiveEconomicPolicy,
     risk: RiskDecision,
+    *,
+    emergency_assessment: EmergencyVenueAssessment | None = None,
 ) -> LiveEconomicDecision:
     route = DirectedRouteKey(quote.key.base, quote.long_venue, quote.short_venue)
     required_values = (
@@ -107,6 +257,7 @@ def evaluate_live_entry(
         or any(value is None for value in fees)
         or any(value is None for value in funding_values)
         or quote.base_quantity != qualified.size_bucket_base_quantity
+        or (emergency_assessment is not None and not emergency_assessment.passed)
     ):
         return LiveEconomicDecision(
             False,
@@ -117,6 +268,7 @@ def evaluate_live_entry(
             None,
             quote.entry_long_marginal_price,
             quote.entry_short_marginal_price,
+            emergency_assessment,
         )
     assert quote.entry_long_vwap is not None
     assert quote.entry_short_vwap is not None
@@ -181,7 +333,14 @@ def evaluate_live_entry(
         ),
         liquidation_distance_reserve_usdt=Decimal(0),
         partial_fill_reserve_usdt=bps_unit * policy.partial_fill_reserve_bps,
-        emergency_hedge_reserve_usdt=bps_unit * policy.emergency_hedge_reserve_bps,
+        emergency_hedge_reserve_usdt=(
+            bps_unit * policy.emergency_hedge_reserve_bps
+            + (
+                emergency_assessment.worst_hedge_and_flatten_cost_usdt
+                if emergency_assessment is not None
+                else Decimal(0)
+            )
+        ),
     )
     parameters = GridParameters(
         route=route,
@@ -225,7 +384,38 @@ def evaluate_live_entry(
         short_protected_price=short_protected,
         long_marginal_price=quote.entry_long_marginal_price,
         short_marginal_price=quote.entry_short_marginal_price,
+        emergency_venue=emergency_assessment,
     )
+
+
+def _decimal_gcd(first: Decimal, second: Decimal) -> Decimal:
+    if not first.is_finite() or not second.is_finite() or first <= 0 or second <= 0:
+        raise ValueError("residual amount steps must be positive and finite")
+    first_exponent = first.normalize().as_tuple().exponent
+    second_exponent = second.normalize().as_tuple().exponent
+    if not isinstance(first_exponent, int) or not isinstance(second_exponent, int):
+        raise ValueError("residual amount steps must be finite")
+    places = max(0, -first_exponent, -second_exponent)
+    scale = 10**places
+    return Decimal(gcd(int(first * scale), int(second * scale))) / Decimal(scale)
+
+
+def _quantity_is_executable(
+    quantity: Decimal,
+    instrument: Instrument,
+    book: OrderBookSnapshot,
+) -> bool:
+    step = instrument.base_amount_step
+    if step <= 0 or quantity < instrument.minimum_base_amount:
+        return False
+    units = quantity / step
+    if units != units.to_integral_value():
+        return False
+    if instrument.minimum_notional is None:
+        return True
+    if not book.bids or not book.asks:
+        return False
+    return quantity * min(book.bids[0].price, book.asks[0].price) >= instrument.minimum_notional
 
 
 def _funding_cost(

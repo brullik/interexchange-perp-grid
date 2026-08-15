@@ -14,10 +14,13 @@ from interexchange_perp_grid.qualification import (
     QualificationRuntimeEvidence,
     QualifiedStrategyParameters,
     ReplayShadowStatistics,
+    code_hash,
+    config_hash,
     qualification_is_current,
     run_qualification,
 )
 from interexchange_perp_grid.reason_codes import ReasonCode
+from interexchange_perp_grid.state import QualificationEpochStatus
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _SHA = "a" * 40
@@ -25,11 +28,17 @@ _IMAGE = "sha256:" + "b" * 64
 _ROUTE = DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX)
 
 
-def _runtime() -> QualificationRuntimeEvidence:
+def _runtime(source_sha256: str, config_sha256: str) -> QualificationRuntimeEvidence:
     start = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
     return QualificationRuntimeEvidence(
+        epoch_id="epoch-fixture",
+        epoch_started_at=start,
+        epoch_ended_at=start + timedelta(hours=24),
+        epoch_status=QualificationEpochStatus.FINALIZED,
         route=_ROUTE,
         release_code_sha=_SHA,
+        source_sha256=source_sha256,
+        config_sha256=config_sha256,
         container_image_digest=_IMAGE,
         private_taker_fee_rates={
             Venue.BINANCE_USDM: Decimal("0.0004"),
@@ -150,7 +159,7 @@ async def test_qualification_counts_unique_events_not_book_levels(
         config,
         data,
         repo / "qualification.json",
-        runtime_evidence=_runtime(),
+        runtime_evidence=_runtime(code_hash(repo), config_hash(config)),
         policy=_policy(),
         now=observed,
     )
@@ -180,7 +189,7 @@ async def test_route_qualification_binds_complete_release_evidence(
         config,
         data,
         repo / "qualification.json",
-        runtime_evidence=_runtime(),
+        runtime_evidence=_runtime(code_hash(repo), config_hash(config)),
         policy=_policy(),
         now=observed + timedelta(seconds=2),
     )
