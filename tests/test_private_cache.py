@@ -1355,7 +1355,7 @@ async def test_forced_recovery_uses_authoritative_rest_while_stream_failure_bloc
 
 
 @pytest.mark.asyncio
-async def test_recovery_returns_newer_exposure_when_stream_advances_during_persistence() -> None:
+async def test_recovery_rejects_rest_when_applied_stream_advances_during_persistence() -> None:
     observed = datetime.now(UTC)
     position = PositionSnapshot(
         Venue.BYBIT,
@@ -1401,11 +1401,10 @@ async def test_recovery_returns_newer_exposure_when_stream_advances_during_persi
     assert (await cache.view()).reason == "PRIVATE_WATERMARK_PERSIST_PENDING"
     allow_persistence.set()
 
-    recovery = await recovery_task
+    with pytest.raises(RuntimeError, match="PRIVATE_RECOVERY_SNAPSHOT_SUPERSEDED"):
+        await recovery_task
     await stream_task
 
-    assert recovery.positions == (position,)
-    assert recovery.event_watermark == 2
     degraded = await cache.view()
     assert degraded.status == PrivateCacheStatus.UNKNOWN
     assert degraded.reason == "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError"
@@ -1442,6 +1441,69 @@ async def test_recovery_rejects_rest_snapshot_while_newer_received_event_is_pend
 
     with pytest.raises(RuntimeError, match="PRIVATE_RECOVERY_SNAPSHOT_SUPERSEDED"):
         await recovery_task
+
+
+@pytest.mark.asyncio
+async def test_failed_position_partition_rejects_rest_flat_after_filled_order_event() -> None:
+    observed = datetime.now(UTC)
+    persistence_started = asyncio.Event()
+    allow_persistence = asyncio.Event()
+
+    async def persist(watermark: int) -> None:
+        if watermark == 1:
+            persistence_started.set()
+            await allow_persistence.wait()
+
+    delegate = CachedDelegate(
+        (
+            _snapshot(0, observed_at=observed),
+            _snapshot(1, observed_at=observed + timedelta(microseconds=1)),
+        )
+    )
+    cache = PrivateStateCache(delegate, persist_watermark=persist)
+    cached = CachedPrivateStateAdapter(delegate, cache)
+    assert (await cache.startup()).ready is True
+    await cache.invalidate_stream(
+        PrivateStreamKind.POSITIONS,
+        "PRIVATE_STREAM_FAILED:POSITIONS:ConnectionError",
+    )
+    recovery_task = asyncio.create_task(cached.reconcile_active_snapshot("PRE_CLOSE:bybit"))
+    await persistence_started.wait()
+    filled = PrivateOrder(
+        Venue.BYBIT,
+        "filled-after-rest",
+        "client-filled-after-rest",
+        "BTC/USDT:USDT",
+        Side.BUY,
+        PrivateOrderStatus.FILLED,
+        Decimal("0.001"),
+        Decimal("0.001"),
+        Decimal("100"),
+        Decimal(0),
+        observed + timedelta(microseconds=2),
+    )
+    stream_task = asyncio.create_task(
+        cache.ingest_stream_event(
+            PrivateStreamEvent(
+                Venue.BYBIT,
+                PrivateStreamKind.ORDERS,
+                2,
+                observed + timedelta(microseconds=2),
+                time.monotonic_ns(),
+                orders=(filled,),
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    allow_persistence.set()
+
+    with pytest.raises(RuntimeError, match="PRIVATE_RECOVERY_SNAPSHOT_SUPERSEDED"):
+        await recovery_task
+    await stream_task
+
+    degraded = await cache.view()
+    assert degraded.status == PrivateCacheStatus.UNKNOWN
+    assert degraded.reason == "PRIVATE_STREAM_FAILED:POSITIONS:ConnectionError"
 
 
 @pytest.mark.asyncio

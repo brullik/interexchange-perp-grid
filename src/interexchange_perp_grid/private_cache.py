@@ -215,43 +215,37 @@ class PrivateStateCache:
                     self._positions_updated_monotonic_ns = self._updated_monotonic_ns
                 self._mark_persistence_pending_locked(snapshot.event_watermark, accepted)
                 view = self._view_locked()
-                recovery_eligible = (
-                    accepted
+                recovery_snapshot = (
+                    snapshot
+                    if accepted
                     and _uses_authoritative_recovery_snapshot(trigger)
                     and snapshot.account_wide
                     and snapshot.completeness == SnapshotCompleteness.COMPLETE
                     and snapshot.request_count <= self._policy.maximum_rest_requests
+                    else None
                 )
             persisted_view = await self._persist_accepted_watermark(
                 snapshot.event_watermark,
                 view,
                 accepted,
             )
-            if recovery_eligible:
+            if recovery_snapshot is not None:
                 async with self._lock:
-                    latest = self._snapshot
                     latest_view = self._view_locked()
                     received_watermark = self._received_watermark_locked()
                     if (
-                        latest is None
-                        or received_watermark is None
-                        or latest.event_watermark < received_watermark
+                        received_watermark is None
+                        or recovery_snapshot.event_watermark < received_watermark
                     ):
                         return replace(
                             latest_view,
                             status=PrivateCacheStatus.UNKNOWN,
                             reason="PRIVATE_RECOVERY_SNAPSHOT_SUPERSEDED",
                         )
-                    if (
-                        latest.account_wide
-                        and latest.completeness == SnapshotCompleteness.COMPLETE
-                        and latest.request_count <= self._policy.maximum_rest_requests
-                    ):
-                        return replace(
-                            latest_view,
-                            authoritative_recovery_snapshot=latest,
-                        )
-                    return latest_view
+                    return replace(
+                        latest_view,
+                        authoritative_recovery_snapshot=recovery_snapshot,
+                    )
             return persisted_view
 
     def _detach_fetch_task(self, task: asyncio.Task[PrivateActiveSnapshot]) -> None:

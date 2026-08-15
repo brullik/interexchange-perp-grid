@@ -21,7 +21,7 @@ This is the only mutable project-status document.
 | C2 strategy/risk/simulator | COMPLETE | [GitHub Actions run 31839163485](https://github.com/brullik/interexchange-perp-grid/actions/runs/31839163485): Linux `make verify` (43 tests) and Docker health/restart passed on `0849413`; deterministic tests cover open/add/partial close/full close, profitable and losing four-leg PnL, funding, protected prices, partial/rejected/unknown orders, private staleness, venue outage, third-venue hedge, forced close, and property-based 5/50 USDT risk invariants |
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
-| Phase 2 Wave 1 data/private core | DRAFT_PR_GATES | Draft PR #4 is rooted at exact `main`; account-wide bounded private snapshots/cache, persistent ordered event watermarks, native Bybit V5 `u/seq`, recovery-priority REST budgeting, hard deadlines, newest-received storage-independent recovery snapshots, and private-event-aware stable-FLAT barriers pass 255 local tests; repeat exact-head CI and independent review remain required |
+| Phase 2 Wave 1 data/private core | DRAFT_PR_GATES | Draft PR #4 is rooted at exact `main`; account-wide bounded private snapshots/cache, persistent ordered event watermarks, native Bybit V5 `u/seq`, recovery-priority REST budgeting, hard deadlines, post-REST-event-safe storage-independent recovery snapshots, and private-event-aware stable-FLAT barriers pass 256 local tests; repeat exact-head CI and independent review remain required |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -70,6 +70,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-15 — Preserve sticky WebSocket failure for entry while exposing only the just-completed full REST snapshot to cancel, close, restart, and terminal recovery — stream outage must block risk increase without hiding exchange exposure from risk reduction — `private_cache.py`, live reconciliation
 2026-08-15 — Include received private-event watermarks in stable-FLAT signatures and verify the combined journal/private watermark before and after the atomic journal commit — a late cache event must reset the barrier or quarantine the action — private adapter/cache, reconciliation, coordinator, control
 2026-08-15 — Return the newest fully applied complete private state to recovery and reject a REST snapshot when the received watermark is still ahead of cache delivery — emergency close must neither wait on storage nor act on a stale flat view — `private_cache.py`
+2026-08-15 — Bind each recovery result to its complete REST snapshot and reject it after any newer received event, even when that event is applied — local receipt order has no cross-channel/exchange causality, so composed REST/stream state cannot prove account-wide flatness — `private_cache.py`
 
 ## Active blockers / owner actions
 
@@ -84,7 +85,7 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (85 files)
 - mypy --strict: PASS (83 source/test files)
-- pytest: 255 passed
+- pytest: 256 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,
