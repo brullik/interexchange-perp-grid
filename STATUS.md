@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE3_1_EXACT_7CCD_P1_REMEDIATION_LOCAL_GATE
-- **Current checkpoint:** Draft PR #5 exact head `7ccdeaa` passed all five GitHub jobs but failed independent lifecycle review because a recorder held beyond the shutdown deadline could publish market history after `close()` returned; deadline cancellation and two-phase Parquet staging now prevent late visible commits locally, with two complete 305-test Windows-equivalent runs green pending a new exact head
+- **State:** PHASE3_1_EXACT_BC05_P1_REMEDIATION_LOCAL_GATE
+- **Current checkpoint:** Draft PR #5 exact head `bc05e070` passed all five GitHub jobs and closed late visible Parquet commits, but independent review found that event-loop shutdown or a partial writer failure could leave an orphan `.parquet.pending`; a shared cancellation-aware staging session now retains cleanup ownership through worker and loop cancellation locally, with a complete 307-test Windows-equivalent run green pending a new exact head
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -22,7 +22,7 @@ This is the only mutable project-status document.
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
 | Phase 2 Wave 1 data/private core | COMPLETE | PR #4 was independently verified with P0/P1/P2=0 and squash-merged as `0e87a1e`; post-merge [run 31904798345](https://github.com/brullik/interexchange-perp-grid/actions/runs/31904798345) passed all five jobs |
-| Phase 3.1 multi-instrument broad BBO | P1_REMEDIATION_LOCAL_GATE | Draft PR #5; real Wave 1 fixture qualifies one common instrument/six routes without fabricated OKX notional; malformed typed records are isolated through registry, route, and canary sizing; 102-safe-common/608-route synthetic boundary; one watchdog-protected batch watcher per venue; cancellation-safe retirement, idempotent transactional startup, single-flight refresh/recycle, tracked broad and selected-route scans, one bounded lifecycle shutdown barrier, explicit shutdown/teardown failure, cancellation-safe partial-factory rollback, and cancellation-safe two-phase Parquet publication; six-hour resubscription; jittered 1→30 s reconnect; bounded cache with stale provenance; actual quote-receipt-to-prefilter latency; restart-identical proof; stable non-executable prefilter; 305 local tests |
+| Phase 3.1 multi-instrument broad BBO | P1_REMEDIATION_LOCAL_GATE | Draft PR #5; real Wave 1 fixture qualifies one common instrument/six routes without fabricated OKX notional; malformed typed records are isolated through registry, route, and canary sizing; 102-safe-common/608-route synthetic boundary; one watchdog-protected batch watcher per venue; cancellation-safe retirement, idempotent transactional startup, single-flight refresh/recycle, tracked broad and selected-route scans, one bounded lifecycle shutdown barrier, explicit shutdown/teardown failure, cancellation-safe partial-factory rollback, and cancellation-aware two-phase Parquet publication with partial-write and event-loop-shutdown cleanup; six-hour resubscription; jittered 1→30 s reconnect; bounded cache with stale provenance; actual quote-receipt-to-prefilter latency; restart-identical proof; stable non-executable prefilter; 307 local tests |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -96,6 +96,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-16 — Track complete broad and selected-route scans in the bounded shutdown contract and retain rollback closers before awaiting them — funding/L2 work and cancellation during factory cleanup must never outlive ownership or resume on closed adapters — `public_engine.py`
 2026-08-16 — Give the private-event stable-FLAT race test scheduler margin without changing production policy or assertions — exact CI evidence must not fail on a 100 ms wall-clock runner jitter while still proving barrier reset — private cache test
 2026-08-16 — Cancel overdue public scans before returning shutdown failure and publish Parquet only after a cancellable staging phase — a recorder worker may finish late but must leave no visible market-history commit after `close()` returns — public engine, history recorder
+2026-08-16 — Share pending-file ownership between the event loop and Parquet staging thread and register it before writing — loop shutdown, cancellation, and partial writer failure must remove every unpublished staging artifact — history recorder
 
 ## Active blockers / owner actions
 
@@ -110,7 +111,7 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (88 files)
 - mypy --strict: PASS (86 source/test files)
-- pytest: 305 passed (two consecutive complete runs)
+- pytest: 307 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,
