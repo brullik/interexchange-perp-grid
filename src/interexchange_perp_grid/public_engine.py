@@ -146,6 +146,7 @@ class PublicMarketEngine:
         self._retiring_bbo_transports: dict[Venue, asyncio.Task[tuple[BboQuote, ...]]] = {}
         self._retiring_adapter_closers: dict[Venue, asyncio.Task[None]] = {}
         self._adapter_recycle_locks: dict[Venue, asyncio.Lock] = {}
+        self._initialise_lock = asyncio.Lock()
         self._bbo_changed = asyncio.Event()
         self._bbo_watch_timeout_seconds = settings.market_data.max_bbo_age_ms / 1000
         self._bbo_retirement_grace_seconds = min(
@@ -155,12 +156,23 @@ class PublicMarketEngine:
         self._closed = False
 
     async def initialise(self, timeout_seconds: int = 30) -> None:
-        configured = tuple(Venue(value) for value in self.settings.venues.wave1_public)
-        self._adapters = {venue: self._adapter_factory(venue) for venue in configured}
-        await asyncio.gather(
-            *(self._initialise_venue_with_timeout(venue, timeout_seconds) for venue in configured)
-        )
-        await self._refresh_universe_snapshot(force=True)
+        async with self._initialise_lock:
+            self._require_open()
+            configured = tuple(Venue(value) for value in self.settings.venues.wave1_public)
+            self._adapters = {venue: self._adapter_factory(venue) for venue in configured}
+            await asyncio.gather(
+                *(
+                    self._initialise_venue_with_timeout(venue, timeout_seconds)
+                    for venue in configured
+                )
+            )
+            self._require_open()
+            await self._refresh_universe_snapshot(force=True)
+            self._require_open()
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("public market engine is closed")
 
     async def _initialise_venue_with_timeout(self, venue: Venue, timeout_seconds: int) -> None:
         try:
@@ -509,8 +521,7 @@ class PublicMarketEngine:
         force: bool = False,
         reconnected: tuple[Venue, ...] = (),
     ) -> UniverseSnapshot:
-        if self._closed:
-            raise RuntimeError("public market engine is closed")
+        self._require_open()
         now_ns = self._monotonic_ns()
         due = self._universe.refresh_due(now_ns)
         due_reconnects = {
@@ -559,8 +570,7 @@ class PublicMarketEngine:
             )
         )
         if not force and not due and not reconnect_targets:
-            if self._closed:
-                raise RuntimeError("public market engine is closed")
+            self._require_open()
             current = self._universe.snapshot
             assert current is not None
             return current
@@ -579,11 +589,9 @@ class PublicMarketEngine:
         await asyncio.gather(
             *(self._initialise_venue_with_timeout(venue, timeout_seconds) for venue in targets)
         )
-        if self._closed:
-            raise RuntimeError("public market engine is closed")
+        self._require_open()
         snapshot = await self._refresh_universe_snapshot(force=True)
-        if self._closed:
-            raise RuntimeError("public market engine is closed")
+        self._require_open()
         return snapshot
 
     async def _wait_for_bbo_coverage(self, timeout_seconds: int) -> None:
@@ -607,18 +615,15 @@ class PublicMarketEngine:
                 return
 
     async def scan_broad_bbo(self, timeout_seconds: int) -> BroadBboResult:
-        if self._closed:
-            raise RuntimeError("public market engine is closed")
+        self._require_open()
         if not self._adapters:
             await self.initialise(timeout_seconds)
         universe = await self.refresh_universe(timeout_seconds)
-        if self._closed:
-            raise RuntimeError("public market engine is closed")
+        self._require_open()
         await self._sync_bbo_watchers()
         started_ns = time.perf_counter_ns()
         await self._wait_for_bbo_coverage(timeout_seconds)
-        if self._closed:
-            raise RuntimeError("public market engine is closed")
+        self._require_open()
         now_ns = self._monotonic_ns()
         available_routes = tuple(
             route
@@ -660,6 +665,7 @@ class PublicMarketEngine:
         requested_base_quantity: Decimal,
         timeout_seconds: int,
     ) -> ScanResult:
+        self._require_open()
         if not self._adapters:
             await self.initialise(timeout_seconds)
         broad = await self.scan_broad_bbo(timeout_seconds)
@@ -823,6 +829,16 @@ class PublicMarketEngine:
         self._closed = True
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + 1
+        initialise_lock_acquired = False
+        initialise_lock_blocked = False
+        try:
+            await asyncio.wait_for(
+                self._initialise_lock.acquire(),
+                timeout=max(0, shutdown_deadline - loop.time()),
+            )
+            initialise_lock_acquired = True
+        except TimeoutError:
+            initialise_lock_blocked = True
         recycle_locks = tuple(
             (venue, self._adapter_recycle_locks.setdefault(venue, asyncio.Lock()))
             for venue in sorted(self._adapters, key=str)
@@ -843,15 +859,20 @@ class PublicMarketEngine:
             await self._close_with_recycles_blocked(
                 shutdown_deadline,
                 blocked_recycle_venues,
+                initialise_lock_blocked=initialise_lock_blocked,
             )
         finally:
             for lock in reversed(acquired_locks):
                 lock.release()
+            if initialise_lock_acquired:
+                self._initialise_lock.release()
 
     async def _close_with_recycles_blocked(
         self,
         shutdown_deadline: float,
         blocked_recycle_venues: set[Venue],
+        *,
+        initialise_lock_blocked: bool,
     ) -> None:
         close_failures: list[str] = []
         timed_out_closer_venues: set[Venue] = set()
@@ -935,6 +956,8 @@ class PublicMarketEngine:
             )
         )
         shutdown_failures: list[str] = []
+        if initialise_lock_blocked:
+            shutdown_failures.append("shutdown deadline exceeded for: initialisation")
         if pending_venues:
             shutdown_failures.append(
                 f"shutdown deadline exceeded for: "

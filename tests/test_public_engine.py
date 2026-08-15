@@ -945,6 +945,65 @@ async def test_shutdown_during_replacement_probe_cannot_report_recovery(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_closed_uninitialised_engine_cannot_create_adapters(tmp_path: Path) -> None:
+    created: list[BroadFakeAdapter] = []
+
+    def adapter_factory(venue: Venue) -> BroadFakeAdapter:
+        adapter = BroadFakeAdapter(venue, 1_000_000_000)
+        created.append(adapter)
+        return adapter
+
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapter_factory,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+
+    await engine.close()
+
+    with pytest.raises(RuntimeError, match="public market engine is closed"):
+        await engine.initialise(timeout_seconds=1)
+    with pytest.raises(RuntimeError, match="public market engine is closed"):
+        await engine.scan_once("BTC", Decimal("0.001"), timeout_seconds=1)
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_initial_probe_closes_all_created_adapters(tmp_path: Path) -> None:
+    clock = 1_000_000_000
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+    }
+    probing = CoordinatedProbeBroadFakeAdapter(Venue.OKX, clock)
+    adapters[Venue.OKX] = probing
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+    )
+
+    initialise = asyncio.create_task(engine.initialise(timeout_seconds=1))
+    await asyncio.wait_for(probing.probe_started.wait(), timeout=1)
+    shutdown = asyncio.create_task(engine.close())
+    await asyncio.sleep(0)
+    probing.allow_probe.set()
+    initialise_result, shutdown_result = await asyncio.gather(
+        initialise,
+        shutdown,
+        return_exceptions=True,
+    )
+
+    assert isinstance(initialise_result, RuntimeError)
+    assert str(initialise_result) == "public market engine is closed"
+    assert shutdown_result is None
+    assert all(adapter.closed for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
 async def test_concurrent_failed_recycle_observes_new_backoff(tmp_path: Path) -> None:
     clock = [1_000_000_000]
     adapters: dict[Venue, BroadFakeAdapter] = {
