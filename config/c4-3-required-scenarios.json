@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "name": "C4_3_STABLE_FLAT_REQUIRED_SCENARIOS",
+  "baseline_sha": "95a30f9821bae2c7515b07cba1f2ca51af2565de",
+  "required_scenarios": [
+    {
+      "id": "SF-001",
+      "pytest_nodeid": "tests/test_c4_3_stable_flat.py::test_sf_001_one_flat_snapshot_then_timeout_never_succeeds",
+      "expected": "success=false; timed_out=true; embedded flat report cannot authorize FLAT"
+    },
+    {
+      "id": "SF-002",
+      "pytest_nodeid": "tests/test_c4_3_stable_flat.py::test_sf_002_two_flat_snapshots_without_quiet_period_never_succeed",
+      "expected": "success=false until the full quiet period completes"
+    },
+    {
+      "id": "SF-003",
+      "pytest_nodeid": "tests/test_c4_3_stable_flat.py::test_sf_003_event_watermark_change_resets_stability_counter",
+      "expected": "watermark race resets stability; later stable snapshots may verify"
+    },
+    {
+      "id": "SF-004",
+      "pytest_nodeid": "tests/test_c4_3_stable_flat.py::test_sf_004_late_position_after_flat_snapshot_never_succeeds",
+      "expected": "late position prevents success and requires recovery"
+    },
+    {
+      "id": "SF-005",
+      "pytest_nodeid": "tests/test_c4_3_stable_flat.py::test_sf_005_identical_snapshots_quiet_period_and_watermark_verify",
+      "expected": "two or more identical snapshots plus quiet period and watermark verify"
+    },
+    {
+      "id": "SF-006",
+      "pytest_nodeid": "tests/test_c4_3_stable_flat.py::test_sf_006_coordinator_cannot_transition_on_unverified_flat_report",
+      "expected": "coordinator cannot transition to FLAT when barrier.verified=false"
+    },
+    {
+      "id": "SF-007",
+      "pytest_nodeid": "tests/test_c4_3_stable_flat.py::test_sf_007_live_control_returns_failure_for_unverified_flat_report",
+      "expected": "live control returns success=false and barrier evidence"
+    },
+    {
+      "id": "SF-008",
+      "pytest_nodeid": "tests/test_c4_3_stable_flat.py::test_sf_008_private_unknown_during_barrier_times_out_fail_closed",
+      "expected": "private UNKNOWN produces timeout/quarantine reason and never success"
+    }
+  ]
+}

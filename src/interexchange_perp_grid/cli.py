@@ -13,6 +13,7 @@ import typer
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.c4_3_proof import run_c4_3_proof
 from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
@@ -476,6 +477,34 @@ def c4_proof(
         config.resolve(),
         baseline.resolve(),
         nodeids.resolve(),
+        output_root.resolve(),
+        image_digest,
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+
+
+@app.command("c4-3-proof")
+def c4_3_proof_command(
+    image_digest: Annotated[
+        str,
+        typer.Option("--image-digest", envvar="IPEG_CONTAINER_IMAGE_DIGEST"),
+    ],
+    output_root: Annotated[Path, typer.Option("--output-root")] = Path("artifacts"),
+    scenarios: Annotated[Path, typer.Option("--scenarios")] = Path(
+        "config/c4-3-required-scenarios.json"
+    ),
+    runtime_policy: Annotated[Path, typer.Option("--runtime-policy")] = Path(
+        "config/RUNTIME_POLICY.yaml"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create the exact-head C4.3 stable-FLAT proof artifact."""
+    result = run_c4_3_proof(
+        repo_root.resolve(),
+        config.resolve(),
+        runtime_policy.resolve(),
+        scenarios.resolve(),
         output_root.resolve(),
         image_digest,
     )

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "action_id": "REPOSITORY-MAKE-PRIVATE-20260815",
+  "type": "REPOSITORY_MAKE_PRIVATE",
+  "reason": "The repository is currently PUBLIC. The autonomous safety protocol requires PRIVATE visibility before any operational evidence or secrets are added. Codex cannot make this persistent access-control change without the owner's explicit authorization.",
+  "required_inputs": [
+    "Explicit owner authorization to change brullik/interexchange-perp-grid from PUBLIC to PRIVATE"
+  ],
+  "steps": [
+    "Review whether existing collaborators and public consumers are prepared for loss of public access.",
+    "In GitHub repository Settings, open Danger Zone, choose Change repository visibility, select Private, and confirm brullik/interexchange-perp-grid.",
+    "Run: gh repo view brullik/interexchange-perp-grid --json visibility,isPrivate"
+  ],
+  "unblock_conditions": [
+    "The validation command reports visibility=PRIVATE and isPrivate=true.",
+    "No credential, token, operational evidence, or production secret was added to Git or GitHub during the change."
+  ],
+  "forbidden_to_include": [
+    "GitHub access tokens",
+    "VPS credentials",
+    "Telegram credentials",
+    "Exchange API keys or secrets",
+    "Any live-money consent"
+  ],
+  "independent_work_remaining": [
+    "C4.3 stable-FLAT hotfix, exact proof, and adversarial review",
+    "All software-only master-plan phases that do not publish operational evidence or secrets"
+  ]
+}

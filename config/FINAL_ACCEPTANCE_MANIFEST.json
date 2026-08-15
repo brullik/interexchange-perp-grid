@@ -1,0 +1,428 @@
+{
+  "schema_version": 1,
+  "baseline_sha": "95a30f9821bae2c7515b07cba1f2ca51af2565de",
+  "criteria_count": 42,
+  "criteria": [
+    {
+      "id": "C43-01",
+      "phase": "C4_3_HOTFIX",
+      "description": "Barrier verified flag is never discarded",
+      "required_evidence": [
+        "pytest node ID",
+        "JUnit",
+        "exact SHA proof"
+      ]
+    },
+    {
+      "id": "C43-02",
+      "phase": "C4_3_HOTFIX",
+      "description": "Coordinator cannot return success when barrier verified=false",
+      "required_evidence": [
+        "pytest node ID",
+        "JUnit",
+        "exact SHA proof"
+      ]
+    },
+    {
+      "id": "C43-03",
+      "phase": "C4_3_HOTFIX",
+      "description": "Live control cannot return success when barrier verified=false",
+      "required_evidence": [
+        "pytest node ID",
+        "JUnit",
+        "exact SHA proof"
+      ]
+    },
+    {
+      "id": "C43-04",
+      "phase": "C4_3_HOTFIX",
+      "description": "Late event watermark resets stable counter",
+      "required_evidence": [
+        "pytest node ID",
+        "JUnit",
+        "exact SHA proof"
+      ]
+    },
+    {
+      "id": "C43-05",
+      "phase": "C4_3_HOTFIX",
+      "description": "Private UNKNOWN during barrier leads to quarantine",
+      "required_evidence": [
+        "pytest node ID",
+        "JUnit",
+        "exact SHA proof"
+      ]
+    },
+    {
+      "id": "C43-06",
+      "phase": "C4_3_HOTFIX",
+      "description": "Exact-head c4-3 artifact has zero production submits",
+      "required_evidence": [
+        "pytest node ID",
+        "JUnit",
+        "exact SHA proof"
+      ]
+    },
+    {
+      "id": "PROD-01",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Wave1 account-wide private state cache replaces per-symbol hot path",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-02",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Shadow works without private credentials",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-03",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Universe contains all unambiguous common linear USDT perpetuals",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-04",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Broad BBO is bounded and coalesced",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-05",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Dynamic L2 scheduler respects subscription budget",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-06",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Adaptive parameters are route and size specific",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-07",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Persistent risk supports 10 routes and 5 tranches",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-08",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Multi-action supervisor recovers every active action",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-09",
+      "phase": "PRODUCT_ENGINE",
+      "description": "One normal route per base is enforced atomically",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-10",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Overload preserves P0-P3 and disables new entries first",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-11",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Telegram control plane has one poller and all required commands",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "PROD-12",
+      "phase": "PRODUCT_ENGINE",
+      "description": "Restart restores identical portfolio and risk reservations",
+      "required_evidence": [
+        "unit/integration tests",
+        "large-universe fixture",
+        "restart/chaos proof"
+      ]
+    },
+    {
+      "id": "EX-BINANCE-PUBLIC",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "BINANCE public capability contract passes",
+      "required_evidence": [
+        "official API source record",
+        "contract tests",
+        "shadow probe"
+      ]
+    },
+    {
+      "id": "EX-BINANCE-PRIVATE",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "BINANCE private/live is either qualified or explicitly quarantined",
+      "required_evidence": [
+        "capability matrix",
+        "private simulator/contract tests",
+        "reason code"
+      ]
+    },
+    {
+      "id": "EX-BYBIT-PUBLIC",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "BYBIT public capability contract passes",
+      "required_evidence": [
+        "official API source record",
+        "contract tests",
+        "shadow probe"
+      ]
+    },
+    {
+      "id": "EX-BYBIT-PRIVATE",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "BYBIT private/live is either qualified or explicitly quarantined",
+      "required_evidence": [
+        "capability matrix",
+        "private simulator/contract tests",
+        "reason code"
+      ]
+    },
+    {
+      "id": "EX-OKX-PUBLIC",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "OKX public capability contract passes",
+      "required_evidence": [
+        "official API source record",
+        "contract tests",
+        "shadow probe"
+      ]
+    },
+    {
+      "id": "EX-OKX-PRIVATE",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "OKX private/live is either qualified or explicitly quarantined",
+      "required_evidence": [
+        "capability matrix",
+        "private simulator/contract tests",
+        "reason code"
+      ]
+    },
+    {
+      "id": "EX-BITGET-PUBLIC",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "BITGET public capability contract passes",
+      "required_evidence": [
+        "official API source record",
+        "contract tests",
+        "shadow probe"
+      ]
+    },
+    {
+      "id": "EX-BITGET-PRIVATE",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "BITGET private/live is either qualified or explicitly quarantined",
+      "required_evidence": [
+        "capability matrix",
+        "private simulator/contract tests",
+        "reason code"
+      ]
+    },
+    {
+      "id": "EX-KUCOIN_CLASSIC-PUBLIC",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "KUCOIN_CLASSIC public capability contract passes",
+      "required_evidence": [
+        "official API source record",
+        "contract tests",
+        "shadow probe"
+      ]
+    },
+    {
+      "id": "EX-KUCOIN_CLASSIC-PRIVATE",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "KUCOIN_CLASSIC private/live is either qualified or explicitly quarantined",
+      "required_evidence": [
+        "capability matrix",
+        "private simulator/contract tests",
+        "reason code"
+      ]
+    },
+    {
+      "id": "EX-BINGX-PUBLIC",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "BINGX public capability contract passes",
+      "required_evidence": [
+        "official API source record",
+        "contract tests",
+        "shadow probe"
+      ]
+    },
+    {
+      "id": "EX-BINGX-PRIVATE",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "BINGX private/live is either qualified or explicitly quarantined",
+      "required_evidence": [
+        "capability matrix",
+        "private simulator/contract tests",
+        "reason code"
+      ]
+    },
+    {
+      "id": "EX-MEXC-PUBLIC",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "MEXC public capability contract passes",
+      "required_evidence": [
+        "official API source record",
+        "contract tests",
+        "shadow probe"
+      ]
+    },
+    {
+      "id": "EX-MEXC-PRIVATE",
+      "phase": "EXCHANGE_ADAPTERS",
+      "description": "MEXC private/live is either qualified or explicitly quarantined",
+      "required_evidence": [
+        "capability matrix",
+        "private simulator/contract tests",
+        "reason code"
+      ]
+    },
+    {
+      "id": "OPS-01",
+      "phase": "OPERATIONS",
+      "description": "Clean Ubuntu 24.04 deploy is idempotent",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-02",
+      "phase": "OPERATIONS",
+      "description": "Image is pinned by digest",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-03",
+      "phase": "OPERATIONS",
+      "description": "Secrets exist only outside Git with mode 0600",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-04",
+      "phase": "OPERATIONS",
+      "description": "Upgrade backs up and rolls back on failed health",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-05",
+      "phase": "OPERATIONS",
+      "description": "Supervisor recovers after process/container/VPS restart simulation",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-06",
+      "phase": "OPERATIONS",
+      "description": "Qualification epoch binds release/source/config/image/route",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-07",
+      "phase": "OPERATIONS",
+      "description": "24h qualification reports progress and exact blockers",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-08",
+      "phase": "OPERATIONS",
+      "description": "Canary succeeds only stable FLAT",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-09",
+      "phase": "OPERATIONS",
+      "description": "Stage promotion follows locked risk table",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    },
+    {
+      "id": "OPS-10",
+      "phase": "OPERATIONS",
+      "description": "No automatic withdrawal or transfer path exists",
+      "required_evidence": [
+        "Docker/VPS test",
+        "machine-readable proof",
+        "runbook"
+      ]
+    }
+  ],
+  "done_rule": "all applicable criteria PASS; unsupported live venue must be explicit QUARANTINED, never silently skipped"
+}

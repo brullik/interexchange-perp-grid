@@ -143,6 +143,44 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  c4-3-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact lock
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps --no-build-isolation
+          python scripts/check_lock.py --lock requirements.lock --pyproject pyproject.toml --verify-installed
+      - name: Build exact release image
+        run: docker build --tag interexchange-perp-grid:c4-3-proof .
+      - name: Build exact C4.3 stable-FLAT proof
+        run: |
+          IMAGE_DIGEST="$(docker image inspect interexchange-perp-grid:c4-3-proof --format '{{.Id}}')"
+          interexchange-grid c4-3-proof \
+            --repo-root . \
+            --config config/defaults.yaml \
+            --runtime-policy config/RUNTIME_POLICY.yaml \
+            --scenarios config/c4-3-required-scenarios.json \
+            --output-root artifacts \
+            --image-digest "$IMAGE_DIGEST"
+      - name: Upload exact C4.3 artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: c4-3-proof-${{ github.event.pull_request.head.sha || github.sha }}
+          path: artifacts/c4-3-proof-${{ github.event.pull_request.head.sha || github.sha }}/
+          if-no-files-found: error
+          retention-days: 30
+
   docker-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 30

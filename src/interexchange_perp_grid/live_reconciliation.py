@@ -110,6 +110,20 @@ class FlatBarrierResult:
     consecutive_snapshots: int
     event_watermark: int
     timed_out: bool
+    failure_reason: ReasonCode | None = None
+
+
+def flat_barrier_failure_reason(result: FlatBarrierResult) -> ReasonCode:
+    """Return the stable fail-closed reason for an unverified terminal barrier."""
+    if result.verified:
+        raise ValueError("a verified flat barrier has no failure reason")
+    if result.failure_reason is not None:
+        return result.failure_reason
+    if result.report.status == ReconciliationStatus.UNKNOWN or not result.report.snapshots_complete:
+        return ReasonCode.FLAT_BARRIER_PRIVATE_STATE_UNKNOWN
+    if result.report.flat_verified and result.consecutive_snapshots == 0:
+        return ReasonCode.FLAT_BARRIER_EVENT_RACE
+    return ReasonCode.FLAT_BARRIER_TIMEOUT
 
 
 def _flat_signature(report: ReconciliationReport, watermark: int) -> tuple[object, ...]:
@@ -141,38 +155,98 @@ async def wait_for_stable_flat(
     stable_since: float | None = None
     previous_signature: tuple[object, ...] | None = None
     consecutive = 0
-    last_report: ReconciliationReport | None = None
     last_watermark = -1
+    last_report: ReconciliationReport | None = None
+    private_unknown_report: ReconciliationReport | None = None
+    event_race_observed = False
+
+    async def before_deadline[T](factory: Callable[[], Awaitable[T]]) -> T:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError
+        return await asyncio.wait_for(factory(), timeout=remaining)
+
+    def timed_out_result() -> FlatBarrierResult:
+        report = private_unknown_report or last_report or _unavailable_private_report()
+        if private_unknown_report is not None or last_report is None:
+            reason = ReasonCode.FLAT_BARRIER_PRIVATE_STATE_UNKNOWN
+        elif event_race_observed:
+            reason = ReasonCode.FLAT_BARRIER_EVENT_RACE
+        else:
+            reason = ReasonCode.FLAT_BARRIER_TIMEOUT
+        return FlatBarrierResult(False, report, consecutive, last_watermark, True, reason)
+
     while True:
-        before = await watermark_factory()
-        report = await report_factory()
-        after = await watermark_factory()
-        last_report = report
+        try:
+            before = await before_deadline(watermark_factory)
+            report = await before_deadline(report_factory)
+            last_report = report
+            after = await before_deadline(watermark_factory)
+        except TimeoutError:
+            return timed_out_result()
         last_watermark = after
         now = loop.time()
         signature = _flat_signature(report, after)
-        if report.flat_verified and before == after:
+        if now >= deadline:
+            return timed_out_result()
+        private_unknown = (
+            report.status == ReconciliationStatus.UNKNOWN or not report.snapshots_complete
+        )
+        if private_unknown and private_unknown_report is None:
+            private_unknown_report = report
+        if before != after:
+            event_race_observed = True
+        if private_unknown_report is None and report.flat_verified and before == after:
             if signature == previous_signature:
                 consecutive += 1
             else:
                 previous_signature = signature
                 consecutive = 1
                 stable_since = now
-            if (
+            ready = (
                 consecutive >= policy.consecutive_snapshots
                 and stable_since is not None
                 and now - stable_since >= policy.quiet_period_seconds
-                and await watermark_factory() == after
-            ):
-                return FlatBarrierResult(True, report, consecutive, after, False)
+            )
+            if ready:
+                try:
+                    final_watermark = await before_deadline(watermark_factory)
+                except TimeoutError:
+                    return timed_out_result()
+                if loop.time() >= deadline:
+                    last_watermark = final_watermark
+                    return timed_out_result()
+                if final_watermark == after:
+                    return FlatBarrierResult(True, report, consecutive, after, False)
+                event_race_observed = True
+                previous_signature = None
+                stable_since = None
+                consecutive = 0
+                last_watermark = final_watermark
         else:
             previous_signature = None
             stable_since = None
             consecutive = 0
-        if now >= deadline:
-            assert last_report is not None
-            return FlatBarrierResult(False, last_report, consecutive, last_watermark, True)
         await asyncio.sleep(min(policy.poll_interval_seconds, max(0, deadline - now)))
+
+
+def _unavailable_private_report() -> ReconciliationReport:
+    return ReconciliationReport(
+        status=ReconciliationStatus.UNKNOWN,
+        states={},
+        discrepancies=("FLAT_BARRIER_PRIVATE_STATE_UNAVAILABLE",),
+        unknown_client_order_ids=(),
+        open_bot_order_count=0,
+        open_position_count=0,
+        actual_signed_positions={},
+        expected_signed_positions={},
+        residual_delta=Decimal(0),
+        flat_verified=False,
+        raw_open_order_count=0,
+        raw_nonzero_position_count=0,
+        unknown_active_record_count=1,
+        snapshots_complete=False,
+    )
 
 
 async def collect_private_states(

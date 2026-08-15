@@ -160,6 +160,13 @@ class LiveJournalAction:
     legs: tuple[JournalLeg, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class FlatBarrierCommitResult:
+    committed: bool
+    action: LiveJournalAction | None
+    event_watermark: int
+
+
 def request_payload_hash(request: VenueOrderRequest) -> str:
     encoded = json.dumps(asdict(request), default=str, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -692,6 +699,78 @@ class LiveOrderJournal:
             raise RuntimeError("transitioned action disappeared")
         return action
 
+    async def commit_flat_barrier(
+        self,
+        pair_action_id: str | None,
+        expected_event_watermark: int,
+        details: dict[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> FlatBarrierCommitResult:
+        """Atomically validate the event watermark and commit a terminal FLAT state."""
+        return await asyncio.to_thread(
+            self._commit_flat_barrier_sync,
+            pair_action_id,
+            expected_event_watermark,
+            details or {},
+            now or datetime.now(UTC),
+        )
+
+    def _commit_flat_barrier_sync(
+        self,
+        pair_action_id: str | None,
+        expected_event_watermark: int,
+        details: dict[str, Any],
+        now: datetime,
+    ) -> FlatBarrierCommitResult:
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            observed_watermark = self._event_watermark_in_transaction(database)
+            if pair_action_id is not None:
+                row = database.execute(
+                    "SELECT state FROM live_pair_actions WHERE pair_action_id = ?",
+                    (pair_action_id,),
+                ).fetchone()
+                if row is None:
+                    database.rollback()
+                    raise KeyError(pair_action_id)
+                state = LiveActionState(str(row["state"]))
+                if observed_watermark != expected_event_watermark:
+                    if state != LiveActionState.QUARANTINED:
+                        self._transition_in_transaction(
+                            database,
+                            pair_action_id,
+                            LiveActionState.QUARANTINED,
+                            {
+                                **details,
+                                "reason": "FLAT_BARRIER_EVENT_RACE",
+                                "expected_event_watermark": expected_event_watermark,
+                                "observed_event_watermark": observed_watermark,
+                            },
+                            now,
+                            recovery_action="FLAT_BARRIER_EVENT_RACE",
+                        )
+                elif state != LiveActionState.FLAT:
+                    self._transition_in_transaction(
+                        database,
+                        pair_action_id,
+                        LiveActionState.FLAT,
+                        {**details, "verified": True, "event_watermark": observed_watermark},
+                        now,
+                        residual_delta=Decimal(0),
+                    )
+            action = (
+                self._load_in_transaction(database, pair_action_id)
+                if pair_action_id is not None
+                else None
+            )
+            final_watermark = self._event_watermark_in_transaction(database)
+            committed = observed_watermark == expected_event_watermark == final_watermark and (
+                action is None or action.state == LiveActionState.FLAT
+            )
+            database.commit()
+        return FlatBarrierCommitResult(committed, action, final_watermark)
+
     def _transition_in_transaction(
         self,
         database: sqlite3.Connection,
@@ -944,10 +1023,12 @@ class LiveOrderJournal:
 
     def _event_watermark_sync(self) -> int:
         with self._connect() as database:
-            order_events = database.execute("SELECT count(*) FROM live_order_events").fetchone()
-            audit_events = database.execute(
-                "SELECT count(*) FROM live_journal_audit_events"
-            ).fetchone()
+            return self._event_watermark_in_transaction(database)
+
+    @staticmethod
+    def _event_watermark_in_transaction(database: sqlite3.Connection) -> int:
+        order_events = database.execute("SELECT count(*) FROM live_order_events").fetchone()
+        audit_events = database.execute("SELECT count(*) FROM live_journal_audit_events").fetchone()
         return int(order_events[0]) + int(audit_events[0])
 
     async def load(self, pair_action_id: str) -> LiveJournalAction | None:
@@ -978,20 +1059,27 @@ class LiveOrderJournal:
 
     def _load_sync(self, pair_action_id: str) -> LiveJournalAction | None:
         with self._connect() as database:
-            row = database.execute(
-                "SELECT * FROM live_pair_actions WHERE pair_action_id = ?",
-                (pair_action_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            legs = database.execute(
-                """
-                SELECT * FROM live_order_legs
-                WHERE pair_action_id = ?
-                ORDER BY venue, client_order_id
-                """,
-                (pair_action_id,),
-            ).fetchall()
+            return self._load_in_transaction(database, pair_action_id)
+
+    def _load_in_transaction(
+        self,
+        database: sqlite3.Connection,
+        pair_action_id: str,
+    ) -> LiveJournalAction | None:
+        row = database.execute(
+            "SELECT * FROM live_pair_actions WHERE pair_action_id = ?",
+            (pair_action_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        legs = database.execute(
+            """
+            SELECT * FROM live_order_legs
+            WHERE pair_action_id = ?
+            ORDER BY venue, client_order_id
+            """,
+            (pair_action_id,),
+        ).fetchall()
         return LiveJournalAction(
             pair_action_id=str(row["pair_action_id"]),
             route=DirectedRouteKey(

@@ -1,0 +1,102 @@
+{
+  "schema_version": 1,
+  "initial_state": "BASELINE_VERIFIED",
+  "states": [
+    {
+      "id": "BASELINE_VERIFIED",
+      "next": "C4_3_HOTFIX"
+    },
+    {
+      "id": "C4_3_HOTFIX",
+      "next": "C4_3_PROOF"
+    },
+    {
+      "id": "C4_3_PROOF",
+      "next": "C4_3_ADVERSARIAL_REVIEW"
+    },
+    {
+      "id": "C4_3_ADVERSARIAL_REVIEW",
+      "next": "PR1_MERGE_RC1"
+    },
+    {
+      "id": "PR1_MERGE_RC1",
+      "next": "WAVE1_PRODUCTION_CORE"
+    },
+    {
+      "id": "WAVE1_PRODUCTION_CORE",
+      "next": "MULTI_INSTRUMENT_SHADOW"
+    },
+    {
+      "id": "MULTI_INSTRUMENT_SHADOW",
+      "next": "MULTI_ROUTE_LIVE_ENGINE"
+    },
+    {
+      "id": "MULTI_ROUTE_LIVE_ENGINE",
+      "next": "WAVE2_ADAPTERS"
+    },
+    {
+      "id": "WAVE2_ADAPTERS",
+      "next": "WAVE3_ADAPTERS"
+    },
+    {
+      "id": "WAVE3_ADAPTERS",
+      "next": "SOFTWARE_RELEASE_V1_RC"
+    },
+    {
+      "id": "SOFTWARE_RELEASE_V1_RC",
+      "next": "OWNER_ONBOARDING_OR_DEPLOY"
+    },
+    {
+      "id": "OWNER_ONBOARDING_OR_DEPLOY",
+      "next": "SHADOW_DEPLOYED"
+    },
+    {
+      "id": "SHADOW_DEPLOYED",
+      "next": "QUALIFICATION_EPOCH"
+    },
+    {
+      "id": "QUALIFICATION_EPOCH",
+      "next": "C5_CANARY"
+    },
+    {
+      "id": "C5_CANARY",
+      "next": "PILOT_A"
+    },
+    {
+      "id": "PILOT_A",
+      "next": "PILOT_B"
+    },
+    {
+      "id": "PILOT_B",
+      "next": "WAVE1_PRODUCTION"
+    },
+    {
+      "id": "WAVE1_PRODUCTION",
+      "next": "VENUE_EXPANSION_CANARIES"
+    },
+    {
+      "id": "VENUE_EXPANSION_CANARIES",
+      "next": "FULL_PRODUCTION"
+    },
+    {
+      "id": "FULL_PRODUCTION",
+      "next": "DONE"
+    },
+    {
+      "id": "DONE",
+      "next": null
+    }
+  ],
+  "global_fail_states": [
+    "QUARANTINED",
+    "OWNER_ACTION_REQUIRED",
+    "SHADOW_CLOSE_ONLY"
+  ],
+  "rules": {
+    "technical_questions_to_owner": false,
+    "continue_independent_work_when_owner_blocked": true,
+    "real_orders_before_c5": false,
+    "risk_can_only_auto_decrease": true,
+    "merge_requires_exact_artifact": true
+  }
+}

@@ -37,7 +37,32 @@ def test_fast_track_contract_is_lean() -> None:
     assert required <= {path.name for path in ROOT.iterdir() if path.is_file()}
 
     markdown_files = [path for path in repository_files() if path.suffix == ".md"]
-    assert len(markdown_files) <= 12, "do not recreate documentation sprawl"
+    autonomous_docs = {
+        path.relative_to(ROOT).as_posix()
+        for path in markdown_files
+        if path.relative_to(ROOT).as_posix().startswith("docs/autonomous/")
+    }
+    required_autonomous_docs = {
+        f"docs/autonomous/{name}"
+        for name in (
+            "00_BASELINE_AND_INDEPENDENT_REVIEW.md",
+            "01_C4_3_STABLE_FLAT_HOTFIX.md",
+            "02_LOCKED_PRODUCT_ARCHITECTURE.md",
+            "03_LOCKED_STRATEGY_RISK_EXECUTION.md",
+            "05_AUTONOMOUS_MASTER_PLAN.md",
+            "06_ACCEPTANCE_GATES.md",
+            "07_AUTONOMOUS_OPERATING_PROTOCOL.md",
+            "08_OWNER_ACTION_PROTOCOL.md",
+            "09_DEPLOYMENT_AND_OPERATIONS.md",
+            "10_OFFICIAL_API_SOURCES.md",
+            "11_AUTONOMY_AUTHORIZATION.md",
+            "CODEX_AUTONOMOUS_MASTER_GOAL_RU.md",
+        )
+    }
+    assert autonomous_docs == required_autonomous_docs
+    assert len(markdown_files) - len(autonomous_docs) <= 12, (
+        "do not recreate non-normative documentation sprawl"
+    )
 
 
 def test_no_runtime_secret_or_database_is_committed() -> None:

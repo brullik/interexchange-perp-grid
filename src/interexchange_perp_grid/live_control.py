@@ -24,8 +24,10 @@ from interexchange_perp_grid.live_journal import (
 )
 from interexchange_perp_grid.live_reconciliation import (
     FlatBarrierPolicy,
+    FlatBarrierResult,
     ReconciliationReport,
     collect_private_states,
+    flat_barrier_failure_reason,
     reconcile_private_states,
     wait_for_stable_flat,
 )
@@ -37,6 +39,7 @@ from interexchange_perp_grid.private_domain import (
     VenueOrderRequest,
 )
 from interexchange_perp_grid.private_execution import translate_protected_order
+from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 EMERGENCY_CONFIRMATION = "I_CONFIRM_EMERGENCY_FLATTEN_ALL_LIVE_EXPOSURE"
@@ -51,6 +54,11 @@ class LiveControlResult:
     terminal_state: LiveActionState | None
     reconciliation: ReconciliationReport | None
     instruction: str | None
+    flat_barrier_verified: bool = False
+    flat_barrier_timed_out: bool = False
+    flat_barrier_snapshots: int = 0
+    flat_barrier_watermark: int = -1
+    reason: ReasonCode | None = None
 
 
 class LiveControlService:
@@ -214,18 +222,41 @@ class LiveControlService:
         positions = tuple(position for state in states.values() for position in state.positions)
         active = await self._journal.active()
         if not positions:
-            report = await self._stable_report(active)
-            if report.flat_verified:
-                active = await self._mark_flat_if_needed(active, action_name)
-                return LiveControlResult(
-                    True,
-                    action_name,
-                    0,
-                    cancellation.cancelled_orders,
-                    active.state if active else LiveActionState.FLAT,
-                    report,
-                    None,
-                )
+            barrier = await self._stable_report(active)
+            report = barrier.report
+            if barrier.verified:
+                active, barrier = await self._mark_flat_if_needed(active, action_name, barrier)
+                if barrier.verified:
+                    return LiveControlResult(
+                        True,
+                        action_name,
+                        0,
+                        cancellation.cancelled_orders,
+                        active.state if active else LiveActionState.FLAT,
+                        report,
+                        None,
+                        barrier.verified,
+                        barrier.timed_out,
+                        barrier.consecutive_snapshots,
+                        barrier.event_watermark,
+                        None,
+                    )
+            if active is not None:
+                active = await self._quarantine(active, report, action_name)
+            return LiveControlResult(
+                False,
+                action_name,
+                0,
+                cancellation.cancelled_orders,
+                active.state if active is not None else None,
+                report,
+                "Stable FLAT barrier was not verified; keep live disabled.",
+                barrier.verified,
+                barrier.timed_out,
+                barrier.consecutive_snapshots,
+                barrier.event_watermark,
+                flat_barrier_failure_reason(barrier),
+            )
         requests = tuple(
             translate_protected_order(
                 ExecutionIntent(
@@ -319,19 +350,27 @@ class LiveControlService:
                 None,
                 "Private state did not verify flat and no durable emergency action exists.",
             )
-        report = await self._stable_report(active)
-        if report.flat_verified:
-            active = await self._mark_flat_if_needed(active, action_name)
-            assert active is not None
-            return LiveControlResult(
-                True,
-                action_name,
-                orders_sent,
-                cancellation.cancelled_orders,
-                active.state,
-                report,
-                None,
-            )
+        barrier = await self._stable_report(active)
+        report = barrier.report
+        if barrier.verified:
+            active, barrier = await self._mark_flat_if_needed(active, action_name, barrier)
+            if barrier.verified:
+                assert active is not None
+                return LiveControlResult(
+                    True,
+                    action_name,
+                    orders_sent,
+                    cancellation.cancelled_orders,
+                    active.state,
+                    report,
+                    None,
+                    barrier.verified,
+                    barrier.timed_out,
+                    barrier.consecutive_snapshots,
+                    barrier.event_watermark,
+                    None,
+                )
+        assert active is not None
         active = await self._quarantine(active, report, action_name)
         return LiveControlResult(
             False,
@@ -344,6 +383,11 @@ class LiveControlService:
                 "FAILED_QUARANTINED: keep live disabled; inspect every involved exchange, "
                 "cancel remaining bot orders, and manually flatten residual positions."
             ),
+            barrier.verified,
+            barrier.timed_out,
+            barrier.consecutive_snapshots,
+            barrier.event_watermark,
+            flat_barrier_failure_reason(barrier),
         )
 
     async def _submit_emergency(
@@ -387,19 +431,18 @@ class LiveControlService:
             set(self._adapters),
         )
 
-    async def _stable_report(self, active: LiveJournalAction | None) -> ReconciliationReport:
+    async def _stable_report(self, active: LiveJournalAction | None) -> FlatBarrierResult:
         async def report_factory() -> ReconciliationReport:
             current = active
             if current is not None:
                 current = await self._journal.load(current.pair_action_id)
             return await self._report(current)
 
-        result = await wait_for_stable_flat(
+        return await wait_for_stable_flat(
             report_factory,
             self._journal.event_watermark,
             self._flat_barrier_policy,
         )
-        return result.report
 
     async def _cancel(self, order: PrivateOrder) -> PrivateOrder:
         assert order.order_id is not None
@@ -452,15 +495,34 @@ class LiveControlService:
         self,
         active: LiveJournalAction | None,
         action_name: str,
-    ) -> LiveJournalAction | None:
-        if active is None or active.state == LiveActionState.FLAT:
-            return active
-        active = await self._move_to_recovering(active, action_name)
-        return await self._journal.transition(
-            active.pair_action_id,
-            LiveActionState.FLAT,
+        barrier: FlatBarrierResult,
+    ) -> tuple[LiveJournalAction | None, FlatBarrierResult]:
+        if not barrier.verified:
+            raise RuntimeError(flat_barrier_failure_reason(barrier).value)
+        if active is not None:
+            current = await self._journal.load(active.pair_action_id)
+            if current is None:
+                raise RuntimeError("flat barrier action disappeared")
+            active = current
+            if active.state != LiveActionState.FLAT:
+                active = await self._move_to_recovering(active, action_name)
+        commit = await self._journal.commit_flat_barrier(
+            active.pair_action_id if active is not None else None,
+            barrier.event_watermark,
             {"action": action_name, "verified": True},
-            residual_delta=Decimal(0),
+        )
+        if commit.committed:
+            return commit.action, barrier
+        return (
+            commit.action,
+            FlatBarrierResult(
+                False,
+                barrier.report,
+                0,
+                commit.event_watermark,
+                False,
+                ReasonCode.FLAT_BARRIER_EVENT_RACE,
+            ),
         )
 
     async def _quarantine(

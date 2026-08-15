@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-15T15:19:04Z",
+  "state": "C4_3_ADVERSARIAL_REVIEW",
+  "phase": "Phase 1 — C4.3 adversarial review",
+  "repository": "brullik/interexchange-perp-grid",
+  "branch": "codex/fast-track-mvp",
+  "pr": 1,
+  "head_sha": "95a30f9821bae2c7515b07cba1f2ca51af2565de",
+  "ci_run": null,
+  "artifact": null,
+  "completed_criteria": [
+    "Autonomous normative package imported with exact ZIP entry hashes",
+    "C4.3 atomic watermark-to-FLAT commit and fail-closed UNKNOWN handling implemented",
+    "Local verify equivalent passed: lock, Ruff, strict mypy, 177 tests, and doctor",
+    "Exact SF-001 through SF-008 run passed 8/8 with six public success=false outcomes",
+    "Independent adversarial re-review passed with no P0, P1, or P2 findings"
+  ],
+  "active_work": [
+    "Commit the reviewed C4.3 checkpoint and obtain the exact-head CI proof artifact"
+  ],
+  "blockers": [
+    "REPOSITORY_VISIBILITY_PUBLIC"
+  ],
+  "owner_action_file": "OWNER_ACTION.json",
+  "next_action": "Require adversarial PASS, then commit the checkpoint and obtain the exact-head C4.3 CI artifact.",
+  "known_limitations": [
+    "The exact-head C4.3 artifact cannot exist until the reviewed checkpoint is committed and pushed.",
+    "The current repository visibility is PUBLIC."
+  ]
+}

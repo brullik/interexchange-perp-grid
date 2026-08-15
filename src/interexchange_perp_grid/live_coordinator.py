@@ -22,10 +22,12 @@ from interexchange_perp_grid.live_journal import (
 )
 from interexchange_perp_grid.live_reconciliation import (
     FlatBarrierPolicy,
+    FlatBarrierResult,
     PrivateStateAdapter,
     ReconciliationReport,
     ReconciliationStatus,
     collect_private_states,
+    flat_barrier_failure_reason,
     reconcile_private_states,
     wait_for_stable_flat,
 )
@@ -136,6 +138,10 @@ class CanaryCycleResult:
     terminal_state: LiveActionState
     reconciliation: ReconciliationReport | None
     owner_instruction: str | None
+    flat_barrier_verified: bool = False
+    flat_barrier_timed_out: bool = False
+    flat_barrier_snapshots: int = 0
+    flat_barrier_watermark: int = -1
 
 
 class LiveCanaryCoordinator:
@@ -211,10 +217,23 @@ class LiveCanaryCoordinator:
         active = await self._journal.active()
         completed = await self._journal.load(plan.pair_action_id)
         if active is None and completed is not None and completed.state == LiveActionState.FLAT:
-            report = await self._verify_stable_flat(completed)
+            barrier = await self._verify_stable_flat(completed)
+            report = barrier.report
+            if barrier.verified:
+                completed, barrier = await self._to_flat(
+                    completed,
+                    "REVERIFIED_COMPLETED_FLAT",
+                    barrier,
+                )
+            if not barrier.verified and completed.state != LiveActionState.QUARANTINED:
+                completed = await self._quarantine(
+                    completed,
+                    report,
+                    flat_barrier_failure_reason(barrier).value,
+                )
             return CanaryCycleResult(
-                report.flat_verified,
-                None if report.flat_verified else ReasonCode.RECONCILIATION_FAILED,
+                barrier.verified,
+                None if barrier.verified else flat_barrier_failure_reason(barrier),
                 0,
                 False,
                 report.residual_delta,
@@ -222,7 +241,11 @@ class LiveCanaryCoordinator:
                 None,
                 completed.state,
                 report,
-                None if report.flat_verified else "Previously flat action no longer verifies flat.",
+                None if barrier.verified else "Previously flat action no longer verifies flat.",
+                barrier.verified,
+                barrier.timed_out,
+                barrier.consecutive_snapshots,
+                barrier.event_watermark,
             )
         if active is not None and active.pair_action_id != plan.pair_action_id:
             return self._failed(
@@ -263,27 +286,43 @@ class LiveCanaryCoordinator:
             action, opening_recovery = await self._recover_opening(action)
             hedged = await self._is_hedged(action)
             if not hedged:
-                report = await self._verify_stable_flat(action)
-                if report.flat_verified:
-                    action = await self._to_flat(action, "OPEN_RECOVERY_FLATTENED")
-                    return CanaryCycleResult(
-                        False,
-                        ReasonCode.FORCED_CLOSED,
-                        self._orders_sent,
-                        False,
-                        report.residual_delta,
-                        opening_recovery,
-                        None,
-                        action.state,
-                        report,
-                        None,
+                barrier = await self._verify_stable_flat(action)
+                report = barrier.report
+                if barrier.verified:
+                    action, barrier = await self._to_flat(
+                        action,
+                        "OPEN_RECOVERY_FLATTENED",
+                        barrier,
                     )
-                action = await self._quarantine(action, report, opening_recovery)
+                    if barrier.verified:
+                        return CanaryCycleResult(
+                            False,
+                            ReasonCode.FORCED_CLOSED,
+                            self._orders_sent,
+                            False,
+                            report.residual_delta,
+                            opening_recovery,
+                            None,
+                            action.state,
+                            report,
+                            None,
+                            barrier.verified,
+                            barrier.timed_out,
+                            barrier.consecutive_snapshots,
+                            barrier.event_watermark,
+                        )
+                if action.state != LiveActionState.QUARANTINED:
+                    action = await self._quarantine(
+                        action,
+                        report,
+                        flat_barrier_failure_reason(barrier).value,
+                    )
                 return self._failed(
                     action,
-                    ReasonCode.RECONCILIATION_FAILED,
+                    flat_barrier_failure_reason(barrier),
                     recovery_action=opening_recovery,
                     reconciliation=report,
+                    flat_barrier=barrier,
                 )
 
         if not resuming_close and action.state != LiveActionState.HEDGED:
@@ -310,9 +349,10 @@ class LiveCanaryCoordinator:
                 raise RuntimeError(f"unexpected live-control state {action.state.value}")
         await self._close_exchange_positions(action, emergency=False)
         action = await self._require_action(action.pair_action_id)
-        report = await self._verify_stable_flat(action)
+        barrier = await self._verify_stable_flat(action)
+        report = barrier.report
         recovery_action: str | None = opening_recovery
-        if not report.flat_verified:
+        if not barrier.verified:
             action = await self._journal.transition(
                 action.pair_action_id,
                 LiveActionState.RECOVERING,
@@ -324,18 +364,26 @@ class LiveCanaryCoordinator:
             await self._cancel_all_bot_orders()
             await self._close_exchange_positions(action, emergency=True)
             action = await self._require_action(action.pair_action_id)
-            report = await self._verify_stable_flat(action)
-        if not report.flat_verified:
-            action = await self._quarantine(action, report, recovery_action)
+            barrier = await self._verify_stable_flat(action)
+            report = barrier.report
+        if barrier.verified:
+            action, barrier = await self._to_flat(action, "EXCHANGE_VERIFIED_FLAT", barrier)
+        if not barrier.verified:
+            if action.state != LiveActionState.QUARANTINED:
+                action = await self._quarantine(
+                    action,
+                    report,
+                    flat_barrier_failure_reason(barrier).value,
+                )
             return self._failed(
                 action,
-                ReasonCode.RECONCILIATION_FAILED,
+                flat_barrier_failure_reason(barrier),
                 hedged=True,
                 recovery_action=recovery_action,
                 close_reason=close_reason,
                 reconciliation=report,
+                flat_barrier=barrier,
             )
-        action = await self._to_flat(action, "EXCHANGE_VERIFIED_FLAT")
         return CanaryCycleResult(
             True,
             None,
@@ -347,6 +395,10 @@ class LiveCanaryCoordinator:
             action.state,
             report,
             None,
+            barrier.verified,
+            barrier.timed_out,
+            barrier.consecutive_snapshots,
+            barrier.event_watermark,
         )
 
     async def _classify_open_pair(
@@ -656,17 +708,16 @@ class LiveCanaryCoordinator:
             set(self._adapters),
         )
 
-    async def _verify_stable_flat(self, action: LiveJournalAction) -> ReconciliationReport:
+    async def _verify_stable_flat(self, action: LiveJournalAction) -> FlatBarrierResult:
         async def report_factory() -> ReconciliationReport:
             current = await self._require_action(action.pair_action_id)
             return await self._verify(current)
 
-        result = await wait_for_stable_flat(
+        return await wait_for_stable_flat(
             report_factory,
             self._journal.event_watermark,
             self._flat_barrier_policy,
         )
-        return result.report
 
     async def _advance_to_hedged(self, action: LiveJournalAction) -> LiveJournalAction:
         if not await self._is_hedged(action):
@@ -697,16 +748,18 @@ class LiveCanaryCoordinator:
         except TimeoutError:
             return CloseReason.CANARY_TIMEOUT
 
-    async def _to_flat(self, action: LiveJournalAction, reason: str) -> LiveJournalAction:
+    async def _to_flat(
+        self,
+        action: LiveJournalAction,
+        reason: str,
+        barrier: FlatBarrierResult,
+    ) -> tuple[LiveJournalAction, FlatBarrierResult]:
+        if not barrier.verified:
+            raise RuntimeError(flat_barrier_failure_reason(barrier).value)
         current = await self._require_action(action.pair_action_id)
-        if current.state == LiveActionState.QUARANTINED:
-            return await self._journal.transition(
-                current.pair_action_id,
-                LiveActionState.FLAT,
-                {"reason": reason},
-                residual_delta=Decimal(0),
-            )
         if current.state not in {
+            LiveActionState.FLAT,
+            LiveActionState.QUARANTINED,
             LiveActionState.REJECTED,
             LiveActionState.RECOVERING,
             LiveActionState.CLOSING,
@@ -716,11 +769,25 @@ class LiveCanaryCoordinator:
                 LiveActionState.RECOVERING,
                 {"reason": reason},
             )
-        return await self._journal.transition(
+        commit = await self._journal.commit_flat_barrier(
             current.pair_action_id,
-            LiveActionState.FLAT,
+            barrier.event_watermark,
             {"reason": reason},
-            residual_delta=Decimal(0),
+        )
+        if commit.action is None:
+            raise RuntimeError("flat barrier commit lost the durable action")
+        if commit.committed:
+            return commit.action, barrier
+        return (
+            commit.action,
+            FlatBarrierResult(
+                False,
+                barrier.report,
+                0,
+                commit.event_watermark,
+                False,
+                ReasonCode.FLAT_BARRIER_EVENT_RACE,
+            ),
         )
 
     async def _quarantine(
@@ -774,6 +841,7 @@ class LiveCanaryCoordinator:
         recovery_action: str | None = None,
         close_reason: CloseReason | None = None,
         reconciliation: ReconciliationReport | None = None,
+        flat_barrier: FlatBarrierResult | None = None,
     ) -> CanaryCycleResult:
         return CanaryCycleResult(
             False,
@@ -795,6 +863,10 @@ class LiveCanaryCoordinator:
                 if action.state == LiveActionState.QUARANTINED
                 else None
             ),
+            flat_barrier.verified if flat_barrier is not None else False,
+            flat_barrier.timed_out if flat_barrier is not None else False,
+            flat_barrier.consecutive_snapshots if flat_barrier is not None else 0,
+            flat_barrier.event_watermark if flat_barrier is not None else -1,
         )
 
 

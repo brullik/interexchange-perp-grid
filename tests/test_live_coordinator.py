@@ -18,6 +18,7 @@ from interexchange_perp_grid.live_coordinator import (
     first_close_reason,
 )
 from interexchange_perp_grid.live_journal import (
+    FlatBarrierCommitResult,
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
@@ -84,6 +85,25 @@ class CrashAfterTransitionJournal(LiveOrderJournal):
             self.fired = True
             raise InjectedRestart(state.value)
         return action
+
+    async def commit_flat_barrier(
+        self,
+        pair_action_id: str | None,
+        expected_event_watermark: int,
+        details: dict[str, object] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> FlatBarrierCommitResult:
+        result = await super().commit_flat_barrier(
+            pair_action_id,
+            expected_event_watermark,
+            details,
+            now=now,
+        )
+        if result.committed and self.target == LiveActionState.FLAT and not self.fired:
+            self.fired = True
+            raise InjectedRestart(LiveActionState.FLAT.value)
+        return result
 
 
 @pytest.mark.parametrize(
@@ -587,7 +607,7 @@ async def test_journal_balanced_but_exchange_mismatched_positions_are_never_hedg
             consecutive_snapshots=2,
             quiet_period_seconds=0,
             poll_interval_seconds=0.01,
-            timeout_seconds=0.05,
+            timeout_seconds=0.2,
         ),
     )
     result = await coordinator.run(plan)
