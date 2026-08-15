@@ -209,6 +209,8 @@ class DeterministicPrivateExchange:
             unknown_active_records=(),
             completeness=SnapshotCompleteness.COMPLETE,
             observed_at=datetime.now(UTC),
+            request_count=0,
+            account_wide=True,
         )
 
     async def resolve_instrument(self, symbol: str) -> Instrument | None:

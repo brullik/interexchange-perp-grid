@@ -16,6 +16,8 @@ def make_book(
     is_snapshot: bool = True,
     received_monotonic_ns: int | None = None,
     clock_skew_ms: int | None = 0,
+    sequence_reset: bool = False,
+    sequence_contiguous: bool = True,
 ) -> OrderBookSnapshot:
     return OrderBookSnapshot(
         venue=Venue.BYBIT,
@@ -30,6 +32,8 @@ def make_book(
         is_snapshot=is_snapshot,
         synchronised=True,
         clock_skew_ms=clock_skew_ms,
+        sequence_reset=sequence_reset,
+        sequence_contiguous=sequence_contiguous,
     )
 
 
@@ -71,3 +75,45 @@ def test_book_registry_blocks_unknown_sequence_and_clock() -> None:
         max_clock_skew_ms=1000,
     )
     assert unknown_clock.reason == ReasonCode.CLOCK_SKEW_UNKNOWN
+
+
+def test_book_registry_allows_explicit_snapshot_sequence_reset_only() -> None:
+    registry = BookRegistry()
+    assert registry.accept(make_book(), max_age_ms=1000, max_clock_skew_ms=1000).accepted
+
+    reset = registry.accept(
+        make_book(sequence_start=1, sequence_end=1, sequence_reset=True),
+        max_age_ms=1000,
+        max_clock_skew_ms=1000,
+    )
+    invalid_delta_reset = registry.accept(
+        make_book(
+            sequence_start=2,
+            sequence_end=2,
+            is_snapshot=False,
+            sequence_reset=True,
+        ),
+        max_age_ms=1000,
+        max_clock_skew_ms=1000,
+    )
+
+    assert reset.accepted is True
+    assert invalid_delta_reset.reason == ReasonCode.BOOK_SEQUENCE_GAP
+
+
+def test_book_registry_accepts_monotonic_non_contiguous_native_sequence() -> None:
+    registry = BookRegistry()
+    assert registry.accept(make_book(), max_age_ms=1000, max_clock_skew_ms=1000).accepted
+
+    jumped = registry.accept(
+        make_book(
+            sequence_start=15,
+            sequence_end=15,
+            is_snapshot=False,
+            sequence_contiguous=False,
+        ),
+        max_age_ms=1000,
+        max_clock_skew_ms=1000,
+    )
+
+    assert jumped.accepted is True

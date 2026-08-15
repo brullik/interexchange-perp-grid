@@ -77,6 +77,12 @@ class SnapshotCompleteness(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class PrivateStreamKind(StrEnum):
+    ORDERS = "ORDERS"
+    POSITIONS = "POSITIONS"
+    ACCOUNT = "ACCOUNT"
+
+
 @dataclass(frozen=True, slots=True)
 class UnknownActiveRecord:
     venue: Venue
@@ -95,10 +101,19 @@ class PrivateActiveSnapshot:
     unknown_active_records: tuple[UnknownActiveRecord, ...]
     completeness: SnapshotCompleteness
     observed_at: datetime
+    event_watermark: int = 0
+    request_count: int = 0
+    latency_ms: Decimal = Decimal(0)
+    account_wide: bool = False
+    source_monotonic_ns: int | None = None
 
     def __post_init__(self) -> None:
         if self.raw_open_order_count < 0 or self.raw_nonzero_position_count < 0:
             raise ValueError("raw active record counts must be non-negative")
+        if self.event_watermark < 0 or self.request_count < 0 or self.latency_ms < 0:
+            raise ValueError("private snapshot evidence must be non-negative")
+        if self.source_monotonic_ns is not None and self.source_monotonic_ns < 0:
+            raise ValueError("private event source monotonic time must be non-negative")
         counts_match = self.raw_open_order_count == len(
             self.open_orders
         ) and self.raw_nonzero_position_count == len(self.positions)
@@ -106,6 +121,33 @@ class PrivateActiveSnapshot:
             self.unknown_active_records or not counts_match
         ):
             raise ValueError("complete private snapshot must account for every raw active record")
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateStreamEvent:
+    venue: Venue
+    kind: PrivateStreamKind
+    event_watermark: int
+    observed_at: datetime
+    source_monotonic_ns: int
+    orders: tuple[PrivateOrder, ...] = ()
+    positions: tuple[PositionSnapshot, ...] = ()
+    account: AccountSnapshot | None = None
+    unknown_active_records: tuple[UnknownActiveRecord, ...] = ()
+    account_wide: bool = True
+
+    def __post_init__(self) -> None:
+        if self.event_watermark <= 0 or self.source_monotonic_ns < 0:
+            raise ValueError("private stream event evidence is invalid")
+        if not self.account_wide:
+            raise ValueError("private stream event must be account-wide")
+        payloads = bool(self.orders), bool(self.positions), self.account is not None
+        if self.kind == PrivateStreamKind.ORDERS and (payloads[1] or payloads[2]):
+            raise ValueError("order stream event contains a foreign payload")
+        if self.kind == PrivateStreamKind.POSITIONS and (payloads[0] or payloads[2]):
+            raise ValueError("position stream event contains a foreign payload")
+        if self.kind == PrivateStreamKind.ACCOUNT and (payloads[0] or payloads[1]):
+            raise ValueError("account stream event contains a foreign payload")
 
 
 @dataclass(frozen=True, slots=True)

@@ -150,12 +150,6 @@ class TelegramConfig(StrictModel):
     owner_chat_id: int | None = None
     challenge_ttl_seconds: int = Field(gt=0, le=600)
 
-    @model_validator(mode="after")
-    def enabled_requires_owner(self) -> TelegramConfig:
-        if self.enabled and self.owner_chat_id is None:
-            raise ValueError("enabled Telegram control requires an owner chat ID")
-        return self
-
 
 class ShadowConfig(StrictModel):
     base: str
@@ -197,6 +191,12 @@ class Settings(StrictModel):
     def live_mode_requires_flag(self) -> Settings:
         if self.app.mode == "live" and not self.live.enabled:
             raise ValueError("live mode requires live.enabled=true")
+        if (
+            self.app.mode == "live"
+            and self.telegram.enabled
+            and self.telegram.owner_chat_id is None
+        ):
+            raise ValueError("live Telegram control requires an owner chat ID")
         return self
 
 

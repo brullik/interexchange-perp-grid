@@ -10,6 +10,7 @@ from typing import Any
 import ccxt.pro as ccxtpro  # type: ignore[import-untyped]
 
 from interexchange_perp_grid.adapters.base import ExchangeAdapter
+from interexchange_perp_grid.adapters.bybit_v5 import SequenceQualifiedBybitExchange
 from interexchange_perp_grid.domain import (
     BboQuote,
     BookLevel,
@@ -114,6 +115,8 @@ class CcxtProAdapter(ExchangeAdapter):
                 "defaultSubType": "linear",
             }
             return ccxtpro.binance(configuration)
+        if venue == Venue.BYBIT:
+            return SequenceQualifiedBybitExchange(configuration)
         exchange_class = getattr(ccxtpro, venue.value)
         return exchange_class(configuration)
 
@@ -257,6 +260,8 @@ class CcxtProAdapter(ExchangeAdapter):
             is_snapshot=True,
             synchronised=bool(bids and asks),
             clock_skew_ms=self._clock_skew_ms,
+            sequence_reset=raw.get("ipegSequenceReset") is True,
+            sequence_contiguous=raw.get("ipegSequenceContiguous") is not False,
         )
 
     @staticmethod

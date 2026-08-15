@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -7,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from interexchange_perp_grid.client_ids import venue_client_order_id
-from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.live_reconciliation import (
@@ -15,6 +17,7 @@ from interexchange_perp_grid.live_reconciliation import (
     ReconciliationReport,
     ReconciliationStatus,
     VenuePrivateState,
+    collect_private_states,
     evaluate_canary_risk_from_private_state,
     reconcile_private_states,
     wait_for_stable_flat,
@@ -22,6 +25,7 @@ from interexchange_perp_grid.live_reconciliation import (
 from interexchange_perp_grid.private_domain import (
     AccountSnapshot,
     PositionSnapshot,
+    PrivateActiveSnapshot,
     PrivateOrder,
     PrivateOrderStatus,
     SnapshotCompleteness,
@@ -35,6 +39,24 @@ _ROUTE = DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX)
 _REQUIRED = {Venue.BINANCE_USDM, Venue.OKX, Venue.BYBIT}
 _LONG_ID = venue_client_order_id("pair-1", "long")
 _SHORT_ID = venue_client_order_id("pair-1", "short")
+
+
+def _instrument(venue: Venue) -> Instrument:
+    return Instrument(
+        venue,
+        "BTC/USDT:USDT",
+        "BTCUSDT",
+        "BTC",
+        "USDT",
+        "USDT",
+        Decimal("0.001"),
+        Decimal("1"),
+        Decimal("0.1"),
+        Decimal("1"),
+        Decimal("5"),
+        Decimal("0.0005"),
+        "fixture",
+    )
 
 
 def _account(venue: Venue) -> AccountSnapshot:
@@ -72,6 +94,7 @@ def _state(
         len(positions),
         (),
         SnapshotCompleteness.UNKNOWN if error else SnapshotCompleteness.COMPLETE,
+        True,
     )
 
 
@@ -172,11 +195,23 @@ def test_unknown_raw_active_record_and_count_mismatch_deny_entry_and_flat() -> N
             ),
         ),
         SnapshotCompleteness.UNKNOWN,
+        True,
     )
     report = reconcile_private_states(None, states, set(), _REQUIRED)
     assert report.status == ReconciliationStatus.UNKNOWN
     assert report.raw_open_order_count == 1
     assert report.unknown_active_record_count == 1
+    assert report.snapshots_complete is False
+    assert report.flat_verified is False
+
+
+def test_non_account_wide_snapshot_can_never_verify_flat() -> None:
+    states = _empty_states()
+    states[Venue.BYBIT] = replace(states[Venue.BYBIT], account_wide=False)
+
+    report = reconcile_private_states(None, states, set(), _REQUIRED)
+
+    assert report.status == ReconciliationStatus.UNKNOWN
     assert report.snapshots_complete is False
     assert report.flat_verified is False
 
@@ -359,3 +394,110 @@ def test_canary_risk_bootstraps_from_exchange_positions_and_one_dollar_limit() -
         exit_depth_sufficient=True,
     )
     assert over_limit.reason == ReasonCode.PAIR_STRESS_LIMIT
+
+
+class HangingPrivateStateAdapter:
+    async def fetch_account(self, instrument: Instrument) -> AccountSnapshot:
+        return _account(instrument.venue)
+
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def fetch_all_open_orders(self) -> tuple[PrivateOrder, ...]:
+        return ()
+
+    async def fetch_all_positions(self) -> tuple[PositionSnapshot, ...]:
+        return ()
+
+    async def fetch_closed_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
+        del instrument
+        return ()
+
+    async def fetch_trading_fee(self, instrument: Instrument) -> Decimal:
+        del instrument
+        return Decimal("0.0005")
+
+
+@pytest.mark.asyncio
+async def test_private_state_collection_has_a_hard_deadline() -> None:
+    venue = Venue.BYBIT
+    states = await asyncio.wait_for(
+        collect_private_states(
+            {venue: HangingPrivateStateAdapter()},
+            {venue: _instrument(venue)},
+            timeout_seconds=0.001,
+        ),
+        timeout=1,
+    )
+
+    assert states[venue].error == "TimeoutError:"
+    assert states[venue].completeness == SnapshotCompleteness.UNKNOWN
+    assert states[venue].account_wide is False
+
+
+class SlowCancellationAdapter(HangingPrivateStateAdapter):
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.2)
+            raise
+        raise AssertionError("unreachable")
+
+
+@pytest.mark.asyncio
+async def test_private_state_deadline_does_not_wait_for_slow_child_cancellation() -> None:
+    venue = Venue.BYBIT
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    states = await collect_private_states(
+        {venue: SlowCancellationAdapter()},
+        {venue: _instrument(venue)},
+        timeout_seconds=0.01,
+    )
+    elapsed = loop.time() - started
+
+    assert elapsed < 0.05
+    assert states[venue].error == "TimeoutError:"
+    await asyncio.sleep(0.21)
+
+
+class RecordingReconcilingAdapter(HangingPrivateStateAdapter):
+    def __init__(self, venue: Venue) -> None:
+        self.venue = venue
+        self.triggers: list[str] = []
+
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
+        raise AssertionError("qualified consumers must request explicit reconciliation")
+
+    async def reconcile_active_snapshot(self, trigger: str) -> PrivateActiveSnapshot:
+        self.triggers.append(trigger)
+        return PrivateActiveSnapshot(
+            self.venue,
+            0,
+            0,
+            (),
+            (),
+            (),
+            SnapshotCompleteness.COMPLETE,
+            datetime.now(UTC),
+            account_wide=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_qualified_consumer_can_force_immediate_account_wide_reconciliation() -> None:
+    venue = Venue.BYBIT
+    adapter = RecordingReconcilingAdapter(venue)
+
+    states = await collect_private_states(
+        {venue: adapter},
+        {venue: _instrument(venue)},
+        reconciliation_trigger="PRE_SUBMIT",
+    )
+
+    assert states[venue].error is None
+    assert states[venue].account_wide is True
+    assert adapter.triggers == ["PRE_SUBMIT:bybit"]

@@ -165,7 +165,11 @@ class LiveControlService:
 
     async def _cancel_orders(self, *, bot_only: bool) -> LiveControlResult:
         await self._journal.initialise()
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="PRE_CANCEL",
+        )
         cancellable = tuple(
             order
             for state in states.values()
@@ -178,7 +182,11 @@ class LiveControlService:
             return_exceptions=True,
         )
         cancelled = sum(not isinstance(result, BaseException) for result in results)
-        refreshed = await collect_private_states(self._adapters, self._account_instruments)
+        refreshed = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="POST_CANCEL",
+        )
         remaining = sum(
             (not bot_only or is_bot_client_order_id(order.client_order_id))
             for state in refreshed.values()
@@ -218,7 +226,11 @@ class LiveControlService:
 
     async def _flatten(self, action_name: str) -> LiveControlResult:
         cancellation = await self._cancel_orders(bot_only=False)
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="PRE_CLOSE",
+        )
         positions = tuple(position for state in states.values() for position in state.positions)
         active = await self._journal.active()
         if not positions:
@@ -423,7 +435,11 @@ class LiveControlService:
     async def _report(self, active: LiveJournalAction | None) -> ReconciliationReport:
         if active is not None:
             active = await self._journal.load(active.pair_action_id)
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="TERMINAL_FLAT",
+        )
         return reconcile_private_states(
             active,
             states,

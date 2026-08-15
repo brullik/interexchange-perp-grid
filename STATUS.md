@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** C4_REWORK_V2_FINAL_HEAD_CI_GREEN_PENDING_INDEPENDENT_REVIEW
-- **Current checkpoint:** C4 rework v2 complete on the exact final head; independent review pending
+- **State:** WAVE1_PRODUCTION_CORE_ADVERSARIAL_REVIEW
+- **Current checkpoint:** Phase 2 Wave 1 data/private core passes local verify; exact-current independent review pending
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -20,7 +20,8 @@ This is the only mutable project-status document.
 | C1 public market vertical slice | COMPLETE | [GitHub Actions run 31837867113](https://github.com/brullik/interexchange-perp-grid/actions/runs/31837867113): Linux `make verify` (29 tests) and Docker health/restart passed on `a790344`; live read-only scan found 656 common instruments and two eligible Binance USD-M/OKX directed BTC routes while Bybit failed closed with `BOOK_SEQUENCE_UNKNOWN`; Parquet/DuckDB replay contained 206 L2 levels across all three venues |
 | C2 strategy/risk/simulator | COMPLETE | [GitHub Actions run 31839163485](https://github.com/brullik/interexchange-perp-grid/actions/runs/31839163485): Linux `make verify` (43 tests) and Docker health/restart passed on `0849413`; deterministic tests cover open/add/partial close/full close, profitable and losing four-leg PnL, funding, protected prices, partial/rejected/unknown orders, private staleness, venue outage, third-venue hedge, forced close, and property-based 5/50 USDT risk invariants |
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
-| C4 live-canary-ready execution | C4_REWORK_V2_FINAL_HEAD_CI_GREEN_PENDING_INDEPENDENT_REVIEW | Exact-head CI requires Linux `make verify`, dependency/secret/static scans, SBOM, an exact 30-scenario six-file `c4-critical-proof-<FULL_SHA>` artifact, and process-kill Docker supervisor recovery with zero production transports; independent re-review remains mandatory |
+| C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
+| Phase 2 Wave 1 data/private core | ADVERSARIAL_REVIEW | Account-wide bounded private snapshots/cache, persistent and ordered event watermarks, native Bybit V5 `u/seq`, page-limit completeness, recovery-priority REST budgeting, hard deadlines, measured p95, no-credential public scan, and Telegram shadow fallback pass local verification (244 tests) |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -56,25 +57,32 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-15 — Require a two-snapshot quiet stable-FLAT barrier and make emergency flatten qualification-independent and account-wide on dedicated subaccounts — late fills, unknown orders, and non-route positions must remain recoverable without authorizing entry — reconciliation, control, supervisor
 2026-08-15 — Prove every possible main-leg residual executable on the third venue and price protected round-trip depth plus its private fee into stress — emergency feasibility must be admission evidence rather than an assumed reserve — `live_economics.py`, `canary_runtime.py`
 2026-08-15 — Pin application/build/security dependencies and bind the exact 30-scenario C4 proof to clean head/source/config/image with a zero-production-submit guard — final-head CI must produce auditable deterministic evidence and a reproducible SBOM — locks, `c4_proof.py`, CI, release scripts
+2026-08-15 — Install a native Bybit V5 `u/seq` guard before CCXT mutates its order book and carry explicit `u=1` reset evidence downstream — CCXT Pro's Bybit handler assembles deltas but drops both native sequence fields — `adapters/bybit_v5.py`, `adapters/ccxt_pro.py`, `market_data.py`
+2026-08-15 — Replace private per-symbol enumeration with two account-wide calls and mark responses at documented page limits UNKNOWN — bounded request rate must not create a false COMPLETE snapshot — `adapters/private.py`, `private_cache.py`
+2026-08-15 — Enforce a two-second private-cache age, 250 ms synthetic p95, serialized hard-deadline reconciliation, and monotonic event watermarks — stale, hung, regressing, cross-venue, or incomplete state must block entry — `private_cache.py`
+2026-08-15 — Keep Telegram shadow mode alive without a token while retaining credential failure outside shadow mode — public observation and service health must not depend on private control credentials — `telegram_control.py`
+2026-08-15 — Persist received private-event watermarks and buffer cross-channel delivery by global watermark with a bounded authoritative-REST recovery path — delayed or reordered order/position/account events must never create false READY state or unbounded memory — `adapters/private.py`, `private_cache.py`, `state.py`
+2026-08-15 — Apply the internal per-minute REST budget only to monitoring and entry gates — cancel, close, restart, and unknown-order recovery must retain priority while venue transport limits and hard deadlines still apply — `private_cache.py`, live reconciliation call sites
+2026-08-15 — Interpret Bybit's CCXT `side=None, contracts=0` close update as zero-quantity tombstones for both one-way cached sides — a normal terminal close must remove stale exposure without poisoning the stream — `adapters/private.py`
+2026-08-15 — Use venue- and channel-specific account-wide WebSocket params and consume only fresh cached account data — CCXT subscription payloads must match Binance USD-M, Bybit, and OKX contracts without masking stale state — private adapter/cache
 
 ## Active blockers / owner actions
 
-### C4 independent acceptance
+### Repository visibility
 
-No owner credential or live-money action is requested. C5 remains forbidden until an independent reviewer accepts every P0 item. Repository defaults remain shadow/live-disabled, production secrets remain absent, and CI makes the production submit transport unreachable while asserting `production_submit_calls=0`.
+The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action required to make it PRIVATE. No credential or operational evidence may be committed while this remains unresolved.
 
 ## Last verified command
 
 ```text
-2026-08-15 local Windows equivalent of every Makefile verify target: PASS
+2026-08-15 Phase 2 local Windows equivalent of every Makefile verify target: PASS
 - exact main lock validation: PASS (64 packages)
-- ruff format --check + ruff check: PASS (78 files, including release scripts)
-- mypy --strict: PASS (76 source/test files)
-- pytest: 163 passed (including the pytest 9 JUnit compatibility regression)
+- ruff format --check + ruff check: PASS (85 files)
+- mypy --strict: PASS (83 source/test files)
+- pytest: 244 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
-GNU make is not installed on this Windows host. Exact `make verify`, Docker smoke,
-hashed replay/C4 artifacts, security evidence, and final commit identity are enforced
-by required Linux GitHub Actions checks on the current Draft PR head.
+GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,
+security evidence, independent exact-head review, and final commit identity remain required before merging this checkpoint.
 No production credentials were used and no real order was submitted.
 ```

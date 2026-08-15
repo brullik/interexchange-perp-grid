@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +26,8 @@ from interexchange_perp_grid.private_domain import (
     PrivateCapabilityReport,
     PrivateOrder,
     PrivateOrderStatus,
+    PrivateStreamEvent,
+    PrivateStreamKind,
     SnapshotCompleteness,
     UnknownActiveRecord,
     VenueOrderRequest,
@@ -82,6 +85,9 @@ class CcxtPrivateAdapter:
         self.venue = venue
         self._production_transport = exchange is None
         self._exchange: Any = exchange or CcxtProAdapter._build_exchange(venue)
+        self._private_event_watermark = 0
+        self._private_events_pending: set[int] = set()
+        self._private_event_lock = asyncio.Lock()
         if credentials is not None:
             self._exchange.apiKey = credentials.api_key
             self._exchange.secret = credentials.secret
@@ -90,6 +96,18 @@ class CcxtPrivateAdapter:
 
     def _has(self, capability: str) -> bool:
         return _supported(_mapping(self._exchange.has).get(capability))
+
+    def seed_private_event_watermark(self, watermark: int) -> None:
+        if watermark < self._private_event_watermark:
+            raise ValueError("private event watermark cannot regress")
+        self._private_event_watermark = watermark
+
+    def acknowledge_private_event(self, watermark: int) -> None:
+        self._private_events_pending.discard(watermark)
+
+    def _advance_private_event_watermark(self) -> int:
+        self._private_event_watermark += 1
+        return self._private_event_watermark
 
     async def probe_private_capabilities(self) -> PrivateCapabilityReport:
         await self._exchange.load_markets()
@@ -172,24 +190,123 @@ class CcxtPrivateAdapter:
 
     async def watch_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
         raw = await self._exchange.watch_orders(instrument.symbol)
+        self._advance_private_event_watermark()
         return _normalise_orders(self.venue, raw, instrument)
 
     async def watch_positions(self, instrument: Instrument) -> tuple[PositionSnapshot, ...]:
         raw = await self._exchange.watch_positions([instrument.symbol])
+        self._advance_private_event_watermark()
         if not isinstance(raw, Sequence):
             raise TypeError("CCXT watch_positions must return a sequence")
-        return tuple(
+        positions = tuple(
             position
             for value in raw
             if isinstance(value, Mapping)
             and (position := _normalise_position(self.venue, value, instrument)) is not None
         )
+        return positions
 
     async def watch_balance(self, instrument: Instrument) -> AccountSnapshot:
         raw = await self._exchange.watch_balance({"type": "swap"})
+        self._advance_private_event_watermark()
         if not isinstance(raw, Mapping):
             raise TypeError("CCXT watch_balance must return a mapping")
         return await self.fetch_account(instrument)
+
+    async def watch_account_wide_orders(self) -> PrivateStreamEvent:
+        params = _account_wide_stream_params(self.venue, PrivateStreamKind.ORDERS)
+        raw = await self._exchange.watch_orders(None, None, None, params)
+        source_ns = time.monotonic_ns()
+        watermark = self._advance_private_event_watermark()
+        self._private_events_pending.add(watermark)
+        try:
+            async with self._private_event_lock:
+                instruments = await self._linear_instruments()
+                orders, unknown = _normalise_account_order_updates(self.venue, raw, instruments)
+                return PrivateStreamEvent(
+                    self.venue,
+                    PrivateStreamKind.ORDERS,
+                    watermark,
+                    datetime.now(UTC),
+                    source_ns,
+                    orders=orders,
+                    unknown_active_records=unknown,
+                )
+        except (Exception, asyncio.CancelledError):
+            self._private_events_pending.discard(watermark)
+            raise
+
+    async def watch_account_wide_positions(self) -> PrivateStreamEvent:
+        params = _account_wide_stream_params(self.venue, PrivateStreamKind.POSITIONS)
+        raw = await self._exchange.watch_positions(None, None, None, params)
+        source_ns = time.monotonic_ns()
+        watermark = self._advance_private_event_watermark()
+        self._private_events_pending.add(watermark)
+        try:
+            async with self._private_event_lock:
+                instruments = await self._linear_instruments()
+                positions, unknown = _normalise_account_position_updates(
+                    self.venue, raw, instruments
+                )
+                return PrivateStreamEvent(
+                    self.venue,
+                    PrivateStreamKind.POSITIONS,
+                    watermark,
+                    datetime.now(UTC),
+                    source_ns,
+                    positions=positions,
+                    unknown_active_records=unknown,
+                )
+        except (Exception, asyncio.CancelledError):
+            self._private_events_pending.discard(watermark)
+            raise
+
+    async def watch_account_wide_balance(self) -> PrivateStreamEvent:
+        params = _account_wide_stream_params(self.venue, PrivateStreamKind.ACCOUNT)
+        raw = await self._exchange.watch_balance(params)
+        source_ns = time.monotonic_ns()
+        watermark = self._advance_private_event_watermark()
+        self._private_events_pending.add(watermark)
+        try:
+            async with self._private_event_lock:
+                unknown: tuple[UnknownActiveRecord, ...]
+                if not isinstance(raw, Mapping):
+                    account = None
+                    unknown = (
+                        UnknownActiveRecord(
+                            self.venue,
+                            "ACCOUNT",
+                            "NOT_A_MAPPING",
+                            _raw_payload(raw),
+                        ),
+                    )
+                else:
+                    try:
+                        account = _normalise_stream_account(self.venue, raw)
+                    except (TypeError, ValueError) as error:
+                        account = None
+                        unknown = (
+                            UnknownActiveRecord(
+                                self.venue,
+                                "ACCOUNT",
+                                f"{type(error).__name__}:{error}",
+                                _raw_payload(raw),
+                            ),
+                        )
+                    else:
+                        unknown = ()
+                return PrivateStreamEvent(
+                    self.venue,
+                    PrivateStreamKind.ACCOUNT,
+                    watermark,
+                    datetime.now(UTC),
+                    source_ns,
+                    account=account,
+                    unknown_active_records=unknown,
+                )
+        except (Exception, asyncio.CancelledError):
+            self._private_events_pending.discard(watermark)
+            raise
 
     async def fetch_positions(self, instrument: Instrument) -> tuple[PositionSnapshot, ...]:
         raw = await self._exchange.fetch_positions([instrument.symbol])
@@ -224,29 +341,78 @@ class CcxtPrivateAdapter:
         if not self._has("fetchOpenOrders") or not self._has("fetchPositions"):
             raise RuntimeError("complete private active snapshot capability is unavailable")
         instruments = await self._linear_instruments()
-        semaphore = asyncio.Semaphore(4)
+        order_limit, position_limit = _account_wide_snapshot_limits(self.venue)
 
-        async def open_orders(instrument: Instrument) -> tuple[object, ...]:
-            async with semaphore:
-                raw = await self._exchange.fetch_open_orders(instrument.symbol)
-            return _require_sequence(raw, "fetch_open_orders")
+        async def sample() -> tuple[tuple[object, ...], tuple[object, ...]]:
+            order_params = _account_wide_snapshot_params(self.venue)
+            position_params = _account_wide_snapshot_params(self.venue)
+            if position_limit is not None:
+                position_params["limit"] = position_limit
+            raw_orders, raw_positions = await asyncio.gather(
+                self._exchange.fetch_open_orders(None, None, order_limit, order_params),
+                self._exchange.fetch_positions(None, position_params),
+            )
+            return (
+                _require_sequence(raw_orders, "fetch_open_orders"),
+                _require_sequence(raw_positions, "fetch_positions"),
+            )
 
-        async def positions(instrument: Instrument) -> tuple[object, ...]:
-            async with semaphore:
-                raw = await self._exchange.fetch_positions([instrument.symbol])
-            return _require_sequence(raw, "fetch_positions")
-
-        ordered = tuple(instruments.values())
-        order_batches, position_batches = await asyncio.gather(
-            asyncio.gather(*(open_orders(instrument) for instrument in ordered)),
-            asyncio.gather(*(positions(instrument) for instrument in ordered)),
-        )
-        return _normalise_active_snapshot(
+        started_ns = time.monotonic_ns()
+        before_watermark = self._private_event_watermark
+        before_pending = tuple(sorted(self._private_events_pending))
+        first_orders, first_positions = await sample()
+        middle_watermark = self._private_event_watermark
+        middle_pending = tuple(sorted(self._private_events_pending))
+        second_orders, second_positions = await sample()
+        after_watermark = self._private_event_watermark
+        after_pending = tuple(sorted(self._private_events_pending))
+        latency_ms = Decimal(time.monotonic_ns() - started_ns) / Decimal(1_000_000)
+        first = _normalise_active_snapshot(
             self.venue,
-            tuple(value for batch in order_batches for value in batch),
-            tuple(value for batch in position_batches for value in batch),
+            first_orders,
+            first_positions,
             instruments,
+            event_watermark=middle_watermark,
+            request_count=4,
+            latency_ms=latency_ms,
+            account_wide=True,
+            additional_unknown=_page_warnings(
+                self.venue,
+                first_orders,
+                first_positions,
+                order_limit,
+                position_limit,
+                "FIRST",
+            ),
         )
+        second = _normalise_active_snapshot(
+            self.venue,
+            second_orders,
+            second_positions,
+            instruments,
+            event_watermark=after_watermark,
+            request_count=4,
+            latency_ms=latency_ms,
+            account_wide=True,
+            additional_unknown=_page_warnings(
+                self.venue,
+                second_orders,
+                second_positions,
+                order_limit,
+                position_limit,
+                "SECOND",
+            ),
+        )
+        samples_match = _active_snapshot_signature(first) == _active_snapshot_signature(second)
+        if first.completeness != SnapshotCompleteness.COMPLETE:
+            second = _snapshot_unknown(second, "FIRST_ACCOUNT_WIDE_SAMPLE_INCOMPLETE")
+        if not samples_match:
+            second = _snapshot_unknown(second, "ACCOUNT_WIDE_SNAPSHOT_UNSTABLE")
+        if not (before_watermark == middle_watermark == after_watermark):
+            second = _snapshot_unknown(second, "PRIVATE_EVENT_DURING_ACCOUNT_WIDE_SNAPSHOT")
+        if before_pending or middle_pending or after_pending:
+            second = _snapshot_unknown(second, "PRIVATE_EVENT_DELIVERY_PENDING")
+        return second
 
     async def resolve_instrument(self, symbol: str) -> Instrument | None:
         return (await self._linear_instruments()).get(symbol)
@@ -281,6 +447,7 @@ class CcxtPrivateAdapter:
             float(request.price) if request.price is not None else None,
             request.params,
         )
+        self._private_event_watermark += 1
         if not isinstance(raw, Mapping):
             raise TypeError("CCXT create_order must return a mapping")
         return _normalise_order(self.venue, raw, instrument, request.client_order_id)
@@ -291,6 +458,7 @@ class CcxtPrivateAdapter:
         instrument: Instrument,
     ) -> PrivateOrder:
         raw = await self._exchange.cancel_order(order_id, instrument.symbol)
+        self._private_event_watermark += 1
         if not isinstance(raw, Mapping):
             raise TypeError("CCXT cancel_order must return a mapping")
         return _normalise_order(self.venue, raw, instrument, "cancelled-order")
@@ -416,10 +584,232 @@ def _normalise_multi_instrument_orders(
     return tuple(orders)
 
 
+def _normalise_account_order_updates(
+    venue: Venue,
+    raw: object,
+    instruments: Mapping[str, Instrument],
+) -> tuple[tuple[PrivateOrder, ...], tuple[UnknownActiveRecord, ...]]:
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return (), (UnknownActiveRecord(venue, "OPEN_ORDER", "NOT_A_SEQUENCE", _raw_payload(raw)),)
+    orders: list[PrivateOrder] = []
+    unknown: list[UnknownActiveRecord] = []
+    for value in raw:
+        if not isinstance(value, Mapping):
+            unknown.append(
+                UnknownActiveRecord(venue, "OPEN_ORDER", "NOT_A_MAPPING", _raw_payload(value))
+            )
+            continue
+        instrument = instruments.get(str(value.get("symbol")))
+        if instrument is None:
+            unknown.append(
+                UnknownActiveRecord(venue, "OPEN_ORDER", "UNKNOWN_SYMBOL", _raw_payload(value))
+            )
+            continue
+        try:
+            orders.append(_normalise_order(venue, value, instrument, "unknown-client-id"))
+        except (TypeError, ValueError) as error:
+            unknown.append(
+                UnknownActiveRecord(
+                    venue,
+                    "OPEN_ORDER",
+                    f"{type(error).__name__}:{error}",
+                    _raw_payload(value),
+                )
+            )
+    return tuple(orders), tuple(unknown)
+
+
+def _normalise_account_position_updates(
+    venue: Venue,
+    raw: object,
+    instruments: Mapping[str, Instrument],
+) -> tuple[tuple[PositionSnapshot, ...], tuple[UnknownActiveRecord, ...]]:
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return (), (UnknownActiveRecord(venue, "POSITION", "NOT_A_SEQUENCE", _raw_payload(raw)),)
+    positions: list[PositionSnapshot] = []
+    unknown: list[UnknownActiveRecord] = []
+    for value in raw:
+        if not isinstance(value, Mapping):
+            unknown.append(
+                UnknownActiveRecord(venue, "POSITION", "NOT_A_MAPPING", _raw_payload(value))
+            )
+            continue
+        instrument = instruments.get(str(value.get("symbol")))
+        if instrument is None:
+            unknown.append(
+                UnknownActiveRecord(venue, "POSITION", "UNKNOWN_SYMBOL", _raw_payload(value))
+            )
+            continue
+        contracts = _decimal(value.get("contracts"))
+        side_value = str(value.get("side", "")).lower()
+        side = Side.BUY if side_value == "long" else Side.SELL if side_value == "short" else None
+        if venue == Venue.BYBIT and contracts == 0 and side is None:
+            positions.extend(
+                PositionSnapshot(
+                    venue,
+                    instrument.symbol,
+                    tombstone_side,
+                    Decimal(0),
+                    _decimal(value.get("entryPrice")),
+                    _decimal(value.get("markPrice")),
+                    datetime.now(UTC),
+                )
+                for tombstone_side in (Side.BUY, Side.SELL)
+            )
+            continue
+        if contracts is None or side is None:
+            unknown.append(
+                UnknownActiveRecord(
+                    venue,
+                    "POSITION",
+                    "QUANTITY_OR_SIDE_UNKNOWN",
+                    _raw_payload(value),
+                )
+            )
+            continue
+        positions.append(
+            PositionSnapshot(
+                venue,
+                instrument.symbol,
+                side,
+                abs(contracts) * instrument.contract_size_base,
+                _decimal(value.get("entryPrice")),
+                _decimal(value.get("markPrice")),
+                datetime.now(UTC),
+            )
+        )
+    return tuple(positions), tuple(unknown)
+
+
+def _normalise_stream_account(venue: Venue, raw: Mapping[str, object]) -> AccountSnapshot:
+    total = _currency_value(raw, "total", "USDT")
+    free = _currency_value(raw, "free", "USDT")
+    info = _mapping(raw.get("info"))
+    if total is None or free is None:
+        raise ValueError("USDT equity/free margin is unavailable")
+    trading_enabled = _optional_bool(
+        raw.get("tradingEnabled") if raw.get("tradingEnabled") is not None else info.get("canTrade")
+    )
+    permissions_value = raw.get("permissions") or info.get("permissions")
+    permissions = (
+        {str(value).lower() for value in permissions_value}
+        if isinstance(permissions_value, Sequence)
+        and not isinstance(permissions_value, (str, bytes))
+        else set()
+    )
+    if trading_enabled is True:
+        permissions.add("trade")
+    return AccountSnapshot(
+        venue,
+        total,
+        free,
+        _string_or_none(raw.get("marginMode") or info.get("marginMode")),
+        _string_or_none(raw.get("positionMode") or info.get("positionMode")),
+        trading_enabled,
+        tuple(sorted(permissions)),
+        datetime.now(UTC),
+        _optional_bool(
+            raw.get("withdrawalEnabled")
+            if raw.get("withdrawalEnabled") is not None
+            else info.get("canWithdraw")
+        ),
+        _optional_bool(
+            raw.get("transferEnabled")
+            if raw.get("transferEnabled") is not None
+            else info.get("canTransfer")
+        ),
+    )
+
+
 def _require_sequence(raw: object, operation: str) -> tuple[object, ...]:
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         raise TypeError(f"CCXT {operation} must return a sequence")
     return tuple(raw)
+
+
+def _account_wide_snapshot_params(venue: Venue) -> dict[str, object]:
+    if venue == Venue.BYBIT:
+        return {"category": "linear", "settleCoin": "USDT"}
+    if venue == Venue.OKX:
+        return {"instType": "SWAP"}
+    if venue == Venue.BINANCE_USDM:
+        return {"type": "future"}
+    raise ValueError(f"account-wide private snapshot is not qualified for {venue.value}")
+
+
+def _account_wide_snapshot_limits(venue: Venue) -> tuple[int | None, int | None]:
+    if venue == Venue.BYBIT:
+        return 50, 200
+    if venue == Venue.OKX:
+        return 100, None
+    if venue == Venue.BINANCE_USDM:
+        return None, None
+    raise ValueError(f"account-wide private snapshot is not qualified for {venue.value}")
+
+
+def _account_wide_stream_params(
+    venue: Venue,
+    kind: PrivateStreamKind,
+) -> dict[str, object]:
+    if venue == Venue.BYBIT:
+        # The configured CCXT transport already selects swap/linear. Unconsumed params are
+        # merged into Bybit's subscribe frame, whose schema only permits op/req_id/args.
+        return {}
+    if venue == Venue.OKX:
+        if kind == PrivateStreamKind.ORDERS:
+            return {"type": "swap"}
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"instType": "SWAP"}
+        return {}
+    if venue == Venue.BINANCE_USDM:
+        return {"type": "future"}
+    raise ValueError(f"account-wide private stream is not qualified for {venue.value}")
+
+
+def _page_warnings(
+    venue: Venue,
+    raw_orders: tuple[object, ...],
+    raw_positions: tuple[object, ...],
+    order_limit: int | None,
+    position_limit: int | None,
+    sample: str,
+) -> tuple[UnknownActiveRecord, ...]:
+    warnings: list[UnknownActiveRecord] = []
+    for kind, values, limit in (
+        ("OPEN_ORDER", raw_orders, order_limit),
+        ("POSITION", raw_positions, position_limit),
+    ):
+        cursor = _next_page_cursor(values)
+        if cursor is not None:
+            warnings.append(
+                UnknownActiveRecord(
+                    venue,
+                    kind,
+                    "ACCOUNT_WIDE_RESULT_HAS_MORE_PAGES",
+                    {"sample": sample, "next_page_cursor": cursor},
+                )
+            )
+        elif limit is not None and len(values) >= limit:
+            warnings.append(
+                UnknownActiveRecord(
+                    venue,
+                    kind,
+                    "ACCOUNT_WIDE_RESULT_AT_PAGE_LIMIT",
+                    {"sample": sample, "observed_count": len(values), "page_limit": limit},
+                )
+            )
+    return tuple(warnings)
+
+
+def _next_page_cursor(values: tuple[object, ...]) -> str | None:
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        info = _mapping(value.get("info"))
+        cursor = value.get("nextPageCursor") or info.get("nextPageCursor")
+        if cursor is not None and str(cursor).strip():
+            return str(cursor)
+    return None
 
 
 def _raw_payload(value: object) -> dict[str, Any]:
@@ -433,10 +823,16 @@ def _normalise_active_snapshot(
     raw_orders: tuple[object, ...],
     raw_positions: tuple[object, ...],
     instruments: Mapping[str, Instrument],
+    *,
+    event_watermark: int = 0,
+    request_count: int = 0,
+    latency_ms: Decimal = Decimal(0),
+    account_wide: bool = False,
+    additional_unknown: tuple[UnknownActiveRecord, ...] = (),
 ) -> PrivateActiveSnapshot:
     orders: list[PrivateOrder] = []
     positions: list[PositionSnapshot] = []
-    unknown: list[UnknownActiveRecord] = []
+    unknown = list(additional_unknown)
     for value in raw_orders:
         if not isinstance(value, Mapping):
             unknown.append(
@@ -503,6 +899,74 @@ def _normalise_active_snapshot(
         unknown_active_records=tuple(unknown),
         completeness=(SnapshotCompleteness.COMPLETE if complete else SnapshotCompleteness.UNKNOWN),
         observed_at=datetime.now(UTC),
+        event_watermark=event_watermark,
+        request_count=request_count,
+        latency_ms=latency_ms,
+        account_wide=account_wide,
+    )
+
+
+def _snapshot_unknown(
+    snapshot: PrivateActiveSnapshot,
+    reason: str,
+) -> PrivateActiveSnapshot:
+    record = UnknownActiveRecord(
+        snapshot.venue,
+        "SNAPSHOT",
+        reason,
+        {"event_watermark": snapshot.event_watermark},
+    )
+    return replace(
+        snapshot,
+        unknown_active_records=(*snapshot.unknown_active_records, record),
+        completeness=SnapshotCompleteness.UNKNOWN,
+    )
+
+
+def _active_snapshot_signature(snapshot: PrivateActiveSnapshot) -> tuple[object, ...]:
+    return (
+        snapshot.raw_open_order_count,
+        snapshot.raw_nonzero_position_count,
+        tuple(
+            sorted(
+                (
+                    order.order_id or "",
+                    order.client_order_id,
+                    order.symbol,
+                    order.side.value,
+                    order.status.value,
+                    str(order.requested_base_quantity),
+                    str(order.filled_base_quantity),
+                )
+                for order in snapshot.open_orders
+            )
+        ),
+        tuple(
+            sorted(
+                (
+                    position.symbol,
+                    position.side.value,
+                    str(position.base_quantity),
+                )
+                for position in snapshot.positions
+            )
+        ),
+        tuple(
+            sorted(
+                (
+                    record.kind,
+                    record.reason,
+                    repr(
+                        sorted(
+                            (key, value)
+                            for key, value in record.raw_record.items()
+                            if key != "sample"
+                        )
+                    ),
+                )
+                for record in snapshot.unknown_active_records
+            )
+        ),
     )
 
 

@@ -19,6 +19,8 @@ from interexchange_perp_grid.state import (
     SCHEMA_VERSION,
     initialise_state,
     load_tranches,
+    read_private_event_watermark,
+    save_private_event_watermark,
     save_tranche,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
@@ -55,6 +57,20 @@ async def test_version_one_state_migrates_without_losing_metadata(tmp_path: Path
         assert database.execute(
             "SELECT value FROM metadata WHERE key = 'owner_value'"
         ).fetchone() == ("preserved",)
+
+
+@pytest.mark.asyncio
+async def test_private_event_watermark_persists_and_cannot_regress(tmp_path: Path) -> None:
+    path = tmp_path / "private-watermark.sqlite3"
+    await initialise_state(path)
+
+    assert await read_private_event_watermark(path, Venue.BYBIT) == 0
+    await save_private_event_watermark(path, Venue.BYBIT, 7)
+    await save_private_event_watermark(path, Venue.BYBIT, 7)
+
+    assert await read_private_event_watermark(path, Venue.BYBIT) == 7
+    with pytest.raises(ValueError, match="cannot regress"):
+        await save_private_event_watermark(path, Venue.BYBIT, 6)
 
 
 @pytest.mark.asyncio

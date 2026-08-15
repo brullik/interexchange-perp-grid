@@ -113,6 +113,8 @@ class OrderBookSnapshot:
     is_snapshot: bool
     synchronised: bool
     clock_skew_ms: int | None
+    sequence_reset: bool = False
+    sequence_contiguous: bool = True
 
 
 @dataclass(frozen=True, slots=True)

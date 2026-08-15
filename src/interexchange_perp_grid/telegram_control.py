@@ -13,6 +13,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.live_control import LiveControlResult, render_control_result
+from interexchange_perp_grid.observability import get_logger
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import record_command_audit, record_live_confirmation
@@ -126,13 +127,18 @@ class TelegramCommandRouter:
             if self._live_control is None:
                 response = "killed=true paused=true"
             else:
-                result = await self._live_control.kill()
+                try:
+                    result = await self._live_control.kill()
+                    live_workflow = json.loads(render_control_result(result))
+                except Exception as error:
+                    get_logger().warning(
+                        "telegram_private_state_unavailable",
+                        operation="kill",
+                        error_type=type(error).__name__,
+                    )
+                    live_workflow = self._private_unavailable("kill")
                 response = json.dumps(
-                    {
-                        "killed": True,
-                        "paused": True,
-                        "live_workflow": json.loads(render_control_result(result)),
-                    },
+                    {"killed": True, "paused": True, "live_workflow": live_workflow},
                     sort_keys=True,
                 )
         elif command == "/confirm_live":
@@ -177,12 +183,36 @@ class TelegramCommandRouter:
             "/pnl",
             "/balances",
         }:
-            live = await self._live_control.snapshot()
+            try:
+                live = await self._live_control.snapshot()
+            except Exception as error:
+                get_logger().warning(
+                    "telegram_private_state_unavailable",
+                    operation=command.removeprefix("/"),
+                    error_type=type(error).__name__,
+                )
+                shadow_payload = await self._shadow_read_payload(command)
+                return json.dumps(
+                    {
+                        "source": "SHADOW_FALLBACK",
+                        "private_state": ReasonCode.PRIVATE_STATE_UNAVAILABLE.value,
+                        "shadow": shadow_payload,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
             key = command.removeprefix("/")
             live_payload = (
                 live if command == "/status" else live.get(key, {"status": "UNAVAILABLE"})
             )
             return json.dumps(live_payload, sort_keys=True, default=str)
+        return json.dumps(
+            await self._shadow_read_payload(command),
+            sort_keys=True,
+            default=str,
+        )
+
+    async def _shadow_read_payload(self, command: str) -> object:
         snapshot = await self._runtime.snapshot()
         market = snapshot.get("market")
         market_payload = market if isinstance(market, dict) else {}
@@ -212,7 +242,7 @@ class TelegramCommandRouter:
             }
         else:
             payload = market_payload.get("balances", {"status": "UNAVAILABLE"})
-        return json.dumps(payload, sort_keys=True, default=str)
+        return payload
 
     async def _live_response(self, operation: str) -> str:
         if self._live_control is None:
@@ -220,15 +250,31 @@ class TelegramCommandRouter:
                 {"success": False, "operation": operation, "reason": "LIVE_CONTROL_UNAVAILABLE"},
                 sort_keys=True,
             )
-        if operation == "close_all_live":
-            result = await self._live_control.close_all_live()
-        elif operation == "cancel_all_live":
-            result = await self._live_control.cancel_all_live()
-        elif operation == "emergency_flatten":
-            result = await self._live_control.emergency_flatten()
-        else:
-            raise ValueError(f"unsupported live control operation: {operation}")
+        try:
+            if operation == "close_all_live":
+                result = await self._live_control.close_all_live()
+            elif operation == "cancel_all_live":
+                result = await self._live_control.cancel_all_live()
+            elif operation == "emergency_flatten":
+                result = await self._live_control.emergency_flatten()
+            else:
+                raise ValueError(f"unsupported live control operation: {operation}")
+        except Exception as error:
+            get_logger().warning(
+                "telegram_private_state_unavailable",
+                operation=operation,
+                error_type=type(error).__name__,
+            )
+            return json.dumps(self._private_unavailable(operation), sort_keys=True)
         return render_control_result(result)
+
+    @staticmethod
+    def _private_unavailable(operation: str) -> dict[str, object]:
+        return {
+            "success": False,
+            "operation": operation,
+            "reason": ReasonCode.PRIVATE_STATE_UNAVAILABLE.value,
+        }
 
     async def _audit(
         self,
@@ -259,6 +305,13 @@ async def run_telegram_bot(
     token = os.environ.get("IPEG_TELEGRAM_BOT_TOKEN", "")
     owner_chat_id = settings.telegram.owner_chat_id
     if not token or owner_chat_id is None:
+        if settings.app.mode == "shadow":
+            get_logger().warning(
+                "telegram_shadow_fallback",
+                reason="runtime_credentials_missing",
+            )
+            await stop_event.wait()
+            return
         raise RuntimeError("Telegram is enabled but runtime credentials are missing")
     router = TelegramCommandRouter(
         runtime,

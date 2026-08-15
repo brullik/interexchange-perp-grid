@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from interexchange_perp_grid.client_ids import is_bot_client_order_id
 from interexchange_perp_grid.domain import Instrument, Venue
@@ -50,6 +51,16 @@ class PrivateStateAdapter(Protocol):
     async def fetch_trading_fee(self, instrument: Instrument) -> Decimal | None: ...
 
 
+@runtime_checkable
+class ReconcilingPrivateStateAdapter(Protocol):
+    async def reconcile_active_snapshot(self, trigger: str) -> PrivateActiveSnapshot: ...
+
+
+def _consume_background_task[T](task: asyncio.Task[T]) -> None:
+    with suppress(asyncio.CancelledError, Exception):
+        task.exception()
+
+
 @dataclass(frozen=True, slots=True)
 class VenuePrivateState:
     venue: Venue
@@ -63,6 +74,7 @@ class VenuePrivateState:
     raw_nonzero_position_count: int = 0
     unknown_active_records: tuple[UnknownActiveRecord, ...] = ()
     completeness: SnapshotCompleteness = SnapshotCompleteness.COMPLETE
+    account_wide: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,17 +264,45 @@ def _unavailable_private_report() -> ReconciliationReport:
 async def collect_private_states(
     adapters: Mapping[Venue, PrivateStateAdapter],
     instruments: Mapping[Venue, Instrument],
+    *,
+    timeout_seconds: float = 2.0,
+    reconciliation_trigger: str | None = None,
 ) -> dict[Venue, VenuePrivateState]:
+    if timeout_seconds <= 0:
+        raise ValueError("private state collection timeout must be positive")
+
     async def collect(venue: Venue) -> VenuePrivateState:
         adapter = adapters[venue]
         instrument = instruments[venue]
         try:
-            account, active, recent_orders, fee = await asyncio.gather(
-                adapter.fetch_account(instrument),
-                adapter.fetch_active_snapshot(),
-                adapter.fetch_closed_orders(instrument),
-                adapter.fetch_trading_fee(instrument),
+            active_request = (
+                adapter.reconcile_active_snapshot(f"{reconciliation_trigger}:{venue.value}")
+                if reconciliation_trigger is not None
+                and isinstance(adapter, ReconcilingPrivateStateAdapter)
+                else adapter.fetch_active_snapshot()
             )
+            account_task = asyncio.create_task(adapter.fetch_account(instrument))
+            active_task = asyncio.create_task(active_request)
+            recent_orders_task = asyncio.create_task(adapter.fetch_closed_orders(instrument))
+            fee_task = asyncio.create_task(adapter.fetch_trading_fee(instrument))
+            tasks = (account_task, active_task, recent_orders_task, fee_task)
+            _, pending = await asyncio.wait(
+                tasks,
+                timeout=timeout_seconds,
+                return_when=asyncio.ALL_COMPLETED,
+            )
+            if pending:
+                for task in tasks:
+                    if task.done():
+                        _consume_background_task(task)
+                    else:
+                        task.cancel()
+                        task.add_done_callback(_consume_background_task)
+                raise TimeoutError
+            account = account_task.result()
+            active = active_task.result()
+            recent_orders = recent_orders_task.result()
+            fee = fee_task.result()
             return VenuePrivateState(
                 venue,
                 account,
@@ -275,6 +315,7 @@ async def collect_private_states(
                 active.raw_nonzero_position_count,
                 active.unknown_active_records,
                 active.completeness,
+                active.account_wide,
             )
         except Exception as error:
             return VenuePrivateState(
@@ -289,6 +330,7 @@ async def collect_private_states(
                 0,
                 (),
                 SnapshotCompleteness.UNKNOWN,
+                False,
             )
 
     results = await asyncio.gather(*(collect(venue) for venue in adapters))
@@ -318,7 +360,8 @@ def reconcile_private_states(
         if state.taker_fee_rate is None:
             unknown.append(f"{venue.value}:FEE_UNKNOWN")
         if (
-            state.completeness != SnapshotCompleteness.COMPLETE
+            not state.account_wide
+            or state.completeness != SnapshotCompleteness.COMPLETE
             or state.raw_open_order_count != len(state.open_orders)
             or state.raw_nonzero_position_count != len(state.positions)
         ):
@@ -372,7 +415,8 @@ def reconcile_private_states(
     open_position_count = sum(state.raw_nonzero_position_count for state in states.values())
     unknown_active_count = sum(len(state.unknown_active_records) for state in states.values())
     snapshots_complete = all(
-        state.completeness == SnapshotCompleteness.COMPLETE
+        state.account_wide
+        and state.completeness == SnapshotCompleteness.COMPLETE
         and state.raw_open_order_count == len(state.open_orders)
         and state.raw_nonzero_position_count == len(state.positions)
         for state in states.values()

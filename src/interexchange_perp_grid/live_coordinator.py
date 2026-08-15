@@ -498,7 +498,11 @@ class LiveCanaryCoordinator:
         await self._journal.record_order_event(pair_action_id, order, key)
 
     async def _refresh_action(self, action: LiveJournalAction) -> LiveJournalAction:
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="POST_SUBMIT_OR_UNKNOWN",
+        )
         known = {leg.client_order_id for leg in action.legs}
         for state in states.values():
             for order in (*state.open_orders, *state.recent_orders):
@@ -660,7 +664,11 @@ class LiveCanaryCoordinator:
         *,
         emergency: bool,
     ) -> None:
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="PRE_CLOSE",
+        )
         positions = tuple(position for state in states.values() for position in state.positions)
         await asyncio.gather(
             *(
@@ -680,7 +688,11 @@ class LiveCanaryCoordinator:
         )
 
     async def _cancel_all_bot_orders(self) -> None:
-        states = await collect_private_states(self._adapters, self._account_instruments)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="PRE_CANCEL",
+        )
         await asyncio.gather(
             *(
                 self._cancel_one(order)

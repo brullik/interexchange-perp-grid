@@ -1,31 +1,36 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T15:19:04Z",
-  "state": "C4_3_ADVERSARIAL_REVIEW",
-  "phase": "Phase 1 — C4.3 adversarial review",
+  "updated_at": "2026-08-15T17:46:14Z",
+  "state": "WAVE1_CORE_ADVERSARIAL_REVIEW",
+  "phase": "Phase 2 — Production-grade Wave 1 data/private core",
   "repository": "brullik/interexchange-perp-grid",
-  "branch": "codex/fast-track-mvp",
-  "pr": 1,
-  "head_sha": "95a30f9821bae2c7515b07cba1f2ca51af2565de",
-  "ci_run": null,
-  "artifact": null,
+  "branch": "codex/wave1-production-core",
+  "pr": null,
+  "head_sha": "c0a2ea6b97f84a688655ed3c2e5199eb8a9a702d",
+  "ci_run": 31896663152,
+  "artifact": "release-image-v0.1.0-rc1-776668b9f02d3bcb633611463d71a09eeb45284f-1",
   "completed_criteria": [
-    "Autonomous normative package imported with exact ZIP entry hashes",
-    "C4.3 atomic watermark-to-FLAT commit and fail-closed UNKNOWN handling implemented",
-    "Local verify equivalent passed: lock, Ruff, strict mypy, 177 tests, and doctor",
-    "Exact SF-001 through SF-008 run passed 8/8 with six public success=false outcomes",
-    "Independent adversarial re-review passed with no P0, P1, or P2 findings"
+    "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
+    "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
+    "PR 1 was squash-merged and annotated prerelease v0.1.0-rc1 plus both GHCR tags were published and independently verified",
+    "Wave 1 private snapshot uses two bounded account-wide calls and fails closed at documented page limits",
+    "Wave 1 latest-value cache enforces persisted and ordered event watermarks, bounded reorder recovery, completeness, two-second age, hard timeouts, and measured 250 ms p95",
+    "Native Bybit V5 u/seq guard is installed in the CCXT Pro factory and handles explicit u=1 reset",
+    "Telegram shadow mode remains healthy without runtime credentials",
+    "Local Phase 2 verify passed: lock, Ruff, strict mypy, 244 tests, and doctor"
   ],
   "active_work": [
-    "Commit the reviewed C4.3 checkpoint and obtain the exact-head CI proof artifact"
+    "Obtain independent adversarial PASS for the current Phase 2 diff",
+    "Transfer the checkpoint onto exact remote main ff40d64 and rerun exact-head verification before draft PR publication"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Require adversarial PASS, then commit the checkpoint and obtain the exact-head C4.3 CI artifact.",
+  "next_action": "Commit the locally verified Phase 2 diff, transfer it onto exact remote main ff40d64 without force-push, rerun verification, and require independent P0/P1-free exact-head review before merge.",
   "known_limitations": [
-    "The exact-head C4.3 artifact cannot exist until the reviewed checkpoint is committed and pushed.",
-    "The current repository visibility is PUBLIC."
+    "The current repository visibility is PUBLIC.",
+    "Operational evidence and secrets remain forbidden while the repository is PUBLIC.",
+    "The current local Phase 2 branch is rooted before the Phase 1 squash and must be recreated on exact remote main before publication."
   ]
 }
