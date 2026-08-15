@@ -21,7 +21,7 @@ This is the only mutable project-status document.
 | C2 strategy/risk/simulator | COMPLETE | [GitHub Actions run 31839163485](https://github.com/brullik/interexchange-perp-grid/actions/runs/31839163485): Linux `make verify` (43 tests) and Docker health/restart passed on `0849413`; deterministic tests cover open/add/partial close/full close, profitable and losing four-leg PnL, funding, protected prices, partial/rejected/unknown orders, private staleness, venue outage, third-venue hedge, forced close, and property-based 5/50 USDT risk invariants |
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
-| Phase 2 Wave 1 data/private core | ADVERSARIAL_REVIEW | Account-wide bounded private snapshots/cache, persistent and ordered event watermarks, native Bybit V5 `u/seq`, page-limit completeness, recovery-priority REST budgeting, hard deadlines, measured p95, no-credential public scan, and Telegram shadow fallback pass local verification (244 tests) |
+| Phase 2 Wave 1 data/private core | ADVERSARIAL_REVIEW | Account-wide bounded private snapshots/cache, persistent and ordered event watermarks, native Bybit V5 `u/seq`, page-limit completeness, recovery-priority REST budgeting, hard deadlines, measured p95, no-credential public scan, and Telegram shadow fallback pass local verification (248 tests) |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -65,6 +65,8 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-15 — Apply the internal per-minute REST budget only to monitoring and entry gates — cancel, close, restart, and unknown-order recovery must retain priority while venue transport limits and hard deadlines still apply — `private_cache.py`, live reconciliation call sites
 2026-08-15 — Interpret Bybit's CCXT `side=None, contracts=0` close update as zero-quantity tombstones for both one-way cached sides — a normal terminal close must remove stale exposure without poisoning the stream — `adapters/private.py`
 2026-08-15 — Use venue- and channel-specific account-wide WebSocket params and consume only fresh cached account data — CCXT subscription payloads must match Binance USD-M, Bybit, and OKX contracts without masking stale state — private adapter/cache
+2026-08-15 — Reserve the persisted private watermark exclusively for account-wide received events and resolve post-submit order watches from the same bounded cache — submit/cancel and legacy symbol watchers must not create invisible sequence gaps — private adapter/cache/coordinator boundary
+2026-08-15 — Detach at most one cancellation-resistant REST fetch after a hard reconciliation deadline and bound stream watcher shutdown — timeout and process shutdown guarantees must not depend on cooperative transport cancellation — `private_cache.py`
 
 ## Active blockers / owner actions
 
@@ -79,7 +81,7 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (85 files)
 - mypy --strict: PASS (83 source/test files)
-- pytest: 244 passed
+- pytest: 248 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,

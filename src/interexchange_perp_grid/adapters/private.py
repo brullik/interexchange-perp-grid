@@ -190,12 +190,10 @@ class CcxtPrivateAdapter:
 
     async def watch_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
         raw = await self._exchange.watch_orders(instrument.symbol)
-        self._advance_private_event_watermark()
         return _normalise_orders(self.venue, raw, instrument)
 
     async def watch_positions(self, instrument: Instrument) -> tuple[PositionSnapshot, ...]:
         raw = await self._exchange.watch_positions([instrument.symbol])
-        self._advance_private_event_watermark()
         if not isinstance(raw, Sequence):
             raise TypeError("CCXT watch_positions must return a sequence")
         positions = tuple(
@@ -208,7 +206,6 @@ class CcxtPrivateAdapter:
 
     async def watch_balance(self, instrument: Instrument) -> AccountSnapshot:
         raw = await self._exchange.watch_balance({"type": "swap"})
-        self._advance_private_event_watermark()
         if not isinstance(raw, Mapping):
             raise TypeError("CCXT watch_balance must return a mapping")
         return await self.fetch_account(instrument)
@@ -447,7 +444,6 @@ class CcxtPrivateAdapter:
             float(request.price) if request.price is not None else None,
             request.params,
         )
-        self._private_event_watermark += 1
         if not isinstance(raw, Mapping):
             raise TypeError("CCXT create_order must return a mapping")
         return _normalise_order(self.venue, raw, instrument, request.client_order_id)
@@ -458,7 +454,6 @@ class CcxtPrivateAdapter:
         instrument: Instrument,
     ) -> PrivateOrder:
         raw = await self._exchange.cancel_order(order_id, instrument.symbol)
-        self._private_event_watermark += 1
         if not isinstance(raw, Mapping):
             raise TypeError("CCXT cancel_order must return a mapping")
         return _normalise_order(self.venue, raw, instrument, "cancelled-order")
@@ -643,7 +638,12 @@ def _normalise_account_position_updates(
         contracts = _decimal(value.get("contracts"))
         side_value = str(value.get("side", "")).lower()
         side = Side.BUY if side_value == "long" else Side.SELL if side_value == "short" else None
-        if venue == Venue.BYBIT and contracts == 0 and side is None:
+        closes_one_way_position = (
+            contracts == 0
+            and side is None
+            and (venue == Venue.BYBIT or (venue == Venue.BINANCE_USDM and side_value == "both"))
+        )
+        if closes_one_way_position:
             positions.extend(
                 PositionSnapshot(
                     venue,

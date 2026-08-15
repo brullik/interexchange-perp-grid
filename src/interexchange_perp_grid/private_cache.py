@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -122,6 +122,7 @@ class PrivateStateCache:
         self._lock = asyncio.Lock()
         self._reconcile_lock = asyncio.Lock()
         self._persist_lock = asyncio.Lock()
+        self._order_update_condition = asyncio.Condition(self._lock)
         self._snapshot: PrivateActiveSnapshot | None = None
         self._updated_monotonic_ns: int | None = None
         self._orders_updated_monotonic_ns: int | None = None
@@ -137,6 +138,9 @@ class PrivateStateCache:
         self._delivery_error: str | None = None
         self._stream_errors: dict[PrivateStreamKind, str] = {}
         self._pending_stream_events: dict[int, PrivateStreamEvent] = {}
+        self._latest_order_updates: OrderedDict[str, tuple[PrivateOrder, ...]] = OrderedDict()
+        self._order_update_generation = 0
+        self._detached_fetch_task: asyncio.Task[PrivateActiveSnapshot] | None = None
         self._rest_latencies_ms: deque[Decimal] = deque(maxlen=256)
         self._rest_request_times_ns: deque[int] = deque()
         self._event_latencies_ms: deque[Decimal] = deque(maxlen=256)
@@ -148,6 +152,14 @@ class PrivateStateCache:
         if not trigger.strip():
             raise ValueError("private cache reconciliation trigger is required")
         async with self._reconcile_lock:
+            if self._detached_fetch_task is not None:
+                if self._detached_fetch_task.done():
+                    _consume_task_result(self._detached_fetch_task)
+                    self._detached_fetch_task = None
+                else:
+                    async with self._lock:
+                        self._invalid_reason = "PRIVATE_RECONCILIATION_CANCELLATION_PENDING"
+                        return self._view_locked()
             if trigger.startswith("CONSUMER_FAIL_CLOSED_REFRESH"):
                 async with self._lock:
                     current = self._view_locked()
@@ -170,12 +182,20 @@ class PrivateStateCache:
                 self._rest_request_times_ns.extend(
                     now_ns for _ in range(self._policy.maximum_rest_requests)
                 )
+            fetch_task = asyncio.create_task(self._adapter.fetch_active_snapshot())
             try:
-                snapshot = await asyncio.wait_for(
-                    self._adapter.fetch_active_snapshot(),
+                done, _ = await asyncio.wait(
+                    {fetch_task},
                     timeout=float(self._policy.reconciliation_timeout_seconds),
                 )
+                if fetch_task not in done:
+                    fetch_task.cancel()
+                    self._detach_fetch_task(fetch_task)
+                    raise TimeoutError
+                snapshot = fetch_task.result()
             except asyncio.CancelledError:
+                fetch_task.cancel()
+                self._detach_fetch_task(fetch_task)
                 raise
             except Exception as error:
                 async with self._lock:
@@ -194,6 +214,18 @@ class PrivateStateCache:
                 self._mark_persistence_pending_locked(snapshot.event_watermark, accepted)
                 view = self._view_locked()
             return await self._persist_accepted_watermark(snapshot.event_watermark, view, accepted)
+
+    def _detach_fetch_task(self, task: asyncio.Task[PrivateActiveSnapshot]) -> None:
+        self._detached_fetch_task = task
+        task.add_done_callback(self._complete_detached_fetch_task)
+
+    def _complete_detached_fetch_task(
+        self,
+        task: asyncio.Task[PrivateActiveSnapshot],
+    ) -> None:
+        _consume_task_result(task)
+        if self._detached_fetch_task is task:
+            self._detached_fetch_task = None
 
     async def ingest_stream_snapshot(self, snapshot: PrivateActiveSnapshot) -> PrivateCacheView:
         async with self._lock:
@@ -338,6 +370,16 @@ class PrivateStateCache:
         accepted_ns = self._updated_monotonic_ns
         if event.kind == PrivateStreamKind.ORDERS:
             self._orders_updated_monotonic_ns = accepted_ns
+            symbols = {order.symbol for order in event.orders}
+            for symbol in symbols:
+                self._latest_order_updates[symbol] = tuple(
+                    order for order in event.orders if order.symbol == symbol
+                )
+                self._latest_order_updates.move_to_end(symbol)
+            while len(self._latest_order_updates) > self._policy.maximum_pending_stream_events:
+                self._latest_order_updates.popitem(last=False)
+            self._order_update_generation += 1
+            self._order_update_condition.notify_all()
         elif event.kind == PrivateStreamKind.POSITIONS:
             self._positions_updated_monotonic_ns = accepted_ns
         elif event.kind == PrivateStreamKind.ACCOUNT:
@@ -384,6 +426,28 @@ class PrivateStateCache:
                 return None
             return self._account_snapshot
 
+    async def watch_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
+        async with self._order_update_condition:
+            existing = self._latest_order_updates.get(instrument.symbol)
+            current = self._view_locked()
+            if existing is not None and current.ready:
+                return self._latest_order_updates.pop(instrument.symbol)
+            generation = self._order_update_generation - int(existing is not None)
+            await self._order_update_condition.wait_for(
+                lambda: (
+                    (
+                        self._order_update_generation > generation
+                        and self._pending_persistence_watermark is None
+                    )
+                    or PrivateStreamKind.ORDERS in self._stream_errors
+                    or self._delivery_error is not None
+                )
+            )
+            current = self._view_locked()
+            if not current.ready:
+                raise RuntimeError(current.reason or "PRIVATE_CACHE_UNKNOWN")
+            return self._latest_order_updates.pop(instrument.symbol, ())
+
     async def _persist_accepted_watermark(
         self,
         watermark: int,
@@ -402,6 +466,7 @@ class PrivateStateCache:
                 if self._pending_persistence_watermark == watermark:
                     self._pending_persistence_watermark = None
                 self._invalid_reason = f"PRIVATE_WATERMARK_PERSIST_FAILED:{type(error).__name__}"
+                self._order_update_condition.notify_all()
                 return self._view_locked()
         async with self._lock:
             if self._pending_persistence_watermark == watermark:
@@ -410,6 +475,7 @@ class PrivateStateCache:
                 "PRIVATE_WATERMARK_PERSIST_FAILED:"
             ):
                 self._invalid_reason = None
+            self._order_update_condition.notify_all()
             return self._view_locked()
 
     def _mark_persistence_pending_locked(self, watermark: int, accepted: bool) -> None:
@@ -677,6 +743,9 @@ class CachedPrivateStateAdapter:
     async def fetch_all_open_orders(self) -> tuple[PrivateOrder, ...]:
         snapshot = await self.fetch_active_snapshot()
         return snapshot.open_orders
+
+    async def watch_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
+        return await self._cache.watch_orders(instrument)
 
     async def fetch_closed_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
         return await self._delegate.fetch_closed_orders(instrument)

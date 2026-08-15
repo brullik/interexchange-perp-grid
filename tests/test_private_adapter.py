@@ -252,11 +252,13 @@ async def test_private_submit_fetch_and_cancel_remain_normalised() -> None:
     submitted = await adapter.submit_order(request, selected)
     fetched = await adapter.fetch_order("order-1", selected, "client-1")
     cancelled = await adapter.cancel_order("order-1", selected)
+    snapshot = await adapter.fetch_active_snapshot()
     assert submitted.status.value == "FILLED"
     assert submitted.filled_base_quantity == Decimal("0.10")
     assert fetched.status.value == "FILLED"
     assert cancelled.status.value == "CANCELLED"
     assert exchange.create_calls == 1
+    assert snapshot.event_watermark == 0
 
 
 def _linear_market(symbol: str = "BTC/USDT:USDT") -> dict[str, object]:
@@ -324,12 +326,12 @@ async def test_wave1_snapshot_is_account_wide_and_request_bounded(
 
 @pytest.mark.asyncio
 async def test_private_event_watermark_is_carried_into_account_snapshot() -> None:
-    exchange = LargeAccountWideExchange()
+    exchange = AccountWideStreamExchange()
     adapter = CcxtPrivateAdapter(Venue.BYBIT, exchange=exchange)
-    selected = instrument(Venue.BYBIT)
 
     first = await adapter.fetch_active_snapshot()
-    await adapter.watch_orders(selected)
+    event = await adapter.watch_account_wide_orders()
+    adapter.acknowledge_private_event(event.event_watermark)
     second = await adapter.fetch_active_snapshot()
 
     assert first.event_watermark == 0
@@ -338,12 +340,13 @@ async def test_private_event_watermark_is_carried_into_account_snapshot() -> Non
 
 @pytest.mark.asyncio
 async def test_private_event_watermark_can_be_restored_without_regression() -> None:
-    exchange = LargeAccountWideExchange()
+    exchange = AccountWideStreamExchange()
     adapter = CcxtPrivateAdapter(Venue.BYBIT, exchange=exchange)
     adapter.seed_private_event_watermark(5)
 
     restored = await adapter.fetch_active_snapshot()
-    await adapter.watch_orders(instrument(Venue.BYBIT))
+    event = await adapter.watch_account_wide_orders()
+    adapter.acknowledge_private_event(event.event_watermark)
     advanced = await adapter.fetch_active_snapshot()
 
     assert restored.event_watermark == 5
@@ -457,7 +460,11 @@ async def test_account_wide_private_streams_are_normalised_and_monotonic(
     assert exchange.stream_params == expected_stream_params
 
 
-class BybitClosedPositionStreamExchange(AccountWideStreamExchange):
+class OneWayClosedPositionStreamExchange(AccountWideStreamExchange):
+    def __init__(self, side: str | None) -> None:
+        super().__init__()
+        self.side = side
+
     async def watch_positions(
         self,
         symbols: list[str] | None = None,
@@ -470,7 +477,7 @@ class BybitClosedPositionStreamExchange(AccountWideStreamExchange):
         return [
             {
                 "symbol": "BTC/USDT:USDT",
-                "side": None,
+                "side": self.side,
                 "contracts": "0",
                 "entryPrice": None,
                 "markPrice": "101",
@@ -478,11 +485,21 @@ class BybitClosedPositionStreamExchange(AccountWideStreamExchange):
         ]
 
 
+@pytest.mark.parametrize(
+    ("venue", "side"),
+    [
+        (Venue.BYBIT, None),
+        (Venue.BINANCE_USDM, "both"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_bybit_side_less_zero_position_closes_both_cached_sides() -> None:
+async def test_one_way_side_less_zero_position_closes_both_cached_sides(
+    venue: Venue,
+    side: str | None,
+) -> None:
     adapter = CcxtPrivateAdapter(
-        Venue.BYBIT,
-        exchange=BybitClosedPositionStreamExchange(),
+        venue,
+        exchange=OneWayClosedPositionStreamExchange(side),
     )
 
     event = await adapter.watch_account_wide_positions()
@@ -524,7 +541,7 @@ class MalformedStreamExchange(LargeAccountWideExchange):
 
 
 @pytest.mark.asyncio
-async def test_malformed_private_event_still_advances_watermark() -> None:
+async def test_malformed_symbol_watcher_does_not_advance_account_wide_watermark() -> None:
     exchange = MalformedStreamExchange()
     adapter = CcxtPrivateAdapter(Venue.BYBIT, exchange=exchange)
 
@@ -532,7 +549,7 @@ async def test_malformed_private_event_still_advances_watermark() -> None:
         await adapter.watch_orders(instrument(Venue.BYBIT))
     snapshot = await adapter.fetch_active_snapshot()
 
-    assert snapshot.event_watermark == 1
+    assert snapshot.event_watermark == 0
 
 
 class MalformedActiveExchange(FakePrivateExchange):

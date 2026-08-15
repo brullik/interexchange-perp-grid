@@ -120,6 +120,17 @@ class CancellationResistantStreamAdapter(ScriptedSnapshotAdapter):
             raise
 
 
+class CancellationResistantSnapshotAdapter(ScriptedSnapshotAdapter):
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
+        self.calls += 1
+        try:
+            await asyncio.Future[None]()
+            raise AssertionError("unreachable private snapshot completion")
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.2)
+            raise
+
+
 class CachedDelegate(ScriptedSnapshotAdapter):
     def __init__(self, snapshots: Iterable[PrivateActiveSnapshot]) -> None:
         super().__init__(snapshots)
@@ -424,6 +435,51 @@ async def test_account_wide_stream_events_merge_and_remove_latest_values() -> No
     assert flat.snapshot.open_orders == ()
     assert flat.snapshot.positions == ()
     assert flat.event_p95_latency_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_dual_zero_position_tombstones_remove_both_cached_one_way_sides() -> None:
+    observed = datetime.now(UTC)
+    clock = 1_000_000
+    long_position = PositionSnapshot(
+        Venue.BINANCE_USDM,
+        "BTC/USDT:USDT",
+        Side.BUY,
+        Decimal("0.001"),
+        Decimal("100"),
+        Decimal("101"),
+        observed,
+    )
+    short_position = replace(long_position, side=Side.SELL)
+    initial = replace(
+        _snapshot(0, observed_at=observed, venue=Venue.BINANCE_USDM),
+        raw_nonzero_position_count=2,
+        positions=(long_position, short_position),
+    )
+    cache = PrivateStateCache(
+        ScriptedSnapshotAdapter((initial,)),
+        monotonic_ns=lambda: clock,
+        expected_venue=Venue.BINANCE_USDM,
+    )
+    assert (await cache.startup()).ready is True
+
+    flat = await cache.ingest_stream_event(
+        PrivateStreamEvent(
+            Venue.BINANCE_USDM,
+            PrivateStreamKind.POSITIONS,
+            1,
+            observed + timedelta(microseconds=1),
+            clock - 1,
+            positions=(
+                replace(long_position, base_quantity=Decimal(0)),
+                replace(short_position, base_quantity=Decimal(0)),
+            ),
+        )
+    )
+
+    assert flat.ready is True
+    assert flat.snapshot is not None
+    assert flat.snapshot.positions == ()
 
 
 @pytest.mark.asyncio
@@ -758,6 +814,46 @@ async def test_cached_adapter_consumes_only_fresh_account_stream_state() -> None
 
 
 @pytest.mark.asyncio
+async def test_cached_order_watch_consumes_pre_delivered_account_wide_terminal_update() -> None:
+    observed = datetime.now(UTC)
+    clock = 1_000_000
+    delegate = CachedDelegate((_snapshot(0, observed_at=observed),))
+    cache = PrivateStateCache(delegate, monotonic_ns=lambda: clock)
+    cached = CachedPrivateStateAdapter(delegate, cache)
+    assert (await cache.startup()).ready is True
+    filled = PrivateOrder(
+        Venue.BYBIT,
+        "order-terminal",
+        "client-terminal",
+        "BTC/USDT:USDT",
+        Side.BUY,
+        PrivateOrderStatus.FILLED,
+        Decimal("0.001"),
+        Decimal("0.001"),
+        Decimal("100"),
+        Decimal("0.01"),
+        observed + timedelta(microseconds=1),
+    )
+    updated = await cache.ingest_stream_event(
+        PrivateStreamEvent(
+            Venue.BYBIT,
+            PrivateStreamKind.ORDERS,
+            1,
+            observed + timedelta(microseconds=1),
+            clock - 1,
+            orders=(filled,),
+        )
+    )
+    assert updated.ready is True
+    assert updated.snapshot is not None
+    assert updated.snapshot.open_orders == ()
+
+    watched = await cached.watch_orders(_instrument())
+
+    assert watched == (filled,)
+
+
+@pytest.mark.asyncio
 async def test_consumer_reconciliations_coalesce_and_obey_per_minute_budget() -> None:
     observed = datetime.now(UTC)
     clock = [1_000_000_000]
@@ -847,6 +943,27 @@ async def test_stream_shutdown_does_not_wait_for_cancellation_resistant_watcher(
     elapsed = time.perf_counter() - started
 
     assert elapsed < 0.1
+    await asyncio.sleep(0.21)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_deadline_does_not_wait_for_cancellation_resistant_fetch() -> None:
+    adapter = CancellationResistantSnapshotAdapter(())
+    cache = PrivateStateCache(
+        adapter,
+        PrivateCachePolicy(reconciliation_timeout_seconds=Decimal("0.01")),
+    )
+
+    started = time.perf_counter()
+    result = await asyncio.wait_for(cache.startup(), timeout=0.15)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.1
+    assert result.status == PrivateCacheStatus.UNKNOWN
+    assert result.reason == "REST_RECONCILIATION_FAILED:TimeoutError"
+    pending = await cache.reconcile("PRE_CLOSE")
+    assert pending.reason == "PRIVATE_RECONCILIATION_CANCELLATION_PENDING"
+    assert adapter.calls == 1
     await asyncio.sleep(0.21)
 
 

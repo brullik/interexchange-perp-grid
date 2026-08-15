@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T17:46:14Z",
+  "updated_at": "2026-08-15T18:02:14Z",
   "state": "WAVE1_CORE_ADVERSARIAL_REVIEW",
   "phase": "Phase 2 — Production-grade Wave 1 data/private core",
   "repository": "brullik/interexchange-perp-grid",
   "branch": "codex/wave1-production-core-v2",
   "pr": null,
   "head_sha": null,
-  "checkpoint_sha": "3f75ec89793d5154c623bfc4399edaf78422d25a",
+  "checkpoint_sha": null,
   "ci_run": 31896663152,
   "artifact": "release-image-v0.1.0-rc1-776668b9f02d3bcb633611463d71a09eeb45284f-1",
   "completed_criteria": [
@@ -18,17 +18,17 @@
     "Wave 1 latest-value cache enforces persisted and ordered event watermarks, bounded reorder recovery, completeness, two-second age, hard timeouts, and measured 250 ms p95",
     "Native Bybit V5 u/seq guard is installed in the CCXT Pro factory and handles explicit u=1 reset",
     "Telegram shadow mode remains healthy without runtime credentials",
-    "Local Phase 2 verify passed: lock, Ruff, strict mypy, 244 tests, and doctor"
+    "Local Phase 2 verify passed: lock, Ruff, strict mypy, 248 tests, and doctor"
   ],
   "active_work": [
-    "Rerun full verification on the current branch rooted at exact remote main ff40d64",
-    "Obtain independent adversarial and release-verification PASS for the exact Phase 2 head before draft PR publication"
+    "Obtain final independent adversarial PASS for the current ff40d64-based Phase 2 tree",
+    "Commit and publish one draft PR, then obtain exact-head CI and release-verification PASS"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Rerun verification on the ff40d64-based branch, publish one draft PR, and require green exact-head CI plus independent P0/P1-free review before merge.",
+  "next_action": "Commit the fully verified fix set, publish one draft PR, and require green exact-head CI plus independent P0/P1-free review before merge.",
   "known_limitations": [
     "The current repository visibility is PUBLIC.",
     "Operational evidence and secrets remain forbidden while the repository is PUBLIC."
