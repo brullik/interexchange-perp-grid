@@ -426,6 +426,27 @@ class PrivateStateCache:
                 return None
             return self._account_snapshot
 
+    async def authoritative_recovery_snapshot(
+        self,
+        trigger: str,
+    ) -> PrivateActiveSnapshot | None:
+        if not _uses_authoritative_recovery_snapshot(trigger):
+            return None
+        async with self._lock:
+            snapshot = self._snapshot
+            if (
+                snapshot is None
+                or self._source != f"REST:{trigger}"
+                or self._invalid_reason is not None
+                or self._delivery_error is not None
+                or self._pending_persistence_watermark is not None
+                or not snapshot.account_wide
+                or snapshot.completeness != SnapshotCompleteness.COMPLETE
+                or snapshot.request_count > self._policy.maximum_rest_requests
+            ):
+                return None
+            return snapshot
+
     async def watch_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
         async with self._order_update_condition:
             existing = self._latest_order_updates.get(instrument.symbol)
@@ -702,6 +723,19 @@ def _uses_consumer_rest_budget(trigger: str) -> bool:
     )
 
 
+def _uses_authoritative_recovery_snapshot(trigger: str) -> bool:
+    return trigger.startswith(
+        (
+            "PRE_CANCEL",
+            "POST_CANCEL",
+            "POST_SUBMIT_OR_UNKNOWN",
+            "RESTART",
+            "PRE_CLOSE",
+            "TERMINAL_FLAT",
+        )
+    )
+
+
 def _consume_task_result(task: asyncio.Task[Any]) -> None:
     with suppress(asyncio.CancelledError, Exception):
         task.result()
@@ -728,11 +762,18 @@ class CachedPrivateStateAdapter:
             raise RuntimeError(view.reason or "PRIVATE_CACHE_UNKNOWN")
         return view.snapshot
 
+    def current_private_event_watermark(self) -> int:
+        reader = getattr(self._delegate, "current_private_event_watermark", None)
+        return int(reader()) if callable(reader) else 0
+
     async def reconcile_active_snapshot(self, trigger: str) -> PrivateActiveSnapshot:
         view = await self._cache.reconcile(trigger)
-        if not view.ready or view.snapshot is None:
-            raise RuntimeError(view.reason or "PRIVATE_RECONCILIATION_UNKNOWN")
-        return view.snapshot
+        if view.ready and view.snapshot is not None:
+            return view.snapshot
+        recovery_snapshot = await self._cache.authoritative_recovery_snapshot(trigger)
+        if recovery_snapshot is not None:
+            return recovery_snapshot
+        raise RuntimeError(view.reason or "PRIVATE_RECONCILIATION_UNKNOWN")
 
     async def fetch_account(self, instrument: Instrument) -> AccountSnapshot:
         cached = await self._cache.account_snapshot()

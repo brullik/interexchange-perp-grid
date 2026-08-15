@@ -27,6 +27,7 @@ from interexchange_perp_grid.live_reconciliation import (
     FlatBarrierResult,
     ReconciliationReport,
     collect_private_states,
+    combined_event_watermark,
     flat_barrier_failure_reason,
     reconcile_private_states,
     wait_for_stable_flat,
@@ -456,7 +457,10 @@ class LiveControlService:
 
         return await wait_for_stable_flat(
             report_factory,
-            self._journal.event_watermark,
+            lambda: combined_event_watermark(
+                self._adapters,
+                self._journal.event_watermark,
+            ),
             self._flat_barrier_policy,
         )
 
@@ -522,20 +526,46 @@ class LiveControlService:
             active = current
             if active.state != LiveActionState.FLAT:
                 active = await self._move_to_recovering(active, action_name)
+        observed_before = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if observed_before != barrier.event_watermark:
+            if active is not None:
+                active = await self._quarantine(active, barrier.report, action_name)
+            return (
+                active,
+                FlatBarrierResult(
+                    False,
+                    barrier.report,
+                    0,
+                    observed_before,
+                    False,
+                    ReasonCode.FLAT_BARRIER_EVENT_RACE,
+                ),
+            )
+        journal_watermark = await self._journal.event_watermark()
         commit = await self._journal.commit_flat_barrier(
             active.pair_action_id if active is not None else None,
-            barrier.event_watermark,
+            journal_watermark,
             {"action": action_name, "verified": True},
         )
-        if commit.committed:
+        observed_after = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if commit.committed and observed_after == barrier.event_watermark:
             return commit.action, barrier
+        failed_action = commit.action
+        if failed_action is not None and failed_action.state != LiveActionState.QUARANTINED:
+            failed_action = await self._quarantine(failed_action, barrier.report, action_name)
         return (
-            commit.action,
+            failed_action,
             FlatBarrierResult(
                 False,
                 barrier.report,
                 0,
-                commit.event_watermark,
+                observed_after,
                 False,
                 ReasonCode.FLAT_BARRIER_EVENT_RACE,
             ),

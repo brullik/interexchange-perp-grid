@@ -12,6 +12,14 @@ import pytest
 
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
+from interexchange_perp_grid.live_reconciliation import (
+    FlatBarrierPolicy,
+    ReconciliationReport,
+    collect_private_states,
+    combined_event_watermark,
+    reconcile_private_states,
+    wait_for_stable_flat,
+)
 from interexchange_perp_grid.private_cache import (
     CachedPrivateStateAdapter,
     PrivateCachePolicy,
@@ -84,12 +92,17 @@ class ScriptedSnapshotAdapter:
         self._snapshots = iter(snapshots)
         self.calls = 0
         self.seeded_watermark: int | None = None
+        self.private_event_watermark = 0
 
     def seed_private_event_watermark(self, watermark: int) -> None:
         self.seeded_watermark = watermark
+        self.private_event_watermark = watermark
 
     def acknowledge_private_event(self, watermark: int) -> None:
-        del watermark
+        self.private_event_watermark = max(self.private_event_watermark, watermark)
+
+    def current_private_event_watermark(self) -> int:
+        return self.private_event_watermark
 
     async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
         self.calls += 1
@@ -1297,3 +1310,97 @@ async def test_rest_reconciliation_does_not_hide_failed_stream_channel() -> None
 
     assert reconciled.status == PrivateCacheStatus.UNKNOWN
     assert reconciled.reason == "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_forced_recovery_uses_authoritative_rest_while_stream_failure_blocks_entry() -> None:
+    observed = datetime.now(UTC)
+    position = PositionSnapshot(
+        Venue.BYBIT,
+        "BTC/USDT:USDT",
+        Side.BUY,
+        Decimal("0.001"),
+        Decimal("100"),
+        Decimal("101"),
+        observed + timedelta(microseconds=1),
+    )
+    active = replace(
+        _snapshot(0, observed_at=observed + timedelta(microseconds=1)),
+        raw_nonzero_position_count=1,
+        positions=(position,),
+    )
+    delegate = CachedDelegate(
+        (
+            _snapshot(0, observed_at=observed),
+            active,
+            replace(active, observed_at=observed + timedelta(microseconds=2)),
+        )
+    )
+    cache = PrivateStateCache(delegate)
+    cached = CachedPrivateStateAdapter(delegate, cache)
+    assert (await cache.startup()).ready is True
+    await cache.invalidate_stream(
+        PrivateStreamKind.ORDERS,
+        "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError",
+    )
+
+    recovery = await cached.reconcile_active_snapshot("PRE_CLOSE:bybit")
+
+    assert recovery.positions == (position,)
+    degraded = await cache.view()
+    assert degraded.status == PrivateCacheStatus.UNKNOWN
+    assert degraded.reason == "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError"
+    with pytest.raises(RuntimeError, match="PRIVATE_STREAM_FAILED:ORDERS:ConnectionError"):
+        await cached.reconcile_active_snapshot("PRE_SUBMIT:bybit")
+
+
+@pytest.mark.asyncio
+async def test_private_event_between_flat_snapshot_and_watermark_check_resets_barrier() -> None:
+    observed = datetime.now(UTC)
+    delegate = CachedDelegate((_snapshot(0, observed_at=observed),))
+    cache = PrivateStateCache(delegate)
+    cached = CachedPrivateStateAdapter(delegate, cache)
+    instrument = _instrument()
+    adapters = {Venue.BYBIT: cached}
+    assert (await cache.startup()).ready is True
+    report_calls = 0
+
+    async def report_factory() -> ReconciliationReport:
+        nonlocal report_calls
+        states = await collect_private_states(
+            adapters,
+            {Venue.BYBIT: instrument},
+            timeout_seconds=0.1,
+        )
+        report = reconcile_private_states(None, states, set(), {Venue.BYBIT})
+        report_calls += 1
+        if report_calls == 2:
+            delegate.private_event_watermark = 1
+            updated = await cache.ingest_stream_event(
+                PrivateStreamEvent(
+                    Venue.BYBIT,
+                    PrivateStreamKind.ORDERS,
+                    1,
+                    observed + timedelta(microseconds=1),
+                    time.monotonic_ns(),
+                )
+            )
+            assert updated.ready is True
+        return report
+
+    async def journal_watermark() -> int:
+        return 0
+
+    async def watermark() -> int:
+        return await combined_event_watermark(adapters, journal_watermark)
+
+    barrier = await wait_for_stable_flat(
+        report_factory,
+        watermark,
+        FlatBarrierPolicy(2, 0, 0.001, 0.1),
+    )
+
+    assert barrier.verified is True
+    assert barrier.event_watermark == 1
+    assert barrier.report.states[Venue.BYBIT].event_watermark == 1
+    assert report_calls >= 4

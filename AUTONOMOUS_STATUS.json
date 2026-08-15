@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T18:13:00Z",
-  "state": "WAVE1_CORE_DRAFT_PR",
+  "updated_at": "2026-08-15T18:34:52Z",
+  "state": "WAVE1_CORE_P1_REMEDIATION",
   "phase": "Phase 2 — Production-grade Wave 1 data/private core",
   "repository": "brullik/interexchange-perp-grid",
   "branch": "codex/wave1-production-core-v2",
   "pr": 4,
   "head_sha": "ecdf9e04cc4e3a822781bb47705096d920ce8e86",
-  "ci_run": 31900237327,
-  "artifact": "c4-3-proof-ecdf9e04cc4e3a822781bb47705096d920ce8e86",
+  "ci_run": 31900574684,
+  "artifact": "c4-3-proof-6c0178cf4dfc0400a7e43fa097bec364afe8d62a",
   "completed_criteria": [
     "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
     "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
@@ -17,19 +17,19 @@
     "Wave 1 latest-value cache enforces persisted and ordered event watermarks, bounded reorder recovery, completeness, two-second age, hard timeouts, and measured 250 ms p95",
     "Native Bybit V5 u/seq guard is installed in the CCXT Pro factory and handles explicit u=1 reset",
     "Telegram shadow mode remains healthy without runtime credentials",
-    "Local Phase 2 verify passed: lock, Ruff, strict mypy, 248 tests, and doctor",
+    "Local Phase 2 P1-remediation verify passed: lock, Ruff, strict mypy, 252 tests, and doctor",
     "Independent adversarial review passed exact checkpoint 76d5f143 with P0/P1/P2 all zero",
-    "Draft PR 4 exact-head run 31900237327 passed all five required checks and produced exact-SHA proof/security artifacts"
+    "Draft PR 4 exact-head run 31900574684 passed all five required checks before the latest local P1 remediation"
   ],
   "active_work": [
-    "Wait for exact-head required checks on draft PR 4",
-    "Obtain final independent adversarial and release-verification PASS before marking the PR Ready"
+    "Commit and push the recovery-authoritative REST and private-event stable-FLAT fixes to draft PR 4",
+    "Obtain fresh exact-head required checks and independent adversarial plus release-verification PASS before marking the PR Ready"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Keep PR 4 draft until green exact-head CI and independent P0/P1-free adversarial plus release verification, then mark Ready and squash-merge under the standing authorization.",
+  "next_action": "Push the locally verified P1 remediation, keep PR 4 draft until fresh green exact-head CI and independent P0/P1-free adversarial plus release verification, then mark Ready and squash-merge under the standing authorization.",
   "known_limitations": [
     "The current repository visibility is PUBLIC.",
     "Operational evidence and secrets remain forbidden while the repository is PUBLIC."

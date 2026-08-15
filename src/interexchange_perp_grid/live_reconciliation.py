@@ -56,6 +56,11 @@ class ReconcilingPrivateStateAdapter(Protocol):
     async def reconcile_active_snapshot(self, trigger: str) -> PrivateActiveSnapshot: ...
 
 
+@runtime_checkable
+class PrivateEventWatermarkAdapter(Protocol):
+    def current_private_event_watermark(self) -> int: ...
+
+
 def _consume_background_task[T](task: asyncio.Task[T]) -> None:
     with suppress(asyncio.CancelledError, Exception):
         task.exception()
@@ -75,6 +80,7 @@ class VenuePrivateState:
     unknown_active_records: tuple[UnknownActiveRecord, ...] = ()
     completeness: SnapshotCompleteness = SnapshotCompleteness.COMPLETE
     account_wide: bool = False
+    event_watermark: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +160,24 @@ def _flat_signature(report: ReconciliationReport, watermark: int) -> tuple[objec
         ),
         report.discrepancies,
         report.unknown_client_order_ids,
+        tuple(
+            sorted((venue.value, state.event_watermark) for venue, state in report.states.items())
+        ),
     )
+
+
+async def combined_event_watermark(
+    adapters: Mapping[Venue, PrivateStateAdapter],
+    journal_watermark_factory: Callable[[], Awaitable[int]],
+) -> int:
+    watermark = await journal_watermark_factory()
+    for adapter in adapters.values():
+        if isinstance(adapter, PrivateEventWatermarkAdapter):
+            private_watermark = adapter.current_private_event_watermark()
+            if private_watermark < 0:
+                raise ValueError("private event watermark cannot be negative")
+            watermark += private_watermark
+    return watermark
 
 
 async def wait_for_stable_flat(
@@ -316,6 +339,7 @@ async def collect_private_states(
                 active.unknown_active_records,
                 active.completeness,
                 active.account_wide,
+                active.event_watermark,
             )
         except Exception as error:
             return VenuePrivateState(

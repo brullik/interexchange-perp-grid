@@ -19,6 +19,7 @@ from interexchange_perp_grid.live_coordinator import (
     LiveCanaryCoordinator,
 )
 from interexchange_perp_grid.live_journal import (
+    FlatBarrierCommitResult,
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
@@ -101,6 +102,47 @@ class _BarrierPublicResult(Protocol):
 
     @property
     def flat_barrier_verified(self) -> bool: ...
+
+
+class _WatermarkedPrivateExchange(DeterministicPrivateExchange):
+    private_event_watermark = 0
+
+    def current_private_event_watermark(self) -> int:
+        return self.private_event_watermark
+
+
+class _PrivateWatermarkRaceJournal(LiveOrderJournal):
+    def __init__(self, path: Path, adapter: _WatermarkedPrivateExchange) -> None:
+        super().__init__(path)
+        self._adapter = adapter
+
+    async def commit_flat_barrier(
+        self,
+        pair_action_id: str | None,
+        expected_event_watermark: int,
+        details: dict[str, object] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> FlatBarrierCommitResult:
+        result = await super().commit_flat_barrier(
+            pair_action_id,
+            expected_event_watermark,
+            details,
+            now=now,
+        )
+        self._adapter.private_event_watermark += 1
+        return result
+
+
+def _watermarked_adapters(
+    watermark: int,
+) -> dict[Venue, _WatermarkedPrivateExchange]:
+    adapters: dict[Venue, _WatermarkedPrivateExchange] = {}
+    for venue in Venue:
+        adapter = _WatermarkedPrivateExchange(venue, _instrument(venue), ())
+        adapter.private_event_watermark = watermark
+        adapters[venue] = adapter
+    return adapters
 
 
 def _requests(identity: str) -> tuple[VenueOrderRequest, VenueOrderRequest]:
@@ -206,7 +248,7 @@ async def test_sf_001_one_flat_snapshot_then_timeout_never_succeeds(
         nonlocal calls
         calls += 1
         if calls > 1:
-            await asyncio.sleep(0.01)
+            await asyncio.Event().wait()
         return flat
 
     async def watermark() -> int:
@@ -215,7 +257,7 @@ async def test_sf_001_one_flat_snapshot_then_timeout_never_succeeds(
     barrier = await wait_for_stable_flat(
         report_factory,
         watermark,
-        FlatBarrierPolicy(2, 0, 0.001, 0.005),
+        FlatBarrierPolicy(2, 0, 0.001, 0.05),
     )
 
     assert barrier.verified is False
@@ -383,6 +425,55 @@ async def test_sf_005_identical_snapshots_quiet_period_and_watermark_verify() ->
     assert barrier.timed_out is False
     assert barrier.consecutive_snapshots >= 2
     assert barrier.event_watermark == 12
+
+
+@pytest.mark.asyncio
+async def test_private_watermark_is_preserved_across_atomic_flat_commit(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    adapters = _watermarked_adapters(2)
+    service = LiveControlService(
+        journal,
+        adapters,
+        {venue: _instrument(venue) for venue in Venue},
+        _ROUTE,
+        "a" * 64,
+        flat_barrier_policy=FlatBarrierPolicy(2, 0, 0.001, 0.05),
+    )
+
+    result = await service.emergency_flatten()
+
+    assert result.success is True
+    assert result.flat_barrier_verified is True
+    assert result.flat_barrier_watermark == 6
+
+
+@pytest.mark.asyncio
+async def test_private_event_during_flat_commit_quarantines_action(tmp_path: Path) -> None:
+    adapters = _watermarked_adapters(0)
+    raced_adapter = adapters[Venue.BINANCE_USDM]
+    journal = _PrivateWatermarkRaceJournal(tmp_path / "state.sqlite3", raced_adapter)
+    action, _, _ = await _recovering_action(journal, "private-race")
+    service = LiveControlService(
+        journal,
+        adapters,
+        {venue: _instrument(venue) for venue in Venue},
+        _ROUTE,
+        "a" * 64,
+        flat_barrier_policy=FlatBarrierPolicy(2, 0, 0.001, 0.05),
+    )
+
+    marked_action, barrier = await service._mark_flat_if_needed(
+        action,
+        "PRIVATE_EVENT_RACE_TEST",
+        FlatBarrierResult(True, _report(), 2, 0, False),
+    )
+
+    assert marked_action is not None
+    assert marked_action.state == LiveActionState.QUARANTINED
+    assert barrier.verified is False
+    assert barrier.failure_reason == ReasonCode.FLAT_BARRIER_EVENT_RACE
+    assert barrier.event_watermark == 1
 
 
 @pytest.mark.asyncio

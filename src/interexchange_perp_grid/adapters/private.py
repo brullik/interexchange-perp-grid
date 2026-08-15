@@ -105,6 +105,9 @@ class CcxtPrivateAdapter:
     def acknowledge_private_event(self, watermark: int) -> None:
         self._private_events_pending.discard(watermark)
 
+    def current_private_event_watermark(self) -> int:
+        return self._private_event_watermark
+
     def _advance_private_event_watermark(self) -> int:
         self._private_event_watermark += 1
         return self._private_event_watermark
