@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** C4_REWORK_IMPLEMENTED_PENDING_INDEPENDENT_REVIEW
-- **Current checkpoint:** C4 (P0 rework implemented locally; final-head CI and independent review pending)
+- **State:** C4_REWORK_FINAL_HEAD_CI_GREEN_PENDING_INDEPENDENT_REVIEW
+- **Current checkpoint:** C4 (P0 rework and required final-head CI complete; independent review pending)
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -20,7 +20,7 @@ This is the only mutable project-status document.
 | C1 public market vertical slice | COMPLETE | [GitHub Actions run 31837867113](https://github.com/brullik/interexchange-perp-grid/actions/runs/31837867113): Linux `make verify` (29 tests) and Docker health/restart passed on `a790344`; live read-only scan found 656 common instruments and two eligible Binance USD-M/OKX directed BTC routes while Bybit failed closed with `BOOK_SEQUENCE_UNKNOWN`; Parquet/DuckDB replay contained 206 L2 levels across all three venues |
 | C2 strategy/risk/simulator | COMPLETE | [GitHub Actions run 31839163485](https://github.com/brullik/interexchange-perp-grid/actions/runs/31839163485): Linux `make verify` (43 tests) and Docker health/restart passed on `0849413`; deterministic tests cover open/add/partial close/full close, profitable and losing four-leg PnL, funding, protected prices, partial/rejected/unknown orders, private staleness, venue outage, third-venue hedge, forced close, and property-based 5/50 USDT risk invariants |
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
-| C4 live-canary-ready execution | REWORK_IMPLEMENTED_REVIEW_REQUIRED | Corrected implementation has local lint/type/124-test/doctor evidence; exact final-head Linux CI, replay artifact, and independent re-review remain mandatory |
+| C4 live-canary-ready execution | REWORK_IMPLEMENTED_REVIEW_REQUIRED | Corrected implementation has local lint/type/124-test/doctor evidence; required current-head Linux `make verify`, replay artifact, and Docker smoke are green; independent re-review remains mandatory |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -54,7 +54,7 @@ YYYY-MM-DD — decision — reason — affected modules
 
 ### C4 independent acceptance
 
-No owner credential or live-money action is requested. C5 remains forbidden until the exact final head has green Linux CI with the replay artifact and an independent reviewer accepts every P0 item. Repository defaults remain shadow/live-disabled, production secrets remain absent, and tests never reach a production submit endpoint.
+No owner credential or live-money action is requested. The exact final head has required green Linux CI with a commit-bound replay artifact. C5 remains forbidden until an independent reviewer accepts every P0 item. Repository defaults remain shadow/live-disabled, production secrets remain absent, and tests never reach a production submit endpoint.
 
 ## Last verified command
 
@@ -62,10 +62,11 @@ No owner credential or live-money action is requested. C5 remains forbidden unti
 2026-08-15 local Windows equivalent of every Makefile verify target: PASS
 - ruff format --check + ruff check: PASS (66 files)
 - mypy --strict: PASS (66 source/test files)
-- pytest: 124 passed in 11.08s
+- pytest: 124 passed in 13.05s
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact `make verify`, Docker smoke,
-hashed replay artifact, and final commit identity must pass in Linux GitHub Actions.
+hashed replay artifact, and final commit identity are enforced by required Linux
+GitHub Actions checks on the current Draft PR head.
 No production credentials were used and no real order was submitted.
 ```
