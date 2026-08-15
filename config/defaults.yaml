@@ -51,6 +51,11 @@ execution:
   emergency_unbounded_market_allowed: true
   idempotent_client_order_ids: true
   third_venue_emergency_hedge: true
+  latency_reserve_bps: "2"
+  partial_fill_reserve_bps: "3"
+  emergency_hedge_reserve_bps: "10"
+  reconciliation_forced_exit_reserve_bps: "10"
+  funding_stress_multiplier: "2"
 
 market_data:
   broad_feed: bbo
@@ -71,9 +76,13 @@ live:
   require_current_hash_qualification: true
   canary_max_routes: 1
   canary_max_tranches: 1
-  canary_base: BTC
-  canary_long_venue: bybit
-  canary_short_venue: okx
+  canary_pair_stressed_loss_limit_usdt: "1"
+  canary_effective_leverage_cap: "3"
+  canary_free_margin_floor_ratio: "0.20"
+  canary_entry_slippage_cap_bps: "5"
+  canary_close_slippage_cap_bps: "8"
+  canary_timeout_seconds: 300
+  canary_minimum_profit_usdt: "0.01"
   qualification_max_age_seconds: 86400
 
 telegram:
@@ -88,4 +97,11 @@ shadow:
   scan_timeout_seconds: 30
   overload_pending_limit: 100
   history_retention_days: 30
-  qualification_min_samples: 100
+  qualification_min_duration_seconds: 86400
+  qualification_min_synchronised_snapshots_per_venue: 10000
+  qualification_min_funding_checkpoints_per_venue: 3
+  qualification_max_inter_snapshot_gap_seconds: 60
+  qualification_max_sequence_gaps: 0
+  qualification_max_stale_snapshots: 0
+  qualification_max_sequence_unknown_snapshots: 0
+  qualification_max_clock_skew_snapshots: 0

@@ -38,6 +38,8 @@ from interexchange_perp_grid.state import (
     load_tranches,
     read_runtime_controls,
     read_shadow_snapshot,
+    record_qualification_exception,
+    record_qualification_scan,
     save_shadow_snapshot,
     save_tranche,
     update_runtime_controls,
@@ -666,6 +668,16 @@ class ContinuousShadowEvaluator:
                         self.runtime.state_path,
                         _scan_payload(result, decisions),
                     )
+                    await record_qualification_scan(
+                        self.runtime.state_path,
+                        result.base,
+                        result.funding,
+                        decisions,
+                        tuple(self.runtime.tranches.values()),
+                        self.settings.strategy.stressed_cost_multiplier,
+                        min(3600, self.settings.risk.max_hold_seconds),
+                        self.settings.risk.max_hold_seconds,
+                    )
                     logger.info(
                         "shadow_evaluated",
                         base=result.base,
@@ -676,6 +688,10 @@ class ContinuousShadowEvaluator:
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
+                    await record_qualification_exception(
+                        self.runtime.state_path,
+                        type(error).__name__,
+                    )
                     logger.error(
                         "shadow_evaluation_failed",
                         reason=type(error).__name__,

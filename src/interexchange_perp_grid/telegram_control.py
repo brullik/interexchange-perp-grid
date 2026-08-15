@@ -6,16 +6,25 @@ import os
 import secrets
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Protocol
 
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from interexchange_perp_grid.config import Settings
+from interexchange_perp_grid.live_control import LiveControlResult, render_control_result
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import record_command_audit, record_live_confirmation
 
-DANGEROUS_COMMANDS = {"/close_all_simulated", "/kill", "/confirm_live"}
+DANGEROUS_COMMANDS = {
+    "/close_all_simulated",
+    "/close_all_live",
+    "/cancel_all_live",
+    "/emergency_flatten",
+    "/kill",
+    "/confirm_live",
+}
 READ_COMMANDS = {
     "/status",
     "/opportunities",
@@ -26,6 +35,18 @@ READ_COMMANDS = {
 }
 
 
+class LiveControlPlane(Protocol):
+    async def snapshot(self) -> dict[str, object]: ...
+
+    async def close_all_live(self) -> LiveControlResult: ...
+
+    async def cancel_all_live(self) -> LiveControlResult: ...
+
+    async def emergency_flatten(self) -> LiveControlResult: ...
+
+    async def kill(self) -> LiveControlResult: ...
+
+
 class TelegramCommandRouter:
     def __init__(
         self,
@@ -33,12 +54,14 @@ class TelegramCommandRouter:
         owner_chat_id: int,
         challenge_ttl_seconds: int,
         token_factory: Callable[[], str] | None = None,
+        live_control: LiveControlPlane | None = None,
     ) -> None:
         self._runtime = runtime
         self._owner_chat_id = owner_chat_id
         self._ttl = challenge_ttl_seconds
         self._token_factory = token_factory or (lambda: secrets.token_hex(3).upper())
         self._challenge: tuple[str, datetime] | None = None
+        self._live_control = live_control
 
     async def handle(
         self,
@@ -92,9 +115,26 @@ class TelegramCommandRouter:
         elif command == "/close_all_simulated":
             closed = await self._runtime.close_all_simulated()
             response = f"closed_simulated={len(closed)} paused=true"
+        elif command == "/close_all_live":
+            response = await self._live_response("close_all_live")
+        elif command == "/cancel_all_live":
+            response = await self._live_response("cancel_all_live")
+        elif command == "/emergency_flatten":
+            response = await self._live_response("emergency_flatten")
         elif command == "/kill":
             await self._runtime.kill()
-            response = "killed=true paused=true"
+            if self._live_control is None:
+                response = "killed=true paused=true"
+            else:
+                result = await self._live_control.kill()
+                response = json.dumps(
+                    {
+                        "killed": True,
+                        "paused": True,
+                        "live_workflow": json.loads(render_control_result(result)),
+                    },
+                    sort_keys=True,
+                )
         elif command == "/confirm_live":
             confirmed_until = observed_at + timedelta(seconds=self._ttl)
             await record_live_confirmation(
@@ -131,6 +171,18 @@ class TelegramCommandRouter:
         return now <= expires_at and secrets.compare_digest(arguments[0], expected)
 
     async def _read_response(self, command: str) -> str:
+        if self._live_control is not None and command in {
+            "/status",
+            "/positions",
+            "/pnl",
+            "/balances",
+        }:
+            live = await self._live_control.snapshot()
+            key = command.removeprefix("/")
+            live_payload = (
+                live if command == "/status" else live.get(key, {"status": "UNAVAILABLE"})
+            )
+            return json.dumps(live_payload, sort_keys=True, default=str)
         snapshot = await self._runtime.snapshot()
         market = snapshot.get("market")
         market_payload = market if isinstance(market, dict) else {}
@@ -162,6 +214,22 @@ class TelegramCommandRouter:
             payload = market_payload.get("balances", {"status": "UNAVAILABLE"})
         return json.dumps(payload, sort_keys=True, default=str)
 
+    async def _live_response(self, operation: str) -> str:
+        if self._live_control is None:
+            return json.dumps(
+                {"success": False, "operation": operation, "reason": "LIVE_CONTROL_UNAVAILABLE"},
+                sort_keys=True,
+            )
+        if operation == "close_all_live":
+            result = await self._live_control.close_all_live()
+        elif operation == "cancel_all_live":
+            result = await self._live_control.cancel_all_live()
+        elif operation == "emergency_flatten":
+            result = await self._live_control.emergency_flatten()
+        else:
+            raise ValueError(f"unsupported live control operation: {operation}")
+        return render_control_result(result)
+
     async def _audit(
         self,
         actor: str,
@@ -184,6 +252,7 @@ async def run_telegram_bot(
     settings: Settings,
     runtime: ShadowRuntime,
     stop_event: asyncio.Event,
+    live_control: LiveControlPlane | None = None,
 ) -> None:
     if not settings.telegram.enabled:
         return
@@ -195,6 +264,7 @@ async def run_telegram_bot(
         runtime,
         owner_chat_id,
         settings.telegram.challenge_ttl_seconds,
+        live_control=live_control,
     )
 
     async def on_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

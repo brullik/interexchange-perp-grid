@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Protocol
 
 from interexchange_perp_grid.config import Settings
@@ -12,6 +12,7 @@ from interexchange_perp_grid.execution import (
     EMERGENCY_PURPOSES,
     ExecutionIntent,
     OrderPurpose,
+    Side,
 )
 from interexchange_perp_grid.private_domain import (
     AccountSnapshot,
@@ -24,6 +25,30 @@ from interexchange_perp_grid.private_domain import (
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.strategy import DirectedRouteKey
+
+
+def protected_ioc_price(
+    side: Side,
+    marginal_worst_price: Decimal,
+    tick_size: Decimal,
+    slippage_cap_bps: Decimal,
+) -> Decimal:
+    """Return the side-aware IOC cap from the marginal consumed book level, not VWAP."""
+    if marginal_worst_price <= 0 or tick_size <= 0:
+        raise ValueError("marginal price and tick size must be positive")
+    if slippage_cap_bps < 0 or slippage_cap_bps > Decimal(10_000):
+        raise ValueError("slippage cap must be between zero and 10000 bps")
+    ratio = slippage_cap_bps / Decimal(10_000)
+    if side == Side.BUY:
+        raw = marginal_worst_price * (Decimal(1) + ratio)
+        ticks = (raw / tick_size).to_integral_value(rounding=ROUND_CEILING)
+    else:
+        raw = marginal_worst_price * (Decimal(1) - ratio)
+        ticks = (raw / tick_size).to_integral_value(rounding=ROUND_FLOOR)
+    protected = ticks * tick_size
+    if protected <= 0:
+        raise ValueError("protected price must remain positive")
+    return protected
 
 
 def translate_protected_order(
@@ -189,7 +214,15 @@ def run_private_preflight(inputs: PrivatePreflightInput) -> PrivatePreflightRepo
         "capability": inputs.capability.ready,
         "account_mode": account.margin_mode == "cross",
         "position_mode": account.position_mode == "oneway",
-        "trading_permission": "trade" in permissions and "withdraw" not in permissions,
+        "trading_permission": (
+            "trade" in permissions
+            and "withdraw" not in permissions
+            and "transfer" not in permissions
+            and "wallet" not in permissions
+        ),
+        "credential_restrictions": (
+            account.withdrawal_enabled is False and account.transfer_enabled is False
+        ),
         "api_trading": account.trading_enabled is True,
         "symbol": inputs.symbol_available,
         "fee": inputs.fee_rate is not None and inputs.fee_rate >= 0,
@@ -206,6 +239,7 @@ def run_private_preflight(inputs: PrivatePreflightInput) -> PrivatePreflightRepo
         ("account_mode", ReasonCode.ACCOUNT_MODE_INVALID),
         ("position_mode", ReasonCode.POSITION_MODE_INVALID),
         ("trading_permission", ReasonCode.TRADING_PERMISSION_MISSING),
+        ("credential_restrictions", ReasonCode.TRADING_PERMISSION_MISSING),
         ("api_trading", ReasonCode.API_TRADING_UNAVAILABLE),
         ("symbol", ReasonCode.SYMBOL_UNAVAILABLE),
         ("fee", ReasonCode.FEE_UNKNOWN),
@@ -226,12 +260,20 @@ class CanaryAction:
     tranche_count: int
     notional_usdt: Decimal
     minimum_valid_notional_usdt: Decimal
+    projected_stressed_loss_usdt: Decimal
+    maximum_effective_leverage: Decimal
+    minimum_stressed_free_margin_ratio: Decimal
+    existing_position_count: int
+    existing_open_order_count: int
 
 
 @dataclass(frozen=True, slots=True)
 class CanaryPolicy:
     base: str
     route: DirectedRouteKey
+    pair_stressed_loss_limit_usdt: Decimal = Decimal("1")
+    effective_leverage_cap: Decimal = Decimal("3")
+    free_margin_floor_ratio: Decimal = Decimal("0.20")
 
     def evaluate(self, action: CanaryAction) -> tuple[bool, ReasonCode | None]:
         passed = (
@@ -240,6 +282,11 @@ class CanaryPolicy:
             and action.tranche_count == 1
             and action.notional_usdt == action.minimum_valid_notional_usdt
             and action.minimum_valid_notional_usdt > 0
+            and 0 < action.projected_stressed_loss_usdt <= self.pair_stressed_loss_limit_usdt
+            and action.maximum_effective_leverage <= self.effective_leverage_cap
+            and action.minimum_stressed_free_margin_ratio >= self.free_margin_floor_ratio
+            and action.existing_position_count == 0
+            and action.existing_open_order_count == 0
         )
         return (True, None) if passed else (False, ReasonCode.CANARY_POLICY_VIOLATION)
 

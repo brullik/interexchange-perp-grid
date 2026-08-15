@@ -22,6 +22,7 @@ from interexchange_perp_grid.reason_codes import ReasonCode
 class VwapResult:
     price: Decimal
     quantity: Decimal
+    marginal_price: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,9 +34,13 @@ class DirectedRouteQuote:
     eligible: bool
     reason: ReasonCode
     entry_long_vwap: Decimal | None = None
+    entry_long_marginal_price: Decimal | None = None
     entry_short_vwap: Decimal | None = None
+    entry_short_marginal_price: Decimal | None = None
     exit_long_vwap: Decimal | None = None
+    exit_long_marginal_price: Decimal | None = None
     exit_short_vwap: Decimal | None = None
+    exit_short_marginal_price: Decimal | None = None
     entry_spread: Decimal | None = None
     exit_spread: Decimal | None = None
     entry_spread_bps: Decimal | None = None
@@ -83,7 +88,7 @@ def executable_vwap(levels: tuple[BookLevel, ...], quantity: Decimal) -> VwapRes
         notional += consumed * level.price
         remaining -= consumed
         if remaining == 0:
-            return VwapResult(notional / quantity, quantity)
+            return VwapResult(notional / quantity, quantity, level.price)
     return None
 
 
@@ -232,9 +237,13 @@ def evaluate_directed_route(
         eligible=True,
         reason=ReasonCode.QUOTE_READY,
         entry_long_vwap=entry_long.price,
+        entry_long_marginal_price=entry_long.marginal_price,
         entry_short_vwap=entry_short.price,
+        entry_short_marginal_price=entry_short.marginal_price,
         exit_long_vwap=exit_long.price,
+        exit_long_marginal_price=exit_long.marginal_price,
         exit_short_vwap=exit_short.price,
+        exit_short_marginal_price=exit_short.marginal_price,
         entry_spread=entry_spread,
         exit_spread=exit_spread,
         entry_spread_bps=(entry_spread / entry_long.price) * Decimal(10_000),

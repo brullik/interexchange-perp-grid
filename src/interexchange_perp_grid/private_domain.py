@@ -23,6 +23,8 @@ class PrivateCapabilityReport:
     fetch_fee: bool
     checked_at: datetime
     missing: tuple[str, ...]
+    fetch_open_orders: bool = False
+    fetch_closed_orders: bool = False
 
     @property
     def ready(self) -> bool:
@@ -39,6 +41,8 @@ class AccountSnapshot:
     trading_enabled: bool | None
     permissions: tuple[str, ...]
     observed_at: datetime
+    withdrawal_enabled: bool | None = None
+    transfer_enabled: bool | None = None
 
     def __post_init__(self) -> None:
         if self.equity_usdt < 0 or self.free_margin_usdt < 0:
@@ -80,6 +84,7 @@ class PrivateOrder:
     average_price: Decimal | None
     fee_usdt: Decimal | None
     observed_at: datetime
+    limit_price: Decimal | None = None
 
     def __post_init__(self) -> None:
         if not self.client_order_id.strip() or not self.symbol.strip():
@@ -99,6 +104,8 @@ class PrivateOrder:
             raise ValueError("filled status requires the full requested quantity")
         if self.fee_usdt is not None and self.fee_usdt < 0:
             raise ValueError("order fee must be non-negative")
+        if self.limit_price is not None and self.limit_price <= 0:
+            raise ValueError("limit price must be positive when present")
 
 
 @dataclass(frozen=True, slots=True)

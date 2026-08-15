@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -27,6 +28,7 @@ from interexchange_perp_grid.private_execution import (
     IdempotentOrderExecutor,
     LiveCanaryExecutor,
     PrivatePreflightInput,
+    protected_ioc_price,
     run_private_preflight,
     translate_protected_order,
 )
@@ -82,6 +84,21 @@ def test_protected_ioc_translation_is_contract_tested_per_venue(
     assert request.params["timeInForce"] == "IOC"
     if venue == Venue.OKX:
         assert request.params["tdMode"] == "cross"
+
+
+def test_protected_price_uses_marginal_level_side_cap_and_tick_rounding() -> None:
+    assert protected_ioc_price(
+        Side.BUY,
+        Decimal("101.03"),
+        Decimal("0.1"),
+        Decimal("5"),
+    ) == Decimal("101.1")
+    assert protected_ioc_price(
+        Side.SELL,
+        Decimal("99.97"),
+        Decimal("0.1"),
+        Decimal("5"),
+    ) == Decimal("99.9")
 
 
 def test_emergency_market_translation_is_explicit_and_close_is_reduce_only() -> None:
@@ -196,6 +213,8 @@ def test_private_preflight_checks_every_account_and_runtime_gate() -> None:
         True,
         ("trade",),
         datetime.now(UTC),
+        False,
+        False,
     )
     inputs = PrivatePreflightInput(
         ready_capability(),
@@ -215,6 +234,13 @@ def test_private_preflight_checks_every_account_and_runtime_gate() -> None:
     assert report.passed is True
     assert all(report.checks.values())
 
+    unknown_restrictions = run_private_preflight(
+        replace(inputs, account=replace(account, transfer_enabled=None))
+    )
+    assert unknown_restrictions.passed is False
+    assert unknown_restrictions.checks["credential_restrictions"] is False
+    assert unknown_restrictions.reason == ReasonCode.TRADING_PERMISSION_MISSING
+
     unsafe_account = AccountSnapshot(
         Venue.BYBIT,
         Decimal("100"),
@@ -222,8 +248,10 @@ def test_private_preflight_checks_every_account_and_runtime_gate() -> None:
         "isolated",
         "hedge",
         True,
-        ("trade", "withdraw"),
+        ("trade", "withdraw", "transfer"),
         datetime.now(UTC),
+        True,
+        True,
     )
     rejected = run_private_preflight(
         PrivatePreflightInput(
@@ -248,17 +276,30 @@ def test_private_preflight_checks_every_account_and_runtime_gate() -> None:
 def test_canary_policy_allows_only_one_minimum_tranche_on_exact_route() -> None:
     route = DirectedRouteKey("BTC", Venue.BYBIT, Venue.OKX)
     policy = CanaryPolicy("BTC", route)
-    assert policy.evaluate(CanaryAction(route, 1, Decimal("5"), Decimal("5"))) == (
+    safe = CanaryAction(
+        route,
+        1,
+        Decimal("5"),
+        Decimal("5"),
+        Decimal("0.8"),
+        Decimal("2"),
+        Decimal("0.50"),
+        0,
+        0,
+    )
+    assert policy.evaluate(safe) == (
         True,
         None,
     )
     reverse = DirectedRouteKey("BTC", Venue.OKX, Venue.BYBIT)
-    assert policy.evaluate(CanaryAction(reverse, 1, Decimal("5"), Decimal("5"))) == (
+    assert policy.evaluate(replace(safe, route=reverse)) == (
         False,
         ReasonCode.CANARY_POLICY_VIOLATION,
     )
-    assert policy.evaluate(CanaryAction(route, 2, Decimal("5"), Decimal("5")))[0] is False
-    assert policy.evaluate(CanaryAction(route, 1, Decimal("10"), Decimal("5")))[0] is False
+    assert policy.evaluate(replace(safe, tranche_count=2))[0] is False
+    assert policy.evaluate(replace(safe, notional_usdt=Decimal("10")))[0] is False
+    assert policy.evaluate(replace(safe, projected_stressed_loss_usdt=Decimal("1.01")))[0] is False
+    assert policy.evaluate(replace(safe, existing_position_count=1))[0] is False
 
 
 class FilledAdapter:
@@ -314,7 +355,17 @@ async def test_live_canary_submission_is_physically_behind_every_guard() -> None
         IdempotentOrderExecutor(long_adapter),
         IdempotentOrderExecutor(short_adapter),
     )
-    action = CanaryAction(route, 1, Decimal("10"), Decimal("10"))
+    action = CanaryAction(
+        route,
+        1,
+        Decimal("10"),
+        Decimal("10"),
+        Decimal("0.8"),
+        Decimal("2"),
+        Decimal("0.50"),
+        0,
+        0,
+    )
     long_intent = ExecutionIntent(
         "live-long",
         Venue.BYBIT,

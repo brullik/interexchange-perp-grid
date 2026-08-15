@@ -4,12 +4,13 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PRODUCT_READY_LIVE_CANARY_READY
-- **Current checkpoint:** C5 (owner-operated canary; blocked by design)
+- **State:** C4_REWORK_IMPLEMENTED_PENDING_INDEPENDENT_REVIEW
+- **Current checkpoint:** C4 (P0 rework implemented locally; final-head CI and independent review pending)
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
-- **Canary default:** Bybit + OKX, subject to runtime qualification
+- **Canary route:** none; selected only from a route-specific qualified allowlist
+- **C5:** forbidden until every P0 blocker in the independent audit is closed and re-verified
 
 ## Checkpoints
 
@@ -19,8 +20,8 @@ This is the only mutable project-status document.
 | C1 public market vertical slice | COMPLETE | [GitHub Actions run 31837867113](https://github.com/brullik/interexchange-perp-grid/actions/runs/31837867113): Linux `make verify` (29 tests) and Docker health/restart passed on `a790344`; live read-only scan found 656 common instruments and two eligible Binance USD-M/OKX directed BTC routes while Bybit failed closed with `BOOK_SEQUENCE_UNKNOWN`; Parquet/DuckDB replay contained 206 L2 levels across all three venues |
 | C2 strategy/risk/simulator | COMPLETE | [GitHub Actions run 31839163485](https://github.com/brullik/interexchange-perp-grid/actions/runs/31839163485): Linux `make verify` (43 tests) and Docker health/restart passed on `0849413`; deterministic tests cover open/add/partial close/full close, profitable and losing four-leg PnL, funding, protected prices, partial/rejected/unknown orders, private staleness, venue outage, third-venue hedge, forced close, and property-based 5/50 USDT risk invariants |
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
-| C4 live-canary-ready execution | COMPLETE | [GitHub Actions run 31842172015](https://github.com/brullik/interexchange-perp-grid/actions/runs/31842172015): Linux `make verify` (70 tests) and Docker health/restart passed on `059439a`; read-only production probes reported no missing CCXT Pro private capability for Bybit, OKX, or Binance USD-M; contract tests cover streams/account/orders/cancel/fees, protected IOC, idempotent unknown reconciliation, complete preflight, exact minimal canary policy, both venue-failure hedge directions, and zero submit calls before all live gates |
-| C5 owner-operated canary | BLOCKED_BY_DESIGN | Requires owner credentials and explicit live consent |
+| C4 live-canary-ready execution | REWORK_IMPLEMENTED_REVIEW_REQUIRED | Corrected implementation has local lint/type/123-test/doctor evidence; exact final-head Linux CI, replay artifact, and independent re-review remain mandatory |
+| C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
 ## Decisions made during implementation
@@ -42,40 +43,28 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-15 — Keep one CCXT Pro private boundary and limit venue-specific code to protected IOC/client-ID parameters — measured contracts support the required Wave 1 private capabilities without native connectors — `adapters/private.py`, `private_execution.py`
 2026-08-15 — Never resubmit an unknown client order ID; query positions and order history until reconciled — a timeout must not create a duplicate live leg — `private_execution.py`
 2026-08-15 — Make `LiveCanaryExecutor` the only private submit boundary and require an exact owner phrase plus all independent gates — YAML/env flags alone must remain incapable of placing an order — `safety.py`, `canary_runtime.py`, CLI
+2026-08-15 — Bind qualification to one exact directed route, release/image/config, immutable Parquet manifest, private fees, 24-hour continuity, three funding checkpoints, persisted shadow statistics, and hashed replay/JUnit evidence — row counts or mutable JSON cannot qualify a canary — `qualification.py`, `state.py`, `shadow.py`, `release_evidence.py`, CLI, CI
+2026-08-15 — Recompute all four-leg live economics from private fees, schedule-aware funding, depth impact and explicit recovery reserves; derive IOC caps from the marginal consumed level — canary entry must remain profitable after current full stress — `live_economics.py`, `routes.py`, `private_execution.py`
+2026-08-15 — Persist both exact requests and every transition in SQLite WAL before network submission, and resume only the same idempotent action — crashes and unknown acknowledgements must never duplicate a leg or permit a new pair — `live_journal.py`, `live_coordinator.py`, `canary_runtime.py`
+2026-08-15 — Treat exchange account/orders/positions as reconciliation truth and require zero open positions plus zero bot orders for terminal FLAT — netting nonzero positions is not flat — `adapters/private.py`, `live_reconciliation.py`, `live_control.py`
+2026-08-15 — Select canary direction only from exact qualification evidence and derive the remaining Wave 1 venue for emergency recovery — hard-coded Bybit/OKX direction is unsafe while Bybit sequence is unknown — `config.py`, `canary_runtime.py`, owner runbook
 
 ## Active blockers / owner actions
 
-### C5 owner action — one minimal live canary
+### C4 independent acceptance
 
-1. Review and deploy commit `059439a` from draft PR #1 to one bot-dedicated VPS. Create bot-dedicated Bybit and OKX accounts/subaccounts in cross margin and one-way position mode. Keys must have trading/read permissions only, IP allowlisting where supported, and no withdrawal permission. Codex cannot perform account eligibility, VPS access, credential creation, or irreversible live-money consent.
-2. Store only outside Git in the VPS `.env`: `IPEG_BYBIT_API_KEY`, `IPEG_BYBIT_API_SECRET`, `IPEG_OKX_API_KEY`, `IPEG_OKX_API_SECRET`, `IPEG_OKX_API_PASSWORD`, `IPEG_TELEGRAM_ENABLED=true`, `IPEG_TELEGRAM_BOT_TOKEN`, `IPEG_TELEGRAM_OWNER_CHAT_ID`, and a new random `IPEG_LOCAL_UNLOCK_SECRET`. Keep `IPEG_MODE=shadow` and `IPEG_LIVE_ENABLED=false` while qualifying.
-3. Deploy and collect current-hash evidence:
-
-   ```text
-   docker compose up --build --detach --wait
-   docker compose exec -T app interexchange-grid private-probe --venue bybit
-   docker compose exec -T app interexchange-grid private-probe --venue okx
-   docker compose exec -T app interexchange-grid qualify --config /app/config/defaults.yaml --repo-root /app --evidence /app/state/qualification.json
-   ```
-
-   Observable result: both probes have `missing: []`; qualification has `accepted: true` and `QUALIFICATION_PASSED`. If either fails, that venue is not eligible and canary submission remains denied.
-4. In the owner Telegram chat send `/challenge`, then `/confirm_live <TOKEN>`. Within the configured 120-second TTL, execute exactly one owner-confirmed minimum-notional pair:
-
-   ```text
-   docker compose exec -T -e IPEG_MODE=live -e IPEG_LIVE_ENABLED=true app interexchange-grid canary-run --config /app/config/defaults.yaml --repo-root /app --qualification /app/state/qualification.json --confirmation I_ACCEPT_LIVE_CANARY_RISK
-   ```
-
-   Observable result: `submitted: true`, exactly one configured base/route/tranche, and both returned orders contain actual fill state. Any stale/wrong hash, missing unlock/challenge, non-allowlisted route, account/data/risk/reconciliation failure, pause/kill, or unknown order returns `submitted: false` and a stable reason code.
-5. Observe `/status`, `/positions`, `/pnl`, `/data_health`, exchange order/position panels, and structured logs. To disable, issue a fresh `/challenge` then `/kill <TOKEN>`, restore `IPEG_MODE=shadow` and `IPEG_LIVE_ENABLED=false`, restart Compose, and revoke the trading keys.
-
-Fail-closed until completion: repository defaults stay shadow/live-disabled; credentials are absent; no Telegram live confirmation or local unlock exists; `canary-run` refuses before network without the exact owner phrase and refuses before submit unless every independent gate passes.
+No owner credential or live-money action is requested. C5 remains forbidden until the exact final head has green Linux CI with the replay artifact and an independent reviewer accepts every P0 item. Repository defaults remain shadow/live-disabled, production secrets remain absent, and tests never reach a production submit endpoint.
 
 ## Last verified command
 
 ```text
-GitHub Actions run 31842172015 on 059439a:
-- make verify: PASS (Ruff, mypy, 70 pytest tests, doctor)
-- docker-smoke: PASS (continuous shadow process build, health, persisted restart count)
-- read-only private-probe: PASS on Bybit, OKX, and Binance USD-M (`missing: []`; no credentials or orders)
-- guarded canary runner: PASS (wrong owner phrase exits before network; config-only and every missing independent gate produce zero private submissions)
+2026-08-15 local Windows equivalent of every Makefile verify target: PASS
+- ruff format --check + ruff check: PASS (66 files)
+- mypy --strict: PASS (66 source/test files)
+- pytest: 123 passed in 11.26s
+- interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
+
+GNU make is not installed on this Windows host. Exact `make verify`, Docker smoke,
+hashed replay artifact, and final commit identity must pass in Linux GitHub Actions.
+No production credentials were used and no real order was submitted.
 ```

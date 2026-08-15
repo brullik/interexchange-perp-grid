@@ -60,6 +60,8 @@ class FakePrivateExchange:
             "positionMode": "oneway",
             "tradingEnabled": True,
             "permissions": ["trade"],
+            "withdrawalEnabled": False,
+            "transferEnabled": False,
         }
 
     async def fetch_margin_mode(self, symbol: str) -> dict[str, object]:

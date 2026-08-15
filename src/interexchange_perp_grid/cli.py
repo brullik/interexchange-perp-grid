@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter
-from interexchange_perp_grid.canary_runtime import run_canary_once
+from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
+from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.maintenance import (
@@ -22,11 +25,23 @@ from interexchange_perp_grid.maintenance import (
 from interexchange_perp_grid.observability import configure_logging, render_metrics
 from interexchange_perp_grid.private_domain import PrivateCapabilityReport
 from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
-from interexchange_perp_grid.qualification import run_qualification
+from interexchange_perp_grid.qualification import (
+    QualificationPolicy,
+    QualificationRuntimeEvidence,
+    build_runtime_evidence_from_state,
+    code_hash,
+    config_hash,
+    current_code_commit_sha,
+    load_runtime_evidence,
+    run_qualification,
+    write_runtime_evidence,
+)
+from interexchange_perp_grid.release_evidence import REPLAY_TEST_FILES, run_replay_proof
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.service import run_until_signal
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import initialise_state, read_service_health
+from interexchange_perp_grid.strategy import DirectedRouteKey
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 ConfigPath = Annotated[
@@ -51,6 +66,21 @@ def _load(config: Path) -> Settings:
     settings = load_settings(config)
     configure_logging(settings.app.log_level)
     return settings
+
+
+def _parse_route(value: str) -> DirectedRouteKey:
+    base, separator, venues = value.strip().partition(":")
+    long_venue, direction, short_venue = venues.partition(">")
+    if not separator or not direction:
+        raise typer.BadParameter("route must use BASE:long_venue>short_venue")
+    try:
+        return DirectedRouteKey(
+            base=base.upper(),
+            long_venue=Venue(long_venue.lower()),
+            short_venue=Venue(short_venue.lower()),
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
 
 
 @app.command()
@@ -187,21 +217,143 @@ def qualify(
     config: ConfigPath = Path("config/defaults.yaml"),
     evidence: Annotated[Path, typer.Option("--evidence")] = Path("state/qualification.json"),
     repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
-    minimum_samples: Annotated[int, typer.Option("--minimum-samples", min=0)] = 0,
+    runtime_evidence: Annotated[
+        Path,
+        typer.Option(
+            "--runtime-evidence",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = Path("state/qualification-runtime.json"),
 ) -> None:
-    """Write code/config/data-hash-bound shadow qualification evidence."""
+    """Write exact-route, release/image/data-bound qualification evidence."""
     settings = _load(config)
-    required = minimum_samples or settings.shadow.qualification_min_samples
+    policy = QualificationPolicy(
+        minimum_duration_seconds=settings.shadow.qualification_min_duration_seconds,
+        minimum_synchronised_snapshots_per_venue=(
+            settings.shadow.qualification_min_synchronised_snapshots_per_venue
+        ),
+        minimum_funding_checkpoints_per_venue=(
+            settings.shadow.qualification_min_funding_checkpoints_per_venue
+        ),
+        maximum_inter_snapshot_gap_seconds=(
+            settings.shadow.qualification_max_inter_snapshot_gap_seconds
+        ),
+        maximum_sequence_gaps=settings.shadow.qualification_max_sequence_gaps,
+        maximum_stale_snapshots=settings.shadow.qualification_max_stale_snapshots,
+        maximum_sequence_unknown_snapshots=(
+            settings.shadow.qualification_max_sequence_unknown_snapshots
+        ),
+        maximum_clock_skew_snapshots=(settings.shadow.qualification_max_clock_skew_snapshots),
+        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+        maximum_snapshot_age_ms=settings.market_data.max_l2_age_ms,
+    )
     result = run_qualification(
         repo_root.resolve(),
         config.resolve(),
         Path(settings.storage.parquet_dir).resolve(),
         evidence.resolve(),
-        required,
+        runtime_evidence=load_runtime_evidence(runtime_evidence.resolve()),
+        policy=policy,
     )
     typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
     if not result.accepted:
         raise typer.Exit(code=4)
+
+
+@app.command("qualification-runtime")
+def qualification_runtime(
+    route: Annotated[str, typer.Option("--route")],
+    container_image_digest: Annotated[
+        str,
+        typer.Option("--container-image-digest", envvar="IPEG_CONTAINER_IMAGE_DIGEST"),
+    ],
+    replay_proof: Annotated[
+        Path,
+        typer.Option("--replay-proof", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output")] = Path("state/qualification-runtime.json"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Collect private fees and persisted route shadow/replay evidence without trading."""
+    settings = _load(config)
+    selected_route = _parse_route(route)
+    release_sha = current_code_commit_sha(repo_root.resolve())
+    if release_sha is None:
+        raise typer.BadParameter("exact release commit SHA is unavailable")
+    proof = json.loads(replay_proof.read_text(encoding="utf-8"))
+    junit_path = replay_proof.with_suffix(".junit.xml")
+    replay_passed = (
+        isinstance(proof, dict)
+        and proof.get("passed") is True
+        and proof.get("code_commit_sha") == release_sha
+        and proof.get("source_sha256") == code_hash(repo_root.resolve())
+        and proof.get("config_sha256") == config_hash(config.resolve())
+        and int(proof.get("scenario_count", 0)) >= 11
+        and int(proof.get("failure_count", -1)) == 0
+        and int(proof.get("error_count", -1)) == 0
+        and int(proof.get("skipped_count", -1)) == 0
+        and tuple(proof.get("test_files", ())) == REPLAY_TEST_FILES
+        and junit_path.is_file()
+        and proof.get("junit_sha256") == hashlib.sha256(junit_path.read_bytes()).hexdigest()
+    )
+    if not replay_passed:
+        raise typer.BadParameter("replay proof does not match the exact release/config")
+
+    async def collect() -> dict[Venue, Decimal]:
+        fees: dict[Venue, Decimal] = {}
+        for venue in (selected_route.long_venue, selected_route.short_venue):
+            public = CcxtProAdapter(venue)
+            private = CcxtPrivateAdapter(
+                venue,
+                PrivateCredentials.from_environment(venue),
+            )
+            try:
+                instruments = await public.discover_instruments()
+                instrument = next(
+                    item
+                    for item in instruments
+                    if item.base == selected_route.base and item.settle == "USDT"
+                )
+                fee = await private.fetch_trading_fee(instrument)
+                if fee is None:
+                    raise RuntimeError(f"{venue.value}: private taker fee is unavailable")
+                fees[venue] = fee
+            finally:
+                await asyncio.gather(public.close(), private.close(), return_exceptions=True)
+        return fees
+
+    async def build() -> QualificationRuntimeEvidence:
+        fees = await collect()
+        return await build_runtime_evidence_from_state(
+            Path(settings.storage.sqlite_path),
+            selected_route,
+            release_sha,
+            container_image_digest,
+            fees,
+            datetime.now(UTC)
+            - timedelta(seconds=settings.shadow.qualification_min_duration_seconds),
+            replay_completed=True,
+        )
+
+    runtime = asyncio.run(build())
+    write_runtime_evidence(runtime, output.resolve())
+    typer.echo(json.dumps(asdict(runtime), default=str, sort_keys=True))
+
+
+@app.command("replay-proof")
+def replay_proof(
+    output: Annotated[Path, typer.Option("--output")] = Path("state/replay-proof.json"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Run the exact release replay/fault/restart suite and write hashed evidence."""
+    proof = run_replay_proof(repo_root.resolve(), config.resolve(), output.resolve())
+    typer.echo(json.dumps(asdict(proof), default=str, sort_keys=True))
+    if not proof.passed:
+        raise typer.Exit(code=5)
 
 
 @app.command("backup-state")
@@ -276,8 +428,36 @@ def canary_run(
         )
     )
     typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
-    if not result.submitted:
+    if not result.success:
         raise typer.Exit(code=5)
+
+
+@app.command("emergency-flatten")
+def emergency_flatten(
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    qualification: Annotated[Path, typer.Option("--qualification")] = Path(
+        "state/qualification.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Cancel and flatten live exposure with a separate unlock and exact phrase."""
+    settings = _load(config)
+    result = asyncio.run(
+        run_emergency_flatten(
+            settings,
+            config.resolve(),
+            qualification.resolve(),
+            repo_root.resolve(),
+            confirmation,
+        )
+    )
+    if result is None:
+        typer.echo("EMERGENCY_UNLOCK_OR_QUALIFICATION_INVALID", err=True)
+        raise typer.Exit(code=6)
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+    if not result.success:
+        raise typer.Exit(code=6)
 
 
 if __name__ == "__main__":

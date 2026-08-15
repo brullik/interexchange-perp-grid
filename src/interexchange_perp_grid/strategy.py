@@ -158,6 +158,8 @@ class CostInputs:
     reconciliation_forced_exit_reserve_usdt: Decimal
     liquidation_distance_reserve_usdt: Decimal
     precomputed_four_leg_fee_usdt: Decimal | None = None
+    partial_fill_reserve_usdt: Decimal = Decimal(0)
+    emergency_hedge_reserve_usdt: Decimal = Decimal(0)
 
     def __post_init__(self) -> None:
         positive = (
@@ -178,6 +180,8 @@ class CostInputs:
             self.unmatched_hedge_reserve_usdt,
             self.reconciliation_forced_exit_reserve_usdt,
             self.liquidation_distance_reserve_usdt,
+            self.partial_fill_reserve_usdt,
+            self.emergency_hedge_reserve_usdt,
         )
         if any(not value.is_finite() or value <= 0 for value in positive):
             raise ValueError("quantity and prices must be positive finite decimals")
@@ -198,6 +202,8 @@ class CostBreakdown:
     funding_stress_usdt: Decimal
     latency_reserve_usdt: Decimal
     unmatched_hedge_reserve_usdt: Decimal
+    partial_fill_reserve_usdt: Decimal
+    emergency_hedge_reserve_usdt: Decimal
     reconciliation_forced_exit_reserve_usdt: Decimal
     liquidation_distance_reserve_usdt: Decimal
     stressed_total_cost_usdt: Decimal
@@ -223,6 +229,8 @@ def calculate_stressed_cost(inputs: CostInputs) -> CostBreakdown:
         + inputs.funding_stress_usdt
         + inputs.latency_reserve_usdt
         + inputs.unmatched_hedge_reserve_usdt
+        + inputs.partial_fill_reserve_usdt
+        + inputs.emergency_hedge_reserve_usdt
         + inputs.reconciliation_forced_exit_reserve_usdt
         + inputs.liquidation_distance_reserve_usdt
     )
@@ -237,6 +245,8 @@ def calculate_stressed_cost(inputs: CostInputs) -> CostBreakdown:
         funding_stress_usdt=inputs.funding_stress_usdt,
         latency_reserve_usdt=inputs.latency_reserve_usdt,
         unmatched_hedge_reserve_usdt=inputs.unmatched_hedge_reserve_usdt,
+        partial_fill_reserve_usdt=inputs.partial_fill_reserve_usdt,
+        emergency_hedge_reserve_usdt=inputs.emergency_hedge_reserve_usdt,
         reconciliation_forced_exit_reserve_usdt=(inputs.reconciliation_forced_exit_reserve_usdt),
         liquidation_distance_reserve_usdt=inputs.liquidation_distance_reserve_usdt,
         stressed_total_cost_usdt=total,
@@ -249,6 +259,7 @@ def calculate_stressed_cost(inputs: CostInputs) -> CostBreakdown:
 class SignalDecision:
     accepted: bool
     reason: ReasonCode
+    route: DirectedRouteKey
     calibration_version: int
     inputs: dict[str, Decimal]
     cost: CostBreakdown
@@ -267,7 +278,14 @@ def evaluate_entry_signal(
         raise ValueError("cost multiplier must be at least one")
     cost = calculate_stressed_cost(inputs)
     required_gross = cost_multiplier * cost.stressed_total_cost_usdt
-    if cost.expected_gross_pnl_usdt < required_gross:
+    observed_entry_spread_bps = (
+        (inputs.entry_short_price - inputs.entry_long_price)
+        / inputs.entry_long_price
+        * Decimal(10_000)
+    )
+    if observed_entry_spread_bps < parameters.entry_quantile_bps:
+        reason = ReasonCode.ADAPTIVE_THRESHOLD_NOT_MET
+    elif cost.expected_gross_pnl_usdt < required_gross:
         reason = ReasonCode.GROSS_BELOW_COST_FLOOR
     elif cost.expected_net_pnl_usdt < parameters.minimum_profit_usdt:
         reason = ReasonCode.NET_BELOW_MINIMUM
@@ -278,6 +296,7 @@ def evaluate_entry_signal(
     return SignalDecision(
         accepted=reason == ReasonCode.ENTRY_ACCEPTED,
         reason=reason,
+        route=parameters.route,
         calibration_version=parameters.version,
         inputs={
             "quantity": inputs.quantity,
@@ -287,6 +306,11 @@ def evaluate_entry_signal(
             "target_exit_short_price": inputs.target_exit_short_price,
             "cost_multiplier": cost_multiplier,
             "required_gross_pnl_usdt": required_gross,
+            "observed_entry_spread_bps": observed_entry_spread_bps,
+            "adaptive_entry_threshold_bps": parameters.entry_quantile_bps,
+            "target_exit_spread_bps": parameters.exit_quantile_bps,
+            "size_bucket_base_quantity": parameters.size_bucket,
+            "minimum_profit_usdt": parameters.minimum_profit_usdt,
         },
         cost=cost,
         risk_breakdown=dict(risk_breakdown),

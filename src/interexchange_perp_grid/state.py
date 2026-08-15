@@ -5,10 +5,11 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.domain import FundingSnapshot, Venue
 from interexchange_perp_grid.execution import (
     Fill,
     OrderPurpose,
@@ -17,9 +18,9 @@ from interexchange_perp_grid.execution import (
     Tranche,
 )
 from interexchange_perp_grid.reason_codes import ReasonCode
-from interexchange_perp_grid.strategy import DirectedRouteKey
+from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
@@ -77,6 +78,57 @@ SCHEMA_STATEMENTS = (
         created_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS qualification_funding_observations (
+        base TEXT NOT NULL,
+        venue TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        rate TEXT NOT NULL,
+        next_funding_timestamp_ms INTEGER NOT NULL,
+        interval TEXT NOT NULL,
+        PRIMARY KEY (base, venue, next_funding_timestamp_ms, observed_at)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS qualification_signal_observations (
+        observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route TEXT NOT NULL,
+        accepted INTEGER NOT NULL CHECK (accepted IN (0, 1)),
+        reason TEXT NOT NULL,
+        expected_net_pnl_usdt TEXT NOT NULL,
+        observed_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS qualification_strategy_parameters (
+        observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route TEXT NOT NULL,
+        size_bucket_base_quantity TEXT NOT NULL,
+        calibration_version INTEGER NOT NULL,
+        adaptive_entry_threshold_bps TEXT NOT NULL,
+        target_exit_spread_bps TEXT NOT NULL,
+        minimum_profit_usdt TEXT NOT NULL,
+        stressed_cost_multiplier TEXT NOT NULL,
+        expected_holding_seconds INTEGER NOT NULL,
+        maximum_holding_seconds INTEGER NOT NULL,
+        observed_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS qualification_pnl_observations (
+        observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route TEXT NOT NULL,
+        simulated_net_pnl_usdt TEXT NOT NULL,
+        observed_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS qualification_runtime_errors (
+        error_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        error_type TEXT NOT NULL,
+        observed_at TEXT NOT NULL
+    )
+    """,
 )
 
 
@@ -127,7 +179,7 @@ def _initialise_state_sync(path: Path) -> None:
         existing = database.execute(
             "SELECT value FROM metadata WHERE key = ?", ("schema_version",)
         ).fetchone()
-        if existing is not None and existing[0] not in {"1", "2", SCHEMA_VERSION}:
+        if existing is not None and existing[0] not in {"1", "2", "3", SCHEMA_VERSION}:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
         database.execute(
             """
@@ -587,4 +639,270 @@ async def live_confirmation_valid(path: Path, now: datetime | None = None) -> bo
         _live_confirmation_valid_sync,
         path,
         now or datetime.now(UTC),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StoredQualificationStatistics:
+    funding_rows: tuple[tuple[Venue, datetime, str, int, str], ...]
+    accepted_signals: int
+    rejected_signals: int
+    latest_simulated_net_pnl_usdt: str
+    maximum_adverse_excursion_usdt: str
+    unhandled_exception_count: int
+    strategy: dict[str, str | int] | None
+
+
+def _record_qualification_scan_sync(
+    path: Path,
+    base: str,
+    funding: tuple[FundingSnapshot, ...],
+    decisions: tuple[SignalDecision, ...],
+    tranches: tuple[Tranche, ...],
+    stressed_cost_multiplier: str,
+    expected_holding_seconds: int,
+    maximum_holding_seconds: int,
+    now: datetime,
+) -> None:
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        for snapshot in funding:
+            if (
+                snapshot.rate is None
+                or snapshot.next_funding_timestamp_ms is None
+                or snapshot.interval is None
+            ):
+                continue
+            database.execute(
+                """
+                INSERT OR IGNORE INTO qualification_funding_observations (
+                    base, venue, observed_at, rate, next_funding_timestamp_ms, interval
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    base.upper(),
+                    snapshot.venue.value,
+                    now.isoformat(),
+                    str(snapshot.rate),
+                    snapshot.next_funding_timestamp_ms,
+                    snapshot.interval,
+                ),
+            )
+        for decision in decisions:
+            database.execute(
+                """
+                INSERT INTO qualification_signal_observations (
+                    route, accepted, reason, expected_net_pnl_usdt, observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.route.value,
+                    int(decision.accepted),
+                    decision.reason.value,
+                    str(decision.cost.expected_net_pnl_usdt),
+                    now.isoformat(),
+                ),
+            )
+            database.execute(
+                """
+                INSERT INTO qualification_strategy_parameters (
+                    route, size_bucket_base_quantity, calibration_version,
+                    adaptive_entry_threshold_bps, target_exit_spread_bps,
+                    minimum_profit_usdt, stressed_cost_multiplier,
+                    expected_holding_seconds, maximum_holding_seconds, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision.route.value,
+                    str(decision.inputs["size_bucket_base_quantity"]),
+                    decision.calibration_version,
+                    str(decision.inputs["adaptive_entry_threshold_bps"]),
+                    str(decision.inputs["target_exit_spread_bps"]),
+                    str(decision.inputs["minimum_profit_usdt"]),
+                    stressed_cost_multiplier,
+                    expected_holding_seconds,
+                    maximum_holding_seconds,
+                    now.isoformat(),
+                ),
+            )
+        routes = {decision.route for decision in decisions} | {
+            tranche.route for tranche in tranches
+        }
+        for route in routes:
+            pnl = sum(
+                (tranche.pnl().net_pnl_usdt for tranche in tranches if tranche.route == route),
+                Decimal(0),
+            )
+            database.execute(
+                """
+                INSERT INTO qualification_pnl_observations (
+                    route, simulated_net_pnl_usdt, observed_at
+                ) VALUES (?, ?, ?)
+                """,
+                (route.value, str(pnl), now.isoformat()),
+            )
+        database.commit()
+
+
+async def record_qualification_scan(
+    path: Path,
+    base: str,
+    funding: tuple[FundingSnapshot, ...],
+    decisions: tuple[SignalDecision, ...],
+    tranches: tuple[Tranche, ...],
+    stressed_cost_multiplier: Decimal,
+    expected_holding_seconds: int,
+    maximum_holding_seconds: int,
+    now: datetime | None = None,
+) -> None:
+    await asyncio.to_thread(
+        _record_qualification_scan_sync,
+        path,
+        base,
+        funding,
+        decisions,
+        tranches,
+        str(stressed_cost_multiplier),
+        expected_holding_seconds,
+        maximum_holding_seconds,
+        now or datetime.now(UTC),
+    )
+
+
+def _record_qualification_exception_sync(
+    path: Path,
+    error_type: str,
+    now: datetime,
+) -> None:
+    with _connect(path) as database:
+        database.execute(
+            """
+            INSERT INTO qualification_runtime_errors(error_type, observed_at)
+            VALUES (?, ?)
+            """,
+            (error_type, now.isoformat()),
+        )
+        database.commit()
+
+
+async def record_qualification_exception(
+    path: Path,
+    error_type: str,
+    now: datetime | None = None,
+) -> None:
+    if not error_type.strip():
+        raise ValueError("qualification exception type must be non-empty")
+    await asyncio.to_thread(
+        _record_qualification_exception_sync,
+        path,
+        error_type,
+        now or datetime.now(UTC),
+    )
+
+
+def _read_qualification_statistics_sync(
+    path: Path,
+    route: DirectedRouteKey,
+    since: datetime,
+) -> StoredQualificationStatistics:
+    with _connect(path) as database:
+        funding_rows = database.execute(
+            """
+            SELECT venue, observed_at, rate, next_funding_timestamp_ms, interval
+            FROM qualification_funding_observations
+            WHERE base = ? AND venue IN (?, ?) AND observed_at >= ?
+            ORDER BY observed_at, venue
+            """,
+            (
+                route.base.upper(),
+                route.long_venue.value,
+                route.short_venue.value,
+                since.isoformat(),
+            ),
+        ).fetchall()
+        signal_row = database.execute(
+            """
+            SELECT
+                coalesce(sum(CASE WHEN accepted = 1 THEN 1 ELSE 0 END), 0),
+                coalesce(sum(CASE WHEN accepted = 0 THEN 1 ELSE 0 END), 0)
+            FROM qualification_signal_observations
+            WHERE route = ? AND observed_at >= ?
+            """,
+            (route.value, since.isoformat()),
+        ).fetchone()
+        pnl_rows = database.execute(
+            """
+            SELECT simulated_net_pnl_usdt
+            FROM qualification_pnl_observations
+            WHERE route = ? AND observed_at >= ?
+            ORDER BY observed_at
+            """,
+            (route.value, since.isoformat()),
+        ).fetchall()
+        error_row = database.execute(
+            """
+            SELECT count(*) FROM qualification_runtime_errors
+            WHERE observed_at >= ?
+            """,
+            (since.isoformat(),),
+        ).fetchone()
+        strategy_row = database.execute(
+            """
+            SELECT size_bucket_base_quantity, calibration_version,
+                   adaptive_entry_threshold_bps, target_exit_spread_bps,
+                   minimum_profit_usdt, stressed_cost_multiplier,
+                   expected_holding_seconds, maximum_holding_seconds
+            FROM qualification_strategy_parameters
+            WHERE route = ? AND observed_at >= ?
+            ORDER BY observation_id DESC LIMIT 1
+            """,
+            (route.value, since.isoformat()),
+        ).fetchone()
+    pnl_values = tuple(Decimal(str(row[0])) for row in pnl_rows)
+    latest_pnl = pnl_values[-1] if pnl_values else Decimal(0)
+    adverse = abs(min((Decimal(0), *pnl_values)))
+    strategy: dict[str, str | int] | None = (
+        {
+            "size_bucket_base_quantity": str(strategy_row[0]),
+            "calibration_version": int(strategy_row[1]),
+            "adaptive_entry_threshold_bps": str(strategy_row[2]),
+            "target_exit_spread_bps": str(strategy_row[3]),
+            "minimum_profit_usdt": str(strategy_row[4]),
+            "stressed_cost_multiplier": str(strategy_row[5]),
+            "expected_holding_seconds": int(strategy_row[6]),
+            "maximum_holding_seconds": int(strategy_row[7]),
+        }
+        if strategy_row is not None
+        else None
+    )
+    return StoredQualificationStatistics(
+        funding_rows=tuple(
+            (
+                Venue(str(row[0])),
+                datetime.fromisoformat(str(row[1])),
+                str(row[2]),
+                int(row[3]),
+                str(row[4]),
+            )
+            for row in funding_rows
+        ),
+        accepted_signals=int(signal_row[0]) if signal_row else 0,
+        rejected_signals=int(signal_row[1]) if signal_row else 0,
+        latest_simulated_net_pnl_usdt=str(latest_pnl),
+        maximum_adverse_excursion_usdt=str(adverse),
+        unhandled_exception_count=int(error_row[0]) if error_row else 0,
+        strategy=strategy,
+    )
+
+
+async def read_qualification_statistics(
+    path: Path,
+    route: DirectedRouteKey,
+    since: datetime,
+) -> StoredQualificationStatistics:
+    return await asyncio.to_thread(
+        _read_qualification_statistics_sync,
+        path,
+        route,
+        since,
     )

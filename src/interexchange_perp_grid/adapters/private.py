@@ -13,6 +13,7 @@ from interexchange_perp_grid.adapters.ccxt_pro import (
     _decimal,
     _mapping,
     _supported,
+    normalize_market,
 )
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
@@ -82,6 +83,8 @@ class CcxtPrivateAdapter:
             "cancel_order": self._has("cancelOrder"),
             "fetch_order": self._has("fetchOrder")
             or (self._has("fetchOpenOrders") and self._has("fetchClosedOrders")),
+            "fetch_open_orders": self._has("fetchOpenOrders"),
+            "fetch_closed_orders": self._has("fetchClosedOrders"),
             "fetch_fee": self._has("fetchTradingFee") or self._has("fetchTradingFees"),
         }
         return PrivateCapabilityReport(
@@ -115,10 +118,22 @@ class CcxtPrivateAdapter:
         )
         permissions_value = raw.get("permissions") or info.get("permissions")
         permissions = (
-            tuple(str(value).lower() for value in permissions_value)
+            {str(value).lower() for value in permissions_value}
             if isinstance(permissions_value, Sequence)
             and not isinstance(permissions_value, (str, bytes))
-            else ()
+            else set()
+        )
+        if trading_enabled is True:
+            permissions.add("trade")
+        withdrawal_enabled = _optional_bool(
+            raw.get("withdrawalEnabled")
+            if raw.get("withdrawalEnabled") is not None
+            else info.get("canWithdraw")
+        )
+        transfer_enabled = _optional_bool(
+            raw.get("transferEnabled")
+            if raw.get("transferEnabled") is not None
+            else info.get("canTransfer")
         )
         if total is None or free is None:
             raise ValueError("USDT equity/free margin is unavailable")
@@ -129,8 +144,10 @@ class CcxtPrivateAdapter:
             margin_mode=margin_mode,
             position_mode=position_mode,
             trading_enabled=trading_enabled,
-            permissions=permissions,
+            permissions=tuple(sorted(permissions)),
             observed_at=datetime.now(UTC),
+            withdrawal_enabled=withdrawal_enabled,
+            transfer_enabled=transfer_enabled,
         )
 
     async def watch_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
@@ -164,6 +181,54 @@ class CcxtPrivateAdapter:
             if isinstance(value, Mapping)
             and (position := _normalise_position(self.venue, value, instrument)) is not None
         )
+
+    async def fetch_open_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
+        if not self._has("fetchOpenOrders"):
+            raise RuntimeError("fetchOpenOrders is unavailable")
+        raw = await self._exchange.fetch_open_orders(instrument.symbol)
+        return _normalise_orders(self.venue, raw, instrument)
+
+    async def fetch_all_open_orders(self) -> tuple[PrivateOrder, ...]:
+        if not self._has("fetchOpenOrders"):
+            raise RuntimeError("fetchOpenOrders is unavailable")
+        instruments = await self._linear_instruments()
+        raw = await self._exchange.fetch_open_orders()
+        return _normalise_multi_instrument_orders(self.venue, raw, instruments)
+
+    async def fetch_closed_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
+        if not self._has("fetchClosedOrders"):
+            raise RuntimeError("fetchClosedOrders is unavailable")
+        raw = await self._exchange.fetch_closed_orders(instrument.symbol)
+        return _normalise_orders(self.venue, raw, instrument)
+
+    async def fetch_all_positions(self) -> tuple[PositionSnapshot, ...]:
+        instruments = await self._linear_instruments()
+        raw = await self._exchange.fetch_positions()
+        if not isinstance(raw, Sequence):
+            raise TypeError("CCXT fetch_positions must return a sequence")
+        positions: list[PositionSnapshot] = []
+        for value in raw:
+            if not isinstance(value, Mapping):
+                continue
+            instrument = instruments.get(str(value.get("symbol")))
+            if instrument is None:
+                continue
+            position = _normalise_position(self.venue, value, instrument)
+            if position is not None:
+                positions.append(position)
+        return tuple(positions)
+
+    async def _linear_instruments(self) -> dict[str, Instrument]:
+        raw_markets = await self._exchange.load_markets()
+        if not isinstance(raw_markets, Mapping):
+            raise TypeError("CCXT load_markets must return a mapping")
+        instruments = (
+            instrument
+            for raw in raw_markets.values()
+            if isinstance(raw, Mapping)
+            and (instrument := normalize_market(self.venue, raw)) is not None
+        )
+        return {instrument.symbol: instrument for instrument in instruments}
 
     async def submit_order(
         self,
@@ -296,6 +361,23 @@ def _normalise_orders(
     )
 
 
+def _normalise_multi_instrument_orders(
+    venue: Venue,
+    raw: object,
+    instruments: Mapping[str, Instrument],
+) -> tuple[PrivateOrder, ...]:
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise TypeError("CCXT all-orders result must be a sequence")
+    orders: list[PrivateOrder] = []
+    for value in raw:
+        if not isinstance(value, Mapping):
+            continue
+        instrument = instruments.get(str(value.get("symbol")))
+        if instrument is not None:
+            orders.append(_normalise_order(venue, value, instrument, "unknown-client-id"))
+    return tuple(orders)
+
+
 def _normalise_order(
     venue: Venue,
     raw: Mapping[str, Any],
@@ -333,6 +415,7 @@ def _normalise_order(
         average_price=_decimal(raw.get("average")),
         fee_usdt=fee_cost,
         observed_at=datetime.now(UTC),
+        limit_price=_decimal(raw.get("price")),
     )
 
 
@@ -341,7 +424,7 @@ def _order_status(raw: str, filled: Decimal, amount: Decimal) -> PrivateOrderSta
     if normalized == "filled" or filled == amount:
         return PrivateOrderStatus.FILLED
     if normalized in {"canceled", "cancelled", "expired"}:
-        return PrivateOrderStatus.CANCELLED
+        return PrivateOrderStatus.PARTIAL if filled > 0 else PrivateOrderStatus.CANCELLED
     if normalized in {"rejected"}:
         return PrivateOrderStatus.REJECTED
     if filled > 0:

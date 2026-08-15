@@ -97,6 +97,11 @@ class ExecutionConfig(StrictModel):
     emergency_unbounded_market_allowed: bool
     idempotent_client_order_ids: Literal[True]
     third_venue_emergency_hedge: bool
+    latency_reserve_bps: Decimal = Field(ge=0, le=Decimal("100"))
+    partial_fill_reserve_bps: Decimal = Field(ge=0, le=Decimal("100"))
+    emergency_hedge_reserve_bps: Decimal = Field(ge=0, le=Decimal("500"))
+    reconciliation_forced_exit_reserve_bps: Decimal = Field(ge=0, le=Decimal("500"))
+    funding_stress_multiplier: Decimal = Field(ge=1, le=Decimal("10"))
 
 
 class MarketDataConfig(StrictModel):
@@ -126,18 +131,14 @@ class LiveConfig(StrictModel):
     require_current_hash_qualification: Literal[True]
     canary_max_routes: Literal[1]
     canary_max_tranches: Literal[1]
-    canary_base: str
-    canary_long_venue: Literal["bybit", "okx", "binanceusdm"]
-    canary_short_venue: Literal["bybit", "okx", "binanceusdm"]
+    canary_pair_stressed_loss_limit_usdt: Decimal = Field(gt=0, le=Decimal("1"))
+    canary_effective_leverage_cap: Decimal = Field(gt=0, le=Decimal("3"))
+    canary_free_margin_floor_ratio: Decimal = Field(ge=Decimal("0.20"), lt=1)
+    canary_entry_slippage_cap_bps: Decimal = Field(gt=0, le=Decimal("100"))
+    canary_close_slippage_cap_bps: Decimal = Field(gt=0, le=Decimal("200"))
+    canary_timeout_seconds: int = Field(gt=0, le=3600)
+    canary_minimum_profit_usdt: Decimal = Field(gt=0)
     qualification_max_age_seconds: int = Field(gt=0, le=604800)
-
-    @model_validator(mode="after")
-    def canary_route_is_directed(self) -> LiveConfig:
-        if not self.canary_base.strip():
-            raise ValueError("canary base must be non-empty")
-        if self.canary_long_venue == self.canary_short_venue:
-            raise ValueError("canary venues must differ")
-        return self
 
 
 class TelegramConfig(StrictModel):
@@ -159,7 +160,14 @@ class ShadowConfig(StrictModel):
     scan_timeout_seconds: int = Field(gt=0, le=120)
     overload_pending_limit: int = Field(gt=0, le=10000)
     history_retention_days: int = Field(gt=0, le=3650)
-    qualification_min_samples: int = Field(ge=1, le=1000000)
+    qualification_min_duration_seconds: int = Field(ge=86400, le=604800)
+    qualification_min_synchronised_snapshots_per_venue: int = Field(ge=10000, le=10000000)
+    qualification_min_funding_checkpoints_per_venue: int = Field(ge=3, le=1000)
+    qualification_max_inter_snapshot_gap_seconds: int = Field(gt=0, le=3600)
+    qualification_max_sequence_gaps: int = Field(ge=0, le=10000)
+    qualification_max_stale_snapshots: int = Field(ge=0, le=10000)
+    qualification_max_sequence_unknown_snapshots: int = Field(ge=0, le=10000)
+    qualification_max_clock_skew_snapshots: int = Field(ge=0, le=10000)
 
     @model_validator(mode="after")
     def base_is_valid(self) -> ShadowConfig:

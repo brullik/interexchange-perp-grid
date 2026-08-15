@@ -65,6 +65,9 @@ This is the only implementation plan. Codex updates checkboxes and `STATUS.md`; 
 
 ## C4 — live-canary-ready private execution
 
+Implementation checkboxes below are complete after the P0 rework. C4 is not accepted until
+the exact final head has green CI/replay evidence and passes independent re-review.
+
 - [x] Private streams, balances, positions, orders, cancel, and fee retrieval for Bybit and OKX; Binance USD-M alternate.
 - [x] Protected aggressive taker translation for each venue.
 - [x] Idempotent client order IDs and unknown-result reconciliation.
@@ -74,11 +77,14 @@ This is the only implementation plan. Codex updates checkboxes and `STATUS.md`; 
 - [x] Emergency close and pre-qualified third-venue hedge paths.
 - [x] No withdrawal/transfer endpoint is exposed by the application.
 
-**Exit evidence:** all `CR-*` criteria pass without production secrets; an exact owner-action file lists the minimum credentials and VPS steps for the canary.
+**Exit evidence:** all `CR-*` and P0 audit criteria pass without production submits; CI uploads
+the exact-commit replay/fault/restart artifact; `OWNER_RUNBOOK_RU.md` lists the minimum
+restricted credentials, qualification, canary, and emergency steps.
 
 ## C5 — owner-operated canary
 
-This checkpoint requires owner credentials and explicit consent. Codex prepares but does not invent its evidence.
+**FORBIDDEN pending independent acceptance of corrected C4.** This checkpoint requires owner
+credentials and explicit consent. Codex prepares but does not invent its evidence.
 
 - [ ] Deploy to the lower-latency qualified VPS region.
 - [ ] Add restricted, IP-allowlisted, no-withdrawal API credentials outside Git.

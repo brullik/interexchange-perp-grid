@@ -29,6 +29,21 @@ jobs:
         run: python -m pip install -e '.[dev]'
       - name: Verify
         run: make verify
+      - name: Build exact replay/fault/restart evidence
+        run: >-
+          interexchange-grid replay-proof
+          --repo-root .
+          --config config/defaults.yaml
+          --output state/replay-proof.json
+      - name: Upload replay evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: replay-proof-${{ github.sha }}
+          path: |
+            state/replay-proof.json
+            state/replay-proof.junit.xml
+          if-no-files-found: error
+          retention-days: 30
 
   docker-smoke:
     runs-on: ubuntu-latest

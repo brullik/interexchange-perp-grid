@@ -88,7 +88,9 @@ def test_directed_vwap_honours_contract_steps_depth_fees_and_funding() -> None:
     assert quote.eligible is True
     assert quote.base_quantity == Decimal("0.002")
     assert quote.entry_long_vwap == Decimal("101.5")
+    assert quote.entry_long_marginal_price == Decimal("102")
     assert quote.entry_short_vwap == Decimal("102.5")
+    assert quote.entry_short_marginal_price == Decimal("102")
     assert quote.entry_spread == Decimal("1.0")
     assert quote.funding_rate_delta == Decimal("0.0001")
     assert quote.four_leg_fee_estimate is not None

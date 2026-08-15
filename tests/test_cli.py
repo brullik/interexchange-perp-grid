@@ -30,3 +30,12 @@ def test_canary_run_requires_explicit_live_money_phrase_before_network() -> None
     )
     assert result.exit_code == 5
     assert "OWNER_CONFIRMATION_MISSING" in result.output
+
+
+def test_emergency_flatten_requires_separate_unlock_before_network() -> None:
+    result = runner.invoke(
+        app,
+        ["emergency-flatten", "--confirmation", "WRONG"],
+    )
+    assert result.exit_code == 6
+    assert "EMERGENCY_UNLOCK_OR_QUALIFICATION_INVALID" in result.output
