@@ -5,7 +5,7 @@ import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import StrEnum
 from functools import partial
@@ -96,6 +96,7 @@ class PrivateCacheView:
     age_seconds: Decimal | None
     p95_latency_ms: Decimal | None
     event_p95_latency_ms: Decimal | None
+    authoritative_recovery_snapshot: PrivateActiveSnapshot | None = None
 
     @property
     def ready(self) -> bool:
@@ -213,7 +214,29 @@ class PrivateStateCache:
                     self._positions_updated_monotonic_ns = self._updated_monotonic_ns
                 self._mark_persistence_pending_locked(snapshot.event_watermark, accepted)
                 view = self._view_locked()
-            return await self._persist_accepted_watermark(snapshot.event_watermark, view, accepted)
+                recovery_snapshot = (
+                    snapshot
+                    if accepted
+                    and _uses_authoritative_recovery_snapshot(trigger)
+                    and snapshot.account_wide
+                    and snapshot.completeness == SnapshotCompleteness.COMPLETE
+                    and snapshot.request_count <= self._policy.maximum_rest_requests
+                    else None
+                )
+            persisted_view = await self._persist_accepted_watermark(
+                snapshot.event_watermark,
+                view,
+                accepted,
+            )
+            if recovery_snapshot is not None and not (
+                persisted_view.reason is not None
+                and persisted_view.reason.startswith("PRIVATE_WATERMARK_PERSIST_FAILED:")
+            ):
+                return replace(
+                    persisted_view,
+                    authoritative_recovery_snapshot=recovery_snapshot,
+                )
+            return persisted_view
 
     def _detach_fetch_task(self, task: asyncio.Task[PrivateActiveSnapshot]) -> None:
         self._detached_fetch_task = task
@@ -425,27 +448,6 @@ class PrivateStateCache:
             if age > self._policy.maximum_age_seconds:
                 return None
             return self._account_snapshot
-
-    async def authoritative_recovery_snapshot(
-        self,
-        trigger: str,
-    ) -> PrivateActiveSnapshot | None:
-        if not _uses_authoritative_recovery_snapshot(trigger):
-            return None
-        async with self._lock:
-            snapshot = self._snapshot
-            if (
-                snapshot is None
-                or self._source != f"REST:{trigger}"
-                or self._invalid_reason is not None
-                or self._delivery_error is not None
-                or self._pending_persistence_watermark is not None
-                or not snapshot.account_wide
-                or snapshot.completeness != SnapshotCompleteness.COMPLETE
-                or snapshot.request_count > self._policy.maximum_rest_requests
-            ):
-                return None
-            return snapshot
 
     async def watch_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
         async with self._order_update_condition:
@@ -770,9 +772,8 @@ class CachedPrivateStateAdapter:
         view = await self._cache.reconcile(trigger)
         if view.ready and view.snapshot is not None:
             return view.snapshot
-        recovery_snapshot = await self._cache.authoritative_recovery_snapshot(trigger)
-        if recovery_snapshot is not None:
-            return recovery_snapshot
+        if view.authoritative_recovery_snapshot is not None:
+            return view.authoritative_recovery_snapshot
         raise RuntimeError(view.reason or "PRIVATE_RECONCILIATION_UNKNOWN")
 
     async def fetch_account(self, instrument: Instrument) -> AccountSnapshot:

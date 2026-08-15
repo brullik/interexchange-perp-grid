@@ -1355,6 +1355,66 @@ async def test_forced_recovery_uses_authoritative_rest_while_stream_failure_bloc
 
 
 @pytest.mark.asyncio
+async def test_recovery_returns_its_rest_snapshot_when_stream_advances_during_persistence() -> None:
+    observed = datetime.now(UTC)
+    position = PositionSnapshot(
+        Venue.BYBIT,
+        "BTC/USDT:USDT",
+        Side.BUY,
+        Decimal("0.001"),
+        Decimal("100"),
+        Decimal("101"),
+        observed + timedelta(microseconds=1),
+    )
+    active = replace(
+        _snapshot(1, observed_at=observed + timedelta(microseconds=1)),
+        raw_nonzero_position_count=1,
+        positions=(position,),
+    )
+    persistence_started = asyncio.Event()
+    allow_persistence = asyncio.Event()
+
+    async def persist(watermark: int) -> None:
+        if watermark == 1:
+            persistence_started.set()
+            await allow_persistence.wait()
+
+    delegate = CachedDelegate((_snapshot(0, observed_at=observed), active))
+    cache = PrivateStateCache(delegate, persist_watermark=persist)
+    cached = CachedPrivateStateAdapter(delegate, cache)
+    assert (await cache.startup()).ready is True
+    await cache.invalidate_stream(
+        PrivateStreamKind.ORDERS,
+        "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError",
+    )
+    recovery_task = asyncio.create_task(cached.reconcile_active_snapshot("PRE_CLOSE:bybit"))
+    await persistence_started.wait()
+    stream_task = asyncio.create_task(
+        cache.ingest_stream_event(
+            PrivateStreamEvent(
+                Venue.BYBIT,
+                PrivateStreamKind.POSITIONS,
+                2,
+                observed + timedelta(microseconds=2),
+                time.monotonic_ns(),
+                positions=(replace(position, base_quantity=Decimal(0)),),
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    assert (await cache.view()).reason == "PRIVATE_WATERMARK_PERSIST_PENDING"
+    allow_persistence.set()
+
+    recovery = await recovery_task
+    await stream_task
+
+    assert recovery.positions == (position,)
+    degraded = await cache.view()
+    assert degraded.status == PrivateCacheStatus.UNKNOWN
+    assert degraded.reason == "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError"
+
+
+@pytest.mark.asyncio
 async def test_private_event_between_flat_snapshot_and_watermark_check_resets_barrier() -> None:
     observed = datetime.now(UTC)
     delegate = CachedDelegate((_snapshot(0, observed_at=observed),))

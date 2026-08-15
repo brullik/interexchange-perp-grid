@@ -21,7 +21,7 @@ This is the only mutable project-status document.
 | C2 strategy/risk/simulator | COMPLETE | [GitHub Actions run 31839163485](https://github.com/brullik/interexchange-perp-grid/actions/runs/31839163485): Linux `make verify` (43 tests) and Docker health/restart passed on `0849413`; deterministic tests cover open/add/partial close/full close, profitable and losing four-leg PnL, funding, protected prices, partial/rejected/unknown orders, private staleness, venue outage, third-venue hedge, forced close, and property-based 5/50 USDT risk invariants |
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
-| Phase 2 Wave 1 data/private core | DRAFT_PR_GATES | Draft PR #4 is rooted at exact `main`; account-wide bounded private snapshots/cache, persistent ordered event watermarks, native Bybit V5 `u/seq`, recovery-priority REST budgeting, hard deadlines, authoritative recovery snapshots, and private-event-aware stable-FLAT barriers pass 252 local tests; repeat exact-head CI and independent review remain required |
+| Phase 2 Wave 1 data/private core | DRAFT_PR_GATES | Draft PR #4 is rooted at exact `main`; account-wide bounded private snapshots/cache, persistent ordered event watermarks, native Bybit V5 `u/seq`, recovery-priority REST budgeting, hard deadlines, atomic authoritative recovery snapshots, and private-event-aware stable-FLAT barriers pass 253 local tests; repeat exact-head CI and independent review remain required |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -83,7 +83,7 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (85 files)
 - mypy --strict: PASS (83 source/test files)
-- pytest: 252 passed
+- pytest: 253 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,
