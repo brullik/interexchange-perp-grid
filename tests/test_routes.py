@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import cast
 
 from interexchange_perp_grid.domain import (
     BookLevel,
@@ -190,6 +191,38 @@ def test_venue_proven_absence_of_fixed_notional_uses_amount_floor() -> None:
 
     assert quote.eligible is True
     assert quote.reason == ReasonCode.QUOTE_READY
+
+
+def test_malformed_notional_runtime_types_block_route_without_raising() -> None:
+    bybit = instrument(Venue.BYBIT, "1", "0.001", "0.0006")
+    okx = instrument(Venue.OKX, "0.01", "0.01", "0.0005")
+    accepted = DataQualityAssessment(True, ReasonCode.QUOTE_READY, 1)
+    malformed_pairs = (
+        (replace(bybit, minimum_notional=cast(Decimal, 5.0)), okx),
+        (
+            bybit,
+            replace(
+                okx,
+                minimum_notional=None,
+                no_fixed_minimum_notional=cast(bool, "yes"),
+            ),
+        ),
+    )
+
+    for malformed_long, malformed_short in malformed_pairs:
+        quote = evaluate_directed_route(
+            malformed_long,
+            malformed_short,
+            book(Venue.BYBIT, "100", "101"),
+            book(Venue.OKX, "103", "104"),
+            funding(Venue.BYBIT, "0.0001"),
+            funding(Venue.OKX, "0.0002"),
+            accepted,
+            accepted,
+            Decimal("0.001"),
+        )
+        assert quote.eligible is False
+        assert quote.reason == ReasonCode.CONTRACT_METADATA_UNKNOWN
 
 
 def test_ambiguous_contract_mapping_is_rejected() -> None:

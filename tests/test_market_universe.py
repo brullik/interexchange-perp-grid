@@ -128,6 +128,11 @@ def test_registry_rejects_cross_quote_and_incomplete_contract_metadata() -> None
         replace(_instrument(Venue.OKX, "SOL"), price_tick=Decimal("-0.1")),
         replace(_instrument(Venue.OKX, "XRP"), amount_step_contracts=Decimal(0)),
         replace(
+            _instrument(Venue.OKX, "DOT"),
+            minimum_notional=None,
+            no_fixed_minimum_notional=cast(bool, "yes"),
+        ),
+        replace(
             _instrument(Venue.OKX, "DOGE"),
             product_type=cast(ProductType, "inverse_perpetual"),
         ),
@@ -146,8 +151,17 @@ def test_registry_rejects_cross_quote_and_incomplete_contract_metadata() -> None
                     minimum_notional=None,
                     no_fixed_minimum_notional=True,
                 ),
+                replace(
+                    _instrument(Venue.BYBIT, "ADA"),
+                    minimum_notional=cast(Decimal, 5.0),
+                ),
+                _instrument(Venue.BYBIT, "DOT"),
             ),
-            Venue.OKX: (*malformed, _instrument(Venue.OKX, "BNB")),
+            Venue.OKX: (
+                *malformed,
+                _instrument(Venue.OKX, "BNB"),
+                _instrument(Venue.OKX, "ADA"),
+            ),
         },
         now=NOW,
         monotonic_ns=1,
