@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE3_1_MULTI_INSTRUMENT_BBO_LOCAL_VERIFY
-- **Current checkpoint:** Phase 3.1 universe → bounded broad BBO → ranked non-executable prefilter passes the full local gate and awaits draft-PR exact-head review
+- **State:** PHASE3_1_MULTI_INSTRUMENT_BBO_EXACT_REVIEW
+- **Current checkpoint:** Draft PR #5 contains the locally verified Phase 3.1 universe → bounded broad BBO → ranked non-executable prefilter and awaits exact-head CI plus independent review
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -22,7 +22,7 @@ This is the only mutable project-status document.
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
 | Phase 2 Wave 1 data/private core | COMPLETE | PR #4 was independently verified with P0/P1/P2=0 and squash-merged as `0e87a1e`; post-merge [run 31904798345](https://github.com/brullik/interexchange-perp-grid/actions/runs/31904798345) passed all five jobs |
-| Phase 3.1 multi-instrument broad BBO | LOCAL_GATE_PASS | Typed locked universe policy; active/age/ambiguity gates; startup/6h/reconnect refresh; 101-common/606-route deterministic fixture; one-call-per-venue broad BBO; bounded 100k-update cache; stable non-executable prefilter with p95 ≤100 ms; 265 local tests |
+| Phase 3.1 multi-instrument broad BBO | DRAFT_PR_GATES | Draft PR #5; typed locked universe policy; active/age/ambiguity gates; startup/6h/reconnect refresh; 101-common/606-route deterministic fixture; one-call-per-venue broad BBO; bounded 100k-update cache; stable non-executable prefilter with p95 ≤100 ms; 265 local tests |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
