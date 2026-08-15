@@ -151,6 +151,18 @@ class FakeAdapter(ExchangeAdapter):
         self.closed = True
 
 
+class CoordinatedFundingFakeAdapter(FakeAdapter):
+    def __init__(self, venue: Venue) -> None:
+        super().__init__(venue)
+        self.funding_started = asyncio.Event()
+        self.allow_funding = asyncio.Event()
+
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        self.funding_started.set()
+        await self.allow_funding.wait()
+        return await super().fetch_funding(instrument)
+
+
 class BroadFakeAdapter(ExchangeAdapter):
     def __init__(
         self,
@@ -467,6 +479,34 @@ async def test_wave1_public_scan_does_not_require_private_credentials(
     assert len(result.bbo) == 3
     assert len(result.quotes) == 6
     assert result.quarantined == ()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_never_allows_route_scan_to_resume_on_closed_adapters(
+    tmp_path: Path,
+) -> None:
+    adapters: dict[Venue, FakeAdapter] = {venue: FakeAdapter(venue) for venue in Venue}
+    funding = CoordinatedFundingFakeAdapter(Venue.OKX)
+    adapters[Venue.OKX] = funding
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+    )
+
+    scan = asyncio.create_task(engine.scan_once("BTC", Decimal("0.001"), timeout_seconds=5))
+    await asyncio.wait_for(funding.funding_started.wait(), timeout=1)
+    with pytest.raises(RuntimeError, match=r"shutdown deadline exceeded.*public scans"):
+        await engine.close()
+    assert all(adapter.book_calls == 0 for adapter in adapters.values())
+
+    funding.allow_funding.set()
+    with pytest.raises(RuntimeError, match="public market engine is closed"):
+        await scan
+
+    assert all(adapter.book_calls == 0 for adapter in adapters.values())
+    await engine.close()
 
 
 @pytest.mark.asyncio
@@ -1037,6 +1077,56 @@ async def test_partial_adapter_factory_failure_rolls_back_created_adapters(tmp_p
     assert all(adapter.closed for adapter in created)
     assert engine._adapters == {}
     await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_partial_factory_rollback_retains_adapter_ownership(
+    tmp_path: Path,
+) -> None:
+    created: list[CoordinatedRecycleBroadFakeAdapter] = []
+    factory_failed = asyncio.Event()
+
+    def adapter_factory(venue: Venue) -> BroadFakeAdapter:
+        if venue == Venue.OKX:
+            factory_failed.set()
+            raise RuntimeError("fixture factory failure")
+        adapter = CoordinatedRecycleBroadFakeAdapter(venue, 1_000_000_000)
+        created.append(adapter)
+        return adapter
+
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapter_factory,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: 1_000_000_000,
+    )
+
+    initialise = asyncio.create_task(engine.initialise(timeout_seconds=1))
+    await asyncio.wait_for(factory_failed.wait(), timeout=1)
+    await asyncio.gather(*(adapter.close_started.wait() for adapter in created))
+    initialise.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await initialise
+
+    assert engine._closed is True
+    assert set(engine._adapters) == {Venue.BINANCE_USDM, Venue.BYBIT}
+    assert set(engine._retiring_adapter_closers) == {Venue.BINANCE_USDM, Venue.BYBIT}
+
+    for adapter in created:
+        adapter.allow_close.set()
+    await engine.close()
+    await asyncio.sleep(0)
+
+    assert all(adapter.closed for adapter in created)
+    assert engine._retiring_adapter_closers == {}
+    assert not tuple(
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and task.get_name().startswith("rollback-close-")
+        and not task.done()
+    )
 
 
 @pytest.mark.asyncio

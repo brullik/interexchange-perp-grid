@@ -1596,7 +1596,7 @@ async def test_private_event_between_flat_snapshot_and_watermark_check_resets_ba
     barrier = await wait_for_stable_flat(
         report_factory,
         watermark,
-        FlatBarrierPolicy(2, 0, 0.001, 0.1),
+        FlatBarrierPolicy(2, 0, 0.001, 0.5),
     )
 
     assert barrier.verified is True

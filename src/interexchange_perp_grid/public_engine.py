@@ -148,6 +148,9 @@ class PublicMarketEngine:
         self._retiring_adapter_closers: dict[Venue, asyncio.Task[None]] = {}
         self._adapter_recycle_locks: dict[Venue, asyncio.Lock] = {}
         self._lifecycle_lock = asyncio.Lock()
+        self._active_public_scans: set[asyncio.Task[object]] = set()
+        self._public_scans_idle = asyncio.Event()
+        self._public_scans_idle.set()
         self._bbo_changed = asyncio.Event()
         self._bbo_watch_timeout_seconds = settings.market_data.max_bbo_age_ms / 1000
         self._bbo_retirement_grace_seconds = min(
@@ -188,20 +191,41 @@ class PublicMarketEngine:
         if self._closed:
             raise RuntimeError("public market engine is closed")
 
+    def _begin_public_scan(self) -> asyncio.Task[object]:
+        self._require_open()
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("public scan requires an asyncio task")
+        self._active_public_scans.add(task)
+        self._public_scans_idle.clear()
+        return task
+
+    def _finish_public_scan(self, task: asyncio.Task[object]) -> None:
+        self._active_public_scans.discard(task)
+        if not self._active_public_scans:
+            self._public_scans_idle.set()
+
     async def _close_unpublished_adapters(
         self,
         adapters: dict[Venue, ExchangeAdapter],
     ) -> None:
         if not adapters:
             return
+        self._adapters = dict(adapters)
         closers = {
             venue: asyncio.create_task(adapter.close(), name=f"rollback-close-{venue.value}")
             for venue, adapter in adapters.items()
         }
-        done, _pending = await asyncio.wait(tuple(closers.values()), timeout=1)
+        self._retiring_adapter_closers.update(closers)
+        try:
+            done, _pending = await asyncio.shield(asyncio.wait(tuple(closers.values()), timeout=1))
+        except asyncio.CancelledError:
+            self._closed = True
+            raise
         failures: list[str] = []
         for venue, closer in closers.items():
             if closer in done:
+                self._retiring_adapter_closers.pop(venue, None)
                 try:
                     closer.result()
                 except (asyncio.CancelledError, Exception) as error:
@@ -209,12 +233,11 @@ class PublicMarketEngine:
                 continue
             closer.cancel()
             closer.add_done_callback(self._consume_watcher)
-            self._retiring_adapter_closers[venue] = closer
             failures.append(f"{venue.value}: rollback deadline exceeded")
         if failures:
-            self._adapters = dict(adapters)
             self._closed = True
             raise RuntimeError(f"public adapter factory rollback failed: {'; '.join(failures)}")
+        self._adapters.clear()
 
     async def _initialise_venue_with_timeout(self, venue: Venue, timeout_seconds: int) -> None:
         try:
@@ -725,6 +748,13 @@ class PublicMarketEngine:
                 return
 
     async def scan_broad_bbo(self, timeout_seconds: int) -> BroadBboResult:
+        task = self._begin_public_scan()
+        try:
+            return await self._scan_broad_bbo(timeout_seconds)
+        finally:
+            self._finish_public_scan(task)
+
+    async def _scan_broad_bbo(self, timeout_seconds: int) -> BroadBboResult:
         self._require_open()
         if not self._initialised:
             await self.initialise(timeout_seconds)
@@ -777,10 +807,23 @@ class PublicMarketEngine:
         requested_base_quantity: Decimal,
         timeout_seconds: int,
     ) -> ScanResult:
+        task = self._begin_public_scan()
+        try:
+            return await self._scan_once(base, requested_base_quantity, timeout_seconds)
+        finally:
+            self._finish_public_scan(task)
+
+    async def _scan_once(
+        self,
+        base: str,
+        requested_base_quantity: Decimal,
+        timeout_seconds: int,
+    ) -> ScanResult:
         self._require_open()
         if not self._initialised:
             await self.initialise(timeout_seconds)
-        broad = await self.scan_broad_bbo(timeout_seconds)
+        broad = await self._scan_broad_bbo(timeout_seconds)
+        self._require_open()
         universe = self._universe.snapshot
         assert universe is not None
         common = universe.common
@@ -805,6 +848,7 @@ class PublicMarketEngine:
                 if instrument.venue not in self._quarantined
             )
         )
+        self._require_open()
         funding_by_venue = {
             instrument.venue: (instrument, funding)
             for instrument, funding in funding_samples
@@ -816,6 +860,7 @@ class PublicMarketEngine:
                 for instrument, _ in funding_by_venue.values()
             )
         )
+        self._require_open()
         warmed_instruments = tuple(
             instrument
             for instrument, book in warmup_samples
@@ -824,6 +869,7 @@ class PublicMarketEngine:
         book_samples = await asyncio.gather(
             *(self._sample_book(instrument, timeout_seconds) for instrument in warmed_instruments)
         )
+        self._require_open()
         complete = {
             instrument.venue: (instrument, book, funding_by_venue[instrument.venue][1])
             for instrument, book in book_samples
@@ -860,6 +906,8 @@ class PublicMarketEngine:
         )
         if books:
             await self._recorder.append_books(books)
+            self._require_open()
+        self._require_open()
         return self._result(
             base,
             len(common),
@@ -883,10 +931,11 @@ class PublicMarketEngine:
             )
             return instrument, funding
         except Exception as error:
-            self._quarantine(
-                instrument.venue,
-                f"funding data failed: {type(error).__name__}: {error}",
-            )
+            if not self._closed:
+                self._quarantine(
+                    instrument.venue,
+                    f"funding data failed: {type(error).__name__}: {error}",
+                )
             return instrument, None
 
     async def _sample_book(
@@ -902,10 +951,11 @@ class PublicMarketEngine:
             )
             return instrument, book
         except Exception as error:
-            self._quarantine(
-                instrument.venue,
-                f"L2 stream failed: {type(error).__name__}: {error}",
-            )
+            if not self._closed:
+                self._quarantine(
+                    instrument.venue,
+                    f"L2 stream failed: {type(error).__name__}: {error}",
+                )
             return instrument, None
 
     def _result(
@@ -939,8 +989,18 @@ class PublicMarketEngine:
 
     async def close(self) -> None:
         self._closed = True
+        self._bbo_changed.set()
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + 1
+        public_scans_blocked = False
+        if self._active_public_scans:
+            try:
+                await asyncio.wait_for(
+                    self._public_scans_idle.wait(),
+                    timeout=max(0, shutdown_deadline - loop.time()),
+                )
+            except TimeoutError:
+                public_scans_blocked = True
         lifecycle_lock_acquired = False
         lifecycle_lock_blocked = False
         try:
@@ -972,6 +1032,7 @@ class PublicMarketEngine:
                 shutdown_deadline,
                 blocked_recycle_venues,
                 lifecycle_lock_blocked=lifecycle_lock_blocked,
+                public_scans_blocked=public_scans_blocked,
             )
         finally:
             for lock in reversed(acquired_locks):
@@ -985,6 +1046,7 @@ class PublicMarketEngine:
         blocked_recycle_venues: set[Venue],
         *,
         lifecycle_lock_blocked: bool,
+        public_scans_blocked: bool,
     ) -> None:
         close_failures: list[str] = []
         timed_out_closer_venues: set[Venue] = set()
@@ -1012,6 +1074,7 @@ class PublicMarketEngine:
             )
             for venue, task in adapter_closers:
                 if task in done_closers:
+                    self._retiring_adapter_closers.pop(venue, None)
                     try:
                         task.result()
                     except (asyncio.CancelledError, Exception) as error:
@@ -1068,6 +1131,8 @@ class PublicMarketEngine:
             )
         )
         shutdown_failures: list[str] = []
+        if public_scans_blocked:
+            shutdown_failures.append("shutdown deadline exceeded for: public scans")
         if lifecycle_lock_blocked:
             shutdown_failures.append("shutdown deadline exceeded for: public lifecycle")
         if pending_venues:
