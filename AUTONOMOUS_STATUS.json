@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T22:52:46Z",
-  "state": "PHASE3_1_EXACT_BC05_P1_REMEDIATION_LOCAL_GATE",
+  "updated_at": "2026-08-15T23:00:05Z",
+  "state": "PHASE3_1_EXACT_64E5_TECHNICAL_PASS_EVIDENCE_GATE",
   "phase": "Phase 3.1 — Multi-instrument universe and broad BBO prefilter",
   "repository": "brullik/interexchange-perp-grid",
   "branch": "codex/multi-instrument-shadow",
   "pr": 5,
-  "head_sha": "bc05e070c387f20018c6c03779881a97f9f9ecb0",
-  "ci_run": 31912980237,
-  "artifact": "c4-3-proof-bc05e070c387f20018c6c03779881a97f9f9ecb0",
+  "head_sha": "64e5c86e07766512eb7406797850d8cbd18a9e98",
+  "ci_run": 31913360363,
+  "artifact": "c4-3-proof-64e5c86e07766512eb7406797850d8cbd18a9e98",
   "completed_criteria": [
     "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
     "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
@@ -19,8 +19,8 @@
     "Telegram shadow mode remains healthy without runtime credentials",
     "Phase 2 exact head 3bc15a3 passed independent adversarial and release verification with P0/P1/P2 all zero",
     "PR 4 was squash-merged as 0e87a1e and post-merge run 31904798345 passed all five jobs",
-    "Phase 3.1 exact head bc05e070 passed five GitHub jobs and closed visible post-shutdown Parquet commits, but independent review found orphan pending files after event-loop shutdown cancellation or a partial writer failure; exact bc05 remains prohibited from merge",
-    "Current Phase 3.1 local gate passed: lock64, Ruff over 88 files, strict mypy over 86 source files, 307 tests, and doctor shadow/live denied",
+    "Phase 3.1 exact code head 64e5c86e passed five GitHub jobs, four exact artifacts, and independent adversarial/release technical review with P0=0 and P1=0",
+    "Exact and local Phase 3.1 gates passed: lock64, Ruff over 88 files, strict mypy over 86 source files, 307 tests, and doctor shadow/live denied",
     "Deterministic large universe proves 102 safe common instruments, 608 directed routes, 14-day age boundary, safe ambiguity isolation, and activity rejection",
     "The normalized committed Wave 1 fixture proves one common instrument and six directed routes with native Bybit minimum notional and explicit known-no-fixed-notional OKX semantics",
     "Broad BBO cache coalesces 100000 updates within known-key memory bounds, distinguishes stale from never-observed quotes, and measures latency from actual qualified quote receipt through prefilter ranking",
@@ -28,14 +28,14 @@
     "Closing and reinstantiating the public engine reproduces identical universe, route, and cache bounds without leaked watcher tasks"
   ],
   "active_work": [
-    "Commit and push the locally verified exact-bc05 pending-cleanup remediation",
-    "Obtain fresh exact-head CI and independent adversarial and release verification"
+    "Commit and push this evidence-only binding to the independently reviewed exact code checkpoint 64e5c86e",
+    "Obtain fresh exact-head CI and final independent P0/P1/P2=0 verification before Phase 3.2"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Keep PR 5 draft, publish the 307-test exact-bc05 pending-cleanup remediation, and require fresh exact-head CI plus independent P0/P1/P2-free adversarial and release verification before Phase 3.2.",
+  "next_action": "Keep PR 5 draft, publish the evidence-only 64e5 checkpoint binding, and require fresh exact-head CI plus independent P0/P1/P2=0 verification before Phase 3.2.",
   "known_limitations": [
     "The current repository visibility is PUBLIC.",
     "Operational evidence and secrets remain forbidden while the repository is PUBLIC."
