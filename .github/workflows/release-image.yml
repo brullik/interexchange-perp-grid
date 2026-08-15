@@ -13,7 +13,8 @@ permissions:
   packages: write
 
 concurrency:
-  group: release-image-${{ inputs.release_tag }}
+  # Serialize every publisher run so two release tags can never race on one SHA tag.
+  group: release-image-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -51,28 +52,98 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
         run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
-      - name: Build and publish exact-tag image
+      - name: Build immutable candidate by digest
+        id: build
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           TARGET_SHA: ${{ steps.release.outputs.target_sha }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          docker build \
+          docker buildx build \
+            --platform linux/amd64 \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$TARGET_SHA" \
-            --label "org.opencontainers.image.version=$RELEASE_TAG" \
-            --tag "$image:$RELEASE_TAG" \
-            --tag "$image:sha-$TARGET_SHA" \
+            --label "org.opencontainers.image.version=$TARGET_SHA" \
+            --output "type=registry,name=$image,push-by-digest=true,name-canonical=true" \
+            --metadata-file build-metadata.json \
             .
-          docker push "$image:$RELEASE_TAG"
-          docker push "$image:sha-$TARGET_SHA"
-          registry_digest="$(docker buildx imagetools inspect "$image:$RELEASE_TAG" | awk '$1 == "Digest:" {print $2; exit}')"
-          if [[ ! "$registry_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "registry returned an invalid immutable digest" >&2
+          candidate_digest="$(python -c 'import json; print(json.load(open("build-metadata.json",encoding="utf-8"))["containerimage.digest"])')"
+          if [[ ! "$candidate_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "build returned an invalid immutable digest" >&2
             exit 3
           fi
-          IMAGE="$image" REGISTRY_DIGEST="$registry_digest" \
-            python -c 'import json,os,pathlib; pathlib.Path("release-image-manifest.json").write_text(json.dumps({"image":os.environ["IMAGE"],"release_tag":os.environ["RELEASE_TAG"],"target_sha":os.environ["TARGET_SHA"],"registry_digest":os.environ["REGISTRY_DIGEST"],"run_id":os.environ["GITHUB_RUN_ID"]},sort_keys=True)+"\n",encoding="utf-8")'
+          echo "candidate_digest=$candidate_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse tag overwrite and promote one exact digest
+        id: publish
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET_SHA: ${{ steps.release.outputs.target_sha }}
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.candidate_digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          release_ref="$image:$RELEASE_TAG"
+          sha_ref="$image:sha-$TARGET_SHA"
+
+          inspect_digest() {
+            local ref="$1" output digest
+            if output="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+              digest="$(awk '$1 == "Digest:" {print $2; exit}' <<< "$output")"
+              if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "registry returned an invalid digest for $ref" >&2
+                return 2
+              fi
+              printf '%s' "$digest"
+              return 0
+            fi
+            if grep -Eqi 'manifest unknown|not found' <<< "$output"; then
+              return 1
+            fi
+            echo "$output" >&2
+            return 2
+          }
+
+          if existing_sha="$(inspect_digest "$sha_ref")"; then
+            test "$existing_sha" = "$CANDIDATE_DIGEST" || {
+              echo "refusing to overwrite immutable SHA tag $sha_ref" >&2
+              exit 4
+            }
+          else
+            status=$?
+            test "$status" = 1 || exit "$status"
+          fi
+          if existing_release="$(inspect_digest "$release_ref")"; then
+            test "$existing_release" = "$CANDIDATE_DIGEST" || {
+              echo "refusing to overwrite release tag $release_ref" >&2
+              exit 5
+            }
+          else
+            status=$?
+            test "$status" = 1 || exit "$status"
+          fi
+
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$release_ref" \
+            --tag "$sha_ref" \
+            "$image@$CANDIDATE_DIGEST"
+          release_digest="$(inspect_digest "$release_ref")"
+          sha_digest="$(inspect_digest "$sha_ref")"
+          test "$release_digest" = "$CANDIDATE_DIGEST"
+          test "$sha_digest" = "$CANDIDATE_DIGEST"
+          test "$release_digest" = "$sha_digest"
+          echo "release_digest=$release_digest" >> "$GITHUB_OUTPUT"
+          echo "sha_digest=$sha_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Create digest-bound release manifest
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          TARGET_SHA: ${{ steps.release.outputs.target_sha }}
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.candidate_digest }}
+          RELEASE_DIGEST: ${{ steps.publish.outputs.release_digest }}
+          SHA_DIGEST: ${{ steps.publish.outputs.sha_digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          IMAGE="$image" python -c 'import json,os,pathlib; pathlib.Path("release-image-manifest.json").write_text(json.dumps({"image":os.environ["IMAGE"],"release_tag":os.environ["RELEASE_TAG"],"sha_tag":"sha-"+os.environ["TARGET_SHA"],"target_sha":os.environ["TARGET_SHA"],"candidate_digest":os.environ["CANDIDATE_DIGEST"],"release_digest":os.environ["RELEASE_DIGEST"],"sha_digest":os.environ["SHA_DIGEST"],"run_id":os.environ["GITHUB_RUN_ID"],"run_attempt":os.environ["GITHUB_RUN_ATTEMPT"]},sort_keys=True)+"\n",encoding="utf-8")'
 
       - name: Upload immutable image manifest
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
