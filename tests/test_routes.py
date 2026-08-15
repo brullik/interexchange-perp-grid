@@ -236,6 +236,9 @@ def test_malformed_notional_runtime_types_block_minimum_quantity_sizing() -> Non
     okx = instrument(Venue.OKX, "0.01", "0.01", "0.0005")
     malformed_pairs = (
         (replace(bybit, minimum_notional=cast(Decimal, 5.0)), okx),
+        (replace(bybit, contract_size_base=cast(Decimal, 1.0)), okx),
+        (replace(bybit, amount_step_contracts=cast(Decimal, 0.001)), okx),
+        (replace(bybit, minimum_amount_contracts=cast(Decimal, 0.001)), okx),
         (
             bybit,
             replace(
@@ -247,7 +250,7 @@ def test_malformed_notional_runtime_types_block_minimum_quantity_sizing() -> Non
     )
 
     for malformed_long, malformed_short in malformed_pairs:
-        with pytest.raises(ValueError, match="minimum notional"):
+        with pytest.raises(ValueError, match=r"minimum (notional|quantity)"):
             minimum_common_base_quantity(
                 malformed_long,
                 malformed_short,

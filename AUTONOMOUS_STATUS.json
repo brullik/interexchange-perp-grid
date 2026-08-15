@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T21:25:16Z",
-  "state": "PHASE3_1_EXACT_F775_P1_REMEDIATION_LOCAL_GATE",
+  "updated_at": "2026-08-15T21:42:40Z",
+  "state": "PHASE3_1_EXACT_9E6_P1_REMEDIATION_LOCAL_GATE",
   "phase": "Phase 3.1 — Multi-instrument universe and broad BBO prefilter",
   "repository": "brullik/interexchange-perp-grid",
   "branch": "codex/multi-instrument-shadow",
   "pr": 5,
-  "head_sha": "f775ab1828cafeebb9a4574c07cc9932bdd25693",
-  "ci_run": 31908831988,
-  "artifact": "c4-3-proof-f775ab1828cafeebb9a4574c07cc9932bdd25693",
+  "head_sha": "9e6b2422b10ab77b541ccffab95033c270e19503",
+  "ci_run": 31909637587,
+  "artifact": "c4-3-proof-9e6b2422b10ab77b541ccffab95033c270e19503",
   "completed_criteria": [
     "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
     "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
@@ -19,23 +19,23 @@
     "Telegram shadow mode remains healthy without runtime credentials",
     "Phase 2 exact head 3bc15a3 passed independent adversarial and release verification with P0/P1/P2 all zero",
     "PR 4 was squash-merged as 0e87a1e and post-merge run 31904798345 passed all five jobs",
-    "Phase 3.1 exact head f775ab1 passed five GitHub jobs but independent review found a concurrent adapter-recycle race; exact f775 remains prohibited from merge",
-    "Current Phase 3.1 local gate passed: lock64, Ruff over 88 files, strict mypy over 86 source files, 289 tests, and doctor shadow/live denied",
+    "Phase 3.1 exact head 9e6b242 passed five GitHub jobs but independent review found a recycle-vs-shutdown adapter leak; exact 9e6 remains prohibited from merge",
+    "Current Phase 3.1 local gate passed: lock64, Ruff over 88 files, strict mypy over 86 source files, 291 tests, and doctor shadow/live denied",
     "Deterministic large universe proves 102 safe common instruments, 608 directed routes, 14-day age boundary, safe ambiguity isolation, and activity rejection",
     "The normalized committed Wave 1 fixture proves one common instrument and six directed routes with native Bybit minimum notional and explicit known-no-fixed-notional OKX semantics",
     "Broad BBO cache coalesces 100000 updates within known-key memory bounds, distinguishes stale from never-observed quotes, and measures latency from actual qualified quote receipt through prefilter ranking",
-    "BBO watchers have a hard progress deadline, cancellation-safe one-per-venue retirement, single-flight bounded adapter recycle, explicit shutdown and adapter-teardown failure, six-hour symbol resubscription, and jittered failure streaks reset only by an accepted quote",
+    "BBO watchers have a hard progress deadline, cancellation-safe one-per-venue retirement, single-flight bounded adapter recycle, a shutdown lifecycle barrier, explicit shutdown and adapter-teardown failure, six-hour symbol resubscription, and jittered failure streaks reset only by an accepted quote",
     "Closing and reinstantiating the public engine reproduces identical universe, route, and cache bounds without leaked watcher tasks"
   ],
   "active_work": [
-    "Commit and push the locally verified exact-f775 remediation",
+    "Commit and push the locally verified exact-9e6 remediation",
     "Obtain fresh exact-head CI and independent adversarial and release verification"
   ],
   "blockers": [
     "REPOSITORY_VISIBILITY_PUBLIC"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Keep PR 5 draft, publish the 289-test exact-f775 remediation, and require fresh exact-head CI plus independent P0/P1-free adversarial and release verification before Phase 3.2.",
+  "next_action": "Keep PR 5 draft, publish the 291-test exact-9e6 remediation, and require fresh exact-head CI plus independent P0/P1-free adversarial and release verification before Phase 3.2.",
   "known_limitations": [
     "The current repository visibility is PUBLIC.",
     "Operational evidence and secrets remain forbidden while the repository is PUBLIC."

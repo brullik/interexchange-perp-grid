@@ -125,19 +125,30 @@ def minimum_common_base_quantity(
     long_price: Decimal,
     short_price: Decimal,
 ) -> Decimal:
-    monetary_values = (
-        long_instrument.minimum_base_amount,
-        short_instrument.minimum_base_amount,
-        long_instrument.base_amount_step,
-        short_instrument.base_amount_step,
+    raw_monetary_values = (
+        long_instrument.contract_size_base,
+        long_instrument.amount_step_contracts,
+        long_instrument.minimum_amount_contracts,
+        short_instrument.contract_size_base,
+        short_instrument.amount_step_contracts,
+        short_instrument.minimum_amount_contracts,
         long_price,
         short_price,
     )
     if any(
         not isinstance(value, Decimal) or not value.is_finite() or value <= 0
-        for value in monetary_values
+        for value in raw_monetary_values
     ):
-        raise ValueError("minimum quantity inputs must be finite positive Decimals")
+        raise ValueError("minimum quantity raw inputs must be finite positive Decimals")
+
+    monetary_values = (
+        long_instrument.minimum_base_amount,
+        short_instrument.minimum_base_amount,
+        long_instrument.base_amount_step,
+        short_instrument.base_amount_step,
+    )
+    if any(not value.is_finite() or value <= 0 for value in monetary_values):
+        raise ValueError("minimum quantity derived inputs must be finite positive Decimals")
 
     def minimum_notional_quantity(instrument: Instrument, price: Decimal) -> Decimal:
         if not isinstance(instrument.no_fixed_minimum_notional, bool):

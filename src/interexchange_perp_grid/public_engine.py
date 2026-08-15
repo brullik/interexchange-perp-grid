@@ -246,9 +246,24 @@ class PublicMarketEngine:
         self,
         venue: Venue,
         timeout_seconds: int,
+        *,
+        ignore_backoff: bool,
     ) -> bool:
         lock = self._adapter_recycle_locks.setdefault(venue, asyncio.Lock())
-        async with lock:
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=timeout_seconds)
+        except TimeoutError:
+            return False
+        try:
+            if self._closed:
+                return False
+            retry_at_ns = self._reconnect_after_ns.get(venue)
+            if (
+                not ignore_backoff
+                and retry_at_ns is not None
+                and self._monotonic_ns() < retry_at_ns
+            ):
+                return False
             if (
                 venue not in self._retiring_bbo_watchers
                 and venue not in self._retiring_bbo_transports
@@ -260,6 +275,8 @@ class PublicMarketEngine:
                 return False
             await self._initialise_venue_with_timeout(venue, timeout_seconds)
             return True
+        finally:
+            lock.release()
 
     async def _recycle_retired_venue_adapter_locked(
         self,
@@ -316,6 +333,8 @@ class PublicMarketEngine:
                 venue,
                 "retired BBO transport remained active after adapter close",
             )
+            return False
+        if self._closed:
             return False
         try:
             replacement = self._adapter_factory(venue)
@@ -483,6 +502,7 @@ class PublicMarketEngine:
         requested_reconnects = {
             venue for venue in (*reconnected, *due_reconnects) if venue in self._adapters
         }
+        explicit_reconnects = set(reconnected)
         retired_targets = tuple(
             sorted(
                 {
@@ -499,7 +519,11 @@ class PublicMarketEngine:
         if retired_targets:
             recycle_results = await asyncio.gather(
                 *(
-                    self._recycle_retired_venue_adapter(venue, timeout_seconds)
+                    self._recycle_retired_venue_adapter(
+                        venue,
+                        timeout_seconds,
+                        ignore_backoff=venue in explicit_reconnects,
+                    )
                     for venue in retired_targets
                 )
             )
@@ -765,7 +789,38 @@ class PublicMarketEngine:
 
     async def close(self) -> None:
         self._closed = True
-        shutdown_deadline = asyncio.get_running_loop().time() + 1
+        loop = asyncio.get_running_loop()
+        shutdown_deadline = loop.time() + 1
+        recycle_locks = tuple(
+            (venue, self._adapter_recycle_locks.setdefault(venue, asyncio.Lock()))
+            for venue in sorted(self._adapters, key=str)
+        )
+        acquired_locks: list[asyncio.Lock] = []
+        blocked_recycle_venues: set[Venue] = set()
+        for venue, lock in recycle_locks:
+            remaining = shutdown_deadline - loop.time()
+            if remaining <= 0:
+                blocked_recycle_venues.add(venue)
+                continue
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=remaining)
+                acquired_locks.append(lock)
+            except TimeoutError:
+                blocked_recycle_venues.add(venue)
+        try:
+            await self._close_with_recycles_blocked(
+                shutdown_deadline,
+                blocked_recycle_venues,
+            )
+        finally:
+            for lock in reversed(acquired_locks):
+                lock.release()
+
+    async def _close_with_recycles_blocked(
+        self,
+        shutdown_deadline: float,
+        blocked_recycle_venues: set[Venue],
+    ) -> None:
         close_failures: list[str] = []
         timed_out_closer_venues: set[Venue] = set()
         self._cleanup_retired_bbo_tasks()
@@ -842,7 +897,8 @@ class PublicMarketEngine:
                     for venue, task in self._retiring_adapter_closers.items()
                     if not task.done()
                 }
-                | timed_out_closer_venues,
+                | timed_out_closer_venues
+                | blocked_recycle_venues,
                 key=str,
             )
         )
