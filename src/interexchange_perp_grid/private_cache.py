@@ -130,6 +130,7 @@ class PrivateStateCache:
         self._positions_updated_monotonic_ns: int | None = None
         self._cache_watermark = 0
         self._source: str | None = None
+        self._received_event_watermark = 0
         self._stream_watermark: int | None = None
         self._stream_signature: tuple[object, ...] | None = None
         self._account_snapshot: AccountSnapshot | None = None
@@ -214,28 +215,43 @@ class PrivateStateCache:
                     self._positions_updated_monotonic_ns = self._updated_monotonic_ns
                 self._mark_persistence_pending_locked(snapshot.event_watermark, accepted)
                 view = self._view_locked()
-                recovery_snapshot = (
-                    snapshot
-                    if accepted
+                recovery_eligible = (
+                    accepted
                     and _uses_authoritative_recovery_snapshot(trigger)
                     and snapshot.account_wide
                     and snapshot.completeness == SnapshotCompleteness.COMPLETE
                     and snapshot.request_count <= self._policy.maximum_rest_requests
-                    else None
                 )
             persisted_view = await self._persist_accepted_watermark(
                 snapshot.event_watermark,
                 view,
                 accepted,
             )
-            if recovery_snapshot is not None and not (
-                persisted_view.reason is not None
-                and persisted_view.reason.startswith("PRIVATE_WATERMARK_PERSIST_FAILED:")
-            ):
-                return replace(
-                    persisted_view,
-                    authoritative_recovery_snapshot=recovery_snapshot,
-                )
+            if recovery_eligible:
+                async with self._lock:
+                    latest = self._snapshot
+                    latest_view = self._view_locked()
+                    received_watermark = self._received_watermark_locked()
+                    if (
+                        latest is None
+                        or received_watermark is None
+                        or latest.event_watermark < received_watermark
+                    ):
+                        return replace(
+                            latest_view,
+                            status=PrivateCacheStatus.UNKNOWN,
+                            reason="PRIVATE_RECOVERY_SNAPSHOT_SUPERSEDED",
+                        )
+                    if (
+                        latest.account_wide
+                        and latest.completeness == SnapshotCompleteness.COMPLETE
+                        and latest.request_count <= self._policy.maximum_rest_requests
+                    ):
+                        return replace(
+                            latest_view,
+                            authoritative_recovery_snapshot=latest,
+                        )
+                    return latest_view
             return persisted_view
 
     def _detach_fetch_task(self, task: asyncio.Task[PrivateActiveSnapshot]) -> None:
@@ -252,6 +268,10 @@ class PrivateStateCache:
 
     async def ingest_stream_snapshot(self, snapshot: PrivateActiveSnapshot) -> PrivateCacheView:
         async with self._lock:
+            self._received_event_watermark = max(
+                self._received_event_watermark,
+                snapshot.event_watermark,
+            )
             accepted = self._accept_snapshot_locked(
                 snapshot,
                 "PRIVATE_STREAM",
@@ -281,6 +301,10 @@ class PrivateStateCache:
             if self._expected_venue is not None and event.venue != self._expected_venue:
                 self._invalid_reason = "PRIVATE_STREAM_EVENT_VENUE_MISMATCH"
                 return self._view_locked()
+            self._received_event_watermark = max(
+                self._received_event_watermark,
+                event.event_watermark,
+            )
             previous = self._snapshot
             if previous is None:
                 self._invalid_reason = "PRIVATE_STREAM_EVENT_BEFORE_STARTUP"
@@ -597,6 +621,10 @@ class PrivateStateCache:
                 self._invalid_reason = "PRIVATE_SNAPSHOT_TIME_REGRESSION"
                 return False
         self._snapshot = snapshot
+        self._received_event_watermark = max(
+            self._received_event_watermark,
+            snapshot.event_watermark,
+        )
         if source != "PRIVATE_STREAM":
             stale_watermarks = tuple(
                 watermark
@@ -614,6 +642,18 @@ class PrivateStateCache:
             self._stream_signature = signature
         self._invalid_reason = None
         return True
+
+    def _received_watermark_locked(self) -> int | None:
+        reader = getattr(self._adapter, "current_private_event_watermark", None)
+        if not callable(reader):
+            return self._received_event_watermark
+        try:
+            received = int(reader())
+        except Exception:
+            return None
+        if received < 0:
+            return None
+        return max(self._received_event_watermark, received)
 
     def _view_locked(self) -> PrivateCacheView:
         snapshot = self._snapshot

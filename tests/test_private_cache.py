@@ -1355,7 +1355,7 @@ async def test_forced_recovery_uses_authoritative_rest_while_stream_failure_bloc
 
 
 @pytest.mark.asyncio
-async def test_recovery_returns_its_rest_snapshot_when_stream_advances_during_persistence() -> None:
+async def test_recovery_returns_newer_exposure_when_stream_advances_during_persistence() -> None:
     observed = datetime.now(UTC)
     position = PositionSnapshot(
         Venue.BYBIT,
@@ -1366,11 +1366,7 @@ async def test_recovery_returns_its_rest_snapshot_when_stream_advances_during_pe
         Decimal("101"),
         observed + timedelta(microseconds=1),
     )
-    active = replace(
-        _snapshot(1, observed_at=observed + timedelta(microseconds=1)),
-        raw_nonzero_position_count=1,
-        positions=(position,),
-    )
+    rest_flat = _snapshot(1, observed_at=observed + timedelta(microseconds=1))
     persistence_started = asyncio.Event()
     allow_persistence = asyncio.Event()
 
@@ -1379,7 +1375,7 @@ async def test_recovery_returns_its_rest_snapshot_when_stream_advances_during_pe
             persistence_started.set()
             await allow_persistence.wait()
 
-    delegate = CachedDelegate((_snapshot(0, observed_at=observed), active))
+    delegate = CachedDelegate((_snapshot(0, observed_at=observed), rest_flat))
     cache = PrivateStateCache(delegate, persist_watermark=persist)
     cached = CachedPrivateStateAdapter(delegate, cache)
     assert (await cache.startup()).ready is True
@@ -1397,7 +1393,7 @@ async def test_recovery_returns_its_rest_snapshot_when_stream_advances_during_pe
                 2,
                 observed + timedelta(microseconds=2),
                 time.monotonic_ns(),
-                positions=(replace(position, base_quantity=Decimal(0)),),
+                positions=(position,),
             )
         )
     )
@@ -1409,9 +1405,90 @@ async def test_recovery_returns_its_rest_snapshot_when_stream_advances_during_pe
     await stream_task
 
     assert recovery.positions == (position,)
+    assert recovery.event_watermark == 2
     degraded = await cache.view()
     assert degraded.status == PrivateCacheStatus.UNKNOWN
     assert degraded.reason == "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_rest_snapshot_while_newer_received_event_is_pending() -> None:
+    observed = datetime.now(UTC)
+    persistence_started = asyncio.Event()
+    allow_persistence = asyncio.Event()
+
+    async def persist(watermark: int) -> None:
+        if watermark == 1:
+            persistence_started.set()
+            await allow_persistence.wait()
+
+    delegate = CachedDelegate(
+        (
+            _snapshot(0, observed_at=observed),
+            _snapshot(1, observed_at=observed + timedelta(microseconds=1)),
+        )
+    )
+    cache = PrivateStateCache(delegate, persist_watermark=persist)
+    cached = CachedPrivateStateAdapter(delegate, cache)
+    assert (await cache.startup()).ready is True
+    await cache.invalidate_stream(
+        PrivateStreamKind.ORDERS,
+        "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError",
+    )
+    recovery_task = asyncio.create_task(cached.reconcile_active_snapshot("PRE_CLOSE:bybit"))
+    await persistence_started.wait()
+    delegate.private_event_watermark = 2
+    allow_persistence.set()
+
+    with pytest.raises(RuntimeError, match="PRIVATE_RECOVERY_SNAPSHOT_SUPERSEDED"):
+        await recovery_task
+
+
+@pytest.mark.asyncio
+async def test_storage_failure_blocks_entry_but_not_authoritative_recovery() -> None:
+    observed = datetime.now(UTC)
+    position = PositionSnapshot(
+        Venue.BYBIT,
+        "BTC/USDT:USDT",
+        Side.BUY,
+        Decimal("0.001"),
+        Decimal("100"),
+        Decimal("101"),
+        observed + timedelta(microseconds=1),
+    )
+    active = replace(
+        _snapshot(1, observed_at=observed + timedelta(microseconds=1)),
+        raw_nonzero_position_count=1,
+        positions=(position,),
+    )
+
+    async def persist(watermark: int) -> None:
+        if watermark == 1:
+            raise OSError("synthetic durable write failure")
+
+    delegate = CachedDelegate(
+        (
+            _snapshot(0, observed_at=observed),
+            active,
+            replace(active, observed_at=observed + timedelta(microseconds=2)),
+        )
+    )
+    cache = PrivateStateCache(delegate, persist_watermark=persist)
+    cached = CachedPrivateStateAdapter(delegate, cache)
+    assert (await cache.startup()).ready is True
+    await cache.invalidate_stream(
+        PrivateStreamKind.ORDERS,
+        "PRIVATE_STREAM_FAILED:ORDERS:ConnectionError",
+    )
+
+    recovery = await cached.reconcile_active_snapshot("PRE_CLOSE:bybit")
+
+    assert recovery.positions == (position,)
+    degraded = await cache.view()
+    assert degraded.status == PrivateCacheStatus.UNKNOWN
+    assert degraded.reason == "PRIVATE_WATERMARK_PERSIST_FAILED:OSError"
+    with pytest.raises(RuntimeError, match="PRIVATE_WATERMARK_PERSIST_FAILED:OSError"):
+        await cached.fetch_active_snapshot()
 
 
 @pytest.mark.asyncio

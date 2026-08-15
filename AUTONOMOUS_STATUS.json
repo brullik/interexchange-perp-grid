@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T19:02:39Z",
+  "updated_at": "2026-08-15T19:13:28Z",
   "state": "WAVE1_CORE_P1_REMEDIATION",
   "phase": "Phase 2 — Production-grade Wave 1 data/private core",
   "repository": "brullik/interexchange-perp-grid",
   "branch": "codex/wave1-production-core-v2",
   "pr": 4,
-  "head_sha": "3cce2cd9bd03820814ae24d3c10fc44162258b45",
-  "ci_run": 31901583659,
-  "artifact": "c4-3-proof-3cce2cd9bd03820814ae24d3c10fc44162258b45",
+  "head_sha": "7ad3a7fdb51e2e64fbaf4bba0984db854a59f5ae",
+  "ci_run": 31902907877,
+  "artifact": "c4-3-proof-7ad3a7fdb51e2e64fbaf4bba0984db854a59f5ae",
   "completed_criteria": [
     "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
     "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
@@ -17,9 +17,9 @@
     "Wave 1 latest-value cache enforces persisted and ordered event watermarks, bounded reorder recovery, completeness, two-second age, hard timeouts, and measured 250 ms p95",
     "Native Bybit V5 u/seq guard is installed in the CCXT Pro factory and handles explicit u=1 reset",
     "Telegram shadow mode remains healthy without runtime credentials",
-    "Local Phase 2 P1-remediation verify passed: lock, Ruff, strict mypy, 253 tests, and doctor",
+    "Local Phase 2 P1-remediation verify passed: lock, Ruff, strict mypy, 255 tests, and doctor",
     "Independent adversarial review passed exact checkpoint 76d5f143 with P0/P1/P2 all zero",
-    "Draft PR 4 exact-head run 31901583659 passed all five required checks before the latest recovery-interleaving remediation"
+    "Draft PR 4 exact-head run 31902907877 passed all five required checks before the latest storage-independent recovery remediation"
   ],
   "active_work": [
     "Commit and push the recovery-authoritative REST and private-event stable-FLAT fixes to draft PR 4",
