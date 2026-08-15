@@ -20,7 +20,7 @@ This is the only mutable project-status document.
 | C1 public market vertical slice | COMPLETE | [GitHub Actions run 31837867113](https://github.com/brullik/interexchange-perp-grid/actions/runs/31837867113): Linux `make verify` (29 tests) and Docker health/restart passed on `a790344`; live read-only scan found 656 common instruments and two eligible Binance USD-M/OKX directed BTC routes while Bybit failed closed with `BOOK_SEQUENCE_UNKNOWN`; Parquet/DuckDB replay contained 206 L2 levels across all three venues |
 | C2 strategy/risk/simulator | COMPLETE | [GitHub Actions run 31839163485](https://github.com/brullik/interexchange-perp-grid/actions/runs/31839163485): Linux `make verify` (43 tests) and Docker health/restart passed on `0849413`; deterministic tests cover open/add/partial close/full close, profitable and losing four-leg PnL, funding, protected prices, partial/rejected/unknown orders, private staleness, venue outage, third-venue hedge, forced close, and property-based 5/50 USDT risk invariants |
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
-| C4 live-canary-ready execution | REWORK_IMPLEMENTED_REVIEW_REQUIRED | Corrected implementation has local lint/type/123-test/doctor evidence; exact final-head Linux CI, replay artifact, and independent re-review remain mandatory |
+| C4 live-canary-ready execution | REWORK_IMPLEMENTED_REVIEW_REQUIRED | Corrected implementation has local lint/type/124-test/doctor evidence; exact final-head Linux CI, replay artifact, and independent re-review remain mandatory |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -61,7 +61,7 @@ No owner credential or live-money action is requested. C5 remains forbidden unti
 2026-08-15 local Windows equivalent of every Makefile verify target: PASS
 - ruff format --check + ruff check: PASS (66 files)
 - mypy --strict: PASS (66 source/test files)
-- pytest: 123 passed in 11.26s
+- pytest: 124 passed in 10.49s
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact `make verify`, Docker smoke,

@@ -42,11 +42,13 @@ def _junit_counts(path: Path) -> tuple[int, int, int, int]:
     root = ET.parse(path).getroot()
     if root.tag not in {"testsuite", "testsuites"}:
         raise ValueError("unexpected JUnit root element")
+    suites = tuple(root.findall("testsuite")) if root.tag == "testsuites" else ()
+    elements = suites or (root,)
     return (
-        int(root.attrib.get("tests", "0")),
-        int(root.attrib.get("failures", "0")),
-        int(root.attrib.get("errors", "0")),
-        int(root.attrib.get("skipped", "0")),
+        sum(int(element.attrib.get("tests", "0")) for element in elements),
+        sum(int(element.attrib.get("failures", "0")) for element in elements),
+        sum(int(element.attrib.get("errors", "0")) for element in elements),
+        sum(int(element.attrib.get("skipped", "0")) for element in elements),
     )
 
 
