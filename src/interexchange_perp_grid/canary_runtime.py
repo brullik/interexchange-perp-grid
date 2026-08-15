@@ -715,12 +715,15 @@ async def run_canary_once(
             *(public_adapters[venue].fetch_funding(instruments[venue]) for venue in required_venues)
         )
         funding = {snapshot.venue: snapshot for snapshot in funding_values}
-        quantity = minimum_common_base_quantity(
-            instruments[route.long_venue],
-            instruments[route.short_venue],
-            books[route.long_venue].asks[0].price,
-            books[route.short_venue].bids[0].price,
-        )
+        try:
+            quantity = minimum_common_base_quantity(
+                instruments[route.long_venue],
+                instruments[route.short_venue],
+                books[route.long_venue].asks[0].price,
+                books[route.short_venue].bids[0].price,
+            )
+        except ValueError:
+            return _denied(ReasonCode.CONTRACT_METADATA_UNKNOWN, route)
         if quantity != evidence.strategy.size_bucket_base_quantity:
             return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route, quantity)
         quote = evaluate_directed_route(

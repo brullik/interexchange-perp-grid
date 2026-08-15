@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import cast
 
+import pytest
+
 from interexchange_perp_grid.domain import (
     BookLevel,
     FundingSnapshot,
@@ -14,7 +16,11 @@ from interexchange_perp_grid.domain import (
 )
 from interexchange_perp_grid.market_data import DataQualityAssessment
 from interexchange_perp_grid.reason_codes import ReasonCode
-from interexchange_perp_grid.routes import evaluate_directed_route, match_common_instruments
+from interexchange_perp_grid.routes import (
+    evaluate_directed_route,
+    match_common_instruments,
+    minimum_common_base_quantity,
+)
 
 
 def instrument(venue: Venue, contract_size: str, amount_step: str, fee: str) -> Instrument:
@@ -223,6 +229,31 @@ def test_malformed_notional_runtime_types_block_route_without_raising() -> None:
         )
         assert quote.eligible is False
         assert quote.reason == ReasonCode.CONTRACT_METADATA_UNKNOWN
+
+
+def test_malformed_notional_runtime_types_block_minimum_quantity_sizing() -> None:
+    bybit = instrument(Venue.BYBIT, "1", "0.001", "0.0006")
+    okx = instrument(Venue.OKX, "0.01", "0.01", "0.0005")
+    malformed_pairs = (
+        (replace(bybit, minimum_notional=cast(Decimal, 5.0)), okx),
+        (
+            bybit,
+            replace(
+                okx,
+                minimum_notional=None,
+                no_fixed_minimum_notional=cast(bool, "yes"),
+            ),
+        ),
+    )
+
+    for malformed_long, malformed_short in malformed_pairs:
+        with pytest.raises(ValueError, match="minimum notional"):
+            minimum_common_base_quantity(
+                malformed_long,
+                malformed_short,
+                Decimal(100),
+                Decimal(100),
+            )
 
 
 def test_ambiguous_contract_mapping_is_rejected() -> None:

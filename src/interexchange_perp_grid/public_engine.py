@@ -144,6 +144,7 @@ class PublicMarketEngine:
         self._retiring_bbo_watchers: dict[Venue, asyncio.Task[None]] = {}
         self._retiring_bbo_transports: dict[Venue, asyncio.Task[tuple[BboQuote, ...]]] = {}
         self._retiring_adapter_closers: dict[Venue, asyncio.Task[None]] = {}
+        self._adapter_recycle_locks: dict[Venue, asyncio.Lock] = {}
         self._bbo_changed = asyncio.Event()
         self._bbo_watch_timeout_seconds = settings.market_data.max_bbo_age_ms / 1000
         self._bbo_retirement_grace_seconds = min(
@@ -242,6 +243,25 @@ class PublicMarketEngine:
         self._quarantined[venue] = QuarantineRecord(venue, reason, self._now_factory())
 
     async def _recycle_retired_venue_adapter(
+        self,
+        venue: Venue,
+        timeout_seconds: int,
+    ) -> bool:
+        lock = self._adapter_recycle_locks.setdefault(venue, asyncio.Lock())
+        async with lock:
+            if (
+                venue not in self._retiring_bbo_watchers
+                and venue not in self._retiring_bbo_transports
+                and venue not in self._retiring_adapter_closers
+            ):
+                return True
+            recycled = await self._recycle_retired_venue_adapter_locked(venue, timeout_seconds)
+            if not recycled:
+                return False
+            await self._initialise_venue_with_timeout(venue, timeout_seconds)
+            return True
+
+    async def _recycle_retired_venue_adapter_locked(
         self,
         venue: Venue,
         timeout_seconds: int,
@@ -426,7 +446,7 @@ class PublicMarketEngine:
                 self._reconnect_after_ns.pop(venue, None)
                 self._bbo_changed.set()
                 if time.monotonic_ns() - started_ns < 1_000_000:
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -503,12 +523,13 @@ class PublicMarketEngine:
             tuple(
                 venue
                 for venue in self._adapters
+                if venue not in recycled_targets
                 if venue not in self._retiring_bbo_watchers
                 and venue not in self._retiring_bbo_transports
                 and venue not in self._retiring_adapter_closers
             )
             if force or due
-            else reconnect_targets
+            else tuple(venue for venue in reconnect_targets if venue not in recycled_targets)
         )
         await asyncio.gather(
             *(self._initialise_venue_with_timeout(venue, timeout_seconds) for venue in targets)
@@ -745,11 +766,16 @@ class PublicMarketEngine:
     async def close(self) -> None:
         self._closed = True
         shutdown_deadline = asyncio.get_running_loop().time() + 1
+        close_failures: list[str] = []
+        timed_out_closer_venues: set[Venue] = set()
         self._cleanup_retired_bbo_tasks()
         for venue, closer in tuple(self._retiring_adapter_closers.items()):
             if closer.done():
                 self._retiring_adapter_closers.pop(venue, None)
-                self._consume_watcher(closer)
+                try:
+                    closer.result()
+                except (asyncio.CancelledError, Exception) as error:
+                    close_failures.append(f"{venue.value}: {type(error).__name__}: {error}")
         for task in self._bbo_watchers.values():
             task.cancel()
         for venue, adapter in self._adapters.items():
@@ -758,17 +784,22 @@ class PublicMarketEngine:
                     adapter.close(),
                     name=f"close-{venue.value}",
                 )
-        adapter_closers = tuple(self._retiring_adapter_closers.values())
+        adapter_closers = tuple(self._retiring_adapter_closers.items())
         if adapter_closers:
             done_closers, pending_closers = await asyncio.wait(
-                adapter_closers,
+                (task for _, task in adapter_closers),
                 timeout=max(0, shutdown_deadline - asyncio.get_running_loop().time()),
             )
-            for task in done_closers:
-                self._consume_watcher(task)
-            for task in pending_closers:
-                task.cancel()
-                task.add_done_callback(self._consume_watcher)
+            for venue, task in adapter_closers:
+                if task in done_closers:
+                    try:
+                        task.result()
+                    except (asyncio.CancelledError, Exception) as error:
+                        close_failures.append(f"{venue.value}: {type(error).__name__}: {error}")
+                elif task in pending_closers:
+                    timed_out_closer_venues.add(venue)
+                    task.cancel()
+                    task.add_done_callback(self._consume_watcher)
         await asyncio.sleep(0)
         for venue, task in self._bbo_watchers.items():
             self._retiring_bbo_watchers.setdefault(venue, task)
@@ -810,13 +841,21 @@ class PublicMarketEngine:
                     venue
                     for venue, task in self._retiring_adapter_closers.items()
                     if not task.done()
-                },
+                }
+                | timed_out_closer_venues,
                 key=str,
             )
         )
+        shutdown_failures: list[str] = []
         if pending_venues:
-            joined = ", ".join(venue.value for venue in pending_venues)
-            raise RuntimeError(f"BBO shutdown deadline exceeded for: {joined}")
+            shutdown_failures.append(
+                f"shutdown deadline exceeded for: "
+                f"{', '.join(venue.value for venue in pending_venues)}"
+            )
+        if close_failures:
+            shutdown_failures.append(f"adapter shutdown failed for: {'; '.join(close_failures)}")
+        if shutdown_failures:
+            raise RuntimeError(f"BBO {'; '.join(shutdown_failures)}")
 
     @staticmethod
     def _consume_watcher(task: asyncio.Task[None]) -> None:
