@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE3_1_EXACT_9E6_P1_REMEDIATION_LOCAL_GATE
-- **Current checkpoint:** Draft PR #5 exact head `9e6b242` passed all five GitHub jobs but failed independent adversarial and release review on a recycle-vs-shutdown adapter leak; that lifecycle race plus failed-recycle coalescing and raw canary-sizing metadata are remediated locally with the complete Windows-equivalent gate green and await a new exact head
+- **State:** PHASE3_1_EXACT_B1D4_P1_REMEDIATION_LOCAL_GATE
+- **Current checkpoint:** Draft PR #5 exact head `b1d4a78` passed all five GitHub jobs but failed independent adversarial review on late-probe shutdown false success and duplicate explicit failed-recycle attempts; both interleavings are remediated locally with the complete Windows-equivalent gate green and await a new exact head
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -22,7 +22,7 @@ This is the only mutable project-status document.
 | C3 usable shadow product | COMPLETE | [GitHub Actions run 31840533502](https://github.com/brullik/interexchange-perp-grid/actions/runs/31840533502): Linux `make verify` (54 tests) and Docker continuous-service health/restart passed on `aa3715d`; tests prove live-snapshot calibration/risk/paired simulated fills, restart ledger restore and reconciliation block, overload priority, Telegram owner/challenge audit, integrity-checked backup/restore, retention, and code/config/data-hash qualification |
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
 | Phase 2 Wave 1 data/private core | COMPLETE | PR #4 was independently verified with P0/P1/P2=0 and squash-merged as `0e87a1e`; post-merge [run 31904798345](https://github.com/brullik/interexchange-perp-grid/actions/runs/31904798345) passed all five jobs |
-| Phase 3.1 multi-instrument broad BBO | P1_REMEDIATION_LOCAL_GATE | Draft PR #5; real Wave 1 fixture qualifies one common instrument/six routes without fabricated OKX notional; malformed typed records are isolated through registry, route, and canary sizing; 102-safe-common/608-route synthetic boundary; one watchdog-protected batch watcher per venue; cancellation-safe retirement, single-flight bounded adapter recycle, shutdown lifecycle barrier, and explicit shutdown/teardown failure; six-hour resubscription; jittered 1→30 s reconnect; bounded cache with stale provenance; actual quote-receipt-to-prefilter latency; restart-identical proof; stable non-executable prefilter; 291 local tests |
+| Phase 3.1 multi-instrument broad BBO | P1_REMEDIATION_LOCAL_GATE | Draft PR #5; real Wave 1 fixture qualifies one common instrument/six routes without fabricated OKX notional; malformed typed records are isolated through registry, route, and canary sizing; 102-safe-common/608-route synthetic boundary; one watchdog-protected batch watcher per venue; cancellation-safe retirement, single-flight bounded adapter recycle, shutdown lifecycle barrier with post-initialize fail-close, and explicit shutdown/teardown failure; six-hour resubscription; jittered 1→30 s reconnect; bounded cache with stale provenance; actual quote-receipt-to-prefilter latency; restart-identical proof; stable non-executable prefilter; 293 local tests |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -88,6 +88,8 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-16 — Yield one millisecond after a sub-millisecond BBO batch loop — an immediate fake or anomalous transport must not starve the event loop or fabricate latency-gate failures — `public_engine.py`
 2026-08-16 — Set the closed barrier before waiting on per-venue recycle locks and recheck it before replacement creation — shutdown racing recovery must close the old adapter without allowing a new adapter to escape teardown — `public_engine.py`
 2026-08-16 — Recheck reconnect backoff after acquiring the recycle lock and validate raw Decimal sizing fields before derived arithmetic — concurrent failed recovery and malformed metadata must remain bounded and reason-coded fail-closed — public engine, routes, canary
+2026-08-16 — Reject refresh and scan results after shutdown begins and restore quarantine if close races replacement initialization — a closed engine must never report a recovered venue even when the replacement is eventually torn down — `public_engine.py`
+2026-08-16 — Version retired-adapter failures under the recycle lock — concurrent explicit reconnect followers may bypass an old backoff but must coalesce a failure created by the leader they waited behind — `public_engine.py`
 
 ## Active blockers / owner actions
 
@@ -102,7 +104,7 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (88 files)
 - mypy --strict: PASS (86 source/test files)
-- pytest: 291 passed
+- pytest: 293 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,

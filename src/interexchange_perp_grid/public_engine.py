@@ -127,6 +127,7 @@ class PublicMarketEngine:
         self._quarantined: dict[Venue, QuarantineRecord] = {}
         self._reconnect_attempts: dict[Venue, int] = {}
         self._reconnect_after_ns: dict[Venue, int] = {}
+        self._recycle_failure_generations: dict[Venue, int] = {}
         self._books = BookRegistry()
         self._universe = UniverseService(
             InstrumentRegistry(
@@ -240,6 +241,9 @@ class PublicMarketEngine:
         attempt = max(1, self._reconnect_attempts.get(venue, 1))
         delay_seconds = reconnect_delay_seconds(venue, attempt, self._reconnect_jitter)
         self._reconnect_after_ns[venue] = self._monotonic_ns() + int(delay_seconds * 1_000_000_000)
+        self._recycle_failure_generations[venue] = (
+            self._recycle_failure_generations.get(venue, 0) + 1
+        )
         self._quarantined[venue] = QuarantineRecord(venue, reason, self._now_factory())
 
     async def _recycle_retired_venue_adapter(
@@ -250,6 +254,7 @@ class PublicMarketEngine:
         ignore_backoff: bool,
     ) -> bool:
         lock = self._adapter_recycle_locks.setdefault(venue, asyncio.Lock())
+        observed_failure_generation = self._recycle_failure_generations.get(venue, 0)
         try:
             await asyncio.wait_for(lock.acquire(), timeout=timeout_seconds)
         except TimeoutError:
@@ -258,8 +263,11 @@ class PublicMarketEngine:
             if self._closed:
                 return False
             retry_at_ns = self._reconnect_after_ns.get(venue)
+            failure_advanced_while_waiting = (
+                self._recycle_failure_generations.get(venue, 0) != observed_failure_generation
+            )
             if (
-                not ignore_backoff
+                (not ignore_backoff or failure_advanced_while_waiting)
                 and retry_at_ns is not None
                 and self._monotonic_ns() < retry_at_ns
             ):
@@ -274,6 +282,15 @@ class PublicMarketEngine:
             if not recycled:
                 return False
             await self._initialise_venue_with_timeout(venue, timeout_seconds)
+            if self._closed:
+                self._capabilities.pop(venue, None)
+                self._instruments.pop(venue, None)
+                self._quarantined[venue] = QuarantineRecord(
+                    venue,
+                    "engine shutdown interrupted venue recovery",
+                    self._now_factory(),
+                )
+                return False
             return True
         finally:
             lock.release()
@@ -492,6 +509,8 @@ class PublicMarketEngine:
         force: bool = False,
         reconnected: tuple[Venue, ...] = (),
     ) -> UniverseSnapshot:
+        if self._closed:
+            raise RuntimeError("public market engine is closed")
         now_ns = self._monotonic_ns()
         due = self._universe.refresh_due(now_ns)
         due_reconnects = {
@@ -540,6 +559,8 @@ class PublicMarketEngine:
             )
         )
         if not force and not due and not reconnect_targets:
+            if self._closed:
+                raise RuntimeError("public market engine is closed")
             current = self._universe.snapshot
             assert current is not None
             return current
@@ -558,7 +579,12 @@ class PublicMarketEngine:
         await asyncio.gather(
             *(self._initialise_venue_with_timeout(venue, timeout_seconds) for venue in targets)
         )
-        return await self._refresh_universe_snapshot(force=True)
+        if self._closed:
+            raise RuntimeError("public market engine is closed")
+        snapshot = await self._refresh_universe_snapshot(force=True)
+        if self._closed:
+            raise RuntimeError("public market engine is closed")
+        return snapshot
 
     async def _wait_for_bbo_coverage(self, timeout_seconds: int) -> None:
         loop = asyncio.get_running_loop()
@@ -581,12 +607,18 @@ class PublicMarketEngine:
                 return
 
     async def scan_broad_bbo(self, timeout_seconds: int) -> BroadBboResult:
+        if self._closed:
+            raise RuntimeError("public market engine is closed")
         if not self._adapters:
             await self.initialise(timeout_seconds)
         universe = await self.refresh_universe(timeout_seconds)
+        if self._closed:
+            raise RuntimeError("public market engine is closed")
         await self._sync_bbo_watchers()
         started_ns = time.perf_counter_ns()
         await self._wait_for_bbo_coverage(timeout_seconds)
+        if self._closed:
+            raise RuntimeError("public market engine is closed")
         now_ns = self._monotonic_ns()
         available_routes = tuple(
             route

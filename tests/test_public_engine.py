@@ -309,6 +309,18 @@ class CoordinatedRecycleBroadFakeAdapter(CancellationResistantBroadFakeAdapter):
         await super().close()
 
 
+class CoordinatedProbeBroadFakeAdapter(BroadFakeAdapter):
+    def __init__(self, venue: Venue, received_ns: int) -> None:
+        super().__init__(venue, received_ns)
+        self.probe_started = asyncio.Event()
+        self.allow_probe = asyncio.Event()
+
+    async def probe_public_capabilities(self) -> CapabilityReport:
+        self.probe_started.set()
+        await self.allow_probe.wait()
+        return await super().probe_public_capabilities()
+
+
 class PermanentlyCancellationResistantBroadFakeAdapter(BroadFakeAdapter):
     def __init__(self, venue: Venue, received_ns: int) -> None:
         super().__init__(venue, received_ns)
@@ -854,15 +866,75 @@ async def test_shutdown_waits_for_recycle_and_prevents_escaped_replacement(tmp_p
     shutdown = asyncio.create_task(engine.close())
     await asyncio.sleep(0)
     hanging.allow_close.set()
-    recovered, shutdown_result = await asyncio.gather(scan, shutdown)
+    recovered, shutdown_result = await asyncio.gather(scan, shutdown, return_exceptions=True)
 
     assert shutdown_result is None
-    assert recovered.directed_route_count == 200
-    assert {record.venue for record in recovered.quarantined} == {Venue.OKX}
+    assert isinstance(recovered, RuntimeError)
+    assert str(recovered) == "public market engine is closed"
     assert len(created_okx_adapters) == 1
     assert hanging.close_calls == 2
     assert hanging.closed is True
     assert all(adapters[venue].closed for venue in Venue if venue != Venue.OKX)
+    assert not tuple(
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and task.get_name().startswith("broad-bbo-")
+        and not task.done()
+    )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_replacement_probe_cannot_report_recovery(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue
+    }
+    hanging = CancellationResistantBroadFakeAdapter(Venue.OKX, clock[0])
+    replacement = CoordinatedProbeBroadFakeAdapter(Venue.OKX, clock[0])
+    created_okx_adapters: list[BroadFakeAdapter] = []
+
+    def adapter_factory(venue: Venue) -> BroadFakeAdapter:
+        if venue != Venue.OKX:
+            return adapters[venue]
+        adapter = hanging if not created_okx_adapters else replacement
+        created_okx_adapters.append(adapter)
+        return adapter
+
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    settings = settings.model_copy(
+        update={"market_data": settings.market_data.model_copy(update={"max_bbo_age_ms": 20})}
+    )
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapter_factory,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+        reconnect_jitter=lambda venue, attempt: Decimal(1),
+    )
+
+    failed = await engine.scan_broad_bbo(timeout_seconds=1)
+    assert {record.venue for record in failed.quarantined} == {Venue.OKX}
+    clock[0] += 1_000_000_000
+    for adapter in (*adapters.values(), replacement):
+        adapter.received_ns = clock[0]
+
+    scan = asyncio.create_task(engine.scan_broad_bbo(timeout_seconds=1))
+    await asyncio.wait_for(replacement.probe_started.wait(), timeout=1)
+    shutdown = asyncio.create_task(engine.close())
+    await asyncio.sleep(0)
+    replacement.allow_probe.set()
+    recovered, shutdown_result = await asyncio.gather(scan, shutdown, return_exceptions=True)
+
+    assert shutdown_result is None
+    assert isinstance(recovered, RuntimeError)
+    assert str(recovered) == "public market engine is closed"
+    assert len(created_okx_adapters) == 2
+    assert replacement.probe_calls == 1
+    assert replacement.discover_calls == 1
+    assert replacement.closed is True
+    assert Venue.OKX in engine._quarantined
+    assert Venue.OKX not in engine._instruments
     assert not tuple(
         task
         for task in asyncio.all_tasks()
@@ -908,6 +980,45 @@ async def test_concurrent_failed_recycle_observes_new_backoff(tmp_path: Path) ->
     assert all(
         {record.venue for record in result.quarantined} == {Venue.OKX} for result in recoveries
     )
+
+    with pytest.raises(RuntimeError, match=r"adapter shutdown failed.*okx"):
+        await engine.close()
+    assert failing.close_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_explicit_reconnects_coalesce_new_recycle_failure(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue
+    }
+    failing = SilentFailingCloseBroadFakeAdapter(Venue.OKX, clock[0])
+    adapters[Venue.OKX] = failing
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    settings = settings.model_copy(
+        update={"market_data": settings.market_data.model_copy(update={"max_bbo_age_ms": 20})}
+    )
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+        reconnect_jitter=lambda venue, attempt: Decimal(1),
+    )
+
+    failed = await engine.scan_broad_bbo(timeout_seconds=1)
+    assert {record.venue for record in failed.quarantined} == {Venue.OKX}
+
+    refreshed = await asyncio.gather(
+        engine.refresh_universe(timeout_seconds=1, reconnected=(Venue.OKX,)),
+        engine.refresh_universe(timeout_seconds=1, reconnected=(Venue.OKX,)),
+    )
+
+    assert failing.close_calls == 1
+    assert all(snapshot.generation == failed.universe_generation for snapshot in refreshed)
+    assert Venue.OKX in engine._quarantined
 
     with pytest.raises(RuntimeError, match=r"adapter shutdown failed.*okx"):
         await engine.close()
