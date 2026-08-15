@@ -48,6 +48,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-15 — Persist both exact requests and every transition in SQLite WAL before network submission, and resume only the same idempotent action — crashes and unknown acknowledgements must never duplicate a leg or permit a new pair — `live_journal.py`, `live_coordinator.py`, `canary_runtime.py`
 2026-08-15 — Treat exchange account/orders/positions as reconciliation truth and require zero open positions plus zero bot orders for terminal FLAT — netting nonzero positions is not flat — `adapters/private.py`, `live_reconciliation.py`, `live_control.py`
 2026-08-15 — Select canary direction only from exact qualification evidence and derive the remaining Wave 1 venue for emergency recovery — hard-coded Bybit/OKX direction is unsafe while Bybit sequence is unknown — `config.py`, `canary_runtime.py`, owner runbook
+2026-08-15 — Checkout the exact PR head SHA in every CI job and name replay artifacts from that SHA — GitHub's synthetic pull-request merge commit cannot serve as final-head evidence — CI workflow
 
 ## Active blockers / owner actions
 
@@ -61,7 +62,7 @@ No owner credential or live-money action is requested. C5 remains forbidden unti
 2026-08-15 local Windows equivalent of every Makefile verify target: PASS
 - ruff format --check + ruff check: PASS (66 files)
 - mypy --strict: PASS (66 source/test files)
-- pytest: 124 passed in 10.49s
+- pytest: 124 passed in 11.08s
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
 GNU make is not installed on this Windows host. Exact `make verify`, Docker smoke,
