@@ -90,7 +90,6 @@ class InstrumentRegistry:
             instrument.amount_step_contracts,
             instrument.price_tick,
             instrument.minimum_amount_contracts,
-            instrument.minimum_notional,
         )
         if (
             not instrument.active
@@ -101,6 +100,15 @@ class InstrumentRegistry:
             or instrument.base != instrument.base.upper()
             or not instrument.symbol
             or not instrument.exchange_symbol
+            or (instrument.minimum_notional is None and not instrument.no_fixed_minimum_notional)
+            or (instrument.minimum_notional is not None and instrument.no_fixed_minimum_notional)
+            or (instrument.no_fixed_minimum_notional and instrument.venue != Venue.OKX)
+            or (
+                instrument.minimum_notional is not None
+                and (
+                    not instrument.minimum_notional.is_finite() or instrument.minimum_notional <= 0
+                )
+            )
             or any(
                 not isinstance(value, Decimal) or not value.is_finite() or value <= 0
                 for value in required_positive

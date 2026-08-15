@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import ClassVar
@@ -9,6 +10,7 @@ import pytest
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter, normalize_market
 from interexchange_perp_grid.domain import Instrument, Venue
+from interexchange_perp_grid.market_universe import InstrumentRegistry
 
 FIXTURE = Path("tests/fixtures/wave1_markets.json")
 
@@ -40,6 +42,20 @@ def test_wave1_fixtures_accept_only_exact_linear_usdt_perpetuals() -> None:
         for instruments in qualified.values()
         for instrument in instruments
     )
+    snapshot = InstrumentRegistry(
+        minimum_listing_age_days=14,
+        enforce_listing_age=True,
+    ).build(
+        qualified,
+        now=datetime(2026, 8, 15, tzinfo=UTC),
+        monotonic_ns=1,
+        generation=1,
+    )
+    assert len(snapshot.common) == 1
+    assert len(snapshot.routes) == 6
+    assert qualified[Venue.BYBIT][0].minimum_notional == Decimal(5)
+    assert qualified[Venue.OKX][0].minimum_notional is None
+    assert qualified[Venue.OKX][0].no_fixed_minimum_notional is True
 
 
 def test_inactive_market_is_rejected_and_listing_time_is_normalised() -> None:

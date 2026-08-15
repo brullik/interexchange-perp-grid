@@ -21,7 +21,11 @@ from interexchange_perp_grid.domain import (
     Venue,
 )
 from interexchange_perp_grid.history import ParquetMarketRecorder, query_recorded_level_count
-from interexchange_perp_grid.public_engine import PublicMarketEngine, reconnect_backoff_seconds
+from interexchange_perp_grid.public_engine import (
+    PublicMarketEngine,
+    reconnect_backoff_seconds,
+    reconnect_delay_seconds,
+)
 
 CONFIG = Path("config/defaults.yaml")
 
@@ -164,6 +168,8 @@ class BroadFakeAdapter(ExchangeAdapter):
         self.discover_calls = 0
         self.probe_calls = 0
         self.bbo_calls = 0
+        self.last_bbo_symbols: tuple[str, ...] = ()
+        self.bbo_subscription_changes = 0
 
     async def probe_public_capabilities(self) -> CapabilityReport:
         self.probe_calls += 1
@@ -187,6 +193,9 @@ class BroadFakeAdapter(ExchangeAdapter):
 
     async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
         self.bbo_calls += 1
+        if symbols != self.last_bbo_symbols:
+            self.last_bbo_symbols = symbols
+            self.bbo_subscription_changes += 1
         assert set(symbols).issubset({instrument.symbol for instrument in self.instruments})
         if self.fail_bbo:
             raise ConnectionError("fixture BBO outage")
@@ -257,6 +266,37 @@ class IncrementalBroadFakeAdapter(BroadFakeAdapter):
             )
         finally:
             self.active_calls -= 1
+
+
+class CancellationResistantBroadFakeAdapter(BroadFakeAdapter):
+    def __init__(self, venue: Venue, received_ns: int) -> None:
+        super().__init__(venue, received_ns)
+        self.release = asyncio.Event()
+        self.active_calls = 0
+        self.peak_concurrent_calls = 0
+
+    async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
+        self.bbo_calls += 1
+        self.last_bbo_symbols = symbols
+        self.active_calls += 1
+        self.peak_concurrent_calls = max(self.peak_concurrent_calls, self.active_calls)
+        try:
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                await self.release.wait()
+            return ()
+        finally:
+            self.active_calls -= 1
+
+    async def close(self) -> None:
+        self.release.set()
+
+
+class DelayedBroadFakeAdapter(BroadFakeAdapter):
+    async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
+        await asyncio.sleep(0.02)
+        return await super().watch_bbo(symbols)
 
 
 @pytest.mark.asyncio
@@ -346,7 +386,9 @@ async def test_broad_bbo_scans_100_common_instruments_and_isolates_one_venue(
     assert result.cache.entries == result.cache.peak_entries == 200
     assert result.prefilter_latency_ms <= Decimal(100)
     assert {record.venue for record in result.quarantined} == {Venue.OKX}
-    assert all(adapter.bbo_calls == 1 for adapter in adapters.values())
+    assert adapters[Venue.OKX].bbo_calls == 1
+    assert all(adapter.bbo_calls >= 1 for adapter in adapters.values())
+    assert all(adapter.bbo_subscription_changes == 1 for adapter in adapters.values())
 
 
 @pytest.mark.asyncio
@@ -412,6 +454,7 @@ async def test_failed_bbo_venue_is_retried_automatically_after_backoff(tmp_path:
         adapter_factory=adapters.__getitem__,
         recorder=ParquetMarketRecorder(tmp_path),
         monotonic_ns=lambda: clock[0],
+        reconnect_jitter=lambda venue, attempt: Decimal(1),
     )
 
     initial = await engine.scan_broad_bbo(timeout_seconds=1)
@@ -440,6 +483,171 @@ def test_reconnect_backoff_is_exponential_and_capped_at_30_seconds() -> None:
         30,
         30,
     )
+
+
+def test_reconnect_delay_applies_bounded_jitter() -> None:
+    assert reconnect_delay_seconds(
+        Venue.OKX,
+        3,
+        lambda venue, attempt: Decimal("0.9"),
+    ) == Decimal("3.6")
+    assert reconnect_delay_seconds(
+        Venue.OKX,
+        6,
+        lambda venue, attempt: Decimal("1.1"),
+    ) == Decimal("30")
+    with pytest.raises(ValueError, match="jitter"):
+        reconnect_delay_seconds(
+            Venue.OKX,
+            1,
+            lambda venue, attempt: Decimal("1.3"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_bbo_failure_streak_survives_probe_until_stream_recovers(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue}
+    failing = adapters[Venue.OKX]
+    failing.fail_bbo = True
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+        reconnect_jitter=lambda venue, attempt: Decimal(1),
+    )
+
+    await engine.scan_broad_bbo(timeout_seconds=1)
+    assert failing.probe_calls == 1
+    assert failing.bbo_calls == 1
+    assert engine._reconnect_attempts[Venue.OKX] == 1
+
+    clock[0] += 1_000_000_000
+    for adapter in adapters.values():
+        adapter.received_ns = clock[0]
+    await engine.scan_broad_bbo(timeout_seconds=1)
+    assert failing.probe_calls == 2
+    assert failing.bbo_calls == 2
+    assert engine._reconnect_attempts[Venue.OKX] == 2
+
+    clock[0] += 1_000_000_000
+    for adapter in adapters.values():
+        adapter.received_ns = clock[0]
+    await engine.scan_broad_bbo(timeout_seconds=1)
+    assert failing.probe_calls == 2
+    assert failing.bbo_calls == 2
+
+    clock[0] += 1_000_000_000
+    failing.fail_bbo = False
+    for adapter in adapters.values():
+        adapter.received_ns = clock[0]
+    recovered = await engine.scan_broad_bbo(timeout_seconds=1)
+    await engine.close()
+
+    assert failing.probe_calls == 3
+    assert recovered.directed_route_count == 600
+    assert Venue.OKX not in engine._reconnect_attempts
+
+
+@pytest.mark.asyncio
+async def test_silent_bbo_transport_times_out_without_duplicate_watcher(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue
+    }
+    hanging = CancellationResistantBroadFakeAdapter(Venue.OKX, clock[0])
+    adapters[Venue.OKX] = hanging
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    settings = settings.model_copy(
+        update={"market_data": settings.market_data.model_copy(update={"max_bbo_age_ms": 20})}
+    )
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+        reconnect_jitter=lambda venue, attempt: Decimal(1),
+    )
+
+    failed = await engine.scan_broad_bbo(timeout_seconds=1)
+    clock[0] += 1_000_000_000
+    await engine.scan_broad_bbo(timeout_seconds=1)
+
+    assert {record.venue for record in failed.quarantined} == {Venue.OKX}
+    assert "TimeoutError" in failed.quarantined[0].reason
+    assert hanging.bbo_calls == 1
+    assert hanging.active_calls == hanging.peak_concurrent_calls == 1
+
+    await engine.close()
+    await asyncio.sleep(0)
+
+    assert hanging.active_calls == 0
+    assert not tuple(
+        task
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+        and task.get_name().startswith("broad-bbo-")
+        and not task.done()
+    )
+
+
+@pytest.mark.asyncio
+async def test_six_hour_refresh_resubscribes_watchers_to_new_symbols(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue}
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+
+    initial = await engine.scan_broad_bbo(timeout_seconds=1)
+    for adapter in adapters.values():
+        template = adapter.instruments[0]
+        adapter.instruments = (
+            *adapter.instruments,
+            replace(
+                template,
+                symbol="NEW/USDT:USDT",
+                exchange_symbol=f"{adapter.venue.value}-NEW",
+                base="NEW",
+            ),
+        )
+    clock[0] += settings.universe.instrument_refresh_seconds * 1_000_000_000
+    for adapter in adapters.values():
+        adapter.received_ns = clock[0]
+
+    refreshed = await engine.scan_broad_bbo(timeout_seconds=1)
+    await engine.close()
+
+    assert initial.common_instrument_count == 100
+    assert refreshed.common_instrument_count == 101
+    assert refreshed.discovered_route_count == refreshed.directed_route_count == 606
+    assert refreshed.cache.known_keys == refreshed.cache.entries == 303
+    assert all("NEW/USDT:USDT" in adapter.last_bbo_symbols for adapter in adapters.values())
+    assert all(adapter.bbo_subscription_changes == 2 for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_prefilter_latency_measures_bbo_arrival_to_ranking(tmp_path: Path) -> None:
+    clock = 1_000_000_000
+    adapters = {venue: DelayedBroadFakeAdapter(venue, clock) for venue in Venue}
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+    )
+
+    result = await engine.scan_broad_bbo(timeout_seconds=1)
+    await engine.close()
+
+    assert Decimal(15) <= result.prefilter_latency_ms <= Decimal(100)
 
 
 @pytest.mark.asyncio

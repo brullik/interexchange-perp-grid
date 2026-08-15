@@ -75,6 +75,7 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
     contract_size = _decimal(market.get("contractSize"))
     precision = _mapping(market.get("precision"))
     limits = _mapping(market.get("limits"))
+    info = _mapping(market.get("info"))
     amount_limits = _mapping(limits.get("amount"))
     cost_limits = _mapping(limits.get("cost"))
     amount_step = _decimal(precision.get("amount"))
@@ -99,6 +100,15 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
         return None
     taker_fee = _decimal(market.get("taker"))
     minimum_notional = _decimal(cost_limits.get("min"))
+    if minimum_notional is None and venue == Venue.BYBIT:
+        minimum_notional = _decimal(_mapping(info.get("lotSizeFilter")).get("minNotionalValue"))
+    no_fixed_minimum_notional = (
+        venue == Venue.OKX
+        and minimum_notional is None
+        and info.get("instType") == "SWAP"
+        and info.get("ctType") == "linear"
+        and _decimal(info.get("minSz")) == minimum_amount
+    )
     return Instrument(
         venue=venue,
         symbol=symbol,
@@ -115,6 +125,7 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
         fee_source="ccxt_market_metadata" if taker_fee is not None else None,
         active=True,
         listed_at=_listing_datetime(market),
+        no_fixed_minimum_notional=no_fixed_minimum_notional,
     )
 
 

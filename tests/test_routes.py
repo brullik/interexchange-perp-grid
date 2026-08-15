@@ -167,6 +167,31 @@ def test_unknown_minimum_notional_blocks_route() -> None:
     assert quote.reason == ReasonCode.CONTRACT_METADATA_UNKNOWN
 
 
+def test_venue_proven_absence_of_fixed_notional_uses_amount_floor() -> None:
+    bybit = instrument(Venue.BYBIT, "1", "0.001", "0.0006")
+    okx = replace(
+        instrument(Venue.OKX, "0.01", "0.01", "0.0005"),
+        minimum_notional=None,
+        no_fixed_minimum_notional=True,
+    )
+    accepted = DataQualityAssessment(True, ReasonCode.QUOTE_READY, 1)
+
+    quote = evaluate_directed_route(
+        bybit,
+        okx,
+        book(Venue.BYBIT, "100", "101"),
+        book(Venue.OKX, "103", "104"),
+        funding(Venue.BYBIT, "0.0001"),
+        funding(Venue.OKX, "0.0002"),
+        accepted,
+        accepted,
+        Decimal("0.001"),
+    )
+
+    assert quote.eligible is True
+    assert quote.reason == ReasonCode.QUOTE_READY
+
+
 def test_ambiguous_contract_mapping_is_rejected() -> None:
     bybit = instrument(Venue.BYBIT, "1", "0.001", "0.0006")
     duplicate = replace(bybit, exchange_symbol="duplicate")

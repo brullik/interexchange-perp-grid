@@ -53,7 +53,8 @@
       "contractSize": 1,
       "taker": "0.0006",
       "precision": {"amount": "0.001", "price": "0.1"},
-      "limits": {"amount": {"min": "0.001"}, "cost": {"min": null}}
+      "limits": {"amount": {"min": "0.001"}, "cost": {"min": null}},
+      "info": {"lotSizeFilter": {"minNotionalValue": "5"}}
     },
     {
       "symbol": "BTC/USD:BTC",
@@ -90,7 +91,8 @@
       "contractSize": "0.01",
       "taker": "0.0005",
       "precision": {"amount": "0.01", "price": "0.1"},
-      "limits": {"amount": {"min": "0.01"}, "cost": {"min": null}}
+      "limits": {"amount": {"min": "0.01"}, "cost": {"min": null}},
+      "info": {"instType": "SWAP", "ctType": "linear", "minSz": "0.01"}
     },
     {
       "symbol": "BTC/USDC:USDC",

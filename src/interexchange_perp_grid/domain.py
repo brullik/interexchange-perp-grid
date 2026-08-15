@@ -47,6 +47,7 @@ class Instrument:
     active: bool = True
     listed_at: datetime | None = None
     product_type: ProductType = ProductType.LINEAR_USDT_PERPETUAL
+    no_fixed_minimum_notional: bool = False
 
     def __post_init__(self) -> None:
         if self.listed_at is not None and self.listed_at.tzinfo is None:

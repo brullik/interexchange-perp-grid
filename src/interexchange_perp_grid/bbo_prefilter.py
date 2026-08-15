@@ -17,6 +17,8 @@ class BboCacheStats:
     accepted_updates: int
     coalesced_updates: int
     rejected_updates: int
+    fresh_entries: int = 0
+    stale_entries: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +59,8 @@ class LatestBboCache:
         self._known_keys = keys
         self._quotes = {key: quote for key, quote in self._quotes.items() if key in keys}
 
-    def ingest(self, quotes: Iterable[BboQuote], *, now_monotonic_ns: int) -> None:
+    def ingest(self, quotes: Iterable[BboQuote], *, now_monotonic_ns: int) -> int:
+        accepted = 0
         for quote in quotes:
             key = (quote.venue, quote.symbol)
             if key not in self._known_keys or not self._valid(quote, now_monotonic_ns):
@@ -71,7 +74,9 @@ class LatestBboCache:
                 self._coalesced_updates += 1
             self._quotes[key] = quote
             self._accepted_updates += 1
+            accepted += 1
             self._peak_entries = max(self._peak_entries, len(self._quotes))
+        return accepted
 
     def fresh(self, *, now_monotonic_ns: int) -> tuple[BboQuote, ...]:
         return tuple(
@@ -94,6 +99,27 @@ class LatestBboCache:
             self._rejected_updates,
         )
 
+    def stats_at(self, *, now_monotonic_ns: int) -> BboCacheStats:
+        fresh_entries = sum(
+            1 for quote in self._quotes.values() if self._valid(quote, now_monotonic_ns)
+        )
+        base = self.stats
+        return BboCacheStats(
+            base.known_keys,
+            base.entries,
+            base.peak_entries,
+            base.accepted_updates,
+            base.coalesced_updates,
+            base.rejected_updates,
+            fresh_entries,
+            base.entries - fresh_entries,
+        )
+
+    def stale_keys(self, *, now_monotonic_ns: int) -> frozenset[tuple[Venue, str]]:
+        return frozenset(
+            key for key, quote in self._quotes.items() if not self._valid(quote, now_monotonic_ns)
+        )
+
     def _valid(self, quote: BboQuote, now_monotonic_ns: int) -> bool:
         age_ns = now_monotonic_ns - quote.received_monotonic_ns
         return (
@@ -111,6 +137,8 @@ class LatestBboCache:
 def rank_bbo_prefilter(
     routes: tuple[UniverseRoute, ...],
     quotes: tuple[BboQuote, ...],
+    *,
+    stale_keys: frozenset[tuple[Venue, str]] = frozenset(),
 ) -> tuple[BboPrefilterObservation, ...]:
     by_key = {(quote.venue, quote.symbol): quote for quote in quotes}
     observations: list[BboPrefilterObservation] = []
@@ -124,6 +152,12 @@ def rank_bbo_prefilter(
             short_quote.received_monotonic_ns if short_quote is not None else 0,
         )
         if long_quote is None or short_quote is None:
+            missing_reason = (
+                ReasonCode.BOOK_STALE
+                if (long.venue, long.symbol) in stale_keys
+                or (short.venue, short.symbol) in stale_keys
+                else ReasonCode.BOOK_EMPTY
+            )
             observations.append(
                 BboPrefilterObservation(
                     long.base,
@@ -135,7 +169,7 @@ def rank_bbo_prefilter(
                     None,
                     None,
                     observed_ns,
-                    ReasonCode.BOOK_EMPTY,
+                    missing_reason,
                 )
             )
             continue

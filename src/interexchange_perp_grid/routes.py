@@ -253,8 +253,10 @@ def evaluate_directed_route(
 
 
 def _meets_notional(instrument: Instrument, price: Decimal, quantity: Decimal) -> bool:
+    if instrument.minimum_notional is None:
+        return instrument.no_fixed_minimum_notional
     return (
-        instrument.minimum_notional is not None
+        not instrument.no_fixed_minimum_notional
         and instrument.minimum_notional.is_finite()
         and instrument.minimum_notional > 0
         and price * quantity >= instrument.minimum_notional

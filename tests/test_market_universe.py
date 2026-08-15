@@ -141,8 +141,13 @@ def test_registry_rejects_cross_quote_and_incomplete_contract_metadata() -> None
                 _instrument(Venue.BYBIT, "SOL"),
                 _instrument(Venue.BYBIT, "XRP"),
                 _instrument(Venue.BYBIT, "DOGE"),
+                replace(
+                    _instrument(Venue.BYBIT, "BNB"),
+                    minimum_notional=None,
+                    no_fixed_minimum_notional=True,
+                ),
             ),
-            Venue.OKX: malformed,
+            Venue.OKX: (*malformed, _instrument(Venue.OKX, "BNB")),
         },
         now=NOW,
         monotonic_ns=1,
@@ -298,3 +303,23 @@ def test_prefilter_reports_missing_fee_instead_of_omitting_route() -> None:
     assert observations[0].reason == ReasonCode.FEE_UNKNOWN
     assert observations[0].estimated_edge_bps is None
     assert observations[0].execution_authorized is False
+
+
+def test_prefilter_distinguishes_stale_from_never_observed_bbo() -> None:
+    long = _instrument(Venue.BYBIT, "BTC")
+    short = _instrument(Venue.OKX, "BTC")
+    cache = LatestBboCache(maximum_age_ms=1500, maximum_clock_skew_ms=1000)
+    cache.set_known_keys(frozenset({(long.venue, long.symbol), (short.venue, short.symbol)}))
+    cache.ingest((_quote(long, 1),), now_monotonic_ns=1)
+    now_ns = 1_500_000_002
+
+    observations = rank_bbo_prefilter(
+        (UniverseRoute(long, short),),
+        cache.fresh(now_monotonic_ns=now_ns),
+        stale_keys=cache.stale_keys(now_monotonic_ns=now_ns),
+    )
+    stats = cache.stats_at(now_monotonic_ns=now_ns)
+
+    assert observations[0].reason == ReasonCode.BOOK_STALE
+    assert stats.entries == stats.stale_entries == 1
+    assert stats.fresh_entries == 0

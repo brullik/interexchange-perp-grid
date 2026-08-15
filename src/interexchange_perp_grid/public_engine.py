@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from random import SystemRandom
 
 from interexchange_perp_grid.adapters import CcxtProAdapter, ExchangeAdapter
 from interexchange_perp_grid.bbo_prefilter import (
@@ -40,12 +41,31 @@ from interexchange_perp_grid.routes import (
 )
 
 AdapterFactory = Callable[[Venue], ExchangeAdapter]
+ReconnectJitter = Callable[[Venue, int], Decimal]
+_RECONNECT_RANDOM = SystemRandom()
 
 
 def reconnect_backoff_seconds(attempt: int) -> int:
     if attempt <= 0:
         raise ValueError("reconnect attempt must be positive")
     return 30 if attempt >= 6 else 1 << (attempt - 1)
+
+
+def _default_reconnect_jitter(venue: Venue, attempt: int) -> Decimal:
+    del venue, attempt
+    return Decimal(str(_RECONNECT_RANDOM.uniform(0.8, 1.2)))
+
+
+def reconnect_delay_seconds(
+    venue: Venue,
+    attempt: int,
+    jitter: ReconnectJitter = _default_reconnect_jitter,
+) -> Decimal:
+    factor = jitter(venue, attempt)
+    if not factor.is_finite() or not Decimal("0.8") <= factor <= Decimal("1.2"):
+        raise ValueError("reconnect jitter must be finite and within [0.8, 1.2]")
+    delay = Decimal(reconnect_backoff_seconds(attempt)) * factor
+    return max(Decimal(1), min(Decimal(30), delay))
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,12 +113,14 @@ class PublicMarketEngine:
         *,
         now_factory: Callable[[], datetime] | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        reconnect_jitter: ReconnectJitter = _default_reconnect_jitter,
     ) -> None:
         self.settings = settings
         self._adapter_factory = adapter_factory or CcxtProAdapter
         self._recorder = recorder or ParquetMarketRecorder(Path(settings.storage.parquet_dir))
         self._now_factory = now_factory or (lambda: datetime.now(UTC))
         self._monotonic_ns = monotonic_ns
+        self._reconnect_jitter = reconnect_jitter
         self._adapters: dict[Venue, ExchangeAdapter] = {}
         self._capabilities: dict[Venue, CapabilityReport] = {}
         self._instruments: dict[Venue, tuple[Instrument, ...]] = {}
@@ -118,7 +140,15 @@ class PublicMarketEngine:
             maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
         )
         self._bbo_watchers: dict[Venue, asyncio.Task[None]] = {}
+        self._bbo_watcher_symbols: dict[Venue, tuple[str, ...]] = {}
+        self._retiring_bbo_watchers: dict[Venue, asyncio.Task[None]] = {}
+        self._retiring_bbo_transports: dict[Venue, asyncio.Task[tuple[BboQuote, ...]]] = {}
         self._bbo_changed = asyncio.Event()
+        self._bbo_watch_timeout_seconds = settings.market_data.max_bbo_age_ms / 1000
+        self._bbo_retirement_grace_seconds = min(
+            0.1,
+            max(0.01, self._bbo_watch_timeout_seconds),
+        )
         self._closed = False
 
     async def initialise(self, timeout_seconds: int = 30) -> None:
@@ -127,7 +157,7 @@ class PublicMarketEngine:
         await asyncio.gather(
             *(self._initialise_venue_with_timeout(venue, timeout_seconds) for venue in configured)
         )
-        self._refresh_universe_snapshot(force=True)
+        await self._refresh_universe_snapshot(force=True)
 
     async def _initialise_venue_with_timeout(self, venue: Venue, timeout_seconds: int) -> None:
         try:
@@ -158,8 +188,6 @@ class PublicMarketEngine:
                 return
             self._instruments[venue] = instruments
             self._quarantined.pop(venue, None)
-            self._reconnect_attempts.pop(venue, None)
-            self._reconnect_after_ns.pop(venue, None)
         except Exception as error:
             self._quarantine(venue, f"capability probe failed: {type(error).__name__}: {error}")
 
@@ -168,8 +196,8 @@ class PublicMarketEngine:
         self._instruments.pop(venue, None)
         attempt = self._reconnect_attempts.get(venue, 0) + 1
         self._reconnect_attempts[venue] = attempt
-        delay_seconds = reconnect_backoff_seconds(attempt)
-        self._reconnect_after_ns[venue] = self._monotonic_ns() + delay_seconds * 1_000_000_000
+        delay_seconds = reconnect_delay_seconds(venue, attempt, self._reconnect_jitter)
+        self._reconnect_after_ns[venue] = self._monotonic_ns() + int(delay_seconds * 1_000_000_000)
         self._set_available_bbo_keys()
         self._bbo_changed.set()
 
@@ -196,23 +224,102 @@ class PublicMarketEngine:
             )
         )
 
-    def _sync_bbo_watchers(self) -> None:
+    def _cleanup_retired_bbo_tasks(self) -> None:
+        for venue, watcher in tuple(self._retiring_bbo_watchers.items()):
+            if watcher.done():
+                self._retiring_bbo_watchers.pop(venue, None)
+                self._consume_watcher(watcher)
+        for venue, transport in tuple(self._retiring_bbo_transports.items()):
+            if transport.done():
+                self._retiring_bbo_transports.pop(venue, None)
+                self._consume_transport(transport)
+
+    async def _sync_bbo_watchers(self) -> None:
+        self._cleanup_retired_bbo_tasks()
         desired = {
-            venue
+            venue: self._symbols_for_venue(venue)
             for venue in self._adapters
             if venue not in self._quarantined and self._symbols_for_venue(venue)
         }
+        newly_retiring: list[asyncio.Task[None]] = []
         for venue, task in tuple(self._bbo_watchers.items()):
-            if task.done() or venue not in desired:
-                if not task.done():
-                    task.cancel()
+            symbols_changed = self._bbo_watcher_symbols.get(venue) != desired.get(venue)
+            if task.done():
                 self._bbo_watchers.pop(venue, None)
-        for venue in sorted(desired, key=str):
-            if venue not in self._bbo_watchers:
+                self._bbo_watcher_symbols.pop(venue, None)
+                self._consume_watcher(task)
+            elif venue not in desired or symbols_changed:
+                task.cancel()
+                self._bbo_watchers.pop(venue, None)
+                self._bbo_watcher_symbols.pop(venue, None)
+                self._retiring_bbo_watchers[venue] = task
+                newly_retiring.append(task)
+        if newly_retiring:
+            await asyncio.wait(newly_retiring, timeout=self._bbo_retirement_grace_seconds)
+            await asyncio.sleep(0)
+        self._cleanup_retired_bbo_tasks()
+        retiring = tuple(
+            task
+            for task in (
+                *self._retiring_bbo_watchers.values(),
+                *self._retiring_bbo_transports.values(),
+            )
+            if not task.done()
+        )
+        if retiring:
+            await asyncio.wait(retiring, timeout=self._bbo_retirement_grace_seconds)
+            self._cleanup_retired_bbo_tasks()
+        retiring_venues = {
+            *self._retiring_bbo_watchers,
+            *self._retiring_bbo_transports,
+        }
+        for venue in retiring_venues:
+            if venue not in self._quarantined:
+                self._quarantine(venue, "prior BBO watcher did not terminate")
+        for venue, symbols in sorted(desired.items(), key=lambda item: str(item[0])):
+            if (
+                venue not in self._bbo_watchers
+                and venue not in self._quarantined
+                and venue not in retiring_venues
+            ):
+                self._bbo_watcher_symbols[venue] = symbols
                 self._bbo_watchers[venue] = asyncio.create_task(
                     self._run_bbo_watcher(venue),
                     name=f"broad-bbo-{venue.value}",
                 )
+
+    def _retire_bbo_transport(
+        self,
+        venue: Venue,
+        task: asyncio.Task[tuple[BboQuote, ...]],
+    ) -> None:
+        if task.done():
+            self._consume_transport(task)
+            return
+        task.cancel()
+        existing = self._retiring_bbo_transports.get(venue)
+        if existing is not None and existing is not task and not existing.done():
+            raise RuntimeError("multiple retiring BBO transports for one venue")
+        self._retiring_bbo_transports[venue] = task
+
+    async def _next_bbo_update(
+        self,
+        venue: Venue,
+        symbols: tuple[str, ...],
+    ) -> tuple[BboQuote, ...]:
+        transport = asyncio.create_task(
+            self._adapters[venue].watch_bbo(symbols),
+            name=f"broad-bbo-transport-{venue.value}",
+        )
+        try:
+            done, _ = await asyncio.wait((transport,), timeout=self._bbo_watch_timeout_seconds)
+            if not done:
+                self._retire_bbo_transport(venue, transport)
+                raise TimeoutError("batch BBO stream made no progress before staleness deadline")
+            return transport.result()
+        except asyncio.CancelledError:
+            self._retire_bbo_transport(venue, transport)
+            raise
 
     async def _run_bbo_watcher(self, venue: Venue) -> None:
         try:
@@ -221,16 +328,20 @@ class PublicMarketEngine:
                 if not symbols:
                     return
                 started_ns = time.monotonic_ns()
-                quotes = await self._adapters[venue].watch_bbo(symbols)
+                quotes = await self._next_bbo_update(venue, symbols)
                 if not quotes:
                     raise RuntimeError("batch BBO stream returned no updates")
-                self._bbo_cache.ingest(
+                accepted = self._bbo_cache.ingest(
                     quotes,
                     now_monotonic_ns=self._monotonic_ns(),
                 )
+                if accepted == 0:
+                    raise RuntimeError("batch BBO stream returned no qualified updates")
+                self._reconnect_attempts.pop(venue, None)
+                self._reconnect_after_ns.pop(venue, None)
                 self._bbo_changed.set()
                 if time.monotonic_ns() - started_ns < 1_000_000:
-                    await asyncio.sleep(0.001)
+                    await asyncio.sleep(0)
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -239,7 +350,7 @@ class PublicMarketEngine:
                 f"BBO stream failed: {type(error).__name__}: {error}",
             )
 
-    def _refresh_universe_snapshot(self, *, force: bool) -> UniverseSnapshot:
+    async def _refresh_universe_snapshot(self, *, force: bool) -> UniverseSnapshot:
         snapshot = self._universe.refresh(
             self._instruments,
             now=self._now_factory(),
@@ -247,7 +358,7 @@ class PublicMarketEngine:
             force=force,
         )
         self._set_available_bbo_keys()
-        self._sync_bbo_watchers()
+        await self._sync_bbo_watchers()
         return snapshot
 
     async def refresh_universe(
@@ -263,6 +374,8 @@ class PublicMarketEngine:
             venue
             for venue, retry_at_ns in self._reconnect_after_ns.items()
             if now_ns >= retry_at_ns
+            and venue not in self._retiring_bbo_watchers
+            and venue not in self._retiring_bbo_transports
         )
         reconnect_targets = tuple(
             sorted(
@@ -282,7 +395,7 @@ class PublicMarketEngine:
         await asyncio.gather(
             *(self._initialise_venue_with_timeout(venue, timeout_seconds) for venue in targets)
         )
-        return self._refresh_universe_snapshot(force=True)
+        return await self._refresh_universe_snapshot(force=True)
 
     async def _wait_for_bbo_coverage(self, timeout_seconds: int) -> None:
         loop = asyncio.get_running_loop()
@@ -308,7 +421,8 @@ class PublicMarketEngine:
         if not self._adapters:
             await self.initialise(timeout_seconds)
         universe = await self.refresh_universe(timeout_seconds)
-        self._sync_bbo_watchers()
+        await self._sync_bbo_watchers()
+        started_ns = time.perf_counter_ns()
         await self._wait_for_bbo_coverage(timeout_seconds)
         now_ns = self._monotonic_ns()
         available_routes = tuple(
@@ -318,8 +432,11 @@ class PublicMarketEngine:
             and route.short_instrument.venue not in self._quarantined
         )
         fresh = self._bbo_cache.fresh(now_monotonic_ns=now_ns)
-        started_ns = time.perf_counter_ns()
-        prefilter = rank_bbo_prefilter(available_routes, fresh)
+        prefilter = rank_bbo_prefilter(
+            available_routes,
+            fresh,
+            stale_keys=self._bbo_cache.stale_keys(now_monotonic_ns=now_ns),
+        )
         latency_ms = Decimal(time.perf_counter_ns() - started_ns) / Decimal(1_000_000)
         return BroadBboResult(
             universe.generation,
@@ -328,7 +445,7 @@ class PublicMarketEngine:
             len(available_routes),
             fresh,
             prefilter,
-            self._bbo_cache.stats,
+            self._bbo_cache.stats_at(now_monotonic_ns=now_ns),
             latency_ms,
             tuple(self._quarantined[venue] for venue in sorted(self._quarantined, key=str)),
         )
@@ -500,22 +617,49 @@ class PublicMarketEngine:
 
     async def close(self) -> None:
         self._closed = True
-        watchers = tuple(self._bbo_watchers.values())
-        self._bbo_watchers.clear()
-        for task in watchers:
+        for task in self._bbo_watchers.values():
             task.cancel()
-        if watchers:
-            done, pending = await asyncio.wait(watchers, timeout=1)
-            for task in done:
-                self._consume_watcher(task)
-            for task in pending:
-                task.add_done_callback(self._consume_watcher)
-        await asyncio.gather(
-            *(adapter.close() for adapter in self._adapters.values()),
-            return_exceptions=True,
+        adapter_closers = tuple(
+            asyncio.create_task(adapter.close(), name=f"close-{venue.value}")
+            for venue, adapter in self._adapters.items()
         )
+        if adapter_closers:
+            done_closers, pending_closers = await asyncio.wait(adapter_closers, timeout=1)
+            for task in done_closers:
+                self._consume_watcher(task)
+            for task in pending_closers:
+                task.cancel()
+                task.add_done_callback(self._consume_watcher)
+        await asyncio.sleep(0)
+        for venue, task in self._bbo_watchers.items():
+            self._retiring_bbo_watchers.setdefault(venue, task)
+        self._bbo_watchers.clear()
+        self._bbo_watcher_symbols.clear()
+        retiring_watchers = tuple(set(self._retiring_bbo_watchers.values()))
+        retiring_transports = tuple(set(self._retiring_bbo_transports.values()))
+        for watcher in retiring_watchers:
+            watcher.cancel()
+        for transport in retiring_transports:
+            transport.cancel()
+        if retiring_watchers:
+            await asyncio.wait(retiring_watchers, timeout=1)
+        if retiring_transports:
+            await asyncio.wait(retiring_transports, timeout=1)
+        if retiring_watchers or retiring_transports:
+            self._cleanup_retired_bbo_tasks()
+            for watcher in retiring_watchers:
+                if not watcher.done():
+                    watcher.add_done_callback(self._consume_watcher)
+            for transport in retiring_transports:
+                if not transport.done():
+                    transport.add_done_callback(self._consume_transport)
 
     @staticmethod
     def _consume_watcher(task: asyncio.Task[None]) -> None:
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+    @staticmethod
+    def _consume_transport(task: asyncio.Task[tuple[BboQuote, ...]]) -> None:
         with suppress(asyncio.CancelledError, Exception):
             task.result()
