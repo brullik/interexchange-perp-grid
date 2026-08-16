@@ -135,6 +135,7 @@ class CcxtProAdapter(ExchangeAdapter):
         self._exchange: Any = exchange if exchange is not None else self._build_exchange(venue)
         self._clock_skew_ms: int | None = None
         self._instruments: dict[str, Instrument] = {}
+        self._bbo_subscription_kind: str | None = None
 
     @staticmethod
     def _build_exchange(venue: Venue) -> Any:
@@ -158,9 +159,38 @@ class CcxtProAdapter(ExchangeAdapter):
         capabilities = _mapping(self._exchange.has)
         return _supported(capabilities.get(capability))
 
+    def _has_concrete_method(self, method_name: str) -> bool:
+        method = getattr(self._exchange, method_name, None)
+        if not callable(method):
+            return False
+        for owner in type(self._exchange).__mro__:
+            if method_name not in owner.__dict__:
+                continue
+            return owner.__module__ != "ccxt.async_support.base.exchange"
+        return False
+
+    def _bbo_stream_kind(self) -> str | None:
+        capabilities = _mapping(self._exchange.has)
+        pairs = (
+            ("bids_asks", "watchBidsAsks", "unWatchBidsAsks", "un_watch_bids_asks"),
+            ("tickers", "watchTickers", "unWatchTickers", "un_watch_tickers"),
+        )
+        for kind, watch_capability, unwatch_capability, unwatch_method in pairs:
+            declared_unwatch = capabilities.get(unwatch_capability)
+            if (
+                self._has(watch_capability)
+                and declared_unwatch is not False
+                and self._has_concrete_method(unwatch_method)
+            ):
+                return kind
+        return None
+
+    def _bbo_ticker_params(self) -> dict[str, str]:
+        return {"name": "ticker"} if self.venue == Venue.BINANCE_USDM else {}
+
     async def probe_public_capabilities(self) -> CapabilityReport:
         await self._exchange.load_markets()
-        bbo_stream = any(self._has(capability) for capability in ("watchBidsAsks", "watchTickers"))
+        bbo_stream = self._bbo_stream_kind() is not None
         l2_stream = self._has("watchOrderBook")
         funding = self._has("fetchFundingRate") or self._has("fetchFundingRates")
         mark_index = self._has("fetchMarkPrice") or self._has("fetchTicker")
@@ -239,7 +269,9 @@ class CcxtProAdapter(ExchangeAdapter):
     async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
         if not symbols:
             return ()
-        if self._has("watchBidsAsks"):
+        stream_kind = self._bbo_stream_kind()
+        if stream_kind == "bids_asks":
+            self._bbo_subscription_kind = stream_kind
             raw_result = await self._exchange.watch_bids_asks(list(symbols))
             if not isinstance(raw_result, Mapping):
                 raise TypeError("CCXT watch_bids_asks must return a mapping")
@@ -248,8 +280,12 @@ class CcxtProAdapter(ExchangeAdapter):
                 for raw in raw_result.values()
                 if isinstance(raw, Mapping) and raw.get("symbol") in symbols
             )
-        if self._has("watchTickers"):
-            raw_result = await self._exchange.watch_tickers(list(symbols))
+        if stream_kind == "tickers":
+            self._bbo_subscription_kind = stream_kind
+            raw_result = await self._exchange.watch_tickers(
+                list(symbols),
+                self._bbo_ticker_params(),
+            )
             if not isinstance(raw_result, Mapping):
                 raise TypeError("CCXT watch_tickers must return a mapping")
             return tuple(
@@ -258,6 +294,18 @@ class CcxtProAdapter(ExchangeAdapter):
                 if isinstance(raw, Mapping) and raw.get("symbol") in symbols
             )
         raise RuntimeError("batch BBO stream capability is required")
+
+    async def unwatch_bbo(self, symbols: tuple[str, ...]) -> None:
+        if self._bbo_subscription_kind == "bids_asks":
+            await self._exchange.un_watch_bids_asks(list(symbols))
+        elif self._bbo_subscription_kind == "tickers":
+            await self._exchange.un_watch_tickers(
+                list(symbols),
+                self._bbo_ticker_params(),
+            )
+        else:
+            raise RuntimeError("broad BBO subscription kind is unknown")
+        self._bbo_subscription_kind = None
 
     async def watch_order_book(self, instrument: Instrument, limit: int = 50) -> OrderBookSnapshot:
         if self.venue == Venue.OKX:
@@ -292,6 +340,20 @@ class CcxtProAdapter(ExchangeAdapter):
             sequence_reset=raw.get("ipegSequenceReset") is True,
             sequence_contiguous=raw.get("ipegSequenceContiguous") is not False,
         )
+
+    async def unwatch_order_book(self, instrument: Instrument, limit: int = 50) -> None:
+        if self.venue == Venue.OKX:
+            await self._exchange.un_watch_order_book(
+                instrument.symbol,
+                {"depth": "books"},
+            )
+        elif self.venue == Venue.BYBIT:
+            await self._exchange.un_watch_order_book(
+                instrument.symbol,
+                {"limit": limit},
+            )
+        else:
+            await self._exchange.un_watch_order_book(instrument.symbol, {})
 
     @staticmethod
     def _normalise_levels(raw_levels: object, instrument: Instrument) -> tuple[BookLevel, ...]:

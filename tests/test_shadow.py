@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from interexchange_perp_grid.bbo_prefilter import BboPrefilterObservation
+from interexchange_perp_grid.candidate_l2 import CandidateL2Result, CandidateL2Stats
 from interexchange_perp_grid.config import load_settings
 from interexchange_perp_grid.domain import InstrumentKey, Venue
 from interexchange_perp_grid.execution import (
@@ -16,7 +18,7 @@ from interexchange_perp_grid.execution import (
     Side,
     Tranche,
 )
-from interexchange_perp_grid.public_engine import ScanResult
+from interexchange_perp_grid.public_engine import PublicWorkload, ScanResult
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.routes import DirectedRouteQuote
 from interexchange_perp_grid.shadow import (
@@ -102,14 +104,52 @@ def test_overload_preserves_risk_reduction_and_disables_new_entries_first() -> N
 
 
 class OneScanEngine:
-    def __init__(self, stop_event: asyncio.Event) -> None:
+    def __init__(
+        self,
+        stop_event: asyncio.Event,
+        workload: PublicWorkload | None = None,
+    ) -> None:
         self.stop_event = stop_event
+        self.workload = workload or PublicWorkload(0, 0, 0)
         self.closed = False
+        self.broad_admissions: list[bool] = []
+        self.candidate_admissions: list[bool] = []
 
-    async def scan_once(self, base: str, quantity: Decimal, timeout: int) -> ScanResult:
-        del quantity, timeout
+    async def scan_once(
+        self,
+        base: str,
+        quantity: Decimal,
+        timeout: int,
+        *,
+        active_route_keys: frozenset[tuple[str, str, str]] = frozenset(),
+        entry_work_admitted: bool = True,
+    ) -> ScanResult:
+        del quantity, timeout, active_route_keys, entry_work_admitted
         self.stop_event.set()
         return ScanResult(base, 1, (), (), (), (), (), ())
+
+    async def scan_candidate_l2(
+        self,
+        timeout_seconds: int,
+        *,
+        active_route_keys: frozenset[tuple[str, str, str]] = frozenset(),
+        candidates_admitted: bool = True,
+        prefilter: tuple[BboPrefilterObservation, ...] | None = None,
+        preserve_existing_candidates: bool = False,
+    ) -> CandidateL2Result:
+        del timeout_seconds, active_route_keys, prefilter, preserve_existing_candidates
+        self.candidate_admissions.append(candidates_admitted)
+        return CandidateL2Result(
+            (),
+            CandidateL2Stats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            Decimal(0),
+        )
+
+    def public_workload(self) -> PublicWorkload:
+        return self.workload
+
+    async def set_broad_bbo_admitted(self, admitted: bool) -> None:
+        self.broad_admissions.append(admitted)
 
     async def close(self) -> None:
         self.closed = True
@@ -133,7 +173,61 @@ async def test_continuous_evaluator_persists_non_stub_market_snapshot(tmp_path: 
     assert snapshot is not None
     assert snapshot["base"] == "BTC"
     assert snapshot["evaluated_at"] <= datetime.now(UTC).isoformat()
+    assert snapshot["candidate_l2"]["execution_authorized"] is False
     assert engine.closed is True
+
+
+@pytest.mark.asyncio
+async def test_continuous_evaluator_applies_runtime_overload_before_public_work(
+    tmp_path: Path,
+) -> None:
+    stop = asyncio.Event()
+    loaded = load_settings(
+        CONFIG,
+        {
+            "IPEG_STATE_PATH": str(tmp_path / "overload.sqlite3"),
+            "IPEG_PARQUET_DIR": str(tmp_path / "market"),
+        },
+    )
+    settings = loaded.model_copy(
+        update={
+            "shadow": loaded.shadow.model_copy(update={"overload_pending_limit": 2}),
+        }
+    )
+    engine = OneScanEngine(stop, PublicWorkload(2, 2, 2))
+    evaluator = ContinuousShadowEvaluator(settings, engine=engine)
+
+    await evaluator.run(stop)
+
+    assert engine.broad_admissions == [False]
+    assert engine.candidate_admissions == [False]
+    assert evaluator.runtime.overload.admit(WorkClass.NEW_ENTRY).reason == (
+        ReasonCode.OVERLOAD_ENTRY_DISABLED
+    )
+
+
+def test_public_workload_does_not_double_count_incoming_entry(tmp_path: Path) -> None:
+    loaded = load_settings(
+        CONFIG,
+        {
+            "IPEG_STATE_PATH": str(tmp_path / "entry-capacity.sqlite3"),
+            "IPEG_PARQUET_DIR": str(tmp_path / "market"),
+        },
+    )
+    settings = loaded.model_copy(
+        update={
+            "shadow": loaded.shadow.model_copy(update={"overload_pending_limit": 3}),
+        }
+    )
+    engine = OneScanEngine(asyncio.Event(), PublicWorkload(2, 2, 2))
+    evaluator = ContinuousShadowEvaluator(settings, engine=engine)
+    active = frozenset({("BTC", Venue.BYBIT.value, Venue.OKX.value)})
+
+    broad_admitted, candidates_admitted = evaluator._apply_public_workload(active)
+
+    assert broad_admitted is False
+    assert candidates_admitted is False
+    assert evaluator.runtime.overload.admit(WorkClass.NEW_ENTRY).accepted is True
 
 
 @pytest.mark.asyncio

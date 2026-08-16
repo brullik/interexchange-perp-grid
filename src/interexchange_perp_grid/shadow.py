@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
+from interexchange_perp_grid.bbo_prefilter import BboPrefilterObservation
+from interexchange_perp_grid.candidate_l2 import CandidateL2Result, RouteStableKey
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import (
@@ -24,7 +26,7 @@ from interexchange_perp_grid.execution import (
 )
 from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.observability import get_logger
-from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
+from interexchange_perp_grid.public_engine import PublicMarketEngine, PublicWorkload, ScanResult
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import (
     RiskBook,
@@ -72,7 +74,24 @@ class MarketEngine(Protocol):
         base: str,
         requested_base_quantity: Decimal,
         timeout_seconds: int,
+        *,
+        active_route_keys: frozenset[RouteStableKey] = frozenset(),
+        entry_work_admitted: bool = True,
     ) -> ScanResult: ...
+
+    async def scan_candidate_l2(
+        self,
+        timeout_seconds: int,
+        *,
+        active_route_keys: frozenset[RouteStableKey] = frozenset(),
+        candidates_admitted: bool = True,
+        prefilter: tuple[BboPrefilterObservation, ...] | None = None,
+        preserve_existing_candidates: bool = False,
+    ) -> CandidateL2Result: ...
+
+    def public_workload(self) -> PublicWorkload: ...
+
+    async def set_broad_bbo_admitted(self, admitted: bool) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -82,6 +101,16 @@ CRITICAL_WORK = {
     WorkClass.HEDGE,
     WorkClass.RECONCILE,
     WorkClass.PRIVATE_STREAM,
+}
+
+WORK_PRIORITY = {
+    WorkClass.CLOSE: 0,
+    WorkClass.HEDGE: 1,
+    WorkClass.RECONCILE: 2,
+    WorkClass.PRIVATE_STREAM: 3,
+    WorkClass.NEW_ENTRY: 4,
+    WorkClass.CANDIDATE_L2: 5,
+    WorkClass.BROAD_BBO: 6,
 }
 
 
@@ -97,6 +126,7 @@ class OverloadController:
             raise ValueError("pending work limit must be positive")
         self._pending_limit = pending_limit
         self._pending = 0
+        self._pending_by_class: dict[WorkClass, int] = {}
 
     @property
     def overloaded(self) -> bool:
@@ -106,11 +136,55 @@ class OverloadController:
         if pending < 0:
             raise ValueError("pending work cannot be negative")
         self._pending = pending
+        self._pending_by_class = {}
+
+    def update_pending_by_class(self, pending: dict[WorkClass, int]) -> None:
+        if any(count < 0 for count in pending.values()):
+            raise ValueError("pending work cannot be negative")
+        self._pending_by_class = {work: count for work, count in pending.items() if count}
+        self._pending = sum(self._pending_by_class.values())
+
+    def shed_plan(self) -> tuple[WorkClass, ...]:
+        excess = max(0, self._pending - self._pending_limit)
+        shed: list[WorkClass] = []
+        for work in sorted(
+            (WorkClass.BROAD_BBO, WorkClass.CANDIDATE_L2),
+            key=WORK_PRIORITY.__getitem__,
+            reverse=True,
+        ):
+            count = min(excess, self._pending_by_class.get(work, 0))
+            shed.extend((work,) * count)
+            excess -= count
+        return tuple(shed)
 
     def admit(self, work: WorkClass) -> AdmissionDecision:
-        if not self.overloaded or work in CRITICAL_WORK:
+        if work in CRITICAL_WORK:
             return AdmissionDecision(True, ReasonCode.SHADOW_EVALUATED)
-        return AdmissionDecision(False, ReasonCode.OVERLOAD_ENTRY_DISABLED)
+        if self._pending + 1 <= self._pending_limit:
+            return AdmissionDecision(True, ReasonCode.SHADOW_EVALUATED)
+        if work == WorkClass.BROAD_BBO:
+            return AdmissionDecision(False, ReasonCode.OVERLOAD_BROAD_SHED)
+        if work == WorkClass.CANDIDATE_L2:
+            remaining_excess = max(
+                0,
+                self._pending
+                + 1
+                - self._pending_limit
+                - self._pending_by_class.get(WorkClass.BROAD_BBO, 0),
+            )
+            if remaining_excess > 0:
+                return AdmissionDecision(False, ReasonCode.OVERLOAD_CANDIDATE_SHED)
+            return AdmissionDecision(True, ReasonCode.SHADOW_EVALUATED)
+        lower_priority_pending = sum(
+            self._pending_by_class.get(pending_work, 0)
+            for pending_work in (WorkClass.BROAD_BBO, WorkClass.CANDIDATE_L2)
+        )
+        if (
+            not self._pending_by_class
+            or self._pending + 1 - lower_priority_pending > self._pending_limit
+        ):
+            return AdmissionDecision(False, ReasonCode.OVERLOAD_ENTRY_DISABLED)
+        return AdmissionDecision(True, ReasonCode.SHADOW_EVALUATED)
 
 
 ACTIVE_STATES = {
@@ -634,6 +708,7 @@ def _scan_payload(
         "prefilter_latency_ms": (
             str(result.prefilter_latency_ms) if result.prefilter_latency_ms is not None else None
         ),
+        "candidate_l2": asdict(result.candidate_l2) if result.candidate_l2 is not None else None,
         "opportunities": [asdict(quote) for quote in result.quotes],
         "data_health": [asdict(quality) for quality in result.data_quality],
         "quarantined": [asdict(record) for record in result.quarantined],
@@ -653,6 +728,25 @@ class ContinuousShadowEvaluator:
         self.runtime = runtime or ShadowRuntime(settings)
         self._engine = engine or PublicMarketEngine(settings)
         self._trader = trader or ShadowTrader(settings, self.runtime)
+        self._last_prefilter: tuple[BboPrefilterObservation, ...] = ()
+
+    def _apply_public_workload(
+        self,
+        active_route_keys: frozenset[RouteStableKey],
+    ) -> tuple[bool, bool]:
+        workload = self._engine.public_workload()
+        self.runtime.overload.update_pending_by_class(
+            {
+                WorkClass.RECONCILE: max(
+                    workload.active_l2_tasks,
+                    len(active_route_keys) * 2,
+                ),
+                WorkClass.CANDIDATE_L2: workload.candidate_l2_demand,
+                WorkClass.BROAD_BBO: workload.broad_bbo_demand,
+            }
+        )
+        shed = set(self.runtime.overload.shed_plan())
+        return WorkClass.BROAD_BBO not in shed, WorkClass.CANDIDATE_L2 not in shed
 
     async def run(self, stop_event: asyncio.Event) -> None:
         logger = get_logger()
@@ -681,11 +775,55 @@ class ContinuousShadowEvaluator:
                                 timeout=self.settings.shadow.scan_interval_seconds,
                             )
                         continue
+                    active_route_keys = frozenset(
+                        (
+                            tranche.route.base,
+                            tranche.route.long_venue.value,
+                            tranche.route.short_venue.value,
+                        )
+                        for tranche in self.runtime.tranches.values()
+                        if tranche.state in ACTIVE_STATES
+                    )
+                    broad_admitted, candidates_admitted = self._apply_public_workload(
+                        active_route_keys
+                    )
+                    if active_route_keys:
+                        await self._engine.scan_candidate_l2(
+                            self.settings.shadow.scan_timeout_seconds,
+                            active_route_keys=active_route_keys,
+                            candidates_admitted=candidates_admitted,
+                            prefilter=self._last_prefilter,
+                            preserve_existing_candidates=True,
+                        )
+                    await self._engine.set_broad_bbo_admitted(broad_admitted)
+                    entry_work_admitted = self.runtime.overload.admit(WorkClass.NEW_ENTRY).accepted
                     result = await self._engine.scan_once(
                         self.settings.shadow.base,
                         self.settings.shadow.quantity,
                         self.settings.shadow.scan_timeout_seconds,
+                        active_route_keys=active_route_keys,
+                        entry_work_admitted=entry_work_admitted,
                     )
+                    self._last_prefilter = result.prefilter
+                    candidate_l2 = await self._engine.scan_candidate_l2(
+                        self.settings.shadow.scan_timeout_seconds,
+                        active_route_keys=active_route_keys,
+                        candidates_admitted=candidates_admitted,
+                        prefilter=result.prefilter,
+                    )
+                    next_broad_admitted, next_candidates_admitted = self._apply_public_workload(
+                        active_route_keys
+                    )
+                    if next_broad_admitted != broad_admitted:
+                        await self._engine.set_broad_bbo_admitted(next_broad_admitted)
+                    if candidates_admitted and not next_candidates_admitted:
+                        candidate_l2 = await self._engine.scan_candidate_l2(
+                            self.settings.shadow.scan_timeout_seconds,
+                            active_route_keys=active_route_keys,
+                            candidates_admitted=False,
+                            prefilter=result.prefilter,
+                        )
+                    result = replace(result, candidate_l2=candidate_l2)
                     decisions = await self._trader.process(result)
                     await save_shadow_snapshot(
                         self.runtime.state_path,

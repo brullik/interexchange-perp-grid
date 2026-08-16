@@ -139,6 +139,18 @@ class SequenceBookExchange:
         }
 
 
+class UnwatchExchange:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def un_watch_order_book(
+        self,
+        symbol: str,
+        params: dict[str, object],
+    ) -> None:
+        self.calls.append((symbol, params))
+
+
 class TickerOnlyExchange:
     has: ClassVar[dict[str, object]] = {"watchTicker": True}
 
@@ -151,6 +163,34 @@ class TickerOnlyExchange:
         return {}
 
 
+class PairedBatchTickerExchange:
+    has: ClassVar[dict[str, object]] = {
+        "watchBidsAsks": True,
+        "unWatchBidsAsks": None,
+        "watchTickers": True,
+        "unWatchTickers": True,
+    }
+
+    def __init__(self) -> None:
+        self.watch_calls: list[tuple[list[str], dict[str, str]]] = []
+        self.unwatch_calls: list[tuple[list[str], dict[str, str]]] = []
+
+    async def watch_tickers(
+        self,
+        symbols: list[str],
+        params: dict[str, str],
+    ) -> dict[str, object]:
+        self.watch_calls.append((symbols, params))
+        return {}
+
+    async def un_watch_tickers(
+        self,
+        symbols: list[str],
+        params: dict[str, str],
+    ) -> None:
+        self.unwatch_calls.append((symbols, params))
+
+
 @pytest.mark.asyncio
 async def test_broad_bbo_rejects_unbounded_per_symbol_ticker_fallback() -> None:
     exchange = TickerOnlyExchange()
@@ -160,6 +200,38 @@ async def test_broad_bbo_rejects_unbounded_per_symbol_ticker_fallback() -> None:
         await adapter.watch_bbo(tuple(f"A{index}/USDT:USDT" for index in range(101)))
 
     assert exchange.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("venue", "expected_params"),
+    (
+        (Venue.BINANCE_USDM, {"name": "ticker"}),
+        (Venue.BYBIT, {}),
+        (Venue.OKX, {}),
+    ),
+)
+async def test_broad_bbo_uses_only_a_batch_stream_with_matching_unsubscribe(
+    venue: Venue,
+    expected_params: dict[str, str],
+) -> None:
+    exchange = PairedBatchTickerExchange()
+    adapter = CcxtProAdapter(venue, exchange=exchange)
+    symbols = ("BTC/USDT:USDT", "ETH/USDT:USDT")
+
+    assert await adapter.watch_bbo(symbols) == ()
+    await adapter.unwatch_bbo(symbols)
+
+    expected_call = (list(symbols), expected_params)
+    assert exchange.watch_calls == [expected_call]
+    assert exchange.unwatch_calls == [expected_call]
+
+
+@pytest.mark.parametrize("venue", tuple(Venue))
+def test_pinned_wave1_broad_bbo_transport_has_matching_unsubscribe(venue: Venue) -> None:
+    adapter = CcxtProAdapter(venue)
+
+    assert adapter._bbo_stream_kind() == "tickers"
 
 
 @pytest.mark.asyncio
@@ -186,3 +258,39 @@ async def test_ccxt_book_carries_native_non_contiguous_sequence_evidence() -> No
     assert book.sequence_start == book.sequence_end == 105
     assert book.sequence_contiguous is False
     assert book.sequence_reset is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("venue", "expected_params"),
+    (
+        (Venue.BINANCE_USDM, {}),
+        (Venue.BYBIT, {"limit": 50}),
+        (Venue.OKX, {"depth": "books"}),
+    ),
+)
+async def test_wave1_candidate_l2_unsubscribe_matches_subscription_contract(
+    venue: Venue,
+    expected_params: dict[str, object],
+) -> None:
+    exchange = UnwatchExchange()
+    adapter = CcxtProAdapter(venue, exchange=exchange)
+    instrument = Instrument(
+        venue,
+        "BTC/USDT:USDT",
+        "BTCUSDT",
+        "BTC",
+        "USDT",
+        "USDT",
+        Decimal("0.001"),
+        Decimal(1),
+        Decimal("0.1"),
+        Decimal(1),
+        Decimal(5),
+        Decimal("0.0005"),
+        "fixture",
+    )
+
+    await adapter.unwatch_order_book(instrument)
+
+    assert exchange.calls == [(instrument.symbol, expected_params)]

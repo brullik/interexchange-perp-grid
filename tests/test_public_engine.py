@@ -116,6 +116,9 @@ class FakeAdapter(ExchangeAdapter):
             ),
         )
 
+    async def unwatch_bbo(self, symbols: tuple[str, ...]) -> None:
+        del symbols
+
     async def watch_order_book(self, instrument: Instrument, limit: int = 50) -> OrderBookSnapshot:
         del limit
         self.book_calls += 1
@@ -194,6 +197,7 @@ class BroadFakeAdapter(ExchangeAdapter):
         self.discover_calls = 0
         self.probe_calls = 0
         self.bbo_calls = 0
+        self.bbo_unwatch_calls: list[tuple[str, ...]] = []
         self.last_bbo_symbols: tuple[str, ...] = ()
         self.bbo_subscription_changes = 0
         self.closed = False
@@ -243,6 +247,9 @@ class BroadFakeAdapter(ExchangeAdapter):
             for instrument in self.instruments
             if instrument.symbol in symbols
         )
+
+    async def unwatch_bbo(self, symbols: tuple[str, ...]) -> None:
+        self.bbo_unwatch_calls.append(symbols)
 
     async def watch_order_book(
         self,

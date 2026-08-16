@@ -65,3 +65,14 @@ class BookRegistry:
 
     def get(self, venue: Venue, symbol: str) -> OrderBookSnapshot | None:
         return self._books.get((venue, symbol))
+
+    def retain_keys(self, keys: frozenset[tuple[Venue, str]]) -> None:
+        self._last_sequence = {
+            key: sequence for key, sequence in self._last_sequence.items() if key in keys
+        }
+        self._books = {key: book for key, book in self._books.items() if key in keys}
+
+    def discard_keys(self, keys: frozenset[tuple[Venue, str]]) -> None:
+        for key in keys:
+            self._last_sequence.pop(key, None)
+            self._books.pop(key, None)
