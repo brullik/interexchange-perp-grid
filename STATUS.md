@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE3_2_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
-- **Current checkpoint:** Draft PR #5 Phase 3.2 local candidate passed 359 tests and independent dirty-tree adversarial/release review with P0/P1/P2=0; commit, fresh exact-head CI/artifacts, and exact-head review are still required before the checkpoint is complete
+- **State:** PHASE3_2_EXACT_F4D1_TECHNICAL_PASS_EVIDENCE_GATE
+- **Current checkpoint:** Draft PR #5 exact code checkpoint `f4d1f3e` passed all five jobs in run 31918092230, four exact-head artifacts, 359 tests, and independent technical review with P0=0/P1=0; this evidence-only status binding still requires fresh exact-head CI and final P0/P1/P2=0 review
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -23,7 +23,7 @@ This is the only mutable project-status document.
 | C4 live-canary-ready execution | RELEASED_RC1 | PR #1 was squash-merged; annotated tag and prerelease [`v0.1.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v0.1.0-rc1) are published. Fresh publisher run [31896663152](https://github.com/brullik/interexchange-perp-grid/actions/runs/31896663152) published both GHCR tags at immutable digest `sha256:2c3ba72caab2fd2c0e99e6efa3ecdaf8c18b20a8b272d872f75e6094ee8aecc8`; manifest artifact `9249990229` and release asset were independently verified with P0/P1/P2=0 |
 | Phase 2 Wave 1 data/private core | COMPLETE | PR #4 was independently verified with P0/P1/P2=0 and squash-merged as `0e87a1e`; post-merge [run 31904798345](https://github.com/brullik/interexchange-perp-grid/actions/runs/31904798345) passed all five jobs |
 | Phase 3.1 multi-instrument broad BBO | COMPLETE | Draft PR #5 exact code checkpoint `64e5c86e` and evidence-only head `18ae1b1`; real Wave 1 fixture qualifies one common instrument/six routes without fabricated OKX notional; malformed typed records are isolated through registry, route, and canary sizing; 102-safe-common/608-route synthetic boundary; one watchdog-protected batch watcher per venue; cancellation-safe retirement, idempotent transactional startup, single-flight refresh/recycle, tracked broad and selected-route scans, one bounded lifecycle shutdown barrier, explicit shutdown/teardown failure, cancellation-safe partial-factory rollback, and cancellation-aware two-phase Parquet publication with partial-write and event-loop-shutdown cleanup; six-hour resubscription; jittered 1→30 s reconnect; bounded cache with stale provenance; actual quote-receipt-to-prefilter latency; restart-identical proof; stable non-executable prefilter; exact run 31913700713 and independent P0/P1/P2=0 review passed |
-| Phase 3.2 bounded Candidate L2 + public overload admission | LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE | Deterministic top-30 QUOTE_READY directed candidates plus every active route; one deduplicated venue-symbol L2 subscription with matching Wave 1 unsubscribe; 100 ms coalescing/debounce; active P2 before candidate P5; broad/history P6 then candidate P5 shedding before P4; P0-P3 preserved; exact BookRegistry quality, venue outage, generation, freshness, and receipt-to-decision p95 checks; bounded tasks/cache/locks under 100k churn; restart/recycle/shutdown proof; `execution_authorized=false`; local 359-test gate plus three independent dirty-tree P0/P1/P2=0 reviews passed. This is PROD-05 COMPLETE at code-candidate level and only a narrow PARTIAL PROD-10 implementation; exact commit/CI/evidence remain pending |
+| Phase 3.2 bounded Candidate L2 + public overload admission | EXACT_TECHNICAL_PASS_EVIDENCE_GATE | Exact code checkpoint `f4d1f3e`; deterministic top-30 QUOTE_READY directed candidates plus every active route; one deduplicated venue-symbol L2 subscription with matching Wave 1 unsubscribe; 100 ms coalescing/debounce; active P2 before candidate P5; broad/history P6 then candidate P5 shedding before P4; P0-P3 preserved; exact BookRegistry quality, venue outage, generation, freshness, and receipt-to-decision p95 checks; bounded tasks/cache/locks under 100k churn; restart/recycle/shutdown proof; `execution_authorized=false`; local and Linux 359-test gates plus four exact-head artifacts in run 31918092230 passed. PROD-05 is COMPLETE at the reviewed code checkpoint; PROD-10 remains only narrow PARTIAL. This evidence-only binding needs fresh exact-head CI and final all-zero review |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -117,12 +117,15 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - pytest: 359 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 
-The local Phase 3.2 candidate was independently reviewed on stable file hashes by adversarial,
-release, and gap auditors with P0=0, P1=0, and P2=0. PROD-05 is implemented; PROD-10 is
-PARTIAL only. A checkpoint commit, fresh exact-head CI/artifacts, and exact-head all-zero review
-remain required before completion or any Ready/merge transition.
+Exact code checkpoint `f4d1f3e23d155f17a5c515f5f4224400823d42cf`: GitHub Actions run
+31918092230 passed all five jobs and produced four exact-head artifacts; local and Linux gates both
+passed 359 tests. Independent technical review found P0=0 and P1=0. PROD-05 is implemented;
+PROD-10 is PARTIAL only. This evidence-only status commit still requires fresh exact-head CI and
+final all-zero review before completion or any Ready/merge transition.
 
 GNU make is not installed on this Windows host. Exact Linux `make verify`, Docker smoke,
+security evidence, and independent exact-head technical review passed on code checkpoint `f4d1f3e`.
+Fresh CI and final review of this evidence-only binding remain required.
 No production credentials were used, Candidate L2 keeps `execution_authorized=false`, and no real
 order was submitted.
 ```
