@@ -104,6 +104,19 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
         return None
     if not isinstance(exchange_symbol, str) or not exchange_symbol:
         return None
+    if venue == Venue.MEXC and not (
+        info.get("apiAllowed") is True
+        and str(info.get("state")) == "0"
+        and info.get("symbol") == exchange_symbol
+        and info.get("baseCoin") == base
+        and info.get("quoteCoin") == "USDT"
+        and info.get("settleCoin") == "USDT"
+        and _decimal(info.get("contractSize")) == contract_size
+        and _decimal(info.get("priceUnit")) == price_tick
+        and _decimal(info.get("volUnit")) == amount_step
+        and _decimal(info.get("minVol")) == minimum_amount
+    ):
+        return None
     taker_fee = _decimal(market.get("taker"))
     minimum_notional = _decimal(cost_limits.get("min"))
     if minimum_notional is None and venue == Venue.BYBIT:
@@ -205,7 +218,9 @@ class CcxtProAdapter(ExchangeAdapter):
             ("bids_asks", "watchBidsAsks", "unWatchBidsAsks", "un_watch_bids_asks"),
             ("tickers", "watchTickers", "unWatchTickers", "un_watch_tickers"),
         )
-        if self.venue in {Venue.BITGET, Venue.MEXC}:
+        if self.venue == Venue.MEXC:
+            return None
+        if self.venue == Venue.BITGET:
             pairs = (pairs[1],)
         for kind, watch_capability, unwatch_capability, unwatch_method in pairs:
             declared_unwatch = capabilities.get(unwatch_capability)

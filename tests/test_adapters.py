@@ -346,7 +346,6 @@ async def test_broad_bbo_rejects_unbounded_per_symbol_ticker_fallback() -> None:
         (Venue.BYBIT, {}),
         (Venue.OKX, {}),
         (Venue.BITGET, {}),
-        (Venue.MEXC, {}),
     ),
 )
 async def test_broad_bbo_uses_only_a_batch_stream_with_matching_unsubscribe(

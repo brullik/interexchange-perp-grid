@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from decimal import Decimal
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import pytest
 
@@ -56,90 +55,6 @@ def _market(*, api_allowed: bool = True) -> dict[str, object]:
     }
 
 
-class CapturingMexcExchange(SequenceQualifiedMexcExchange):
-    def __init__(self) -> None:
-        super().__init__({"newUpdates": True, "options": {"defaultType": "swap"}})
-        self.set_markets([_market()])
-        self.frames: list[dict[str, object]] = []
-
-    async def load_markets(
-        self,
-        reload: bool = False,
-        params: dict[str, object] | None = None,
-    ) -> Any:
-        del reload, params
-        return self.markets
-
-    async def watch_multiple(
-        self,
-        url: str,
-        message_hashes: list[str],
-        message: dict[str, object] | None = None,
-        subscribe_hashes: list[str] | None = None,
-        subscription: dict[str, object] | None = None,
-    ) -> Any:
-        del url, message_hashes, subscribe_hashes, subscription
-        assert message is not None
-        self.frames.append(message)
-        return []
-
-    def client(self, url: str) -> object:
-        del url
-        return object()
-
-    def handle_unsubscriptions(self, client: object, message_hashes: list[str]) -> None:
-        del client, message_hashes
-
-
-@pytest.mark.asyncio
-async def test_mexc_batch_ticker_subscribe_and_unsubscribe_are_symmetric() -> None:
-    exchange = CapturingMexcExchange()
-
-    await exchange.watch_tickers(["BTC/USDT:USDT"])
-    await exchange.un_watch_tickers(["BTC/USDT:USDT"])
-
-    assert exchange.frames == [
-        {"method": "sub.tickers", "params": {}},
-        {"method": "unsub.tickers", "params": {}},
-    ]
-
-
-class ResolveClient:
-    def __init__(self) -> None:
-        self.values: list[tuple[object, str]] = []
-
-    def resolve(self, value: object, message_hash: str) -> None:
-        self.values.append((value, message_hash))
-
-
-def test_mexc_batch_ticker_normalizes_bid_and_ask() -> None:
-    exchange = SequenceQualifiedMexcExchange({"newUpdates": True})
-    exchange.set_markets([_market()])
-    client = ResolveClient()
-
-    exchange.handle_message(
-        client,
-        {
-            "channel": "push.tickers",
-            "data": [
-                {
-                    "symbol": "BTC_USDT",
-                    "lastPrice": 100.5,
-                    "bid1": 100,
-                    "ask1": 101,
-                    "timestamp": 1_700_000_000_000,
-                }
-            ],
-            "ts": 1_700_000_000_000,
-        },
-    )
-
-    ticker = exchange.tickers["BTC/USDT:USDT"]
-    assert ticker["bid"] == 100
-    assert ticker["ask"] == 101
-    assert client.values[-1][1] == "ticker"
-
-
 def test_mexc_incremental_depth_gap_latches_until_transport_reinitialises() -> None:
     exchange = SequenceQualifiedMexcExchange({"newUpdates": True})
     book = exchange.order_book({}, 50)
@@ -165,6 +80,22 @@ def test_mexc_exact_linear_usdt_metadata_is_fail_closed() -> None:
     assert instrument.minimum_notional is None
     assert instrument.no_fixed_minimum_notional is True
     assert normalize_market(Venue.MEXC, _market(api_allowed=False)) is None
+    for raw_field, invalid_value in (
+        ("symbol", "ETH_USDT"),
+        ("baseCoin", "ETH"),
+        ("quoteCoin", "USDC"),
+        ("settleCoin", "USDC"),
+        ("contractSize", 0.01),
+        ("priceUnit", 99),
+        ("volUnit", 2),
+        ("minVol", 2),
+        ("state", 4),
+    ):
+        malformed = _market()
+        info = malformed["info"]
+        assert isinstance(info, dict)
+        info[raw_field] = invalid_value
+        assert normalize_market(Venue.MEXC, malformed) is None
 
 
 class PrivateCapabilityExchange:
@@ -189,12 +120,12 @@ class PrivateCapabilityExchange:
     async def load_markets(self) -> dict[str, object]:
         return {}
 
-    async def create_order(self, *args: object) -> Mapping[str, object]:
+    async def create_order(self, *args: object) -> dict[str, object]:
         del args
         self.create_calls += 1
         return {}
 
-    async def cancel_order(self, *args: object) -> Mapping[str, object]:
+    async def cancel_order(self, *args: object) -> dict[str, object]:
         del args
         self.cancel_calls += 1
         return {}
@@ -229,10 +160,10 @@ async def test_mexc_contract_writes_are_physically_denied_while_api_is_in_mainte
     assert exchange.create_calls == exchange.cancel_calls == 0
 
 
-def test_pinned_mexc_uses_batch_tickers_and_sequenced_l2() -> None:
+def test_pinned_mexc_rejects_unqualified_broad_bbo_and_exposes_sequenced_l2() -> None:
     adapter = CcxtProAdapter(Venue.MEXC)
 
     assert isinstance(adapter._exchange, SequenceQualifiedMexcExchange)
-    assert adapter._bbo_stream_kind() == "tickers"
+    assert adapter._bbo_stream_kind() is None
     assert adapter._exchange.has["watchOrderBook"] is True
     assert adapter._exchange.has["unWatchOrderBook"] is True

@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE5_4_MEXC_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
-- **Current checkpoint:** Phase 5.4 MEXC public/read-only code candidate passes the local locked gate; checkpoint commit, exact-head CI/artifacts, and independent exact review remain required. MEXC contract writes and live remain disabled
+- **State:** PHASE5_4_MEXC_REMEDIATION_LOCAL_PASS_AWAITING_NEW_EXACT_GATE
+- **Current checkpoint:** Phase 5.4 MEXC fail-closed remediation passes the local locked gate; a new checkpoint commit, exact-head CI/artifacts, and independent exact review remain required. MEXC broad BBO, contract writes, and live remain disabled
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -37,7 +37,7 @@ This is the only mutable project-status document.
 | Phase 5.1 Bitget Classic code candidate | COMPLETE | Bitget is now a typed venue profile with a Classic-only CCXT Pro transport, exact 4096-byte batch ticker framing and matching unsubscribe acknowledgement, raw books15 sequence propagation/regression rejection, exact linear-USDT discovery, split account-wide read-only snapshot/stream params, and final pinned protected IOC `clientOid`/crossed/force mapping. Wave 1 remains exactly Binance USD-M/Bybit/OKX; Bitget is explicitly denied at the live-canary submit boundary. Exact code head `2bee950`; local locked gate: lock64, Ruff96, mypy94, pytest547, doctor shadow/live=false, Bandit medium/high0, diff-check; exact run `32411553358` passed all five jobs and produced replay, C4 critical, C4.3, and security artifacts bound to the exact SHA; independent exact-head review P0=0/P1=0/P2=0. No credentials or network evidence were fabricated. |
 | Phase 5.2 KuCoin Futures Classic code candidate | COMPLETE | KuCoin Futures is now a typed Classic-only venue profile with exact batch-BBO topic framing and matching unsubscribe, raw Level-50 sequence propagation, strict linear-USDT/no-fixed-notional proof, account-wide Classic position stream, read-only private snapshots/streams, and pinned protected cross/IOC `clientOid` request mapping. Raw `positionSide` preserves independent hedge sides when zero-position tombstones arrive; ambiguous side-less records fail closed. Wave 1 remains exactly Binance USD-M/Bybit/OKX and KuCoin is denied at the live-canary boundary. Exact code head `d37ded5`; local gate lock64/Ruff97/mypy95/pytest566/doctor shadow-live=false/Bandit0/diff-check passed; exact run `32415664858` passed all five jobs with replay `9423845774`, C4 critical `9423825785`, C4.3 `9423818033`, and security `9423805574`; independent exact review P0/P1/P2=0. |
 | Phase 5.3 BingX capability-gated code candidate | COMPLETE | BingX is now a typed venue profile with official `incrDepth` snapshot/update sequence enforcement, persistent desynchronisation until a fresh `action=all`, matching L2 unsubscribe, exact linear-USDT amount/notional metadata, account-wide read-only private parameters, and pinned protected IOC `clientOrderID`/`positionSide=BOTH` mapping. Official BingX WS documents only per-symbol BBO, so the adapter truthfully reports broad BBO unavailable instead of creating an unbounded fallback. Wave 1 remains Binance USD-M/Bybit/OKX and BingX is denied at the live-canary boundary. Exact code head `0678049`; local gate lock64/Ruff99/mypy97/pytest579/doctor shadow-live=false/Bandit0/diff-check passed; exact run `32418726763` passed all five jobs with replay `9424931463`, C4 critical `9424899802`, C4.3 `9424897938`, and security `9424888032`; test-hardening head `54b46f0` passed run `32419627419` 5/5 with replay `9425251748`, C4 critical `9425231202`, C4.3 `9425231328`, and security `9425217060`; independent exact review P0/P1/P2=0. |
-| Phase 5.4 MEXC capability-gated code candidate | LOCAL_TECHNICAL_PASS | MEXC is now a typed venue profile with official all-contract `sub.tickers`/`unsub.tickers`, an awaited matching unsubscribe missing from pinned CCXT, exact incremental-depth continuity with a persistent gap latch, and strict `apiAllowed`/state/contract-size/price-step/amount-step/minimum-amount qualification. Contract create/cancel are physically denied because the official endpoints remain under maintenance; private capability and live canary therefore fail closed. Wave 1 remains Binance USD-M/Bybit/OKX. Local gate: lock64, Ruff101, mypy99, pytest588, doctor shadow/live=false, Bandit0, diff-check. Exact checkpoint evidence remains pending. |
+| Phase 5.4 MEXC capability-gated code candidate | LOCAL_TECHNICAL_PASS | MEXC is a typed public/read-only profile with exact incremental-depth continuity and strict raw symbol/base/quote/settle/contract/price/amount/minimum qualification. Official all-contract tickers do not prove bid/ask and book ticker is per-symbol, so broad BBO is deliberately unavailable rather than using unbounded fan-out. Contract create/cancel are physically denied because the official endpoints remain under maintenance; private capability and live canary fail closed. Local remediation gate: lock64, Ruff101, mypy99, pytest585, doctor shadow/live=false, Bandit0, diff-check. New exact evidence remains pending. |
 | C6 venue expansion | IN_PROGRESS | Bitget Classic, KuCoin Futures Classic, and BingX are exact-head verified; MEXC passes the local technical gate. MEXC exact evidence, seven-venue runtime matrix, FT-02 isolation, and final operations gates remain pending. |
 
 ## Decisions made during implementation
@@ -254,15 +254,19 @@ Fresh exact run `32419627419` passed all five jobs; replay `9425251748`, C4 crit
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (101 files)
 - mypy --strict: PASS (99 source/test files)
-- pytest: 588 passed
+- pytest: 585 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false; Wave 1 unchanged
 - Bandit medium/high: 0; git diff --check: PASS
 
-The adapter uses MEXC's one all-contract ticker subscription and exact matching unsubscribe,
-preserves incremental-depth version continuity, and latches a gap until transport replacement.
-Only `apiAllowed=true`, active linear-USDT swaps with matching official contract metadata qualify;
+The adapter preserves incremental-depth version continuity and latches a gap until transport
+replacement. Broad BBO is unavailable because neither the all-contract ticker payload nor a
+bounded batch book-ticker channel proves best bid/ask. Only `apiAllowed=true`, active linear-USDT
+swaps with matching official raw symbol/currency/contract metadata qualify;
 the documented absence of a fixed notional is represented explicitly. Contract create/cancel are
 physically rejected before transport because the official endpoints remain under maintenance.
 No credential, production-submit authority, or live-canary allowlist expansion was added.
-Checkpoint commit, exact-head CI/artifacts, and independent exact review remain pending.
+The first pushed head `8b022a6` was rejected by independent review because it trusted an
+unsupported all-ticker BBO payload and incomplete raw metadata. Those claims and tests were removed;
+the remediated local tree is fail-closed. A new checkpoint commit, exact-head CI/artifacts, and
+independent exact review remain pending; run `32421228611` is not final MEXC evidence.
 ```
