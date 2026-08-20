@@ -1523,7 +1523,11 @@ def _windows_process_identity(process_id: int) -> str | None:
     import ctypes
     from ctypes import wintypes
 
-    process = ctypes.windll.kernel32.OpenProcess(0x1000, False, process_id)
+    loader = getattr(ctypes, "windll", None)
+    if loader is None:
+        return None
+    kernel32 = loader.kernel32
+    process = kernel32.OpenProcess(0x1000, False, process_id)
     if not process:
         return None
     try:
@@ -1531,7 +1535,7 @@ def _windows_process_identity(process_id: int) -> str | None:
         exited = wintypes.FILETIME()
         kernel = wintypes.FILETIME()
         user = wintypes.FILETIME()
-        if not ctypes.windll.kernel32.GetProcessTimes(
+        if not kernel32.GetProcessTimes(
             process,
             ctypes.byref(created),
             ctypes.byref(exited),
@@ -1542,4 +1546,4 @@ def _windows_process_identity(process_id: int) -> str | None:
         ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
         return f"win:{process_id}:{ticks}"
     finally:
-        ctypes.windll.kernel32.CloseHandle(process)
+        kernel32.CloseHandle(process)
