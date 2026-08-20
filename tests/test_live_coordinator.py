@@ -235,6 +235,56 @@ async def _run(
 
 
 @pytest.mark.asyncio
+async def test_prepared_action_rechecks_opening_gate_before_any_submit(tmp_path: Path) -> None:
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    adapters = {
+        Venue.BINANCE_USDM: DeterministicPrivateExchange(
+            Venue.BINANCE_USDM,
+            instruments[Venue.BINANCE_USDM],
+            (_outcome(PrivateOrderStatus.FILLED, "1"),),
+        ),
+        Venue.OKX: DeterministicPrivateExchange(
+            Venue.OKX,
+            instruments[Venue.OKX],
+            (_outcome(PrivateOrderStatus.FILLED, "1"),),
+        ),
+        Venue.BYBIT: DeterministicPrivateExchange(
+            Venue.BYBIT,
+            instruments[Venue.BYBIT],
+            (),
+        ),
+    }
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+
+    async def deny_opening(_: CanaryExecutionPlan) -> bool:
+        return False
+
+    coordinator = LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        StaticProtectionProvider({}),
+        DeterministicCanaryMonitor(CloseReason.TARGET_CONVERGENCE),
+        Venue.BYBIT,
+        opening_gate=deny_opening,
+    )
+    prepared = await coordinator.prepare(_plan())
+    assert prepared.state == LiveActionState.PREPARED
+
+    result = await coordinator.run(_plan())
+
+    assert result.success is False
+    assert result.reason == ReasonCode.VENUE_QUARANTINED
+    assert result.orders_sent == 0
+    assert result.terminal_state == LiveActionState.QUARANTINED
+    assert result.recovery_action == "OPENING_GATE_DENIED"
+    assert sum(adapter.submit_calls for adapter in adapters.values()) == 0
+    action = await journal.load(_plan().pair_action_id)
+    assert action is not None
+    assert action.state == LiveActionState.QUARANTINED
+
+
+@pytest.mark.asyncio
 async def test_full_fill_canary_auto_closes_and_succeeds_only_flat(tmp_path: Path) -> None:
     result, adapters = await _run(
         tmp_path,

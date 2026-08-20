@@ -27,6 +27,7 @@ from interexchange_perp_grid.public_engine import (
     reconnect_backoff_seconds,
     reconnect_delay_seconds,
 )
+from interexchange_perp_grid.venue_capabilities import CapabilityReason, CapabilityState
 
 CONFIG = Path("config/defaults.yaml")
 
@@ -589,6 +590,21 @@ async def test_broad_bbo_scans_100_common_instruments_and_isolates_one_venue(
     assert result.cache.entries == result.cache.peak_entries == 200
     assert result.prefilter_latency_ms <= Decimal(100)
     assert {record.venue for record in result.quarantined} == {Venue.OKX}
+    assert (
+        result.venue_capability_matrix.for_venue(Venue.OKX).public_runtime
+        == CapabilityState.QUARANTINED
+    )
+    assert CapabilityReason.VENUE_QUARANTINED in (
+        result.venue_capability_matrix.for_venue(Venue.OKX).reasons
+    )
+    assert (
+        result.venue_capability_matrix.for_venue(Venue.BINANCE_USDM).public_runtime
+        == CapabilityState.QUALIFIED
+    )
+    assert (
+        result.venue_capability_matrix.for_venue(Venue.BYBIT).public_runtime
+        == CapabilityState.QUALIFIED
+    )
     assert adapters[Venue.OKX].bbo_calls == 1
     assert all(adapter.bbo_calls >= 1 for adapter in adapters.values())
     assert all(adapter.bbo_subscription_changes == 1 for adapter in adapters.values())

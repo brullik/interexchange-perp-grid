@@ -985,8 +985,11 @@ async def read_service_health(
     )
 
 
-def _read_runtime_controls_sync(path: Path) -> RuntimeControls:
-    with _connect(path) as database:
+def _read_runtime_controls_sync(
+    path: Path,
+    busy_timeout_ms: int = 30000,
+) -> RuntimeControls:
+    with _connect(path, busy_timeout_ms=busy_timeout_ms) as database:
         row = database.execute(
             """
             SELECT paused, killed, reconciliation_state, updated_at
@@ -1005,6 +1008,61 @@ def _read_runtime_controls_sync(path: Path) -> RuntimeControls:
 
 async def read_runtime_controls(path: Path) -> RuntimeControls:
     return await asyncio.to_thread(_read_runtime_controls_sync, path)
+
+
+class _RuntimeControlsReadWorker:
+    def __init__(self, path: Path, busy_timeout_ms: int) -> None:
+        self._path = path
+        self._busy_timeout_ms = busy_timeout_ms
+        self._done = threading.Event()
+        self._result: RuntimeControls | None = None
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="runtime-controls-read",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def _run(self) -> None:
+        try:
+            self._result = _read_runtime_controls_sync(self._path, self._busy_timeout_ms)
+        except BaseException as error:
+            self._error = error
+        finally:
+            self._done.set()
+
+    def result(self) -> RuntimeControls:
+        if not self.done:
+            raise RuntimeError("runtime controls read is not terminal")
+        if self._error is not None:
+            raise self._error
+        if self._result is None:
+            raise RuntimeError("runtime controls read returned no result")
+        return self._result
+
+
+async def read_runtime_controls_bounded(
+    path: Path,
+    *,
+    timeout_seconds: float = 0.1,
+    busy_timeout_ms: int = 50,
+) -> RuntimeControls:
+    if timeout_seconds <= 0 or busy_timeout_ms <= 0:
+        raise ValueError("runtime controls read bounds must be positive")
+    worker = _RuntimeControlsReadWorker(path, busy_timeout_ms)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while not worker.done:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("runtime controls read exceeded its deadline")
+        await asyncio.sleep(min(0.005, remaining))
+    return worker.result()
 
 
 def _update_runtime_controls_sync(

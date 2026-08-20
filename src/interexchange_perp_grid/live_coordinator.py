@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -159,6 +159,8 @@ class LiveCanaryCoordinator:
         *,
         terminal_timeout_seconds: Decimal = Decimal("2"),
         flat_barrier_policy: FlatBarrierPolicy | None = None,
+        opening_gate: Callable[[CanaryExecutionPlan], Awaitable[bool]] | None = None,
+        final_opening_gate: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self._journal = journal
         self._adapters = dict(adapters)
@@ -178,6 +180,8 @@ class LiveCanaryCoordinator:
         self._emergency_venue = emergency_venue
         self._terminal_timeout_seconds = terminal_timeout_seconds
         self._flat_barrier_policy = flat_barrier_policy or FlatBarrierPolicy()
+        self._opening_gate = opening_gate
+        self._final_opening_gate = final_opening_gate
         self._orders_sent = 0
         self._sequence = 0
 
@@ -247,10 +251,63 @@ class LiveCanaryCoordinator:
         if action is None:
             action = await self.prepare(plan)
         if action.state == LiveActionState.PREPARED:
+            opening_allowed = True
+            if self._opening_gate is not None:
+                try:
+                    opening_allowed = await self._opening_gate(plan)
+                except Exception:
+                    opening_allowed = False
+            if not opening_allowed:
+                states = await collect_private_states(
+                    self._adapters,
+                    self._account_instruments,
+                    reconciliation_trigger="PRE_SUBMIT_GATE_DENIED",
+                )
+                report = reconcile_private_states(
+                    action,
+                    states,
+                    await self._journal.known_client_order_ids(),
+                    set(self._adapters),
+                )
+                action = await self._quarantine(action, report, "OPENING_GATE_DENIED")
+                return self._failed(
+                    action,
+                    ReasonCode.VENUE_QUARANTINED,
+                    recovery_action="OPENING_GATE_DENIED",
+                    reconciliation=report,
+                )
             await self._journal.mark_submit_attempted(
                 action.pair_action_id,
                 (plan.long_request.client_order_id, plan.short_request.client_order_id),
             )
+            final_opening_allowed = True
+            if self._final_opening_gate is not None:
+                try:
+                    final_opening_allowed = await self._final_opening_gate()
+                except Exception:
+                    final_opening_allowed = False
+            if not final_opening_allowed:
+                current = await self._journal.load(action.pair_action_id)
+                if current is not None:
+                    action = current
+                states = await collect_private_states(
+                    self._adapters,
+                    self._account_instruments,
+                    reconciliation_trigger="FINAL_PRE_SUBMIT_GATE_DENIED",
+                )
+                report = reconcile_private_states(
+                    action,
+                    states,
+                    await self._journal.known_client_order_ids(),
+                    set(self._adapters),
+                )
+                action = await self._quarantine(action, report, "FINAL_OPENING_GATE_DENIED")
+                return self._failed(
+                    action,
+                    ReasonCode.VENUE_QUARANTINED,
+                    recovery_action="FINAL_OPENING_GATE_DENIED",
+                    reconciliation=report,
+                )
             self._orders_sent += 2
             long_order, short_order = await asyncio.gather(
                 self._submit_and_resolve(

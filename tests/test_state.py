@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,13 +20,46 @@ from interexchange_perp_grid.execution import (
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.state import (
     SCHEMA_VERSION,
+    RuntimeControls,
     initialise_state,
     load_tranches,
     read_private_event_watermark,
+    read_runtime_controls_bounded,
     save_private_event_watermark,
     save_tranche,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
+
+
+@pytest.mark.asyncio
+async def test_bounded_runtime_controls_read_does_not_own_process_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import interexchange_perp_grid.state as state_module
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def resistant_read(path: Path, busy_timeout_ms: int = 30000) -> RuntimeControls:
+        del path, busy_timeout_ms
+        started.set()
+        release.wait(1)
+        return RuntimeControls(False, False, "READY", datetime.now(UTC))
+
+    monkeypatch.setattr(state_module, "_read_runtime_controls_sync", resistant_read)
+    started_at = time.monotonic()
+    with pytest.raises(TimeoutError, match="runtime controls read exceeded its deadline"):
+        await read_runtime_controls_bounded(
+            tmp_path / "state.sqlite3",
+            timeout_seconds=0.05,
+            busy_timeout_ms=10,
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert started.wait(0.1)
+    assert elapsed < 0.2
+    release.set()
 
 
 @pytest.mark.asyncio

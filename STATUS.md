@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE5_4_MEXC_COMPLETE
-- **Current checkpoint:** Phase 5.4 MEXC fail-closed code head `fcb0e45` and test-hardening head `0f1221f` passed local/exact gates and independent technical review P0/P1=0. MEXC broad BBO, contract writes, and live remain disabled. The next software checkpoint is the seven-venue runtime capability matrix and FT-02 isolation
+- **State:** PHASE5_5_CAPABILITY_MATRIX_LOCAL_PASS_AWAITING_EXACT_GATE
+- **Current checkpoint:** Phase 5.5 implements the seven-venue runtime capability matrix and FT-02 Wave 1 isolation on the local code candidate. Expansion venues remain public/read-only candidates, the immutable Wave 1 and live-canary allowlist remain Binance USD-M/Bybit/OKX, and fresh PREPARED opening capability/control/depth/economics gates fail closed before submit. Exact-head CI, artifacts, and independent final review remain required
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -38,7 +38,8 @@ This is the only mutable project-status document.
 | Phase 5.2 KuCoin Futures Classic code candidate | COMPLETE | KuCoin Futures is now a typed Classic-only venue profile with exact batch-BBO topic framing and matching unsubscribe, raw Level-50 sequence propagation, strict linear-USDT/no-fixed-notional proof, account-wide Classic position stream, read-only private snapshots/streams, and pinned protected cross/IOC `clientOid` request mapping. Raw `positionSide` preserves independent hedge sides when zero-position tombstones arrive; ambiguous side-less records fail closed. Wave 1 remains exactly Binance USD-M/Bybit/OKX and KuCoin is denied at the live-canary boundary. Exact code head `d37ded5`; local gate lock64/Ruff97/mypy95/pytest566/doctor shadow-live=false/Bandit0/diff-check passed; exact run `32415664858` passed all five jobs with replay `9423845774`, C4 critical `9423825785`, C4.3 `9423818033`, and security `9423805574`; independent exact review P0/P1/P2=0. |
 | Phase 5.3 BingX capability-gated code candidate | COMPLETE | BingX is now a typed venue profile with official `incrDepth` snapshot/update sequence enforcement, persistent desynchronisation until a fresh `action=all`, matching L2 unsubscribe, exact linear-USDT amount/notional metadata, account-wide read-only private parameters, and pinned protected IOC `clientOrderID`/`positionSide=BOTH` mapping. Official BingX WS documents only per-symbol BBO, so the adapter truthfully reports broad BBO unavailable instead of creating an unbounded fallback. Wave 1 remains Binance USD-M/Bybit/OKX and BingX is denied at the live-canary boundary. Exact code head `0678049`; local gate lock64/Ruff99/mypy97/pytest579/doctor shadow-live=false/Bandit0/diff-check passed; exact run `32418726763` passed all five jobs with replay `9424931463`, C4 critical `9424899802`, C4.3 `9424897938`, and security `9424888032`; test-hardening head `54b46f0` passed run `32419627419` 5/5 with replay `9425251748`, C4 critical `9425231202`, C4.3 `9425231328`, and security `9425217060`; independent exact review P0/P1/P2=0. |
 | Phase 5.4 MEXC capability-gated code candidate | COMPLETE | MEXC is a typed public/read-only profile with exact incremental-depth continuity and strict raw symbol/base/quote/settle/contract/price/amount/minimum qualification. Official all-contract tickers do not prove bid/ask and book ticker is per-symbol, so broad BBO is deliberately unavailable rather than using unbounded fan-out. Contract create/cancel are physically denied because the official endpoints remain under maintenance; private capability and live canary fail closed. Code head `fcb0e45` passed independent technical review P0/P1/P2=0. Test-hardening head `0f1221f` passed exact run `32423071724` 5/5 with replay `9426439525` (79 scenarios), C4 critical `9426417474` (30/30, zero production submits), C4.3 `9426419340` (8/8, zero false success/submits), and security `9426408589` (zero vulnerabilities/secret findings). Local gate: lock64, Ruff101, mypy99, pytest585, doctor shadow/live=false, diff-check. |
-| C6 venue expansion | IN_PROGRESS | Bitget Classic, KuCoin Futures Classic, BingX, and MEXC are exact-head verified code candidates. Seven-venue runtime capability matrix, FT-02 isolation, and final operations gates remain pending; Wave 1 and the live-canary allowlist remain unchanged. |
+| Phase 5.5 seven-venue capability matrix + FT-02 isolation | LOCAL_PASS_AWAITING_EXACT_GATE | One typed matrix reports qualified, quarantined, or disabled state for all seven venue profiles while startup rejects any Wave 1 reclassification. Public scans expose current six-hour-bound reports and isolate one quarantined venue without stopping healthy Wave 1 routes. PREPARED live-canary recovery revalidates current public/private capability, account state, clock, books, funding, economics, journal/reconciliation/risk, protected marketable IOC caps, and final pause/kill immediately before submit; every transport, control-read, and teardown path is owned and bounded. Local gate: lock64, Ruff103, mypy101, pytest610, doctor shadow/live=false, Bandit0, diff-check; independent dirty-tree review P0/P1/P2=0. No credentials, expansion submit authority, or real order was added. |
+| C6 venue expansion | IN_PROGRESS | Bitget Classic, KuCoin Futures Classic, BingX, and MEXC are exact-head verified code candidates; the Phase 5.5 matrix/isolation code candidate is locally green and awaits exact-head evidence. Final operations gates remain pending; Wave 1 and the live-canary allowlist remain unchanged. |
 
 ## Decisions made during implementation
 
@@ -127,6 +128,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-16 — Keep one bounded event-driven L2 owner per venue-symbol and gate public work by P2/P5/P6 priority without execution authority — active routes must survive overload while candidate churn, stale data, unsubscribe, reconnect, and adapter-generation races remain fail-closed — candidate L2, public engine, public adapters, shadow evaluator
 2026-08-16 — Persist public-shadow adaptive parameters per directed route and stable size multiplier with five grid-aligned convergence buckets requiring 30 episodes each — restart-safe robust windows must never substitute aggregate or under-supported convergence evidence for the current entry spread — route calibration, public engine, shadow evaluator, SQLite state
 2026-08-20 — Treat every simulated tranche SQLite write as a bounded ownership transition and retain runtime/risk ownership behind an entry latch when its terminal outcome is unknowable — cancellation, slow native storage, and shutdown may neither create an unowned durable tranche nor block process exit — shadow runtime/trader, execution coordinator, SQLite state
+2026-08-21 — Keep Wave 1 immutable while exposing one current seven-venue capability matrix and repeat every PREPARED opening gate after durable submit intent — expansion evidence must not expand live authority, and stale capability/control/depth/economics must never reach a submit transport — capability matrix, public engine, canary runtime/coordinator
 
 ## Active blockers / owner actions
 
@@ -278,4 +280,25 @@ C4 critical `9426417474` reports 30/30 and zero production submits; C4.3 `942641
 reports 8/8 with zero false success/submits; security `9426408589` reports zero dependency
 vulnerabilities and secret findings. All artifacts bind the exact SHA. Independent exact review
 found P0=0, P1=0; its sole P2 was this then-pending evidence update. Phase 5.4 is complete.
+```
+
+```text
+2026-08-21 Phase 5.5 seven-venue capability matrix and FT-02 local code checkpoint: PASS
+- exact main lock validation: PASS (64 packages)
+- ruff format --check + ruff check: PASS (103 files)
+- mypy --strict: PASS (101 source/test files)
+- pytest: 610 passed
+- interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false; Wave 1 unchanged
+- Bandit medium/high: 0; git diff --check: PASS
+
+All seven typed venue profiles produce one current, reason-coded capability matrix without changing
+the immutable Wave 1 or live-canary allowlist. One quarantined venue is isolated while healthy public
+routes continue. A PREPARED action repeats current capability, private account, clock, book depth,
+funding, economics, journal/reconciliation/risk, protected IOC marketability, and final pause/kill
+checks before any submit. Cancellation-resistant discovery, final control reads, and adapter teardown
+are bounded, retained, and explicitly fail shutdown; every denial persists quarantine with zero submit.
+
+No credentials, production-submit authority, or expansion live path was added, and no real order was
+sent. This is a local code candidate only. Commit identity, exact-head Linux CI and artifacts, and
+independent exact-head all-zero review remain required before Phase 5.5 is complete.
 ```

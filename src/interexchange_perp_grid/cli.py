@@ -184,6 +184,11 @@ def _scan_payload(result: ScanResult) -> dict[str, object]:
         "routes": [asdict(quote) for quote in result.quotes],
         "capabilities": [asdict(report) for report in result.capabilities],
         "quarantined": [asdict(record) for record in result.quarantined],
+        "venue_capability_matrix": (
+            asdict(result.venue_capability_matrix)
+            if result.venue_capability_matrix is not None
+            else None
+        ),
     }
 
 

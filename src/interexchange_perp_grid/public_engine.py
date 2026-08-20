@@ -61,6 +61,10 @@ from interexchange_perp_grid.routes import (
     evaluate_directed_route,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
+from interexchange_perp_grid.venue_capabilities import (
+    VenueCapabilityMatrix,
+    build_venue_capability_matrix,
+)
 
 AdapterFactory = Callable[[Venue], ExchangeAdapter]
 ReconnectJitter = Callable[[Venue, int], Decimal]
@@ -106,6 +110,7 @@ class ScanResult:
     prefilter_latency_ms: Decimal | None = None
     candidate_l2: CandidateL2Result | None = None
     route_calibration: tuple[RouteCalibrationAssessment, ...] = ()
+    venue_capability_matrix: VenueCapabilityMatrix | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +124,7 @@ class BroadBboResult:
     cache: BboCacheStats
     prefilter_latency_ms: Decimal
     quarantined: tuple[QuarantineRecord, ...]
+    venue_capability_matrix: VenueCapabilityMatrix
 
 
 @dataclass(frozen=True, slots=True)
@@ -1011,6 +1017,17 @@ class PublicMarketEngine:
             broad_demand,
         )
 
+    def venue_capability_matrix(self) -> VenueCapabilityMatrix:
+        return build_venue_capability_matrix(
+            self.settings,
+            public_reports=self._capabilities,
+            private_reports={},
+            quarantined_venues=frozenset(self._quarantined),
+            now=self._now_factory(),
+            maximum_report_age_seconds=self.settings.universe.instrument_refresh_seconds,
+            require_all_profiles=False,
+        )
+
     async def set_broad_bbo_admitted(self, admitted: bool) -> None:
         async with self._lifecycle_lock:
             self._require_open()
@@ -1066,6 +1083,7 @@ class PublicMarketEngine:
             self._bbo_cache.stats_at(now_monotonic_ns=now_ns),
             latency_ms,
             tuple(self._quarantined[venue] for venue in sorted(self._quarantined, key=str)),
+            self.venue_capability_matrix(),
         )
 
     async def scan_candidate_l2(
@@ -2488,6 +2506,7 @@ class PublicMarketEngine:
             bbo_cache=broad.cache if broad is not None else None,
             prefilter_latency_ms=broad.prefilter_latency_ms if broad is not None else None,
             candidate_l2=candidate_l2,
+            venue_capability_matrix=self.venue_capability_matrix(),
         )
 
     async def close(self) -> None:

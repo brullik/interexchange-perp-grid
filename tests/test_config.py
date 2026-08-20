@@ -158,6 +158,13 @@ def test_venue_profiles_are_known_unique_and_canary_is_wave1_only() -> None:
     with pytest.raises(ValidationError, match="subset of wave1_public"):
         Settings.model_validate(raw)
 
+    raw = settings.model_dump(mode="json")
+    raw["venues"]["wave1_public"] = ["mexc", "bybit", "okx"]
+    raw["venues"]["wave3"] = ["binanceusdm", "bingx"]
+    raw["venues"]["canary_primary"] = ["mexc", "bybit"]
+    with pytest.raises(ValidationError, match="wave1_public must remain exactly"):
+        Settings.model_validate(raw)
+
 
 def test_typed_environment_overrides_are_applied() -> None:
     settings = load_settings(

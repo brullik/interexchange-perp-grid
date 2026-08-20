@@ -10,7 +10,7 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.domain import WAVE1_VENUES, Venue
 
 KNOWN_VENUE_PROFILES = frozenset({venue.value for venue in Venue} | {"mexc"})
 
@@ -57,6 +57,9 @@ class VenuesConfig(StrictModel):
         unknown = sorted(set(all_venues) - KNOWN_VENUE_PROFILES)
         if unknown:
             raise ValueError(f"unknown venue profiles: {', '.join(unknown)}")
+        required_wave1 = {venue.value for venue in WAVE1_VENUES}
+        if set(self.wave1_public) != required_wave1:
+            raise ValueError("wave1_public must remain exactly binanceusdm, bybit, and okx")
         for name, values in (
             ("wave1_public", self.wave1_public),
             ("canary_primary", self.canary_primary),

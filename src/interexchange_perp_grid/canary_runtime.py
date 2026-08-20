@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
@@ -85,13 +88,64 @@ from interexchange_perp_grid.routes import (
 )
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.state import (
+    RuntimeControls,
     initialise_state,
     live_confirmation_valid,
     read_runtime_controls,
+    read_runtime_controls_bounded,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
+from interexchange_perp_grid.venue_capabilities import (
+    CapabilityState,
+    build_venue_capability_matrix,
+)
 
 OWNER_CONFIRMATION = "I_ACCEPT_LIVE_CANARY_RISK"
+_OPENING_GATE_TASKS: set[asyncio.Task[object]] = set()
+
+
+def _consume_opening_gate_task(task: asyncio.Task[object]) -> None:
+    _OPENING_GATE_TASKS.discard(task)
+    if task.cancelled():
+        return
+    with contextlib.suppress(Exception):
+        task.exception()
+
+
+def _cancel_opening_gate_tasks() -> None:
+    for task in tuple(_OPENING_GATE_TASKS):
+        if not task.done():
+            task.cancel()
+
+
+async def _shutdown_opening_gate_tasks(timeout_seconds: float = 1.0) -> None:
+    pending = tuple(task for task in _OPENING_GATE_TASKS if not task.done())
+    for task in pending:
+        task.cancel()
+    if pending:
+        _, still_pending = await asyncio.wait(pending, timeout=timeout_seconds)
+        if still_pending:
+            raise RuntimeError("opening capability gate transport did not terminate")
+    for task in tuple(_OPENING_GATE_TASKS):
+        if task.done():
+            _consume_opening_gate_task(task)
+
+
+async def _await_owned_opening_operation[OpeningResult](
+    operation: Coroutine[Any, Any, OpeningResult],
+    *,
+    name: str,
+    timeout_seconds: float = 1.0,
+) -> OpeningResult:
+    task = asyncio.create_task(operation, name=name)
+    owned_task = cast(asyncio.Task[object], task)
+    _OPENING_GATE_TASKS.add(owned_task)
+    owned_task.add_done_callback(_consume_opening_gate_task)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+    except TimeoutError:
+        task.cancel()
+        raise
 
 
 async def _start_private_state_supervisor(
@@ -147,6 +201,19 @@ class CanaryRunEvidence:
     reconciliation: ReconciliationReport | None
     owner_instruction: str | None
     emergency_venue: EmergencyVenueAssessment | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _OpeningGateSnapshot:
+    public_reports: tuple[CapabilityReport, ...]
+    private_reports: tuple[PrivateCapabilityReport, ...]
+    private_states: dict[Venue, VenuePrivateState]
+    books: dict[Venue, OrderBookSnapshot]
+    quality: dict[Venue, DataQualityAssessment]
+    funding: tuple[FundingSnapshot, ...]
+    controls: RuntimeControls
+    action: LiveJournalAction | None
+    known_client_ids: set[str]
 
 
 class PublicProtectionProvider(ProtectionProvider):
@@ -487,21 +554,268 @@ async def _coordinate_live_action(
     settings: Settings,
     journal: LiveOrderJournal,
     adapters: dict[Venue, CanaryVenueAdapter],
+    private_capability_adapters: dict[Venue, CcxtPrivateAdapter],
     instruments: dict[Venue, Instrument],
     public_adapters: dict[Venue, CcxtProAdapter],
     plan: CanaryExecutionPlan,
     monitor: CanaryMonitor,
     emergency_venue: Venue,
 ) -> CanaryCycleResult:
+    protection = PublicProtectionProvider(settings, public_adapters, instruments)
+
+    async def opening_gate(current_plan: CanaryExecutionPlan) -> bool:
+        capability_venues = tuple(sorted(adapters, key=lambda venue: venue.value))
+
+        async def collect_snapshot() -> _OpeningGateSnapshot:
+            async def collect_public_reports() -> tuple[CapabilityReport, ...]:
+                return tuple(
+                    await asyncio.gather(
+                        *(
+                            public_adapters[venue].probe_public_capabilities()
+                            for venue in capability_venues
+                        )
+                    )
+                )
+
+            async def collect_private_reports() -> tuple[PrivateCapabilityReport, ...]:
+                return tuple(
+                    await asyncio.gather(
+                        *(
+                            private_capability_adapters[venue].probe_private_capabilities()
+                            for venue in capability_venues
+                        )
+                    )
+                )
+
+            async def collect_funding() -> tuple[FundingSnapshot, ...]:
+                return tuple(
+                    await asyncio.gather(
+                        *(
+                            public_adapters[venue].fetch_funding(instruments[venue])
+                            for venue in capability_venues
+                        )
+                    )
+                )
+
+            results = await asyncio.gather(
+                collect_public_reports(),
+                collect_private_reports(),
+                collect_private_states(
+                    adapters,
+                    instruments,
+                    reconciliation_trigger="PRE_SUBMIT_CAPABILITY_GATE",
+                ),
+                _fresh_books(settings, public_adapters, instruments),
+                collect_funding(),
+                read_runtime_controls(Path(settings.storage.sqlite_path)),
+                journal.load(current_plan.pair_action_id),
+                journal.known_client_order_ids(),
+            )
+            books, quality = cast(
+                tuple[dict[Venue, OrderBookSnapshot], dict[Venue, DataQualityAssessment]],
+                results[3],
+            )
+            return _OpeningGateSnapshot(
+                public_reports=cast(tuple[CapabilityReport, ...], results[0]),
+                private_reports=cast(tuple[PrivateCapabilityReport, ...], results[1]),
+                private_states=cast(dict[Venue, VenuePrivateState], results[2]),
+                books=books,
+                quality=quality,
+                funding=cast(tuple[FundingSnapshot, ...], results[4]),
+                controls=cast(RuntimeControls, results[5]),
+                action=cast(LiveJournalAction | None, results[6]),
+                known_client_ids=cast(set[str], results[7]),
+            )
+
+        try:
+            snapshot = await _await_owned_opening_operation(
+                collect_snapshot(),
+                name=f"opening-capability-gate-{current_plan.pair_action_id}",
+            )
+        except TimeoutError:
+            return False
+        public_reports = {report.venue: report for report in snapshot.public_reports}
+        private_reports = {report.venue: report for report in snapshot.private_reports}
+        funding = {item.venue: item for item in snapshot.funding}
+        if snapshot.action is None:
+            return False
+        reconciliation = reconcile_private_states(
+            snapshot.action,
+            snapshot.private_states,
+            snapshot.known_client_ids,
+            set(adapters),
+        )
+        try:
+            projected_stress = Decimal(str(current_plan.risk_reservation["projected_stress_usdt"]))
+        except (ArithmeticError, KeyError, ValueError):
+            return False
+        risk_current = (
+            projected_stress.is_finite()
+            and Decimal(0) <= projected_stress <= settings.live.canary_pair_stressed_loss_limit_usdt
+            and not _private_risk_deteriorated(settings, snapshot.private_states)
+        )
+        preflight_items: list[PrivatePreflightReport] = []
+        for venue in capability_venues:
+            state = snapshot.private_states[venue]
+            if state.account is None:
+                continue
+            preflight_items.append(
+                run_private_preflight(
+                    PrivatePreflightInput(
+                        capability=private_reports[venue],
+                        account=state.account,
+                        instrument=instruments[venue],
+                        fee_rate=state.taker_fee_rate,
+                        funding_known=(
+                            funding[venue].rate is not None
+                            and funding[venue].next_funding_timestamp_ms is not None
+                            and funding[venue].interval is not None
+                            and funding[venue].exchange_timestamp_ms is not None
+                        ),
+                        clock_skew_ms=public_reports[venue].clock_skew_ms,
+                        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+                        symbol_available=True,
+                        data_quality_passed=(
+                            snapshot.quality[venue].accepted and public_reports[venue].public_ready
+                        ),
+                        reconciliation_passed=(
+                            reconciliation.consistent and reconciliation.flat_verified
+                        ),
+                        risk_passed=risk_current,
+                        free_margin_floor_ratio=settings.live.canary_free_margin_floor_ratio,
+                    )
+                )
+            )
+        all_accounts_ready = len(preflight_items) == len(capability_venues) and all(
+            report.passed for report in preflight_items
+        )
+        account_preflight_passed = (
+            frozenset(capability_venues) if all_accounts_ready else frozenset()
+        )
+        capability_matrix = build_venue_capability_matrix(
+            settings,
+            public_reports=public_reports,
+            private_reports=private_reports,
+            account_preflight_passed=account_preflight_passed,
+            now=datetime.now(UTC),
+            maximum_report_age_seconds=1,
+            require_all_profiles=False,
+        )
+        executable_books = {
+            venue: (
+                executable_vwap(snapshot.books[venue].asks, current_plan.quantity),
+                executable_vwap(snapshot.books[venue].bids, current_plan.quantity),
+            )
+            for venue in capability_venues
+        }
+        if any(buy is None or sell is None for buy, sell in executable_books.values()):
+            return False
+        long_buy = executable_books[current_plan.long_request.venue][0]
+        short_sell = executable_books[current_plan.short_request.venue][1]
+        assert long_buy is not None and short_sell is not None
+        current_long = protected_ioc_price(
+            Side.BUY,
+            long_buy.marginal_price,
+            instruments[current_plan.long_request.venue].price_tick,
+            settings.live.canary_entry_slippage_cap_bps,
+        )
+        current_short = protected_ioc_price(
+            Side.SELL,
+            short_sell.marginal_price,
+            instruments[current_plan.short_request.venue].price_tick,
+            settings.live.canary_entry_slippage_cap_bps,
+        )
+        return (
+            not snapshot.controls.paused
+            and not snapshot.controls.killed
+            and all(
+                capability_matrix.for_venue(venue).live_capability == CapabilityState.QUALIFIED
+                for venue in capability_venues
+            )
+            and _stored_opening_request_is_still_protected(
+                current_plan.long_request,
+                current_long,
+                long_buy.marginal_price,
+            )
+            and _stored_opening_request_is_still_protected(
+                current_plan.short_request,
+                current_short,
+                short_sell.marginal_price,
+            )
+        )
+
     return await LiveCanaryCoordinator(
         journal,
         adapters,
         instruments,
-        PublicProtectionProvider(settings, public_adapters, instruments),
+        protection,
         monitor,
         emergency_venue,
         flat_barrier_policy=_flat_barrier_policy(settings),
+        opening_gate=opening_gate,
+        final_opening_gate=lambda: _final_opening_controls_allow(settings),
     ).run(plan)
+
+
+def _stored_opening_request_is_still_protected(
+    request: VenueOrderRequest,
+    current_protected_price: Decimal,
+    current_marginal_price: Decimal | None = None,
+) -> bool:
+    if request.price is None or not current_protected_price.is_finite():
+        return False
+    if current_marginal_price is not None and (
+        not current_marginal_price.is_finite() or current_marginal_price <= 0
+    ):
+        return False
+    if request.side == Side.BUY:
+        return request.price <= current_protected_price and (
+            current_marginal_price is None or request.price >= current_marginal_price
+        )
+    return request.price >= current_protected_price and (
+        current_marginal_price is None or request.price <= current_marginal_price
+    )
+
+
+async def _final_opening_controls_allow(settings: Settings) -> bool:
+    try:
+        controls = await _await_owned_opening_operation(
+            read_runtime_controls_bounded(Path(settings.storage.sqlite_path)),
+            name="final-opening-controls",
+            timeout_seconds=0.25,
+        )
+    except TimeoutError:
+        return False
+    return not controls.paused and not controls.killed
+
+
+async def _quarantine_prepared_before_submit(
+    journal: LiveOrderJournal,
+    active: LiveJournalAction,
+    recovery_action: str,
+) -> CanaryRunEvidence:
+    quarantined = await journal.transition(
+        active.pair_action_id,
+        LiveActionState.QUARANTINED,
+        {"reason": recovery_action},
+        recovery_action=recovery_action,
+    )
+    return CanaryRunEvidence(
+        submitted=False,
+        success=False,
+        reason=ReasonCode.VENUE_QUARANTINED,
+        route=active.route.value,
+        quantity=None,
+        orders_sent=0,
+        hedged=False,
+        residual_delta=quarantined.residual_delta,
+        recovery_action=recovery_action,
+        terminal_state=quarantined.state,
+        economic_decision=None,
+        preflights=(),
+        reconciliation=None,
+        owner_instruction="FAILED_QUARANTINED: no opening order was submitted",
+    )
 
 
 async def _resume_active_canary(
@@ -535,7 +849,20 @@ async def _resume_active_canary(
     private_stop: asyncio.Event | None = None
     private_task: asyncio.Task[None] | None = None
     try:
-        instruments, _ = await _discover_instruments(active.route.base, public_adapters)
+        if active.state == LiveActionState.PREPARED:
+            try:
+                instruments, _ = await _await_owned_opening_operation(
+                    _discover_instruments(active.route.base, public_adapters),
+                    name=f"prepared-discovery-{active.pair_action_id}",
+                )
+            except TimeoutError:
+                return await _quarantine_prepared_before_submit(
+                    journal,
+                    active,
+                    "PRE_SUBMIT_DISCOVERY_DEADLINE",
+                )
+        else:
+            instruments, _ = await _discover_instruments(active.route.base, public_adapters)
         for venue in venues:
             private_adapters[venue] = CcxtPrivateAdapter(
                 venue,
@@ -588,9 +915,28 @@ async def _resume_active_canary(
             and active.risk_reservation.get("supervisor_intent") == "LIVE_CANARY"
             and active.risk_reservation.get("supervisor_queued") is True
         ):
-            funding_values = await asyncio.gather(
-                *(public_adapters[venue].fetch_funding(instruments[venue]) for venue in venues)
-            )
+
+            async def fetch_initial_funding() -> tuple[FundingSnapshot, ...]:
+                return tuple(
+                    await asyncio.gather(
+                        *(
+                            public_adapters[venue].fetch_funding(instruments[venue])
+                            for venue in venues
+                        )
+                    )
+                )
+
+            try:
+                funding_values = await _await_owned_opening_operation(
+                    fetch_initial_funding(),
+                    name=f"prepared-initial-funding-{active.pair_action_id}",
+                )
+            except TimeoutError:
+                return await _quarantine_prepared_before_submit(
+                    journal,
+                    active,
+                    "PRE_SUBMIT_FUNDING_DEADLINE",
+                )
             initial_funding = {snapshot.venue: snapshot for snapshot in funding_values}
             monitor = RuntimeCanaryMonitor(
                 settings,
@@ -607,6 +953,7 @@ async def _resume_active_canary(
             settings,
             journal,
             typed_adapters,
+            private_adapters,
             instruments,
             public_adapters,
             plan,
@@ -630,13 +977,39 @@ async def _resume_active_canary(
             owner_instruction=result.owner_instruction,
         )
     finally:
+        cleanup_errors: list[str] = []
         await _stop_private_state_supervisor(private_stop, private_task)
-        await asyncio.gather(
-            *(adapter.close() for adapter in public_adapters.values()),
-            *(adapter.close() for adapter in private_adapters.values()),
-            return_exceptions=True,
-        )
-        await shutdown_private_requests(typed_adapters)
+        _cancel_opening_gate_tasks()
+
+        async def close_adapters() -> None:
+            results = await asyncio.gather(
+                *(adapter.close() for adapter in public_adapters.values()),
+                *(adapter.close() for adapter in private_adapters.values()),
+                return_exceptions=True,
+            )
+            failures = tuple(result for result in results if isinstance(result, BaseException))
+            if failures:
+                raise RuntimeError(
+                    "; ".join(f"{type(error).__name__}: {error}" for error in failures)
+                )
+
+        try:
+            await _await_owned_opening_operation(
+                close_adapters(),
+                name=f"canary-adapter-close-{active.pair_action_id}",
+            )
+        except (RuntimeError, TimeoutError) as error:
+            cleanup_errors.append(f"adapter close: {type(error).__name__}: {error}")
+        try:
+            await shutdown_private_requests(typed_adapters)
+        except Exception as error:
+            cleanup_errors.append(f"private request shutdown: {type(error).__name__}: {error}")
+        try:
+            await _shutdown_opening_gate_tasks()
+        except RuntimeError as error:
+            cleanup_errors.append(str(error))
+        if cleanup_errors:
+            raise RuntimeError("canary cleanup failed: " + "; ".join(cleanup_errors))
 
 
 async def recover_active_canary(
@@ -939,6 +1312,19 @@ async def run_canary_once(
         controls = await read_runtime_controls(state_path)
         all_preflights_passed = len(preflights) == len(required_venues) and all(
             report.passed for report in preflights
+        )
+        capability_matrix = build_venue_capability_matrix(
+            settings,
+            public_reports=public_reports,
+            private_reports=capabilities,
+            account_preflight_passed=(
+                frozenset(required_venues) if all_preflights_passed else frozenset()
+            ),
+            require_all_profiles=False,
+        )
+        all_preflights_passed = all_preflights_passed and all(
+            capability_matrix.for_venue(venue).live_capability == CapabilityState.QUALIFIED
+            for venue in required_venues
         )
         live_context = LiveContext(
             ci_or_test=_ci_or_test_environment(),
