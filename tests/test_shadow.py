@@ -815,13 +815,16 @@ async def test_shadow_trader_runs_calibration_risk_and_paired_fill_pipeline(
     async def return_only_after_persisted_deadline(*args: Any, **kwargs: Any) -> None:
         await original_save(*args, **kwargs)
         deadline = cast(float, kwargs["deadline_monotonic"])
-        await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()) + 0.01)
+        loop = asyncio.get_running_loop()
+        while loop.time() < deadline + 0.01:
+            await asyncio.sleep(max(0.001, deadline + 0.01 - loop.time()))
+        assert loop.time() >= deadline
 
     monkeypatch.setattr(shadow_module, "save_tranche", return_only_after_persisted_deadline)
     assert (
         await trader.process(
             scan,
-            decision_deadline=asyncio.get_running_loop().time() + 0.05,
+            decision_deadline=asyncio.get_running_loop().time() + 0.25,
         )
         == ()
     )
