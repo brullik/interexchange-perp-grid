@@ -1150,12 +1150,14 @@ class ContinuousShadowEvaluator:
         try:
             while not stop_event.is_set():
                 try:
-                    active_live_action = await live_journal.active()
-                    if active_live_action is not None:
+                    active_live_actions = await live_journal.active_actions()
+                    if active_live_actions:
                         logger.info(
                             "shadow_suspended_for_live_recovery",
-                            pair_action_id=active_live_action.pair_action_id,
-                            state=active_live_action.state.value,
+                            active_action_count=len(active_live_actions),
+                            pair_action_ids=tuple(
+                                action.pair_action_id for action in active_live_actions
+                            ),
                         )
                         with contextlib.suppress(TimeoutError):
                             await asyncio.wait_for(

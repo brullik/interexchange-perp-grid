@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal
@@ -362,11 +362,18 @@ async def collect_private_states(
 
 
 def reconcile_private_states(
-    action: LiveJournalAction | None,
+    action: LiveJournalAction | Sequence[LiveJournalAction] | None,
     states: dict[Venue, VenuePrivateState],
     known_client_order_ids: set[str],
     required_venues: set[Venue],
 ) -> ReconciliationReport:
+    actions = (
+        ()
+        if action is None
+        else (action,)
+        if isinstance(action, LiveJournalAction)
+        else tuple(action)
+    )
     discrepancies: list[str] = []
     unknown: list[str] = []
     missing = required_venues - set(states)
@@ -407,13 +414,16 @@ def reconcile_private_states(
         recent_by_client.setdefault(order.client_order_id, []).append(order)
 
     expected_positions = {venue: Decimal(0) for venue in required_venues}
-    if action is not None:
-        initial_positions = action.risk_reservation.get("initial_signed_positions", {})
-        if isinstance(initial_positions, dict):
-            for venue, quantity in initial_positions.items():
-                parsed_venue = Venue(str(venue))
-                expected_positions[parsed_venue] = Decimal(str(quantity))
-        for leg in action.legs:
+    if actions:
+        for current_action in actions:
+            initial_positions = current_action.risk_reservation.get("initial_signed_positions", {})
+            if isinstance(initial_positions, dict):
+                for venue, quantity in initial_positions.items():
+                    parsed_venue = Venue(str(venue))
+                    expected_positions[parsed_venue] = expected_positions.get(
+                        parsed_venue, Decimal(0)
+                    ) + Decimal(str(quantity))
+        for leg in (leg for current_action in actions for leg in current_action.legs):
             signed = leg.filled_base_quantity if leg.side == Side.BUY else -leg.filled_base_quantity
             expected_positions[leg.venue] = expected_positions.get(leg.venue, Decimal(0)) + signed
             if not leg.submit_attempted:
@@ -446,12 +456,12 @@ def reconcile_private_states(
         for state in states.values()
     )
     allowed_symbols: dict[Venue, set[str]] = {}
-    if action is not None:
-        for leg in action.legs:
+    if actions:
+        for leg in (leg for current_action in actions for leg in current_action.legs):
             allowed_symbols.setdefault(leg.venue, set()).add(leg.symbol)
     for state in states.values():
         for position in state.positions:
-            if action is None:
+            if not actions:
                 discrepancies.append(f"{position.venue.value}:UNEXPECTED_OPEN_POSITION")
             elif position.symbol not in allowed_symbols.get(position.venue, set()):
                 discrepancies.append(f"{position.venue.value}:NON_ROUTE_POSITION")

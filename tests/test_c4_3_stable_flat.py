@@ -477,6 +477,36 @@ async def test_private_event_during_flat_commit_quarantines_action(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_coordinator_private_event_after_flat_commit_quarantines_action(
+    tmp_path: Path,
+) -> None:
+    adapters = _watermarked_adapters(0)
+    raced_adapter = adapters[Venue.BINANCE_USDM]
+    journal = _PrivateWatermarkRaceJournal(tmp_path / "state.sqlite3", raced_adapter)
+    action, _, _ = await _recovering_action(journal, "coordinator-private-race")
+    action = await journal.transition(action.pair_action_id, LiveActionState.FLAT)
+    coordinator = LiveCanaryCoordinator(
+        journal,
+        adapters,
+        {venue: _instrument(venue) for venue in Venue},
+        StaticProtectionProvider({(venue, side): Decimal(100) for venue in Venue for side in Side}),
+        DeterministicCanaryMonitor(CloseReason.TARGET_CONVERGENCE),
+        Venue.BYBIT,
+    )
+
+    marked_action, barrier = await coordinator._to_flat(
+        action,
+        "COORDINATOR_PRIVATE_EVENT_RACE_TEST",
+        FlatBarrierResult(True, _report(), 2, 0, False),
+    )
+
+    assert marked_action.state == LiveActionState.QUARANTINED
+    assert barrier.verified is False
+    assert barrier.failure_reason == ReasonCode.FLAT_BARRIER_EVENT_RACE
+    assert barrier.event_watermark == 1
+
+
+@pytest.mark.asyncio
 async def test_sf_006_coordinator_cannot_transition_on_unverified_flat_report(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

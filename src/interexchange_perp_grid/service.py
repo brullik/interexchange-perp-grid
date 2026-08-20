@@ -8,7 +8,7 @@ from pathlib import Path
 
 from interexchange_perp_grid.canary_runtime import (
     OnDemandLiveControlPlane,
-    recover_active_canary,
+    recover_active_actions,
 )
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.live_journal import LiveJournalAction, LiveOrderJournal
@@ -58,9 +58,18 @@ class BootstrapService:
         await journal.initialise()
         recovery_runner = self.recovery_runner
         if recovery_runner is None:
+            recovery_dispatch_lock = asyncio.Lock()
 
             async def default_recovery_runner(action: LiveJournalAction) -> object:
-                return await recover_active_canary(self.settings, journal, action)
+                async with recovery_dispatch_lock:
+                    current = await journal.active_actions()
+                    if not current:
+                        return object()
+                    if action.pair_action_id not in {item.pair_action_id for item in current}:
+                        return object()
+                    if len(current) > 1 and action.pair_action_id != current[0].pair_action_id:
+                        return object()
+                    return await recover_active_actions(self.settings, journal, current)
 
             recovery_runner = default_recovery_runner
 

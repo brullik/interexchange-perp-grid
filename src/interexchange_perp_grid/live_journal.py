@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import secrets
 import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -170,6 +171,13 @@ class FlatBarrierCommitResult:
     event_watermark: int
 
 
+@dataclass(frozen=True, slots=True)
+class FlatBarrierBatchCommitResult:
+    committed: bool
+    actions: tuple[LiveJournalAction, ...]
+    event_watermark: int
+
+
 def request_payload_hash(request: VenueOrderRequest) -> str:
     encoded = json.dumps(asdict(request), default=str, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -264,6 +272,11 @@ class LiveOrderJournal:
                 );
                 CREATE INDEX IF NOT EXISTS idx_live_action_leases_pair
                     ON live_action_leases(pair_action_id);
+                CREATE TABLE IF NOT EXISTS live_control_leases (
+                    lease_key TEXT PRIMARY KEY,
+                    owner_token TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL
+                );
                 """
             )
             columns = {
@@ -776,25 +789,80 @@ class LiveOrderJournal:
         now: datetime | None = None,
     ) -> FlatBarrierCommitResult:
         """Atomically validate the event watermark and commit a terminal FLAT state."""
+        batch = await self.commit_flat_barrier_many(
+            (pair_action_id,) if pair_action_id is not None else (),
+            expected_event_watermark,
+            details or {},
+            now=now,
+        )
+        action = next(
+            (action for action in batch.actions if action.pair_action_id == pair_action_id),
+            None,
+        )
+        return FlatBarrierCommitResult(batch.committed, action, batch.event_watermark)
+
+    async def commit_flat_barrier_many(
+        self,
+        pair_action_ids: tuple[str, ...],
+        expected_event_watermark: int,
+        details: dict[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> FlatBarrierBatchCommitResult:
+        """Atomically commit all named actions after one stable-FLAT watermark."""
+        if len(set(pair_action_ids)) != len(pair_action_ids):
+            raise ValueError("flat barrier action IDs must be unique")
         return await asyncio.to_thread(
-            self._commit_flat_barrier_sync,
-            pair_action_id,
+            self._commit_flat_barrier_many_sync,
+            pair_action_ids,
             expected_event_watermark,
             details or {},
             now or datetime.now(UTC),
         )
 
-    def _commit_flat_barrier_sync(
+    def _commit_flat_barrier_many_sync(
         self,
-        pair_action_id: str | None,
+        pair_action_ids: tuple[str, ...],
         expected_event_watermark: int,
         details: dict[str, Any],
         now: datetime,
-    ) -> FlatBarrierCommitResult:
+    ) -> FlatBarrierBatchCommitResult:
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             observed_watermark = self._event_watermark_in_transaction(database)
-            if pair_action_id is not None:
+            active_rows = database.execute(
+                "SELECT pair_action_id FROM live_pair_actions WHERE state <> ? "
+                "ORDER BY created_at, pair_action_id",
+                (LiveActionState.FLAT.value,),
+            ).fetchall()
+            active_ids = tuple(str(row["pair_action_id"]) for row in active_rows)
+            requested_states: dict[str, LiveActionState] = {}
+            for pair_action_id in pair_action_ids:
+                requested = database.execute(
+                    "SELECT state FROM live_pair_actions WHERE pair_action_id = ?",
+                    (pair_action_id,),
+                ).fetchone()
+                if requested is None:
+                    database.rollback()
+                    raise KeyError(pair_action_id)
+                requested_states[pair_action_id] = LiveActionState(str(requested["state"]))
+            expected_active_ids = tuple(
+                pair_action_id
+                for pair_action_id in pair_action_ids
+                if requested_states[pair_action_id] != LiveActionState.FLAT
+            )
+            active_set_matches = set(active_ids) == set(expected_active_ids)
+            action_ids = (
+                pair_action_ids
+                if active_set_matches
+                else active_ids
+                + tuple(
+                    pair_action_id
+                    for pair_action_id in pair_action_ids
+                    if pair_action_id not in active_ids
+                )
+            )
+            for pair_action_id in action_ids:
                 row = database.execute(
                     "SELECT state FROM live_pair_actions WHERE pair_action_id = ?",
                     (pair_action_id,),
@@ -803,8 +871,23 @@ class LiveOrderJournal:
                     database.rollback()
                     raise KeyError(pair_action_id)
                 state = LiveActionState(str(row["state"]))
-                if observed_watermark != expected_event_watermark:
-                    if state != LiveActionState.QUARANTINED:
+                if not active_set_matches:
+                    if state not in {LiveActionState.FLAT, LiveActionState.QUARANTINED}:
+                        self._transition_in_transaction(
+                            database,
+                            pair_action_id,
+                            LiveActionState.QUARANTINED,
+                            {
+                                **details,
+                                "reason": "ACTIVE_ACTION_SET_CHANGED",
+                                "expected_pair_action_ids": pair_action_ids,
+                                "observed_pair_action_ids": active_ids,
+                            },
+                            now,
+                            recovery_action="ACTIVE_ACTION_SET_CHANGED",
+                        )
+                elif observed_watermark != expected_event_watermark:
+                    if state not in {LiveActionState.FLAT, LiveActionState.QUARANTINED}:
                         self._transition_in_transaction(
                             database,
                             pair_action_id,
@@ -827,17 +910,20 @@ class LiveOrderJournal:
                         now,
                         residual_delta=Decimal(0),
                     )
-            action = (
-                self._load_in_transaction(database, pair_action_id)
-                if pair_action_id is not None
-                else None
+            actions = tuple(
+                action
+                for pair_action_id in action_ids
+                if (action := self._load_in_transaction(database, pair_action_id)) is not None
             )
             final_watermark = self._event_watermark_in_transaction(database)
-            committed = observed_watermark == expected_event_watermark == final_watermark and (
-                action is None or action.state == LiveActionState.FLAT
+            committed = (
+                observed_watermark == expected_event_watermark == final_watermark
+                and active_set_matches
+                and all(action.state == LiveActionState.FLAT for action in actions)
+                and len(actions) == len(pair_action_ids)
             )
             database.commit()
-        return FlatBarrierCommitResult(committed, action, final_watermark)
+        return FlatBarrierBatchCommitResult(committed, actions, final_watermark)
 
     def _transition_in_transaction(
         self,
@@ -1135,6 +1221,47 @@ class LiveOrderJournal:
     async def active_actions(self) -> tuple[LiveJournalAction, ...]:
         return await asyncio.to_thread(self._active_actions_sync)
 
+    async def acquire_account_flatten_lease(self) -> str | None:
+        await self.initialise()
+        return await asyncio.to_thread(self._acquire_account_flatten_lease_sync)
+
+    def _acquire_account_flatten_lease_sync(self) -> str | None:
+        owner_token = secrets.token_hex(32)
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            existing = database.execute(
+                "SELECT owner_token FROM live_control_leases "
+                "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+            ).fetchone()
+            if existing is not None:
+                database.rollback()
+                return None
+            database.execute(
+                """
+                INSERT INTO live_control_leases (lease_key, owner_token, acquired_at)
+                VALUES ('ACCOUNT_WIDE_FLATTEN', ?, ?)
+                """,
+                (owner_token, datetime.now(UTC).isoformat()),
+            )
+            database.commit()
+        return owner_token
+
+    async def release_account_flatten_lease(self, owner_token: str) -> None:
+        await asyncio.to_thread(self._release_account_flatten_lease_sync, owner_token)
+
+    def _release_account_flatten_lease_sync(self, owner_token: str) -> None:
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            deleted = database.execute(
+                "DELETE FROM live_control_leases "
+                "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN' AND owner_token = ?",
+                (owner_token,),
+            ).rowcount
+            if deleted != 1:
+                database.rollback()
+                raise RuntimeError("account-wide flatten lease ownership was lost")
+            database.commit()
+
     async def known_client_order_ids(self) -> set[str]:
         return await asyncio.to_thread(self._known_client_order_ids_sync)
 
@@ -1180,6 +1307,11 @@ class LiveOrderJournal:
         idempotent: bool = False,
         emergency_exclusive: bool = False,
     ) -> None:
+        flatten_owner = database.execute(
+            "SELECT owner_token FROM live_control_leases WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+        ).fetchone()
+        if flatten_owner is not None and not emergency_exclusive and not idempotent:
+            raise RuntimeError("account-wide flatten is in progress")
         emergency_owner = database.execute(
             "SELECT pair_action_id FROM live_action_leases WHERE lease_key = 'global:emergency'"
         ).fetchone()

@@ -95,7 +95,7 @@ class LiveControlService:
     async def snapshot(self) -> dict[str, object]:
         await self._journal.initialise()
         states = await collect_private_states(self._adapters, self._account_instruments)
-        active = await self._journal.active()
+        active = await self._journal.active_actions()
         positions = [
             {
                 "venue": position.venue.value,
@@ -135,8 +135,9 @@ class LiveControlService:
         return {
             "source": "PRIVATE_EXCHANGE",
             "status": {
-                "journal_state": active.state.value if active else LiveActionState.FLAT.value,
-                "pair_action_id": active.pair_action_id if active else None,
+                "journal_state": _journal_state(active),
+                "pair_action_id": active[0].pair_action_id if len(active) == 1 else None,
+                "pair_action_ids": tuple(action.pair_action_id for action in active),
                 "private_state_errors": {
                     venue.value: state.error
                     for venue, state in states.items()
@@ -214,13 +215,13 @@ class LiveControlService:
                 for state in refreshed.values()
             )
         )
-        active = await self._journal.active()
+        active = await self._journal.active_actions()
         return LiveControlResult(
             success,
             "CANCEL_ALL_LIVE" if bot_only else "CANCEL_ALL_ACCOUNT_ORDERS",
             0,
             cancelled,
-            active.state if active else None,
+            _terminal_state(active),
             None,
             None
             if success
@@ -237,6 +238,28 @@ class LiveControlService:
         return await self._flatten("KILL_CANCEL_FLATTEN")
 
     async def _flatten(self, action_name: str) -> LiveControlResult:
+        lease_token = await self._journal.acquire_account_flatten_lease()
+        if lease_token is None:
+            return LiveControlResult(
+                False,
+                action_name,
+                0,
+                0,
+                None,
+                None,
+                "Another account-wide flatten is in progress; keep live disabled.",
+                reason=ReasonCode.RECONCILIATION_INCOMPLETE,
+            )
+        try:
+            result = await self._flatten_owned(action_name)
+        except BaseException:
+            # An interrupted network operation has an unknown terminal state. Keep the
+            # durable lease so another caller cannot submit a contradictory close.
+            raise
+        await self._journal.release_account_flatten_lease(lease_token)
+        return result
+
+    async def _flatten_owned(self, action_name: str) -> LiveControlResult:
         cancellation = await self._cancel_orders(bot_only=False)
         states = await collect_private_states(
             self._adapters,
@@ -244,7 +267,15 @@ class LiveControlService:
             reconciliation_trigger="PRE_CLOSE",
         )
         positions = tuple(position for state in states.values() for position in state.positions)
-        active = await self._journal.active()
+        active_actions = await self._journal.active_actions()
+        if len(active_actions) > 1:
+            return await self._flatten_multiple(
+                action_name,
+                cancellation,
+                positions,
+                active_actions,
+            )
+        active = active_actions[0] if active_actions else None
         if not positions:
             barrier = await self._stable_report(active)
             report = barrier.report
@@ -414,6 +445,157 @@ class LiveControlService:
             flat_barrier_failure_reason(barrier),
         )
 
+    async def _flatten_multiple(
+        self,
+        action_name: str,
+        cancellation: LiveControlResult,
+        positions: tuple[PositionSnapshot, ...],
+        active: tuple[LiveJournalAction, ...],
+    ) -> LiveControlResult:
+        if not positions:
+            barrier = await self._stable_report_many(active)
+            if barrier.verified:
+                active, barrier = await self._mark_flat_many(active, action_name, barrier)
+                if barrier.verified:
+                    return LiveControlResult(
+                        True,
+                        action_name,
+                        0,
+                        cancellation.cancelled_orders,
+                        _terminal_state(active),
+                        barrier.report,
+                        None,
+                        True,
+                        barrier.timed_out,
+                        barrier.consecutive_snapshots,
+                        barrier.event_watermark,
+                        None,
+                    )
+            active = await self._quarantine_many(active, barrier.report, action_name)
+            return LiveControlResult(
+                False,
+                action_name,
+                0,
+                cancellation.cancelled_orders,
+                _terminal_state(active),
+                barrier.report,
+                "Stable FLAT barrier was not verified; keep live disabled.",
+                barrier.verified,
+                barrier.timed_out,
+                barrier.consecutive_snapshots,
+                barrier.event_watermark,
+                flat_barrier_failure_reason(barrier),
+            )
+
+        requests = tuple(
+            translate_protected_order(
+                ExecutionIntent(
+                    client_order_id=venue_client_order_id(
+                        f"emergency-{time.time_ns()}-{secrets.token_hex(2)}",
+                        "close",
+                        index,
+                    ),
+                    venue=position.venue,
+                    side=Side.SELL if position.side == Side.BUY else Side.BUY,
+                    purpose=OrderPurpose.EMERGENCY_CLOSE,
+                    quantity=position.base_quantity,
+                    worst_acceptable_price=None,
+                    unbounded_market=True,
+                ),
+                self._instrument(position.venue, position.symbol),
+            )
+            for index, position in enumerate(positions)
+        )
+        owners: list[LiveJournalAction] = []
+        for position in positions:
+            matched = tuple(
+                action
+                for action in active
+                if any(
+                    leg.venue == position.venue and leg.symbol == position.symbol
+                    for leg in action.legs
+                )
+            )
+            if len(matched) != 1:
+                quarantined = await self._quarantine_many(
+                    active,
+                    await self._report_many(active),
+                    action_name,
+                )
+                return LiveControlResult(
+                    False,
+                    action_name,
+                    0,
+                    cancellation.cancelled_orders,
+                    _terminal_state(quarantined),
+                    None,
+                    "Private position ownership is ambiguous; keep live disabled.",
+                    reason=ReasonCode.RECONCILIATION_INCOMPLETE,
+                )
+            owners.append(matched[0])
+
+        recovering = tuple(
+            await asyncio.gather(
+                *(self._move_to_recovering(action, action_name) for action in active)
+            )
+        )
+        recovering_by_id = {action.pair_action_id: action for action in recovering}
+        for owner, request, position in zip(owners, requests, positions, strict=True):
+            current_owner = recovering_by_id[owner.pair_action_id]
+            await self._journal.append_order_leg(
+                current_owner.pair_action_id,
+                request,
+                position.base_quantity,
+                None,
+            )
+            await self._journal.mark_leg_submit_attempted(
+                current_owner.pair_action_id,
+                request.client_order_id,
+            )
+        await asyncio.gather(
+            *(
+                self._submit_emergency(recovering_by_id[owner.pair_action_id], request)
+                for owner, request in zip(owners, requests, strict=True)
+            ),
+            return_exceptions=True,
+        )
+        barrier = await self._stable_report_many(recovering)
+        if barrier.verified:
+            recovered, barrier = await self._mark_flat_many(recovering, action_name, barrier)
+            if barrier.verified:
+                return LiveControlResult(
+                    True,
+                    action_name,
+                    len(requests),
+                    cancellation.cancelled_orders,
+                    _terminal_state(recovered),
+                    barrier.report,
+                    None,
+                    True,
+                    barrier.timed_out,
+                    barrier.consecutive_snapshots,
+                    barrier.event_watermark,
+                    None,
+                )
+        quarantined = await self._quarantine_many(recovering, barrier.report, action_name)
+        return LiveControlResult(
+            False,
+            action_name,
+            len(requests),
+            cancellation.cancelled_orders,
+            _terminal_state(quarantined),
+            barrier.report,
+            (
+                "FAILED_QUARANTINED: keep live disabled; inspect every involved exchange, "
+                "cancel remaining bot orders, and manually flatten residual positions."
+            ),
+            barrier.verified,
+            barrier.timed_out,
+            barrier.consecutive_snapshots,
+            barrier.event_watermark,
+            flat_barrier_failure_reason(barrier),
+        )
+
     async def _submit_emergency(
         self,
         active: LiveJournalAction,
@@ -468,6 +650,37 @@ class LiveControlService:
 
         return await wait_for_stable_flat(
             report_factory,
+            lambda: combined_event_watermark(
+                self._adapters,
+                self._journal.event_watermark,
+            ),
+            self._flat_barrier_policy,
+        )
+
+    async def _report_many(
+        self,
+        active: Sequence[LiveJournalAction],
+    ) -> ReconciliationReport:
+        loaded = await asyncio.gather(*(self._journal.load(item.pair_action_id) for item in active))
+        current = tuple(action for action in loaded if action is not None)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="TERMINAL_FLAT",
+        )
+        return reconcile_private_states(
+            current,
+            states,
+            await self._journal.known_client_order_ids(),
+            set(self._adapters),
+        )
+
+    async def _stable_report_many(
+        self,
+        active: Sequence[LiveJournalAction],
+    ) -> FlatBarrierResult:
+        return await wait_for_stable_flat(
+            lambda: self._report_many(active),
             lambda: combined_event_watermark(
                 self._adapters,
                 self._journal.event_watermark,
@@ -582,6 +795,65 @@ class LiveControlService:
             ),
         )
 
+    async def _mark_flat_many(
+        self,
+        active: Sequence[LiveJournalAction],
+        action_name: str,
+        barrier: FlatBarrierResult,
+    ) -> tuple[tuple[LiveJournalAction, ...], FlatBarrierResult]:
+        if not barrier.verified:
+            raise RuntimeError(flat_barrier_failure_reason(barrier).value)
+        loaded = await asyncio.gather(*(self._journal.load(item.pair_action_id) for item in active))
+        current = tuple(action for action in loaded if action is not None)
+        if len(current) != len(active):
+            raise RuntimeError("flat barrier action disappeared")
+        recovering = tuple(
+            await asyncio.gather(
+                *(self._move_to_recovering(action, action_name) for action in current)
+            )
+        )
+        observed_before = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if observed_before != barrier.event_watermark:
+            failed = await self._quarantine_many(recovering, barrier.report, action_name)
+            return (
+                failed,
+                FlatBarrierResult(
+                    False,
+                    barrier.report,
+                    0,
+                    observed_before,
+                    False,
+                    ReasonCode.FLAT_BARRIER_EVENT_RACE,
+                ),
+            )
+        journal_watermark = await self._journal.event_watermark()
+        commit = await self._journal.commit_flat_barrier_many(
+            tuple(action.pair_action_id for action in recovering),
+            journal_watermark,
+            {"action": action_name, "verified": True},
+        )
+        observed_after = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if commit.committed and observed_after == barrier.event_watermark:
+            return commit.actions, barrier
+        failed = await self._quarantine_many(commit.actions, barrier.report, action_name)
+        return (
+            failed,
+            FlatBarrierResult(
+                False,
+                barrier.report,
+                0,
+                observed_after,
+                False,
+                ReasonCode.FLAT_BARRIER_EVENT_RACE,
+            ),
+        )
+
     async def _quarantine(
         self,
         active: LiveJournalAction,
@@ -605,6 +877,18 @@ class LiveControlService:
             recovery_action=action_name,
         )
 
+    async def _quarantine_many(
+        self,
+        active: Sequence[LiveJournalAction],
+        report: ReconciliationReport,
+        action_name: str,
+    ) -> tuple[LiveJournalAction, ...]:
+        return tuple(
+            await asyncio.gather(
+                *(self._quarantine(action, report, action_name) for action in active)
+            )
+        )
+
 
 def emergency_unlock_valid(
     confirmation: str,
@@ -626,14 +910,15 @@ def render_control_result(result: LiveControlResult) -> str:
 
 
 def _live_risk_snapshot(
-    active: LiveJournalAction | None,
+    active: LiveJournalAction | Sequence[LiveJournalAction] | None,
     positions: Sequence[Mapping[str, object]],
     *,
     private_state_known: bool,
 ) -> dict[str, object]:
+    actions = _actions(active)
     if not private_state_known:
         return {"status": "INVALID_RISK_DATA", "reason": "PRIVATE_STATE_UNAVAILABLE"}
-    if active is None:
+    if not actions:
         if positions:
             return {
                 "status": "INVALID_RISK_DATA",
@@ -646,34 +931,45 @@ def _live_risk_snapshot(
             "per_route_stress_usdt": {},
             "portfolio_stress_usdt": "0",
         }
-    if not _private_positions_match_journal(active, positions):
+    if not _private_positions_match_journal(actions, positions):
         return {
             "status": "INVALID_RISK_DATA",
             "reason": "PRIVATE_POSITION_JOURNAL_MISMATCH",
         }
-    try:
-        projected_stress = Decimal(str(active.risk_reservation["projected_stress_usdt"]))
-    except (DecimalException, KeyError, ValueError):
-        return {"status": "INVALID_RISK_DATA", "reason": "RISK_RESERVATION_UNKNOWN"}
-    if not projected_stress.is_finite() or projected_stress < 0:
-        return {"status": "INVALID_RISK_DATA", "reason": "RISK_RESERVATION_UNKNOWN"}
+    per_route: dict[str, str] = {}
+    portfolio_stress = Decimal(0)
+    for action in actions:
+        try:
+            projected_stress = Decimal(str(action.risk_reservation["projected_stress_usdt"]))
+            if (
+                not projected_stress.is_finite()
+                or projected_stress < 0
+                or projected_stress > Decimal("5")
+            ):
+                raise ValueError("projected route stress is outside the locked limit")
+            portfolio_stress += projected_stress
+            if not portfolio_stress.is_finite() or portfolio_stress > Decimal("50"):
+                raise ValueError("projected portfolio stress is outside the locked limit")
+        except (DecimalException, KeyError, ValueError):
+            return {"status": "INVALID_RISK_DATA", "reason": "RISK_RESERVATION_UNKNOWN"}
+        per_route[action.route.value] = str(projected_stress)
     return {
         "status": "OK",
         "scope": "JOURNAL_RESERVATION",
-        "reservation_count": 1,
-        "per_route_stress_usdt": {active.route.value: str(projected_stress)},
-        "portfolio_stress_usdt": str(projected_stress),
+        "reservation_count": len(actions),
+        "per_route_stress_usdt": per_route,
+        "portfolio_stress_usdt": str(portfolio_stress),
     }
 
 
 def _private_positions_match_journal(
-    active: LiveJournalAction,
+    active: Sequence[LiveJournalAction],
     positions: Sequence[Mapping[str, object]],
 ) -> bool:
     expected: dict[tuple[str, str], Decimal] = {}
     actual: dict[tuple[str, str], Decimal] = {}
     try:
-        for leg in active.legs:
+        for leg in (leg for action in active for leg in action.legs):
             signed = leg.filled_base_quantity if leg.side == Side.BUY else -leg.filled_base_quantity
             key = (leg.venue.value, leg.symbol)
             expected[key] = expected.get(key, Decimal(0)) + signed
@@ -692,6 +988,28 @@ def _private_positions_match_journal(
     return {key: value for key, value in expected.items() if value != 0} == {
         key: value for key, value in actual.items() if value != 0
     }
+
+
+def _actions(
+    active: LiveJournalAction | Sequence[LiveJournalAction] | None,
+) -> tuple[LiveJournalAction, ...]:
+    if active is None:
+        return ()
+    if isinstance(active, LiveJournalAction):
+        return (active,)
+    return tuple(active)
+
+
+def _terminal_state(active: Sequence[LiveJournalAction]) -> LiveActionState | None:
+    states = {action.state for action in active}
+    return next(iter(states)) if len(states) == 1 else None
+
+
+def _journal_state(active: Sequence[LiveJournalAction]) -> str:
+    if not active:
+        return LiveActionState.FLAT.value
+    state = _terminal_state(active)
+    return state.value if state is not None else "MULTIPLE"
 
 
 def _position_pnl(position: PositionSnapshot) -> Decimal:

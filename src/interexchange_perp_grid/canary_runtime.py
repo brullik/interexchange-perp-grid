@@ -356,7 +356,8 @@ class OnDemandLiveControlPlane:
         await initialise_state(state_path)
         journal = LiveOrderJournal(state_path)
         await journal.initialise()
-        active = await journal.active()
+        active_actions = await journal.active_actions()
+        active = active_actions[0] if len(active_actions) == 1 else None
         venues = {Venue(value) for value in self._settings.venues.wave1_public}
         private: dict[Venue, CcxtPrivateAdapter] = {}
         private_stop: asyncio.Event | None = None
@@ -650,6 +651,24 @@ async def recover_active_canary(
     return await _resume_active_canary(settings, journal, active)
 
 
+async def recover_active_actions(
+    settings: Settings,
+    journal: LiveOrderJournal,
+    active: tuple[LiveJournalAction, ...],
+) -> object:
+    """Recover one action normally or flatten a multi-action account as one owned batch."""
+    if not active:
+        return object()
+    if len(active) == 1:
+        return await recover_active_canary(settings, journal, active[0])
+    result = await OnDemandLiveControlPlane(settings).emergency_flatten()
+    if not result.success:
+        raise RuntimeError(
+            result.instruction or "multi-action account recovery did not verify stable FLAT"
+        )
+    return result
+
+
 async def run_canary_once(
     settings: Settings,
     config_path: Path,
@@ -663,9 +682,11 @@ async def run_canary_once(
     await initialise_state(state_path)
     journal = LiveOrderJournal(state_path)
     await journal.initialise()
-    active = await journal.active()
-    if active is not None:
-        return await _resume_active_canary(settings, journal, active)
+    active_actions = await journal.active_actions()
+    if len(active_actions) == 1:
+        return await _resume_active_canary(settings, journal, active_actions[0])
+    if active_actions:
+        return _denied(ReasonCode.RECONCILIATION_INCOMPLETE, active_actions[0].route)
     if not qualification_path.is_file():
         return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING)
     try:
@@ -1041,7 +1062,8 @@ async def run_emergency_flatten(
         return None
     journal = LiveOrderJournal(Path(settings.storage.sqlite_path))
     await journal.initialise()
-    active = await journal.active()
+    active_actions = await journal.active_actions()
+    active = active_actions[0] if len(active_actions) == 1 else None
     venues = {Venue(value) for value in settings.venues.wave1_public}
     private: dict[Venue, CcxtPrivateAdapter] = {}
     try:

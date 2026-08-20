@@ -27,7 +27,10 @@ async def run_supervisor_recovery_smoke(
     """Docker-only deterministic process-kill smoke; it never opens exchange transports."""
     journal = LiveOrderJournal(state_path)
     await journal.initialise()
-    active = await journal.active()
+    active_actions = await journal.active_actions()
+    if len(active_actions) > 1:
+        raise RuntimeError("recovery smoke supports exactly one durable action")
+    active = active_actions[0] if active_actions else None
     if hold_after_active:
         if active is None:
             active = await _prepare_partial(journal)
@@ -61,7 +64,7 @@ async def run_supervisor_recovery_smoke(
 
     supervisor = LiveSafetySupervisor(journal, recover, poll_interval_seconds=0.01)
     health = await supervisor.reconcile_once()
-    if health.mode != SupervisorMode.IDLE or await journal.active() is not None:
+    if health.mode != SupervisorMode.IDLE or await journal.active_actions():
         raise RuntimeError("supervisor recovery smoke did not reach FLAT")
     return {
         "status": "PASS",

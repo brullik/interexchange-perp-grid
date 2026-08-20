@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ from interexchange_perp_grid.private_domain import (
     PrivateOrderStatus,
     VenueOrderRequest,
 )
+from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 
@@ -257,6 +259,122 @@ async def test_live_reads_expose_exact_active_journal_risk(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_live_reads_aggregate_multiple_durable_route_reservations(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, long_outcomes=())
+    await service._journal.initialise()
+    await service._journal.prepare(
+        "active-btc",
+        DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX),
+        "tranche-btc",
+        _seed_request(Venue.BINANCE_USDM, "risk-btc-long", Side.BUY),
+        _seed_request(Venue.OKX, "risk-btc-short", Side.SELL),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {"projected_stress_usdt": "1.25"},
+        "a" * 64,
+    )
+    await service._journal.prepare(
+        "active-eth",
+        DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+        "tranche-eth",
+        replace(
+            _seed_request(Venue.BINANCE_USDM, "risk-eth-long", Side.BUY),
+            symbol="ETH/USDT:USDT",
+        ),
+        replace(
+            _seed_request(Venue.OKX, "risk-eth-short", Side.SELL),
+            symbol="ETH/USDT:USDT",
+        ),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("2000"), Venue.OKX: Decimal("2000")},
+        {"projected_stress_usdt": "2.50"},
+        "b" * 64,
+    )
+
+    snapshot = await service.snapshot()
+
+    status = snapshot["status"]
+    assert isinstance(status, dict)
+    assert status["journal_state"] == LiveActionState.PREPARED.value
+    assert status["pair_action_ids"] == ("active-btc", "active-eth")
+    assert snapshot["risk"] == {
+        "status": "OK",
+        "scope": "JOURNAL_RESERVATION",
+        "reservation_count": 2,
+        "per_route_stress_usdt": {
+            "BTC:binanceusdm>okx": "1.25",
+            "ETH:binanceusdm>okx": "2.50",
+        },
+        "portfolio_stress_usdt": "3.75",
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_reads_reject_extreme_finite_decimal_risk_without_overflow(
+    tmp_path: Path,
+) -> None:
+    service, _ = _service(tmp_path, long_outcomes=())
+    await service._journal.initialise()
+    await service._journal.prepare(
+        "extreme-risk",
+        DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX),
+        "tranche-extreme",
+        _seed_request(Venue.BINANCE_USDM, "extreme-long", Side.BUY),
+        _seed_request(Venue.OKX, "extreme-short", Side.SELL),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {"projected_stress_usdt": "1e999999999"},
+        "d" * 64,
+    )
+
+    snapshot = await service.snapshot()
+
+    assert snapshot["risk"] == {
+        "status": "INVALID_RISK_DATA",
+        "reason": "RISK_RESERVATION_UNKNOWN",
+    }
+
+
+@pytest.mark.asyncio
+async def test_close_all_live_commits_multiple_flat_actions_atomically(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, long_outcomes=())
+    await service._journal.initialise()
+    for pair_id, base in (("active-btc", "BTC"), ("active-eth", "ETH")):
+        symbol = f"{base}/USDT:USDT"
+        await service._journal.prepare(
+            pair_id,
+            DirectedRouteKey(base, Venue.BINANCE_USDM, Venue.OKX),
+            f"tranche-{base.lower()}",
+            replace(
+                _seed_request(Venue.BINANCE_USDM, f"{pair_id}-long", Side.BUY),
+                symbol=symbol,
+            ),
+            replace(
+                _seed_request(Venue.OKX, f"{pair_id}-short", Side.SELL),
+                symbol=symbol,
+            ),
+            {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+            {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+            {"projected_stress_usdt": "1"},
+            "c" * 64,
+        )
+
+    result = await service.close_all_live()
+
+    assert result.success is True
+    assert result.flat_barrier_verified is True
+    assert await service._journal.active_actions() == ()
+    loaded = await asyncio.gather(
+        *(service._journal.load(pair_id) for pair_id in ("active-btc", "active-eth"))
+    )
+    assert all(action is not None for action in loaded)
+    assert tuple(action.state for action in loaded if action is not None) == (
+        LiveActionState.FLAT,
+        LiveActionState.FLAT,
+    )
+
+
+@pytest.mark.asyncio
 async def test_live_reads_never_report_zero_risk_when_private_state_is_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -326,6 +444,52 @@ async def test_emergency_flatten_journals_then_exchange_verifies_flat(tmp_path: 
     assert result.terminal_state == LiveActionState.FLAT
     assert result.reconciliation.flat_verified is True
     assert await adapters[Venue.BINANCE_USDM].fetch_all_positions() == ()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_account_flatten_is_durable_single_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instruments = {(venue, _instrument(venue).symbol): _instrument(venue) for venue in Venue}
+    instruments[(Venue.BINANCE_USDM, "ETH/USDT:USDT")] = _eth_instrument(Venue.BINANCE_USDM)
+    exposed = MultiSymbolEmergencyExchange(Venue.BINANCE_USDM)
+    adapters = {
+        Venue.BINANCE_USDM: exposed,
+        Venue.OKX: DeterministicPrivateExchange(Venue.OKX, _instrument(Venue.OKX), ()),
+        Venue.BYBIT: DeterministicPrivateExchange(Venue.BYBIT, _instrument(Venue.BYBIT), ()),
+    }
+    state_path = tmp_path / "state.sqlite3"
+    journal = LiveOrderJournal(state_path)
+    await journal.initialise()
+    first_service = LiveControlService(journal, adapters, instruments)
+    second_service = LiveControlService(LiveOrderJournal(state_path), adapters, instruments)
+    submit_started = asyncio.Event()
+    release_submit = asyncio.Event()
+    original_submit = exposed.submit_order
+
+    async def held_submit(
+        request: VenueOrderRequest,
+        instrument: Instrument,
+    ) -> PrivateOrder:
+        submit_started.set()
+        await release_submit.wait()
+        return await original_submit(request, instrument)
+
+    monkeypatch.setattr(exposed, "submit_order", held_submit)
+    first_task = asyncio.create_task(first_service.emergency_flatten())
+    await asyncio.wait_for(submit_started.wait(), timeout=1)
+
+    rejected = await second_service.emergency_flatten()
+    release_submit.set()
+    first = await asyncio.wait_for(first_task, timeout=2)
+
+    assert first.success is True
+    assert rejected.success is False
+    assert rejected.orders_sent == 0
+    assert rejected.reason == ReasonCode.RECONCILIATION_INCOMPLETE
+    assert exposed.submit_calls == 1
+    assert exposed.submitted_symbols == ["ETH/USDT:USDT"]
 
 
 @pytest.mark.asyncio

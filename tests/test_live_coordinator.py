@@ -546,6 +546,60 @@ async def test_process_restart_after_durable_transition_resumes_without_duplicat
 
 
 @pytest.mark.asyncio
+async def test_reverifying_flat_action_never_reactivates_it_for_an_unexpected_action(
+    tmp_path: Path,
+) -> None:
+    result, adapters = await _run(
+        tmp_path,
+        (
+            _outcome(PrivateOrderStatus.FILLED, "1"),
+            _outcome(PrivateOrderStatus.FILLED, "1"),
+        ),
+        (
+            _outcome(PrivateOrderStatus.FILLED, "1"),
+            _outcome(PrivateOrderStatus.FILLED, "1"),
+        ),
+    )
+    assert result.success is True and result.terminal_state == LiveActionState.FLAT
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await journal.prepare(
+        "eth-pending",
+        DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+        "eth-tranche",
+        _request(Venue.BINANCE_USDM, "eth-long", Side.BUY),
+        _request(Venue.OKX, "eth-short", Side.SELL),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {"projected_stress_usdt": "0.8"},
+        "b" * 64,
+    )
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    coordinator = LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        StaticProtectionProvider(
+            {
+                (venue, side): Decimal("101") if side == Side.BUY else Decimal("99")
+                for venue in Venue
+                for side in Side
+            }
+        ),
+        DeterministicCanaryMonitor(CloseReason.TARGET_CONVERGENCE),
+        Venue.BYBIT,
+    )
+
+    replay = await coordinator.run(_plan())
+
+    assert replay.success is False
+    completed = await journal.load("cycle-1")
+    unexpected = await journal.load("eth-pending")
+    assert completed is not None and completed.state == LiveActionState.FLAT
+    assert unexpected is not None and unexpected.state == LiveActionState.QUARANTINED
+
+
+@pytest.mark.asyncio
 async def test_journal_balanced_but_exchange_mismatched_positions_are_never_hedged(
     tmp_path: Path,
 ) -> None:

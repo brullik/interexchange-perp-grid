@@ -428,6 +428,129 @@ async def test_active_actions_returns_one_consistent_read_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_flat_barrier_commits_multiple_actions_and_releases_leases_atomically(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    first = await _prepare(journal, "first", "first-long", "first-short")
+    second = await _prepare(
+        journal,
+        "second",
+        "second-long",
+        "second-short",
+        DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+    )
+    await journal.transition(first.pair_action_id, LiveActionState.QUARANTINED)
+    await journal.transition(second.pair_action_id, LiveActionState.QUARANTINED)
+    watermark = await journal.event_watermark()
+
+    commit = await journal.commit_flat_barrier_many(
+        (first.pair_action_id, second.pair_action_id),
+        watermark,
+        {"exchange_verified": True},
+    )
+
+    assert commit.committed is True
+    assert tuple(action.state for action in commit.actions) == (
+        LiveActionState.FLAT,
+        LiveActionState.FLAT,
+    )
+    assert await journal.active_actions() == ()
+    replacements = await asyncio.gather(
+        _prepare(journal, "replacement-btc", "replacement-btc-long", "replacement-btc-short"),
+        _prepare(
+            journal,
+            "replacement-eth",
+            "replacement-eth-long",
+            "replacement-eth-short",
+            DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+        ),
+    )
+    assert len(replacements) == 2
+
+
+@pytest.mark.asyncio
+async def test_multi_action_flat_barrier_event_race_keeps_every_lease_active(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    first = await _prepare(journal, "first", "first-long", "first-short")
+    second = await _prepare(
+        journal,
+        "second",
+        "second-long",
+        "second-short",
+        DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+    )
+    await journal.transition(first.pair_action_id, LiveActionState.QUARANTINED)
+    await journal.transition(second.pair_action_id, LiveActionState.QUARANTINED)
+    expected_watermark = await journal.event_watermark()
+    with pytest.raises(JournalEventQuarantinedError):
+        await journal.record_order_event(
+            first.pair_action_id,
+            replace(_event(venue=Venue.OKX), client_order_id="first-long"),
+            "late-race",
+        )
+
+    commit = await journal.commit_flat_barrier_many(
+        (first.pair_action_id, second.pair_action_id),
+        expected_watermark,
+    )
+
+    assert commit.committed is False
+    assert tuple(action.state for action in commit.actions) == (
+        LiveActionState.QUARANTINED,
+        LiveActionState.QUARANTINED,
+    )
+    assert len(await journal.active_actions()) == 2
+
+
+@pytest.mark.asyncio
+async def test_multi_action_flat_barrier_rejects_a_new_unobserved_active_action(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    first = await _prepare(journal, "first", "first-long", "first-short")
+    expected_watermark = await journal.event_watermark()
+    await _prepare(
+        journal,
+        "late",
+        "late-long",
+        "late-short",
+        DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+    )
+
+    commit = await journal.commit_flat_barrier_many(
+        (first.pair_action_id,),
+        expected_watermark,
+    )
+
+    assert commit.committed is False
+    assert tuple(action.pair_action_id for action in commit.actions) == ("first", "late")
+    assert all(action.state == LiveActionState.QUARANTINED for action in commit.actions)
+    assert len(await journal.active_actions()) == 2
+
+
+@pytest.mark.asyncio
+async def test_account_flatten_lease_blocks_a_new_normal_live_action(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    token = await journal.acquire_account_flatten_lease()
+    assert token is not None
+
+    with pytest.raises(RuntimeError, match="account-wide flatten is in progress"):
+        await _prepare(journal)
+
+    assert await journal.active_actions() == ()
+    await journal.release_account_flatten_lease(token)
+    created = await _prepare(journal)
+    assert created.state == LiveActionState.PREPARED
+
+
+@pytest.mark.asyncio
 async def test_submit_attempt_is_durable_and_client_id_is_never_retried(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     journal = LiveOrderJournal(path)
