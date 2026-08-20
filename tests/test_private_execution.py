@@ -613,7 +613,7 @@ async def test_live_canary_submission_is_physically_behind_every_guard() -> None
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "candidate_venue",
-    [Venue.BITGET, Venue.KUCOIN_FUTURES, Venue.BINGX],
+    [Venue.BITGET, Venue.KUCOIN_FUTURES, Venue.BINGX, Venue.MEXC],
 )
 async def test_expansion_code_candidate_cannot_expand_live_canary_allowlist(
     candidate_venue: Venue,

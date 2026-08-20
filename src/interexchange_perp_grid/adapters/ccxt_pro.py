@@ -13,6 +13,7 @@ from interexchange_perp_grid.adapters.bingx_swap import SequenceQualifiedBingxEx
 from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.adapters.bybit_v5 import SequenceQualifiedBybitExchange
 from interexchange_perp_grid.adapters.kucoin_classic import ClassicKucoinFuturesExchange
+from interexchange_perp_grid.adapters.mexc_swap import SequenceQualifiedMexcExchange
 from interexchange_perp_grid.domain import (
     BboQuote,
     BookLevel,
@@ -84,6 +85,8 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
     amount_step = _decimal(precision.get("amount"))
     price_tick = _decimal(precision.get("price"))
     minimum_amount = _decimal(amount_limits.get("min"))
+    if venue == Venue.MEXC and info.get("apiAllowed") is not True:
+        return None
     if contract_size is None or contract_size <= 0:
         return None
     if amount_step is None or amount_step <= 0:
@@ -118,6 +121,14 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
             and info.get("settleCurrency") == "USDT"
             and _decimal(info.get("lotSize")) == minimum_amount
             and _decimal(info.get("multiplier")) == contract_size
+        )
+        or (
+            venue == Venue.MEXC
+            and info.get("apiAllowed") is True
+            and str(info.get("state")) == "0"
+            and _decimal(info.get("contractSize")) == contract_size
+            and _decimal(info.get("volUnit")) == amount_step
+            and _decimal(info.get("minVol")) == minimum_amount
         )
     )
     return Instrument(
@@ -169,6 +180,8 @@ class CcxtProAdapter(ExchangeAdapter):
             return ClassicKucoinFuturesExchange(configuration)
         if venue == Venue.BINGX:
             return SequenceQualifiedBingxExchange(configuration)
+        if venue == Venue.MEXC:
+            return SequenceQualifiedMexcExchange(configuration)
         exchange_class = getattr(ccxtpro, venue.value)
         return exchange_class(configuration)
 
@@ -192,7 +205,7 @@ class CcxtProAdapter(ExchangeAdapter):
             ("bids_asks", "watchBidsAsks", "unWatchBidsAsks", "un_watch_bids_asks"),
             ("tickers", "watchTickers", "unWatchTickers", "un_watch_tickers"),
         )
-        if self.venue == Venue.BITGET:
+        if self.venue in {Venue.BITGET, Venue.MEXC}:
             pairs = (pairs[1],)
         for kind, watch_capability, unwatch_capability, unwatch_method in pairs:
             declared_unwatch = capabilities.get(unwatch_capability)

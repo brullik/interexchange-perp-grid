@@ -346,6 +346,7 @@ async def test_broad_bbo_rejects_unbounded_per_symbol_ticker_fallback() -> None:
         (Venue.BYBIT, {}),
         (Venue.OKX, {}),
         (Venue.BITGET, {}),
+        (Venue.MEXC, {}),
     ),
 )
 async def test_broad_bbo_uses_only_a_batch_stream_with_matching_unsubscribe(
@@ -516,6 +517,7 @@ async def test_ccxt_book_carries_native_non_contiguous_sequence_evidence() -> No
         (Venue.BITGET, {"limit": 15}),
         (Venue.KUCOIN_FUTURES, {"limit": 50}),
         (Venue.BINGX, {}),
+        (Venue.MEXC, {}),
     ),
 )
 async def test_wave1_candidate_l2_unsubscribe_matches_subscription_contract(

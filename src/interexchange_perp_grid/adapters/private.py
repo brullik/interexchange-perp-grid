@@ -128,6 +128,10 @@ class CcxtPrivateAdapter:
             "fetch_closed_orders": self._has("fetchClosedOrders"),
             "fetch_fee": self._has("fetchTradingFee") or self._has("fetchTradingFees"),
         }
+        if self.venue == Venue.MEXC:
+            # MEXC's official contract API still marks place/cancel endpoints as maintenance.
+            values["submit_order"] = False
+            values["cancel_order"] = False
         return PrivateCapabilityReport(
             venue=self.venue,
             checked_at=datetime.now(UTC),
@@ -443,6 +447,8 @@ class CcxtPrivateAdapter:
         request: VenueOrderRequest,
         instrument: Instrument,
     ) -> PrivateOrder:
+        if self.venue == Venue.MEXC:
+            raise RuntimeError("MEXC contract order submission is not qualified")
         if self._production_transport:
             _enforce_production_submit_guard()
         raw = await self._exchange.create_order(
@@ -462,6 +468,8 @@ class CcxtPrivateAdapter:
         order_id: str,
         instrument: Instrument,
     ) -> PrivateOrder:
+        if self.venue == Venue.MEXC:
+            raise RuntimeError("MEXC contract order cancellation is not qualified")
         raw = await self._exchange.cancel_order(order_id, instrument.symbol)
         if not isinstance(raw, Mapping):
             raise TypeError("CCXT cancel_order must return a mapping")
@@ -760,6 +768,8 @@ def _account_wide_snapshot_params(
         if kind == PrivateStreamKind.POSITIONS:
             return {"subType": "linear"}
         return {"type": "swap", "subType": "linear"}
+    if venue == Venue.MEXC:
+        return {"type": "swap"}
     if venue == Venue.BYBIT:
         return {"category": "linear", "settleCoin": "USDT"}
     if venue == Venue.OKX:
@@ -775,6 +785,8 @@ def _account_wide_snapshot_limits(venue: Venue) -> tuple[int | None, int | None]
     if venue == Venue.KUCOIN_FUTURES:
         return 50, None
     if venue == Venue.BINGX:
+        return None, None
+    if venue == Venue.MEXC:
         return None, None
     if venue == Venue.BYBIT:
         return 50, 200
@@ -806,6 +818,8 @@ def _account_wide_stream_params(
         return {"type": "swap", "uta": False}
     if venue == Venue.BINGX:
         return {"type": "swap", "subType": "linear"}
+    if venue == Venue.MEXC:
+        return {"type": "swap"}
     if venue == Venue.BYBIT:
         # The configured CCXT transport already selects swap/linear. Unconsumed params are
         # merged into Bybit's subscribe frame, whose schema only permits op/req_id/args.
