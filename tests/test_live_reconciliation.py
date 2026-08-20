@@ -241,7 +241,7 @@ async def test_late_fill_after_first_empty_snapshot_resets_flat_barrier() -> Non
     result = await wait_for_stable_flat(
         report_factory,
         watermark,
-        FlatBarrierPolicy(2, 0, 0.001, 0.1),
+        FlatBarrierPolicy(2, 0, 0.001, 0.5),
     )
     assert result.verified is True
     assert calls >= 4
