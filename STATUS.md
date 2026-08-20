@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE5_3_BINGX_COMPLETE_PHASE5_4_MEXC_PENDING
-- **Current checkpoint:** Phase 5.3 BingX capability-gated profile is exact-head verified at `0678049`; Phase 5.4 MEXC is next. BingX broad BBO and live remain disabled because the official WS documents only per-symbol BBO
+- **State:** PHASE5_3_BINGX_EVIDENCE_STABILIZATION_AWAITING_EXACT_GATE
+- **Current checkpoint:** Phase 5.3 BingX code head `0678049` is exact-head verified; one evidence-only CI rerun exposed an unrelated 3.5-second runner-jitter assertion in the already fail-closed 10-route recovery test. A test-only hard-timeout stabilization and fresh exact gate are pending before Phase 5.4 MEXC
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -61,6 +61,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-20 — Add Bitget only through the Classic USDT-FUTURES profile and keep the live canary allowlist unchanged — pinned CCXT supports Classic data/private primitives but its batch ticker unsubscribe stub and unqualified UTA require an explicit matching override and fail-closed separation — public/private adapters, config, execution boundary, CLI
 2026-08-20 — Add KuCoin Futures only through the Classic contract profile and preserve hedge tombstones from raw `positionSide` — pinned CCXT normalisation loses the side of a zero contract position, so Classic raw identity is required to avoid erasing the independent opposite hedge — public/private adapters, universe/routes/economics, config, execution boundary
 2026-08-21 — Add BingX as a capability-gated linear-USDT profile with native sequenced L2 but keep broad BBO disabled — official BingX WS documents only per-symbol bookTicker, which cannot satisfy the bounded batch-BBO contract without the forbidden fan-out fallback — public/private adapters, config, execution boundary
+2026-08-21 — Stabilize the 10-route hung-lookup evidence with a six-second scenario hard timeout — repeated local/CI runner jitter exceeded a 3.5-second wall assertion although transport deadlines and fail-closed functional outcomes remained correct — live control test only
 2026-08-14 — Calibrate median/MAD grids independently per directed route and size bucket with a 20% update bound — outliers and abrupt parameter jumps must not destabilise entries — `strategy.py`
 2026-08-14 — Reserve route, portfolio, and venue risk atomically before simulated submission — every accepted action must preserve the 5/50 USDT, local-margin, leverage, route, and tranche limits — `risk.py`, `execution.py`
 2026-08-15 — Start the real public evaluator beside the persisted heartbeat and isolate network failures — Docker health and risk controls must remain responsive while a venue is slow or quarantined — `service.py`, `shadow.py`

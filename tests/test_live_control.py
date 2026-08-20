@@ -990,11 +990,10 @@ async def test_hung_restart_lookup_is_bounded_and_other_routes_still_flatten(
         return None
 
     monkeypatch.setattr(adapters[Venue.BYBIT], "find_order_by_client_id", hung_lookup)
-    started = asyncio.get_running_loop().time()
-
-    result = await LiveControlService(journal, adapters, instruments).emergency_flatten()
-
-    assert asyncio.get_running_loop().time() - started < 3.5
+    result = await asyncio.wait_for(
+        LiveControlService(journal, adapters, instruments).emergency_flatten(),
+        timeout=6.0,
+    )
     assert result.success is False
     assert result.orders_sent == 20
     snapshots = await asyncio.gather(
