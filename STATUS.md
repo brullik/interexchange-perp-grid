@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE4_4_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
-- **Current checkpoint:** Phase 4.4 multi-symbol private emergency recovery is locally complete; automatic recovery of an exchange-unobservable submit remains deliberately fail-closed and PROD-08 remains PARTIAL
+- **State:** PHASE4_4_COMPLETE_STARTING_PHASE4_5
+- **Current checkpoint:** Phase 4.4 multi-symbol private emergency recovery is exact-gated; Phase 4.5 will add transition-complete process-kill/private-transport chaos without weakening unknown-submit fail-close
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -30,7 +30,7 @@ This is the only mutable project-status document.
 | Phase 4.1 durable multi-action journal ownership | COMPLETE | Exact head `3731d72`; SQLite WAL admits at most 10 active actions with one canonical base lease and one exact route lease per action; concurrent same-base creation has exactly one winner; leases survive restart/migration and release only at FLAT; account-wide emergency actions own a global exclusive lease; legacy over-limit state, conflicting reactivation, noncanonical base identity, and inconsistent active snapshots fail closed; exact run `32373391094` passed all five jobs with replay `9408072839`, C4.3 `9408057869`, C4 critical `9408048167`, and security `9408036741`; independent technical review found P0/P1=0 |
 | Phase 4.2 multi-action recovery and emergency control | COMPLETE | Exact head `593e691`; supervisor recovery is single-flight per durable action and isolates route failures; service/coordinator/reconciliation/shadow consumers use transactionally consistent multi-action snapshots; live control aggregates exact signed risk and concurrently closes uniquely owned venue-symbol positions; stable-FLAT commits the complete active set atomically, quarantines late private events, and preserves terminal idempotency; durable account-wide flatten single-flight prevents duplicate/reversing close submits; exact run `32379906107` passed all five jobs with replay `9410609578`, C4.3 `9410587650`, C4 critical `9410586435`, and security `9410568204`; downloaded artifacts report zero false success and zero production submits; independent review P0/P1/P2=0 |
 | Phase 4.3 bounded 10-action supervisor smoke | COMPLETE | Exact head `e8d12cc`; the journal-level supervisor process-kill smoke persists 10 unique-base labels at the locked 5 USDT each/50 USDT portfolio boundary, supports repeated restart after a subset is already FLAT, rejects non-finite durable stress, and requires a fresh process to recover every remaining action with zero production exchange transports. Exact run `32383862119` passed all five jobs with replay `9412151140`, C4.3 `9412127393`, C4 critical `9412127632`, and security `9412115391`; independent review P0/P1/P2=0 |
-| Phase 4.4 multi-symbol private emergency recovery | LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE | Production `LiveControlService` reconciles and atomically stable-FLAT-closes 10 routes/20 positions across exact venue-symbol histories; one rejected route does not block the other reductions; durable account-wide ownership is restart-adoptable by verified process identity and reusable across one-shot control objects; accepted journaled client IDs are reconciled without duplicate submit; an unobservable attempted submit retains the exclusive lease and requires explicit external resolution rather than unsafe retry. Private reconciliation owns and coalesces bounded cached/forced account, fee, and history requests across caller timeouts and exposes explicit bounded shutdown failure. Local full gate passes 479 tests. PROD-08 remains PARTIAL pending transition-complete process-kill/private-transport chaos evidence |
+| Phase 4.4 multi-symbol private emergency recovery | COMPLETE | Exact code head `c7cfa9f`; production `LiveControlService` reconciles and atomically stable-FLAT-closes 10 routes/20 positions across exact venue-symbol histories; one rejected route does not block the other reductions; durable account-wide ownership is restart-adoptable by verified process identity and reusable across one-shot control objects; accepted journaled client IDs are reconciled without duplicate submit; an unobservable attempted submit retains the exclusive lease and requires explicit external resolution rather than unsafe retry. Private reconciliation owns and coalesces bounded cached/forced account, fee, and history requests across caller timeouts and exposes explicit bounded shutdown failure. Exact run `32390979997` passed all five jobs with replay `9414849317`, C4 critical `9414831961`, C4.3 `9414824434`, and security `9414822131`; independent review P0/P1/P2=0. PROD-08 remains PARTIAL pending transition-complete process-kill/private-transport chaos evidence |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -141,4 +141,7 @@ full PROD-08/10, live qualification, and Ready/merge remain outside this checkpo
 
 GNU make is not installed on this Windows host. No production credentials were used, route
 calibration and Candidate L2 keep `execution_authorized=false`, and no real order was submitted.
+
+Fresh exact-head Linux CI run `32390979997` passed verify, Docker smoke, security, C4 critical,
+and C4.3 proof on `c7cfa9f`; all four uploaded artifacts bind that exact SHA.
 ```
