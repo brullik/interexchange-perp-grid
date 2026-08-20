@@ -516,6 +516,7 @@ def supervisor_recovery_smoke(
     state: Annotated[Path, typer.Option("--state")],
     hold_after_active: Annotated[bool, typer.Option("--hold-after-active")] = False,
     ready: Annotated[Path | None, typer.Option("--ready")] = None,
+    action_count: Annotated[int, typer.Option("--action-count", min=1, max=10)] = 10,
 ) -> None:
     """Run deterministic Docker process-kill/restart recovery proof without exchange I/O."""
     result = asyncio.run(
@@ -523,6 +524,7 @@ def supervisor_recovery_smoke(
             state.resolve(),
             hold_after_active=hold_after_active,
             ready_path=ready.resolve() if ready is not None else None,
+            action_count=action_count,
         )
     )
     typer.echo(json.dumps(result, default=str, sort_keys=True))
