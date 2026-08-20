@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE5_2_KUCOIN_CLASSIC_COMPLETE_PHASE5_3_BINGX_PENDING
-- **Current checkpoint:** Phase 5.2 KuCoin Futures Classic public/read-only/private contract code is exact-head verified at `d37ded5`; Phase 5.3 BingX is next. KuCoin live remains disabled and is not part of the Wave 1 canary allowlist
+- **State:** PHASE5_3_BINGX_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
+- **Current checkpoint:** Phase 5.3 BingX capability-gated code candidate passes the local locked gate and independent dirty-tree review; commit/push, exact-head CI/artifacts, and final exact review remain pending. BingX broad BBO and live remain disabled because the official WS documents only per-symbol BBO
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -36,7 +36,8 @@ This is the only mutable project-status document.
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | Phase 5.1 Bitget Classic code candidate | COMPLETE | Bitget is now a typed venue profile with a Classic-only CCXT Pro transport, exact 4096-byte batch ticker framing and matching unsubscribe acknowledgement, raw books15 sequence propagation/regression rejection, exact linear-USDT discovery, split account-wide read-only snapshot/stream params, and final pinned protected IOC `clientOid`/crossed/force mapping. Wave 1 remains exactly Binance USD-M/Bybit/OKX; Bitget is explicitly denied at the live-canary submit boundary. Exact code head `2bee950`; local locked gate: lock64, Ruff96, mypy94, pytest547, doctor shadow/live=false, Bandit medium/high0, diff-check; exact run `32411553358` passed all five jobs and produced replay, C4 critical, C4.3, and security artifacts bound to the exact SHA; independent exact-head review P0=0/P1=0/P2=0. No credentials or network evidence were fabricated. |
 | Phase 5.2 KuCoin Futures Classic code candidate | COMPLETE | KuCoin Futures is now a typed Classic-only venue profile with exact batch-BBO topic framing and matching unsubscribe, raw Level-50 sequence propagation, strict linear-USDT/no-fixed-notional proof, account-wide Classic position stream, read-only private snapshots/streams, and pinned protected cross/IOC `clientOid` request mapping. Raw `positionSide` preserves independent hedge sides when zero-position tombstones arrive; ambiguous side-less records fail closed. Wave 1 remains exactly Binance USD-M/Bybit/OKX and KuCoin is denied at the live-canary boundary. Exact code head `d37ded5`; local gate lock64/Ruff97/mypy95/pytest566/doctor shadow-live=false/Bandit0/diff-check passed; exact run `32415664858` passed all five jobs with replay `9423845774`, C4 critical `9423825785`, C4.3 `9423818033`, and security `9423805574`; independent exact review P0/P1/P2=0. |
-| C6 venue expansion | IN_PROGRESS | Bitget Classic and KuCoin Futures Classic are exact-head verified; BingX, MEXC, seven-venue runtime matrix, FT-02 isolation, and final operations gates remain pending. |
+| Phase 5.3 BingX capability-gated code candidate | IN_REVIEW | BingX is now a typed venue profile with official `incrDepth` snapshot/update sequence enforcement, persistent desynchronisation until a fresh `action=all`, matching L2 unsubscribe, exact linear-USDT amount/notional metadata, account-wide read-only private parameters, and pinned protected IOC `clientOrderID`/`positionSide=BOTH` mapping. Official BingX WS documents only per-symbol BBO, so the adapter truthfully reports broad BBO unavailable instead of creating an unbounded fallback. Wave 1 remains Binance USD-M/Bybit/OKX and BingX is denied at the live-canary boundary. Local gate lock64/Ruff99/mypy97/pytest579/doctor shadow-live=false/Bandit0/diff-check passed; independent dirty-tree review P0/P1/P2=0. Exact-head CI/artifacts and final exact review remain pending. |
+| C6 venue expansion | IN_PROGRESS | Bitget Classic and KuCoin Futures Classic are exact-head verified; BingX is in exact-gate review with broad BBO safely disabled; MEXC, seven-venue runtime matrix, FT-02 isolation, and final operations gates remain pending. |
 
 ## Decisions made during implementation
 
@@ -59,6 +60,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-20 — Schedule every public/private workload class through bounded P0-P6 ownership with one reserved critical lane per P0-P3 priority and atomic P4 portfolio admission — emergency flatten, hedge, close, and reconciliation must remain runnable while entry, Candidate L2, and broad/history work are shed under overload — priority scheduler, supervisor, shadow runtime, service, Docker smoke
 2026-08-20 — Add Bitget only through the Classic USDT-FUTURES profile and keep the live canary allowlist unchanged — pinned CCXT supports Classic data/private primitives but its batch ticker unsubscribe stub and unqualified UTA require an explicit matching override and fail-closed separation — public/private adapters, config, execution boundary, CLI
 2026-08-20 — Add KuCoin Futures only through the Classic contract profile and preserve hedge tombstones from raw `positionSide` — pinned CCXT normalisation loses the side of a zero contract position, so Classic raw identity is required to avoid erasing the independent opposite hedge — public/private adapters, universe/routes/economics, config, execution boundary
+2026-08-21 — Add BingX as a capability-gated linear-USDT profile with native sequenced L2 but keep broad BBO disabled — official BingX WS documents only per-symbol bookTicker, which cannot satisfy the bounded batch-BBO contract without the forbidden fan-out fallback — public/private adapters, config, execution boundary
 2026-08-14 — Calibrate median/MAD grids independently per directed route and size bucket with a 20% update bound — outliers and abrupt parameter jumps must not destabilise entries — `strategy.py`
 2026-08-14 — Reserve route, portfolio, and venue risk atomically before simulated submission — every accepted action must preserve the 5/50 USDT, local-margin, leverage, route, and tranche limits — `risk.py`, `execution.py`
 2026-08-15 — Start the real public evaluator beside the persisted heartbeat and isolate network failures — Docker health and risk controls must remain responsive while a venue is slow or quarantined — `service.py`, `shadow.py`
@@ -216,4 +218,22 @@ C4 critical, and C4.3; replay `9423845774` reports 79 scenarios, C4 critical `94
 reports 30/30 scenarios and zero production submits, C4.3 `9423818033` reports 8/8 and zero
 false success/production submits, and security `9423805574` reports 64 dependencies with zero
 known vulnerabilities and zero secret findings. All four artifacts bind code head `d37ded5`.
+```
+
+```text
+2026-08-21 Phase 5.3 BingX local code checkpoint: PASS
+- exact main lock validation: PASS (64 packages)
+- ruff format --check + ruff check: PASS (99 files)
+- mypy --strict: PASS (97 source/test files)
+- pytest: 579 passed
+- interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false; Wave 1 unchanged
+- Bandit medium/high: 0; git diff --check: PASS
+
+The profile proves official `incrDepth` subscription/unsubscription and preserves a sequence-gap
+latch until a new `action=all` snapshot. Pinned REST tests prove exact minimum amount/notional,
+account-wide linear position parameters, and protected IOC `clientOrderID`/`positionSide=BOTH`.
+Broad BBO deliberately remains unavailable because the official WS documents only per-symbol
+bookTicker and the product rejects unbounded fan-out. No credential, production-submit authority,
+or live-canary allowlist expansion was added. Independent dirty-tree review reported
+P0=0, P1=0, P2=0. Exact-head CI/artifacts and final exact review remain pending.
 ```

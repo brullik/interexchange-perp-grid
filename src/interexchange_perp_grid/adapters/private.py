@@ -756,6 +756,10 @@ def _account_wide_snapshot_params(
         if kind == PrivateStreamKind.POSITIONS:
             return {"uta": False}
         return {"type": "swap", "uta": False}
+    if venue == Venue.BINGX:
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"subType": "linear"}
+        return {"type": "swap", "subType": "linear"}
     if venue == Venue.BYBIT:
         return {"category": "linear", "settleCoin": "USDT"}
     if venue == Venue.OKX:
@@ -770,6 +774,8 @@ def _account_wide_snapshot_limits(venue: Venue) -> tuple[int | None, int | None]
         return 100, None
     if venue == Venue.KUCOIN_FUTURES:
         return 50, None
+    if venue == Venue.BINGX:
+        return None, None
     if venue == Venue.BYBIT:
         return 50, 200
     if venue == Venue.OKX:
@@ -798,6 +804,8 @@ def _account_wide_stream_params(
         if kind == PrivateStreamKind.POSITIONS:
             return {"uta": False}
         return {"type": "swap", "uta": False}
+    if venue == Venue.BINGX:
+        return {"type": "swap", "subType": "linear"}
     if venue == Venue.BYBIT:
         # The configured CCXT transport already selects swap/linear. Unconsumed params are
         # merged into Bybit's subscribe frame, whose schema only permits op/req_id/args.

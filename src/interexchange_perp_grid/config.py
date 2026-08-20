@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from interexchange_perp_grid.domain import Venue
 
-KNOWN_VENUE_PROFILES = frozenset({venue.value for venue in Venue} | {"bingx", "mexc"})
+KNOWN_VENUE_PROFILES = frozenset({venue.value for venue in Venue} | {"mexc"})
 
 
 class StrictModel(BaseModel):

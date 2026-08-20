@@ -12,6 +12,7 @@ class Venue(StrEnum):
     OKX = "okx"
     BITGET = "bitget"
     KUCOIN_FUTURES = "kucoinfutures"
+    BINGX = "bingx"
 
 
 WAVE1_VENUES = (Venue.BINANCE_USDM, Venue.BYBIT, Venue.OKX)

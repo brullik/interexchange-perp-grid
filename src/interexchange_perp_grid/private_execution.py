@@ -87,6 +87,8 @@ def translate_protected_order(
                 "marginMode": "cross",
             }
         )
+    elif intent.venue == Venue.BINGX:
+        params["clientOrderId"] = intent.client_order_id
     else:
         params["newClientOrderId"] = intent.client_order_id
     if time_in_force is not None:

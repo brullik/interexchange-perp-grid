@@ -9,6 +9,7 @@ from typing import ClassVar
 
 import pytest
 
+from interexchange_perp_grid.adapters.bingx_swap import SequenceQualifiedBingxExchange
 from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter, normalize_market
 from interexchange_perp_grid.adapters.kucoin_classic import ClassicKucoinFuturesExchange
@@ -377,6 +378,13 @@ def test_pinned_kucoin_futures_bbo_transport_has_matching_unsubscribe() -> None:
     assert adapter._exchange.has["watchPositions"] is True
 
 
+def test_pinned_bingx_rejects_unbounded_per_symbol_bbo_fallback() -> None:
+    adapter = CcxtProAdapter(Venue.BINGX)
+
+    assert isinstance(adapter._exchange, SequenceQualifiedBingxExchange)
+    assert adapter._bbo_stream_kind() is None
+
+
 class KucoinPositionClient:
     def __init__(self) -> None:
         self.resolved: tuple[object, str] | None = None
@@ -507,6 +515,7 @@ async def test_ccxt_book_carries_native_non_contiguous_sequence_evidence() -> No
         (Venue.OKX, {"depth": "books"}),
         (Venue.BITGET, {"limit": 15}),
         (Venue.KUCOIN_FUTURES, {"limit": 50}),
+        (Venue.BINGX, {}),
     ),
 )
 async def test_wave1_candidate_l2_unsubscribe_matches_subscription_contract(

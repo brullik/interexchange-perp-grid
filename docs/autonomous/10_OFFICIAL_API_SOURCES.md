@@ -67,5 +67,17 @@ Order/cancel endpoints, помеченные `Under maintenance`, не квал�
 
 - https://bingx-api.github.io/docs/
 - https://bingx-api.github.io/api-ai-skills/
+- https://github.com/BingX-API/api-ai-skills/blob/main/skills/references/websocket.md
+- https://github.com/BingX-API/api-ai-skills/blob/main/skills/swap-market/api-reference.md
+- https://github.com/BingX-API/api-ai-skills/blob/main/skills/swap-trade/SKILL.md
 
-BingX live остаётся capability-gated до точных contract tests официальных endpoints.
+USDT-M использует один GZIP/Ping-capable swap WebSocket endpoint; публичные
+`{symbol}@bookTicker` и `{symbol}@incrDepth` подписываются и отменяются точными
+`sub`/`unsub` frames. Первый incremental-depth event — `action=all`, а каждый
+последующий `lastUpdateId` обязан быть равен предыдущему + 1. Contract info
+публикует `tradeMinQuantity` и `tradeMinUSDT`; protected orders поддерживают
+IOC, `clientOrderID` и `positionSide`. Pinned CCXT не переносит sequence из
+ограниченного depth snapshot, а официальный WS документирует только per-symbol
+BBO. Поэтому Phase 5.3 добавляет лишь узкий sequenced-L2 override и отклоняет
+broad-BBO capability вместо запрещённого unbounded per-symbol fallback. BingX
+live остаётся capability-gated и вне Wave 1 canary allowlist.

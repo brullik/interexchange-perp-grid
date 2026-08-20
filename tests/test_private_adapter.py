@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import pytest
 
+from interexchange_perp_grid.adapters.bingx_swap import SequenceQualifiedBingxExchange
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
@@ -207,7 +208,14 @@ class FakePrivateExchange:
 
 @pytest.mark.parametrize(
     "venue",
-    [Venue.BYBIT, Venue.OKX, Venue.BINANCE_USDM, Venue.BITGET, Venue.KUCOIN_FUTURES],
+    [
+        Venue.BYBIT,
+        Venue.OKX,
+        Venue.BINANCE_USDM,
+        Venue.BITGET,
+        Venue.KUCOIN_FUTURES,
+        Venue.BINGX,
+    ],
 )
 @pytest.mark.asyncio
 async def test_wave_one_private_capabilities_and_account_are_normalised(venue: Venue) -> None:
@@ -320,6 +328,12 @@ class LargeAccountWideExchange(FakePrivateExchange):
             {"uta": False},
             50,
         ),
+        (
+            Venue.BINGX,
+            {"type": "swap", "subType": "linear"},
+            {"subType": "linear"},
+            None,
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -344,6 +358,37 @@ async def test_wave1_snapshot_is_account_wide_and_request_bounded(
     assert snapshot.completeness == SnapshotCompleteness.COMPLETE
     assert snapshot.raw_open_order_count == 1
     assert snapshot.raw_nonzero_position_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pinned_bingx_positions_consumes_subtype_without_extra_rest_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = SequenceQualifiedBingxExchange({})
+    market = _linear_market()
+    market["id"] = "BTC-USDT"
+    market.update(
+        {
+            "type": "swap",
+            "spot": False,
+            "margin": False,
+            "future": False,
+            "option": False,
+        }
+    )
+    exchange.set_markets([market])
+    captured: dict[str, object] = {}
+
+    async def capture(params: dict[str, object]) -> dict[str, object]:
+        captured.update(params)
+        return {"code": 0, "msg": "", "data": []}
+
+    monkeypatch.setattr(exchange, "swapV2PrivateGetUserPositions", capture)
+
+    result = await exchange.fetch_positions(None, {"subType": "linear"})
+
+    assert result == []
+    assert captured == {}
 
 
 @pytest.mark.asyncio
@@ -473,6 +518,14 @@ class AccountWideStreamExchange(LargeAccountWideExchange):
                 ("orders", {"type": "swap", "uta": False}),
                 ("positions", {"uta": False}),
                 ("account", {"type": "swap", "uta": False}),
+            ],
+        ),
+        (
+            Venue.BINGX,
+            [
+                ("orders", {"type": "swap", "subType": "linear"}),
+                ("positions", {"type": "swap", "subType": "linear"}),
+                ("account", {"type": "swap", "subType": "linear"}),
             ],
         ),
     ],

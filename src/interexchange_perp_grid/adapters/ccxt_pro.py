@@ -9,6 +9,7 @@ from typing import Any
 import ccxt.pro as ccxtpro  # type: ignore[import-untyped]
 
 from interexchange_perp_grid.adapters.base import ExchangeAdapter
+from interexchange_perp_grid.adapters.bingx_swap import SequenceQualifiedBingxExchange
 from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.adapters.bybit_v5 import SequenceQualifiedBybitExchange
 from interexchange_perp_grid.adapters.kucoin_classic import ClassicKucoinFuturesExchange
@@ -166,6 +167,8 @@ class CcxtProAdapter(ExchangeAdapter):
             return ClassicBitgetExchange(configuration)
         if venue == Venue.KUCOIN_FUTURES:
             return ClassicKucoinFuturesExchange(configuration)
+        if venue == Venue.BINGX:
+            return SequenceQualifiedBingxExchange(configuration)
         exchange_class = getattr(ccxtpro, venue.value)
         return exchange_class(configuration)
 

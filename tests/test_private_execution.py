@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from interexchange_perp_grid.adapters.bingx_swap import SequenceQualifiedBingxExchange
 from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.adapters.kucoin_classic import ClassicKucoinFuturesExchange
 from interexchange_perp_grid.config import Settings, load_settings
@@ -65,6 +66,7 @@ def instrument(venue: Venue) -> Instrument:
         (Venue.BINANCE_USDM, "newClientOrderId"),
         (Venue.BITGET, "clientOid"),
         (Venue.KUCOIN_FUTURES, "clientOid"),
+        (Venue.BINGX, "clientOrderId"),
     ],
 )
 def test_protected_ioc_translation_is_contract_tested_per_venue(
@@ -209,6 +211,64 @@ def test_pinned_bitget_rest_request_maps_unified_cross_to_classic_crossed() -> N
     assert request["productType"] == "USDT-FUTURES"
     assert request["marginCoin"] == "USDT"
     assert "timeInForce" not in request
+
+
+def test_pinned_bingx_rest_request_keeps_protected_ioc_client_id() -> None:
+    exchange = SequenceQualifiedBingxExchange({})
+    exchange.set_markets(
+        [
+            {
+                "id": "BTC-USDT",
+                "symbol": "BTC/USDT:USDT",
+                "base": "BTC",
+                "quote": "USDT",
+                "settle": "USDT",
+                "settleId": "USDT",
+                "type": "swap",
+                "spot": False,
+                "margin": False,
+                "swap": True,
+                "future": False,
+                "option": False,
+                "contract": True,
+                "linear": True,
+                "inverse": False,
+                "active": True,
+                "precision": {"amount": 0.0001, "price": 0.1},
+                "limits": {
+                    "amount": {"min": 0.0001, "max": None},
+                    "price": {"min": None, "max": None},
+                    "cost": {"min": 2, "max": None},
+                    "leverage": {"min": None, "max": None},
+                },
+                "contractSize": 1,
+                "info": {},
+            }
+        ]
+    )
+    intent = ExecutionIntent(
+        "bingx-client",
+        Venue.BINGX,
+        Side.BUY,
+        OrderPurpose.NORMAL_OPEN,
+        Decimal("0.10"),
+        Decimal("101"),
+    )
+    translated = translate_protected_order(intent, instrument(Venue.BINGX))
+
+    request = exchange.create_order_request(
+        translated.symbol,
+        translated.order_type,
+        translated.side.value.lower(),
+        float(translated.amount_contracts),
+        float(translated.price) if translated.price is not None else None,
+        translated.params,
+    )
+
+    assert request["clientOrderID"] == "bingx-client"
+    assert request["timeInForce"] == "IOC"
+    assert request["positionSide"] == "BOTH"
+    assert request["price"] == 101
 
 
 def test_protected_price_uses_marginal_level_side_cap_and_tick_rounding() -> None:
@@ -551,7 +611,10 @@ async def test_live_canary_submission_is_physically_behind_every_guard() -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("candidate_venue", [Venue.BITGET, Venue.KUCOIN_FUTURES])
+@pytest.mark.parametrize(
+    "candidate_venue",
+    [Venue.BITGET, Venue.KUCOIN_FUTURES, Venue.BINGX],
+)
 async def test_expansion_code_candidate_cannot_expand_live_canary_allowlist(
     candidate_venue: Venue,
 ) -> None:
