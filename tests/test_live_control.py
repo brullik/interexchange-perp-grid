@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -198,6 +199,100 @@ async def test_live_reads_are_actual_private_exchange_state(tmp_path: Path) -> N
     balances = snapshot["balances"]
     assert isinstance(balances, list)
     assert len(balances) == 3
+    assert snapshot["risk"] == {
+        "status": "INVALID_RISK_DATA",
+        "reason": "UNJOURNALED_PRIVATE_EXPOSURE",
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_reads_expose_flat_zero_risk_from_actual_journal_state(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, long_outcomes=())
+    snapshot = await service.snapshot()
+    assert snapshot["risk"] == {
+        "status": "OK",
+        "scope": "JOURNAL_RESERVATION",
+        "reservation_count": 0,
+        "per_route_stress_usdt": {},
+        "portfolio_stress_usdt": "0",
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_reads_expose_exact_active_journal_risk(tmp_path: Path) -> None:
+    service, adapters = _service(
+        tmp_path,
+        long_outcomes=(ScriptedOrderOutcome(PrivateOrderStatus.FILLED, Decimal("1")),),
+    )
+    route = DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX)
+    await service._journal.initialise()
+    await service._journal.prepare(
+        "active-risk",
+        route,
+        "tranche-1",
+        _seed_request(Venue.BINANCE_USDM, "risk-long", Side.BUY),
+        _seed_request(Venue.OKX, "risk-short", Side.SELL),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {"projected_stress_usdt": "1.25"},
+        "a" * 64,
+    )
+    snapshot = await service.snapshot()
+    assert snapshot["risk"] == {
+        "status": "OK",
+        "scope": "JOURNAL_RESERVATION",
+        "reservation_count": 1,
+        "per_route_stress_usdt": {route.value: "1.25"},
+        "portfolio_stress_usdt": "1.25",
+    }
+    await adapters[Venue.BINANCE_USDM].submit_order(
+        _seed_request(Venue.BINANCE_USDM, "external-risk", Side.BUY),
+        _instrument(Venue.BINANCE_USDM),
+    )
+    mismatched = await service.snapshot()
+    assert mismatched["risk"] == {
+        "status": "INVALID_RISK_DATA",
+        "reason": "PRIVATE_POSITION_JOURNAL_MISMATCH",
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_reads_never_report_zero_risk_when_private_state_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, adapters = _service(tmp_path, long_outcomes=())
+
+    async def unavailable_account(instrument: Instrument) -> object:
+        del instrument
+        raise TimeoutError("held private state")
+
+    monkeypatch.setattr(adapters[Venue.OKX], "fetch_account", unavailable_account)
+    snapshot = await service.snapshot()
+    assert snapshot["risk"] == {
+        "status": "INVALID_RISK_DATA",
+        "reason": "PRIVATE_STATE_UNAVAILABLE",
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_reads_reject_symbol_scoped_private_snapshot_for_risk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, adapters = _service(tmp_path, long_outcomes=())
+    adapter = adapters[Venue.OKX]
+    original = adapter.fetch_active_snapshot
+
+    async def symbol_scoped_snapshot() -> object:
+        return replace(await original(), account_wide=False)
+
+    monkeypatch.setattr(adapter, "fetch_active_snapshot", symbol_scoped_snapshot)
+    snapshot = await service.snapshot()
+    assert snapshot["risk"] == {
+        "status": "INVALID_RISK_DATA",
+        "reason": "PRIVATE_STATE_UNAVAILABLE",
+    }
 
 
 @pytest.mark.asyncio

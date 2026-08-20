@@ -6,9 +6,9 @@ import json
 import os
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 
 from interexchange_perp_grid.client_ids import (
     is_bot_client_order_id,
@@ -122,6 +122,16 @@ class LiveControlService:
             }
             for venue, state in sorted(states.items(), key=lambda item: item[0].value)
         ]
+        private_state_known = all(
+            state.error is None
+            and state.completeness == SnapshotCompleteness.COMPLETE
+            and state.account_wide
+            and not state.unknown_active_records
+            and state.raw_open_order_count == len(state.open_orders)
+            and state.raw_nonzero_position_count == len(state.positions)
+            for state in states.values()
+        )
+        risk = _live_risk_snapshot(active, positions, private_state_known=private_state_known)
         return {
             "source": "PRIVATE_EXCHANGE",
             "status": {
@@ -159,6 +169,7 @@ class LiveControlService:
                     )
                 )
             },
+            "risk": risk,
         }
 
     async def cancel_all_live(self) -> LiveControlResult:
@@ -612,6 +623,75 @@ def emergency_unlock_valid(
 
 def render_control_result(result: LiveControlResult) -> str:
     return json.dumps(asdict(result), default=str, sort_keys=True)
+
+
+def _live_risk_snapshot(
+    active: LiveJournalAction | None,
+    positions: Sequence[Mapping[str, object]],
+    *,
+    private_state_known: bool,
+) -> dict[str, object]:
+    if not private_state_known:
+        return {"status": "INVALID_RISK_DATA", "reason": "PRIVATE_STATE_UNAVAILABLE"}
+    if active is None:
+        if positions:
+            return {
+                "status": "INVALID_RISK_DATA",
+                "reason": "UNJOURNALED_PRIVATE_EXPOSURE",
+            }
+        return {
+            "status": "OK",
+            "scope": "JOURNAL_RESERVATION",
+            "reservation_count": 0,
+            "per_route_stress_usdt": {},
+            "portfolio_stress_usdt": "0",
+        }
+    if not _private_positions_match_journal(active, positions):
+        return {
+            "status": "INVALID_RISK_DATA",
+            "reason": "PRIVATE_POSITION_JOURNAL_MISMATCH",
+        }
+    try:
+        projected_stress = Decimal(str(active.risk_reservation["projected_stress_usdt"]))
+    except (DecimalException, KeyError, ValueError):
+        return {"status": "INVALID_RISK_DATA", "reason": "RISK_RESERVATION_UNKNOWN"}
+    if not projected_stress.is_finite() or projected_stress < 0:
+        return {"status": "INVALID_RISK_DATA", "reason": "RISK_RESERVATION_UNKNOWN"}
+    return {
+        "status": "OK",
+        "scope": "JOURNAL_RESERVATION",
+        "reservation_count": 1,
+        "per_route_stress_usdt": {active.route.value: str(projected_stress)},
+        "portfolio_stress_usdt": str(projected_stress),
+    }
+
+
+def _private_positions_match_journal(
+    active: LiveJournalAction,
+    positions: Sequence[Mapping[str, object]],
+) -> bool:
+    expected: dict[tuple[str, str], Decimal] = {}
+    actual: dict[tuple[str, str], Decimal] = {}
+    try:
+        for leg in active.legs:
+            signed = leg.filled_base_quantity if leg.side == Side.BUY else -leg.filled_base_quantity
+            key = (leg.venue.value, leg.symbol)
+            expected[key] = expected.get(key, Decimal(0)) + signed
+        for position in positions:
+            quantity = Decimal(str(position["base_quantity"]))
+            side = Side(str(position["side"]))
+            venue = Venue(str(position["venue"])).value
+            symbol = str(position["symbol"])
+            if not quantity.is_finite() or quantity <= 0 or not venue or not symbol:
+                return False
+            key = (venue, symbol)
+            signed = quantity if side == Side.BUY else -quantity
+            actual[key] = actual.get(key, Decimal(0)) + signed
+    except (DecimalException, KeyError, ValueError):
+        return False
+    return {key: value for key, value in expected.items() if value != 0} == {
+        key: value for key, value in actual.items() if value != 0
+    }
 
 
 def _position_pnl(position: PositionSnapshot) -> Decimal:

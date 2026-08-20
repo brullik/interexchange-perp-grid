@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE3_4_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
-- **Current checkpoint:** Phase 3.4 persistent 10-route/50-tranche shadow portfolio and identical restart risk ownership is locally complete with 433 tests and independent P0=0/P1=0/P2=0 review; commit and exact-head CI/artifacts remain required
+- **State:** PHASE3_5_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
+- **Current checkpoint:** Phase 3.5 bounded Telegram route/risk/PnL visibility is locally complete with independent P0=0/P1=0/P2=0 review; exact-head evidence remains required before Phase 4 multi-action supervisor work is claimed complete
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -25,7 +25,8 @@ This is the only mutable project-status document.
 | Phase 3.1 multi-instrument broad BBO | COMPLETE | Draft PR #5 exact code checkpoint `64e5c86e` and evidence-only head `18ae1b1`; real Wave 1 fixture qualifies one common instrument/six routes without fabricated OKX notional; malformed typed records are isolated through registry, route, and canary sizing; 102-safe-common/608-route synthetic boundary; one watchdog-protected batch watcher per venue; cancellation-safe retirement, idempotent transactional startup, single-flight refresh/recycle, tracked broad and selected-route scans, one bounded lifecycle shutdown barrier, explicit shutdown/teardown failure, cancellation-safe partial-factory rollback, and cancellation-aware two-phase Parquet publication with partial-write and event-loop-shutdown cleanup; six-hour resubscription; jittered 1→30 s reconnect; bounded cache with stale provenance; actual quote-receipt-to-prefilter latency; restart-identical proof; stable non-executable prefilter; exact run 31913700713 and independent P0/P1/P2=0 review passed |
 | Phase 3.2 bounded Candidate L2 + public overload admission | COMPLETE | Exact code checkpoint `f4d1f3e` and evidence head `de3a870`; deterministic top-30 QUOTE_READY directed candidates plus every active route; one deduplicated venue-symbol L2 subscription with matching Wave 1 unsubscribe; 100 ms coalescing/debounce; active P2 before candidate P5; broad/history P6 then candidate P5 shedding before P4; P0-P3 preserved; exact BookRegistry quality, venue outage, generation, freshness, and receipt-to-decision p95 checks; bounded tasks/cache/locks under 100k churn; restart/recycle/shutdown proof; `execution_authorized=false`; exact runs 31918092230 and 31918436474 plus four exact-head artifacts passed; independent final review P0=0/P1=0/P2=0. PROD-05 is COMPLETE; PROD-10 remains only narrow PARTIAL |
 | Phase 3.3 persistent public-shadow adaptive calibration | COMPLETE | Exact code head `45e41c3` and evidence/hardening head `a591da8`; persistent SQLite-WAL parameters per directed route and stable size multiplier; truthful 24h/7d/30d robust windows and long-tail stress; generation-bound funding/depth/quality/regime gates; five parallel grid-aligned episodes with censored timeout evidence and 30-episode production support for bucket-specific convergence p90; 20%/24h staged parameter changes; hard-bounded retention with reserved recent-window coverage; restart, migration, stale/outage, overload, true decision-deadline, cancellation, and bounded daemon-persistence shutdown fail-close; indeterminate save/delete/close outcomes retain runtime/risk ownership and latch entry; ShadowTrader consumes only current persisted bucket-qualified parameters; public estimate scope and `execution_authorized=false`; exact runs `32357556918` and `32359031361` passed all five jobs; independent exact review P0=0/P1=0/P2=0. PROD-06 is COMPLETE only for the Candidate-L2/public-shadow boundary |
-| Phase 3.4 persistent shadow portfolio | LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE | SQLite schema v12 atomically persists each active tranche with its exact risk reservation; startup restores one coherent portfolio snapshot or remains fail-closed; 10 routes × 5 tranches preserve 5 USDT route/50 USDT portfolio limits; concurrent same-base routes admit exactly one; terminal transitions remove risk atomically; corrupt/missing/mismatched risk fails closed; indeterminate storage uses a durable sidecar latch, bounded daemon ownership, exact durable/memory/observed reconciliation, runtime transition lock, and path recovery lease; restart restores identical 50-tranche reservations; local lock/Ruff/mypy/433-test/doctor/Bandit gates and independent review passed P0=0/P1=0/P2=0. PROD-07/09/12 are technically complete at the shadow boundary; commit and exact-head evidence remain pending |
+| Phase 3.4 persistent shadow portfolio | COMPLETE | Exact head `22438c4`; SQLite schema v12 atomically persists each active tranche with its exact risk reservation; startup restores one coherent portfolio snapshot or remains fail-closed; 10 routes × 5 tranches preserve 5 USDT route/50 USDT portfolio limits; concurrent same-base routes admit exactly one; terminal transitions remove risk atomically; corrupt/missing/mismatched risk fails closed; durable indeterminate latch, bounded daemon ownership, exact durable/memory/observed reconciliation, runtime transition lock, and path recovery lease; restart restores identical 50-tranche reservations; exact run `32362827543` passed all five jobs with replay `9404192713`, C4 `9404179777`, C4.3 `9404177260`, and security `9404167259`; independent exact review P0=0/P1=0/P2=0. PROD-07/09/12 are COMPLETE at the shadow boundary |
+| Phase 3.5 bounded Telegram portfolio visibility | LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE | Owner-authenticated `/status`, `/positions`, `/pnl`, and `/risk` expose deterministic 10-route/50-tranche summaries below Telegram's 4096-character limit; every shadow/live/control response passes one final bounded renderer; malformed/non-finite private or shadow data fails closed and remains audited; live risk is zero only for complete account-wide FLAT state, otherwise requires exact signed exchange-position equality with durable journal fills and preserves explicit invalid reasons; no credentials or live authority added. PROD-11 is technically complete; exact-head CI/artifacts remain pending |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -41,6 +42,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-14 — Use `ccxt.pro.binance` future transport for Binance USD-M — the `binanceusdm` Pro class lacked the required WebSocket capabilities in an automated probe — `ccxt_pro.py`
 2026-08-14 — Quarantine books with unknown sequence and continue with remaining qualified venues — fail-closed market data must not stop the Wave 1 process — `market_data.py`, `public_engine.py`
 2026-08-20 — Persist tranche and exact risk reservation in one SQLite transaction and use a separate durable indeterminate marker — restart must restore identical risk while a locked WAL writer cannot delay fail-closed ownership — `state.py`, `risk.py`, `shadow.py`
+2026-08-20 — Render one bounded Telegram summary and derive live risk only from complete account-wide private state plus exact journal-position equality — operator visibility must remain deliverable and must never label unknown or external exposure as zero risk — `telegram_control.py`, `live_control.py`
 2026-08-14 — Calibrate median/MAD grids independently per directed route and size bucket with a 20% update bound — outliers and abrupt parameter jumps must not destabilise entries — `strategy.py`
 2026-08-14 — Reserve route, portfolio, and venue risk atomically before simulated submission — every accepted action must preserve the 5/50 USDT, local-margin, leverage, route, and tranche limits — `risk.py`, `execution.py`
 2026-08-15 — Start the real public evaluator beside the persisted heartbeat and isolate network failures — Docker health and risk controls must remain responsive while a venue is slow or quarantined — `service.py`, `shadow.py`
@@ -115,21 +117,21 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 ## Last verified command
 
 ```text
-2026-08-20 Phase 3.4 local Windows equivalent of every Makefile verify target: PASS
+2026-08-20 Phase 3.5 local Windows equivalent of every Makefile verify target: PASS
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (92 files)
 - mypy --strict: PASS (90 source/test files)
-- pytest: 433 passed
+- pytest: 442 passed; focused live-control and Telegram integration: 19 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 - Bandit medium/high: 0; git diff --check: PASS
 
-The frozen dirty Phase 3.4 snapshot passed independent final read-only review with
-P0=0/P1=0/P2=0. Regression evidence covers v11-to-v12 migration, 50 concurrent reservations,
-one-route-per-base atomicity, exact restart identity, orphan/corrupt risk isolation, generic
-pre/post-commit storage errors, busy-WAL deadline ownership, persistent indeterminate restart,
-and serialized recovery versus concurrent close. PROD-07/09/12 are technically complete only for
-the shadow boundary. PROD-08, PROD-11, full PROD-10, private-account economics, live qualification,
-and Ready/merge remain outside this checkpoint until their own locked gates pass.
+The frozen dirty Phase 3.5 snapshot passed independent final read-only review with
+P0=0/P1=0/P2=0. Regression evidence covers 10-route/50-tranche visibility, long identifiers,
+oversized dangerous-command acknowledgements, malformed and extreme numeric data, private-state
+timeouts/symbol scope, signed journal-position mismatches, and exact active/flat risk visibility.
+PROD-11 is technically complete at the shadow/private-read boundary. PROD-08, full PROD-10,
+multi-action live execution, private-account economics, live qualification, and Ready/merge remain
+outside this checkpoint until their own locked gates pass.
 
 GNU make is not installed on this Windows host. No production credentials were used, route
 calibration and Candidate L2 keep `execution_authorized=false`, and no real order was submitted.
