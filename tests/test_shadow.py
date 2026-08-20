@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 import time
 from dataclasses import replace
@@ -26,6 +27,7 @@ from interexchange_perp_grid.execution import (
 )
 from interexchange_perp_grid.public_engine import PublicWorkload, ScanResult
 from interexchange_perp_grid.reason_codes import ReasonCode
+from interexchange_perp_grid.risk import RiskRequest, VenueProjection
 from interexchange_perp_grid.route_calibration import (
     RouteCalibrationAssessment,
     RouteCalibrationObservation,
@@ -42,6 +44,7 @@ from interexchange_perp_grid.shadow import (
 from interexchange_perp_grid.state import (
     delete_tranche,
     initialise_state,
+    load_shadow_portfolio,
     load_tranches,
     read_shadow_snapshot,
     save_shadow_snapshot,
@@ -88,21 +91,168 @@ def hedged_tranche() -> Tranche:
     )
 
 
+def persisted_risk(tranche: Tranche) -> RiskRequest:
+    return RiskRequest(
+        reservation_id=tranche.tranche_id,
+        route_id=tranche.route.value,
+        base=tranche.route.base,
+        tranche_id=tranche.tranche_id,
+        projected_stress_usdt=tranche.projected_stress_usdt,
+        venues=(
+            VenueProjection(
+                tranche.route.long_venue,
+                Decimal("100"),
+                Decimal("10"),
+                Decimal("2"),
+                tranche.projected_stress_usdt / 2,
+            ),
+            VenueProjection(
+                tranche.route.short_venue,
+                Decimal("100"),
+                Decimal("11"),
+                Decimal("2.2"),
+                tranche.projected_stress_usdt / 2,
+            ),
+        ),
+        exit_depth_sufficient=True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_restart_restores_activity_and_blocks_until_reconciled(tmp_path: Path) -> None:
     path = tmp_path / "shadow.sqlite3"
+    await initialise_state(path)
+    tranche = hedged_tranche()
+    reservation = persisted_risk(tranche)
+    await save_tranche(path, tranche, risk_reservation=reservation)
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(path)})
+
+    restarted = ShadowRuntime(settings)
+    await restarted.start()
+    assert tuple(restarted.tranches) == ("T1",)
+    assert restarted.risk.reservations == (reservation,)
+    assert (await restarted.entry_gate()).reason == ReasonCode.RECONCILIATION_REQUIRED
+    assert await restarted.reconcile(set()) == ReasonCode.RECONCILIATION_FAILED
+    assert (await restarted.entry_gate()).accepted is False
+    assert await restarted.reconcile({"T1"}) == ReasonCode.RECONCILIATION_PASSED
+    assert (await restarted.entry_gate()).accepted is True
+
+
+@pytest.mark.asyncio
+async def test_restart_rejects_active_tranche_without_persisted_risk(tmp_path: Path) -> None:
+    path = tmp_path / "missing-risk.sqlite3"
     await initialise_state(path)
     await save_tranche(path, hedged_tranche())
     settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(path)})
 
     restarted = ShadowRuntime(settings)
     await restarted.start()
-    assert tuple(restarted.tranches) == ("T1",)
+
+    assert restarted.risk.reservations == ()
+    assert await restarted.reconcile({"T1"}) == ReasonCode.RECONCILIATION_FAILED
     assert (await restarted.entry_gate()).reason == ReasonCode.RECONCILIATION_REQUIRED
-    assert await restarted.reconcile(set()) == ReasonCode.RECONCILIATION_FAILED
-    assert (await restarted.entry_gate()).accepted is False
-    assert await restarted.reconcile({"T1"}) == ReasonCode.RECONCILIATION_PASSED
-    assert (await restarted.entry_gate()).accepted is True
+
+
+def portfolio_tranche(route_index: int, tranche_index: int) -> Tranche:
+    base = f"B{route_index:02d}"
+    tranche_id = f"{base}-T{tranche_index}"
+    return Tranche(
+        tranche_id,
+        DirectedRouteKey(base, Venue.BYBIT, Venue.OKX),
+        Decimal("0.01"),
+        Decimal("1"),
+        Decimal("20"),
+        Decimal("1"),
+        state=PairActionState.HEDGED,
+        reason=ReasonCode.ORDERS_HEDGED,
+        entry_long_fills=[
+            Fill(
+                f"{tranche_id}-long",
+                Venue.BYBIT,
+                Side.BUY,
+                OrderPurpose.NORMAL_OPEN,
+                Decimal("0.01"),
+                Decimal("100"),
+                Decimal("0.001"),
+            )
+        ],
+        entry_short_fills=[
+            Fill(
+                f"{tranche_id}-short",
+                Venue.OKX,
+                Side.SELL,
+                OrderPurpose.NORMAL_OPEN,
+                Decimal("0.01"),
+                Decimal("101"),
+                Decimal("0.001"),
+            )
+        ],
+        processed_order_ids={f"{tranche_id}-long", f"{tranche_id}-short"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_fifty_tranche_portfolio_and_risk_restore_identically(tmp_path: Path) -> None:
+    path = tmp_path / "fifty-tranche.sqlite3"
+    await initialise_state(path)
+    expected_requests: list[RiskRequest] = []
+    for route_index in range(10):
+        for tranche_index in range(5):
+            tranche = portfolio_tranche(route_index, tranche_index)
+            request = persisted_risk(tranche)
+            expected_requests.append(request)
+            await save_tranche(path, tranche, risk_reservation=request)
+
+    persisted_tranches, persisted_requests = await load_shadow_portfolio(path)
+    assert len(persisted_tranches) == 50
+    assert persisted_requests == tuple(
+        sorted(expected_requests, key=lambda item: item.reservation_id)
+    )
+
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(path)})
+    restarted = ShadowRuntime(settings)
+    await restarted.start()
+    active_ids = {tranche.tranche_id for tranche in persisted_tranches}
+
+    assert restarted.risk.reservations == persisted_requests
+    per_route, portfolio = restarted.risk.totals()
+    assert len(per_route) == 10
+    assert set(per_route.values()) == {Decimal("5")}
+    assert portfolio == Decimal("50")
+    assert await restarted.reconcile(active_ids) == ReasonCode.RECONCILIATION_PASSED
+    snapshot = await restarted.snapshot()
+    assert snapshot["risk"] == {
+        "reservation_count": 50,
+        "per_route_stress_usdt": {f"B{index:02d}:bybit>okx": "5" for index in range(10)},
+        "portfolio_stress_usdt": "50",
+    }
+
+
+@pytest.mark.asyncio
+async def test_terminal_tranche_atomically_removes_persisted_risk(tmp_path: Path) -> None:
+    path = tmp_path / "terminal-risk.sqlite3"
+    await initialise_state(path)
+    tranche = hedged_tranche()
+    await save_tranche(path, tranche, risk_reservation=persisted_risk(tranche))
+    tranche.state = PairActionState.CLOSED
+    await save_tranche(path, tranche)
+
+    persisted_tranches, persisted_requests = await load_shadow_portfolio(path)
+    assert persisted_tranches == (tranche,)
+    assert persisted_requests == ()
+
+
+@pytest.mark.asyncio
+async def test_mismatched_risk_rolls_back_entire_portfolio_write(tmp_path: Path) -> None:
+    path = tmp_path / "mismatched-risk.sqlite3"
+    await initialise_state(path)
+    tranche = hedged_tranche()
+    mismatched = replace(persisted_risk(tranche), route_id="BTC:okx>bybit")
+
+    with pytest.raises(ValueError, match="does not match persisted tranche"):
+        await save_tranche(path, tranche, risk_reservation=mismatched)
+
+    assert await load_shadow_portfolio(path) == ((), ())
 
 
 def test_overload_preserves_risk_reduction_and_disables_new_entries_first() -> None:
@@ -248,7 +398,8 @@ async def test_active_close_is_evaluated_before_calibration_work(
     stop = asyncio.Event()
     state_path = tmp_path / "active-priority.sqlite3"
     await initialise_state(state_path)
-    await save_tranche(state_path, hedged_tranche())
+    tranche = hedged_tranche()
+    await save_tranche(state_path, tranche, risk_reservation=persisted_risk(tranche))
     settings = load_settings(
         CONFIG,
         {
@@ -276,7 +427,8 @@ async def test_indeterminate_close_persistence_latches_entry_fail_closed(
 ) -> None:
     state_path = tmp_path / "indeterminate-close.sqlite3"
     await initialise_state(state_path)
-    await save_tranche(state_path, hedged_tranche())
+    tranche = hedged_tranche()
+    await save_tranche(state_path, tranche, risk_reservation=persisted_risk(tranche))
     settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
     runtime = ShadowRuntime(settings)
     await runtime.start()
@@ -329,6 +481,176 @@ async def test_indeterminate_close_persistence_latches_entry_fail_closed(
             break
         await asyncio.sleep(0.01)
     assert persisted[0].state == PairActionState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_close_storage_error_latches_entry_and_retains_risk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "failed-close.sqlite3"
+    await initialise_state(state_path)
+    tranche = hedged_tranche()
+    await save_tranche(state_path, tranche, risk_reservation=persisted_risk(tranche))
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    await runtime.reconcile({"T1"})
+    trader = ShadowTrader(settings, runtime)
+    quote = DirectedRouteQuote(
+        key=InstrumentKey("BTC", "USDT"),
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.OKX,
+        base_quantity=Decimal("0.1"),
+        eligible=True,
+        reason=ReasonCode.QUOTE_READY,
+        entry_long_vwap=Decimal(100),
+        entry_short_vwap=Decimal(110),
+        exit_long_vwap=Decimal(100),
+        exit_short_vwap=Decimal(100),
+        entry_spread=Decimal(10),
+        exit_spread=Decimal(0),
+        entry_spread_bps=Decimal(1000),
+        four_leg_fee_estimate=Decimal("0.4"),
+        funding_rate_delta=Decimal(0),
+    )
+    state_any = cast(Any, state_module)
+
+    def fail_before_commit(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("disk write failed before commit")
+
+    monkeypatch.setattr(state_any, "_save_tranche_sync", fail_before_commit)
+    with pytest.raises(RuntimeError, match="close persistence commit state is unknown"):
+        await trader.close_active((quote,))
+
+    assert runtime.tranches["T1"].state == PairActionState.CLOSED
+    assert len(runtime.risk.reservations) == 1
+    persisted, persisted_risk_requests = await load_shadow_portfolio(state_path)
+    assert persisted[0].state == PairActionState.HEDGED
+    assert len(persisted_risk_requests) == 1
+    assert (await runtime.entry_gate()).reason == ReasonCode.RECONCILIATION_REQUIRED
+    assert (
+        await runtime.resolve_indeterminate_persistence({"T1"}) == ReasonCode.RECONCILIATION_FAILED
+    )
+
+
+@pytest.mark.asyncio
+async def test_indeterminate_latch_does_not_wait_for_busy_sqlite_writer(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "busy-close.sqlite3"
+    await initialise_state(state_path)
+    tranche = hedged_tranche()
+    await save_tranche(state_path, tranche, risk_reservation=persisted_risk(tranche))
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    await runtime.reconcile({"T1"})
+    trader = ShadowTrader(settings, runtime)
+    quote = DirectedRouteQuote(
+        key=InstrumentKey("BTC", "USDT"),
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.OKX,
+        base_quantity=Decimal("0.1"),
+        eligible=True,
+        reason=ReasonCode.QUOTE_READY,
+        entry_long_vwap=Decimal(100),
+        entry_short_vwap=Decimal(110),
+        exit_long_vwap=Decimal(100),
+        exit_short_vwap=Decimal(100),
+        entry_spread=Decimal(10),
+        exit_spread=Decimal(0),
+        entry_spread_bps=Decimal(1000),
+        four_leg_fee_estimate=Decimal("0.4"),
+        funding_rate_delta=Decimal(0),
+    )
+    blocker = sqlite3.connect(state_path)
+    blocker.execute("PRAGMA busy_timeout=30000")
+    blocker.execute("BEGIN IMMEDIATE")
+    started = asyncio.get_running_loop().time()
+    try:
+        with pytest.raises(RuntimeError, match="persistence outcome is indeterminate"):
+            await asyncio.wait_for(trader.close_active((quote,)), timeout=1.35)
+        resolve_started = asyncio.get_running_loop().time()
+        assert (
+            await runtime.resolve_indeterminate_persistence({"T1"})
+            == ReasonCode.RECONCILIATION_FAILED
+        )
+        assert asyncio.get_running_loop().time() - resolve_started < 0.1
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert asyncio.get_running_loop().time() - started < 1.35
+    assert runtime.tranches["T1"].state == PairActionState.CLOSED
+    assert len(runtime.risk.reservations) == 1
+    assert (await runtime.entry_gate()).reason == ReasonCode.RECONCILIATION_REQUIRED
+    for _ in range(100):
+        persisted, reservations = await load_shadow_portfolio(state_path)
+        if persisted[0].state == PairActionState.CLOSED:
+            break
+        await asyncio.sleep(0.01)
+    assert persisted[0].state == PairActionState.CLOSED
+    assert reservations == ()
+
+
+@pytest.mark.asyncio
+async def test_recovery_lease_serializes_concurrent_portfolio_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "recovery-close-race.sqlite3"
+    await initialise_state(state_path)
+    tranche = hedged_tranche()
+    await save_tranche(state_path, tranche, risk_reservation=persisted_risk(tranche))
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    await runtime.reconcile({"T1"})
+    await runtime.block_for_indeterminate_persistence()
+    trader = ShadowTrader(settings, runtime)
+    quote = DirectedRouteQuote(
+        key=InstrumentKey("BTC", "USDT"),
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.OKX,
+        base_quantity=Decimal("0.1"),
+        eligible=True,
+        reason=ReasonCode.QUOTE_READY,
+        entry_long_vwap=Decimal(100),
+        entry_short_vwap=Decimal(110),
+        exit_long_vwap=Decimal(100),
+        exit_short_vwap=Decimal(100),
+        entry_spread=Decimal(10),
+        exit_spread=Decimal(0),
+        entry_spread_bps=Decimal(1000),
+        four_leg_fee_estimate=Decimal("0.4"),
+        funding_rate_delta=Decimal(0),
+    )
+    shadow_any = cast(Any, shadow_module)
+    original_update = shadow_any.update_runtime_controls
+    recovery_commit_started = asyncio.Event()
+    recovery_commit_release = asyncio.Event()
+
+    async def held_recovery_commit(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("reconciliation_state") == "CONSISTENT":
+            recovery_commit_started.set()
+            await recovery_commit_release.wait()
+        return await original_update(*args, **kwargs)
+
+    monkeypatch.setattr(shadow_any, "update_runtime_controls", held_recovery_commit)
+    resolving = asyncio.create_task(runtime.resolve_indeterminate_persistence({"T1"}))
+    await asyncio.wait_for(recovery_commit_started.wait(), timeout=1)
+    closing = asyncio.create_task(trader.close_active((quote,)))
+    await asyncio.sleep(0.02)
+    assert closing.done() is False
+    assert runtime.tranches["T1"].state == PairActionState.HEDGED
+
+    recovery_commit_release.set()
+    assert await resolving == ReasonCode.RECONCILIATION_PASSED
+    await closing
+    assert cast(Any, runtime.tranches["T1"]).state == PairActionState.CLOSED
+    assert runtime.risk.reservations == ()
+    assert (await load_shadow_portfolio(state_path))[1] == ()
 
 
 @pytest.mark.asyncio
@@ -873,11 +1195,12 @@ async def test_shadow_trader_runs_calibration_risk_and_paired_fill_pipeline(
     failing_writer_started = threading.Event()
     failing_writer_release = threading.Event()
 
-    def held_failing_sync_save(*_args: Any, **_kwargs: Any) -> None:
+    def held_failing_sync_save(*args: Any, **kwargs: Any) -> None:
         failing_writer_started.set()
         if not failing_writer_release.wait(2):
             raise TimeoutError("test did not release failing tranche writer")
-        raise OSError("simulated SQLite write failure")
+        original_sync_save(*args, **kwargs)
+        raise OSError("simulated SQLite write failure after commit")
 
     monkeypatch.setattr(state_any, "_save_tranche_sync", held_failing_sync_save)
     twice_cancelled_process = asyncio.create_task(
@@ -891,12 +1214,32 @@ async def test_shadow_trader_runs_calibration_risk_and_paired_fill_pipeline(
     await asyncio.sleep(0)
     twice_cancelled_process.cancel()
     failing_writer_release.set()
-    with pytest.raises(OSError, match="simulated SQLite write failure"):
+    with pytest.raises(RuntimeError, match="persistence commit state is unknown"):
         await twice_cancelled_process
-    assert runtime.tranches == {}
-    assert trader._risk.reservations == ()
-    assert await load_tranches(state_path) == ()
+    assert len(runtime.tranches) == 1
+    assert len(trader._risk.reservations) == 1
+    persisted_failed, persisted_failed_risk = await load_shadow_portfolio(state_path)
+    assert len(persisted_failed) == 1
+    assert len(persisted_failed_risk) == 1
+    assert (await runtime.entry_gate()).reason == ReasonCode.RECONCILIATION_REQUIRED
+    failed_tranche_id = next(iter(runtime.tranches))
+    runtime.tranches.pop(failed_tranche_id)
+    trader._managed_ids.discard(failed_tranche_id)
+    trader._risk.release(failed_tranche_id)
+    await delete_tranche(state_path, failed_tranche_id)
     monkeypatch.setattr(state_any, "_save_tranche_sync", original_sync_save)
+    latched_restart = ShadowRuntime(settings)
+    await latched_restart.start()
+    assert latched_restart.portfolio_restored_consistently is True
+    assert (await latched_restart.entry_gate()).reason == ReasonCode.RECONCILIATION_REQUIRED
+    assert (
+        await latched_restart.resolve_indeterminate_persistence(set())
+        == ReasonCode.RECONCILIATION_PASSED
+    )
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    await runtime.reconcile(set())
+    trader = ShadowTrader(settings, runtime)
 
     original_sync_delete = state_any._delete_tranche_sync
     delete_started = threading.Event()
@@ -913,7 +1256,7 @@ async def test_shadow_trader_runs_calibration_risk_and_paired_fill_pipeline(
     cancelled_deletion_process = asyncio.create_task(
         trader.process(
             scan,
-            decision_deadline=asyncio.get_running_loop().time() + 0.05,
+            decision_deadline=asyncio.get_running_loop().time() + 0.25,
         )
     )
     assert await asyncio.to_thread(delete_started.wait, 1)
@@ -938,6 +1281,9 @@ async def test_shadow_trader_runs_calibration_risk_and_paired_fill_pipeline(
     assert opened.actual_long_entry_quantity == Decimal("1")
     assert opened.actual_short_entry_quantity == Decimal("1")
     assert opened.projected_stress_usdt <= Decimal("5")
+    persisted_open, persisted_risk_requests = await load_shadow_portfolio(state_path)
+    assert persisted_open == (opened,)
+    assert persisted_risk_requests == trader._risk.reservations
 
     await save_shadow_snapshot(
         state_path,
@@ -956,6 +1302,7 @@ async def test_shadow_trader_runs_calibration_risk_and_paired_fill_pipeline(
     assert await runtime.close_all_simulated() == (opened.tranche_id,)
     assert trader._risk.reservations == ()
     assert (await load_tranches(state_path))[0].state == PairActionState.FORCED_CLOSED
+    assert (await load_shadow_portfolio(state_path))[1] == ()
     await runtime.resume()
     await delete_tranche(state_path, opened.tranche_id)
     runtime.tranches.pop(opened.tranche_id)

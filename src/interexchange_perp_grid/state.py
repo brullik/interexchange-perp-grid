@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -23,9 +24,10 @@ from interexchange_perp_grid.execution import (
     Tranche,
 )
 from interexchange_perp_grid.reason_codes import ReasonCode
+from interexchange_perp_grid.risk import RiskRequest, VenueProjection
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "12"
 STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS = 1.0
 SCHEMA_STATEMENTS = (
     """
@@ -55,6 +57,14 @@ SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS simulated_tranches (
         tranche_id TEXT PRIMARY KEY,
         lifecycle_state TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadow_risk_reservations (
+        tranche_id TEXT PRIMARY KEY REFERENCES simulated_tranches(tranche_id) ON DELETE CASCADE,
+        reservation_id TEXT NOT NULL UNIQUE,
         payload_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )
@@ -296,12 +306,49 @@ class StateTransitionDeadlineError(RuntimeError):
     """A daemon SQLite transition did not reach a knowable terminal state."""
 
 
+_STATE_WORKERS_LOCK = threading.Lock()
+_STATE_WORKERS: dict[Path, set[_DaemonStateWorker]] = {}
+_STATE_RECOVERY_LEASES: set[Path] = set()
+
+
+def _persistence_indeterminate_marker(path: Path) -> Path:
+    return path.with_name(f"{path.name}.indeterminate")
+
+
+def persistence_indeterminate_marker_exists(path: Path) -> bool:
+    return _persistence_indeterminate_marker(path).is_file()
+
+
+def mark_persistence_indeterminate(path: Path) -> None:
+    """Durably latch an unknown SQLite outcome without competing for its writer lock."""
+    marker = _persistence_indeterminate_marker(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(f"{marker.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write("INDETERMINATE\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def clear_persistence_indeterminate(path: Path) -> None:
+    _persistence_indeterminate_marker(path).unlink(missing_ok=True)
+
+
 class _DaemonStateWorker:
-    def __init__(self, operation: Callable[[], None], *, name: str) -> None:
+    def __init__(self, operation: Callable[[], None], *, name: str, state_path: Path) -> None:
         self._operation = operation
+        self._state_path = state_path.resolve()
         self._done = threading.Event()
         self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        with _STATE_WORKERS_LOCK:
+            if self._state_path in _STATE_RECOVERY_LEASES:
+                raise RuntimeError("state recovery lease blocks new portfolio transitions")
+            _STATE_WORKERS.setdefault(self._state_path, set()).add(self)
         self._thread.start()
 
     @property
@@ -315,12 +362,40 @@ class _DaemonStateWorker:
             self._error = error
         finally:
             self._done.set()
+            with _STATE_WORKERS_LOCK:
+                workers = _STATE_WORKERS.get(self._state_path)
+                if workers is not None:
+                    workers.discard(self)
+                    if not workers:
+                        _STATE_WORKERS.pop(self._state_path, None)
 
     def result(self) -> None:
         if not self.done:
             raise RuntimeError("state transition worker is not terminal")
         if self._error is not None:
             raise self._error
+
+
+def state_transition_workers_terminal(path: Path) -> bool:
+    with _STATE_WORKERS_LOCK:
+        return not _STATE_WORKERS.get(path.resolve())
+
+
+def acquire_state_recovery_lease(path: Path) -> bool:
+    resolved = path.resolve()
+    with _STATE_WORKERS_LOCK:
+        if _STATE_WORKERS.get(resolved) or resolved in _STATE_RECOVERY_LEASES:
+            return False
+        _STATE_RECOVERY_LEASES.add(resolved)
+        return True
+
+
+def release_state_recovery_lease(path: Path) -> None:
+    resolved = path.resolve()
+    with _STATE_WORKERS_LOCK:
+        if resolved not in _STATE_RECOVERY_LEASES:
+            raise RuntimeError("state recovery lease is not held")
+        _STATE_RECOVERY_LEASES.remove(resolved)
 
 
 async def _await_daemon_state_worker(
@@ -345,9 +420,9 @@ async def _await_daemon_state_worker(
     worker.result()
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    database = sqlite3.connect(path, timeout=30)
-    database.execute("PRAGMA busy_timeout=30000")
+def _connect(path: Path, *, busy_timeout_ms: int = 30000) -> sqlite3.Connection:
+    database = sqlite3.connect(path, timeout=busy_timeout_ms / 1000)
+    database.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     database.execute("PRAGMA foreign_keys=ON")
     return database
 
@@ -376,6 +451,7 @@ def _initialise_state_sync(path: Path) -> None:
             "8",
             "9",
             "10",
+            "11",
             SCHEMA_VERSION,
         }:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
@@ -950,7 +1026,12 @@ def _update_runtime_controls_sync(
         next_reconciliation = (
             str(current[2]) if reconciliation_state is None else reconciliation_state
         )
-        if next_reconciliation not in {"PENDING", "CONSISTENT", "INCONSISTENT"}:
+        if next_reconciliation not in {
+            "PENDING",
+            "CONSISTENT",
+            "INCONSISTENT",
+            "INDETERMINATE",
+        }:
             raise ValueError("invalid reconciliation state")
         database.execute(
             """
@@ -1123,11 +1204,57 @@ def _tranche_from_payload(payload: dict[str, Any]) -> Tranche:
     )
 
 
+def _risk_request_to_payload(request: RiskRequest) -> dict[str, Any]:
+    return {
+        "reservation_id": request.reservation_id,
+        "route_id": request.route_id,
+        "base": request.base,
+        "tranche_id": request.tranche_id,
+        "projected_stress_usdt": str(request.projected_stress_usdt),
+        "exit_depth_sufficient": request.exit_depth_sufficient,
+        "venues": [
+            {
+                "venue": projection.venue.value,
+                "equity_usdt": str(projection.equity_usdt),
+                "projected_notional_usdt": str(projection.projected_notional_usdt),
+                "projected_margin_used_usdt": str(projection.projected_margin_used_usdt),
+                "venue_stress_usdt": str(projection.venue_stress_usdt),
+            }
+            for projection in request.venues
+        ],
+    }
+
+
+def _risk_request_from_payload(payload: dict[str, Any]) -> RiskRequest:
+    exit_depth_sufficient = payload["exit_depth_sufficient"]
+    if not isinstance(exit_depth_sufficient, bool):
+        raise ValueError("persisted risk depth flag must be boolean")
+    return RiskRequest(
+        reservation_id=str(payload["reservation_id"]),
+        route_id=str(payload["route_id"]),
+        base=str(payload["base"]),
+        tranche_id=str(payload["tranche_id"]),
+        projected_stress_usdt=Decimal(str(payload["projected_stress_usdt"])),
+        venues=tuple(
+            VenueProjection(
+                venue=Venue(str(item["venue"])),
+                equity_usdt=Decimal(str(item["equity_usdt"])),
+                projected_notional_usdt=Decimal(str(item["projected_notional_usdt"])),
+                projected_margin_used_usdt=Decimal(str(item["projected_margin_used_usdt"])),
+                venue_stress_usdt=Decimal(str(item["venue_stress_usdt"])),
+            )
+            for item in payload["venues"]
+        ),
+        exit_depth_sufficient=exit_depth_sufficient,
+    )
+
+
 def _save_tranche_sync(
     path: Path,
     tranche: Tranche,
     now: datetime,
     deadline_monotonic: float | None,
+    risk_reservation: RiskRequest | None,
 ) -> None:
     if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
         raise TimeoutError("simulated tranche persistence deadline expired")
@@ -1145,6 +1272,54 @@ def _save_tranche_sync(
             """,
             (tranche.tranche_id, tranche.state.value, payload, now.isoformat()),
         )
+        reservation_states = {
+            PairActionState.PARTIALLY_HEDGED,
+            PairActionState.HEDGED,
+            PairActionState.CLOSING,
+            PairActionState.UNKNOWN_ORDER,
+            PairActionState.RECOVERING,
+            PairActionState.EMERGENCY_HEDGED,
+        }
+        if risk_reservation is not None:
+            if (
+                tranche.state not in reservation_states
+                or risk_reservation.reservation_id != tranche.tranche_id
+                or risk_reservation.tranche_id != tranche.tranche_id
+                or risk_reservation.route_id != tranche.route.value
+                or risk_reservation.base != tranche.route.base
+                or risk_reservation.projected_stress_usdt != tranche.projected_stress_usdt
+                or {projection.venue for projection in risk_reservation.venues}
+                != {tranche.route.long_venue, tranche.route.short_venue}
+            ):
+                database.rollback()
+                raise ValueError("risk reservation does not match persisted tranche")
+            reservation_payload = json.dumps(
+                _risk_request_to_payload(risk_reservation),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            database.execute(
+                """
+                INSERT INTO shadow_risk_reservations(
+                    tranche_id, reservation_id, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(tranche_id) DO UPDATE SET
+                    reservation_id = excluded.reservation_id,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    tranche.tranche_id,
+                    risk_reservation.reservation_id,
+                    reservation_payload,
+                    now.isoformat(),
+                ),
+            )
+        elif tranche.state not in reservation_states:
+            database.execute(
+                "DELETE FROM shadow_risk_reservations WHERE tranche_id = ?",
+                (tranche.tranche_id,),
+            )
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             database.rollback()
             raise TimeoutError("simulated tranche persistence deadline expired")
@@ -1157,6 +1332,7 @@ async def save_tranche(
     now: datetime | None = None,
     *,
     deadline_monotonic: float | None = None,
+    risk_reservation: RiskRequest | None = None,
 ) -> None:
     loop = asyncio.get_running_loop()
     if deadline_monotonic is not None and loop.time() >= deadline_monotonic:
@@ -1166,8 +1342,15 @@ async def save_tranche(
         loop.time() + STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS,
     )
     worker = _DaemonStateWorker(
-        lambda: _save_tranche_sync(path, tranche, now or datetime.now(UTC), deadline_monotonic),
+        lambda: _save_tranche_sync(
+            path,
+            tranche,
+            now or datetime.now(UTC),
+            deadline_monotonic,
+            risk_reservation,
+        ),
         name=f"state-save-tranche-{tranche.tranche_id}",
+        state_path=path,
     )
     await _await_daemon_state_worker(worker, deadline_monotonic=terminal_deadline)
 
@@ -1193,6 +1376,7 @@ async def delete_tranche(
     worker = _DaemonStateWorker(
         lambda: _delete_tranche_sync(path, tranche_id),
         name=f"state-delete-tranche-{tranche_id}",
+        state_path=path,
     )
     await _await_daemon_state_worker(
         worker,
@@ -1210,6 +1394,47 @@ def _load_tranches_sync(path: Path) -> tuple[Tranche, ...]:
 
 async def load_tranches(path: Path) -> tuple[Tranche, ...]:
     return await asyncio.to_thread(_load_tranches_sync, path)
+
+
+def _load_shadow_portfolio_sync(
+    path: Path,
+    busy_timeout_ms: int = 30000,
+) -> tuple[tuple[Tranche, ...], tuple[RiskRequest, ...]]:
+    with _connect(path, busy_timeout_ms=busy_timeout_ms) as database:
+        database.execute("BEGIN")
+        tranche_rows = database.execute(
+            "SELECT tranche_id, payload_json FROM simulated_tranches ORDER BY tranche_id"
+        ).fetchall()
+        reservation_rows = database.execute(
+            """
+            SELECT tranche_id, reservation_id, payload_json
+            FROM shadow_risk_reservations ORDER BY reservation_id
+            """
+        ).fetchall()
+        database.commit()
+    tranches = tuple(_tranche_from_payload(json.loads(str(row[1]))) for row in tranche_rows)
+    requests = tuple(
+        _risk_request_from_payload(json.loads(str(row[2]))) for row in reservation_rows
+    )
+    if any(
+        str(row[0]) != tranche.tranche_id
+        for row, tranche in zip(tranche_rows, tranches, strict=True)
+    ):
+        raise ValueError("persisted tranche row identity does not match its payload")
+    if any(
+        str(row[0]) != request.tranche_id or str(row[1]) != request.reservation_id
+        for row, request in zip(reservation_rows, requests, strict=True)
+    ):
+        raise ValueError("persisted risk row identity does not match its payload")
+    return tranches, requests
+
+
+async def load_shadow_portfolio(
+    path: Path,
+    *,
+    busy_timeout_ms: int = 30000,
+) -> tuple[tuple[Tranche, ...], tuple[RiskRequest, ...]]:
+    return await asyncio.to_thread(_load_shadow_portfolio_sync, path, busy_timeout_ms)
 
 
 def _save_shadow_snapshot_sync(path: Path, payload: dict[str, Any], now: datetime) -> None:

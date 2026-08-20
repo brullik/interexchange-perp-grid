@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sqlite3
 from collections import deque
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -45,14 +46,19 @@ from interexchange_perp_grid.routes import DirectedRouteQuote
 from interexchange_perp_grid.state import (
     RuntimeControls,
     StateTransitionDeadlineError,
+    acquire_state_recovery_lease,
+    clear_persistence_indeterminate,
     delete_tranche,
     initialise_state,
-    load_tranches,
+    load_shadow_portfolio,
+    mark_persistence_indeterminate,
+    persistence_indeterminate_marker_exists,
     read_active_qualification_epoch,
     read_runtime_controls,
     read_shadow_snapshot,
     record_qualification_exception,
     record_qualification_scan,
+    release_state_recovery_lease,
     save_shadow_snapshot,
     save_tranche,
     update_runtime_controls,
@@ -244,17 +250,52 @@ class ShadowRuntime:
         self.tranches: dict[str, Tranche] = {}
         self._started = False
         self._persistence_indeterminate = False
+        self._portfolio_restored_consistently = False
+        self._portfolio_transition_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._started:
             return
         await initialise_state(self.state_path)
-        restored = await load_tranches(self.state_path)
+        controls = await read_runtime_controls(self.state_path)
+        self._persistence_indeterminate = (
+            controls.reconciliation_state == "INDETERMINATE"
+            or persistence_indeterminate_marker_exists(self.state_path)
+        )
+        restored, reservations = await load_shadow_portfolio(self.state_path)
         self.tranches = {tranche.tranche_id: tranche for tranche in restored}
         active = tuple(tranche for tranche in restored if tranche.state in ACTIVE_STATES)
+        active_ids = {tranche.tranche_id for tranche in active}
+        reservation_ids = {request.tranche_id for request in reservations}
+        structurally_matched = active_ids == reservation_ids and all(
+            request.reservation_id == request.tranche_id
+            and request.tranche_id in self.tranches
+            and request.route_id == self.tranches[request.tranche_id].route.value
+            and request.base == self.tranches[request.tranche_id].route.base
+            and request.projected_stress_usdt
+            == self.tranches[request.tranche_id].projected_stress_usdt
+            and {projection.venue for projection in request.venues}
+            == {
+                self.tranches[request.tranche_id].route.long_venue,
+                self.tranches[request.tranche_id].route.short_venue,
+            }
+            for request in reservations
+        )
+        if structurally_matched:
+            try:
+                self.risk.restore(reservations)
+            except ValueError:
+                structurally_matched = False
+        self._portfolio_restored_consistently = structurally_matched
         await update_runtime_controls(
             self.state_path,
-            reconciliation_state="PENDING" if active else "CONSISTENT",
+            reconciliation_state=(
+                "INDETERMINATE"
+                if self._persistence_indeterminate
+                else "PENDING"
+                if active or not structurally_matched
+                else "CONSISTENT"
+            ),
         )
         self._started = True
 
@@ -267,10 +308,23 @@ class ShadowRuntime:
         structurally_valid = all(
             self._tranche_is_consistent(self.tranches[tranche_id]) for tranche_id in expected
         )
-        consistent = expected == observed_active_ids and structurally_valid
+        risk_ids = {request.tranche_id for request in self.risk.reservations}
+        consistent = (
+            not self._persistence_indeterminate
+            and self._portfolio_restored_consistently
+            and expected == observed_active_ids
+            and expected == risk_ids
+            and structurally_valid
+        )
         await update_runtime_controls(
             self.state_path,
-            reconciliation_state="CONSISTENT" if consistent else "INCONSISTENT",
+            reconciliation_state=(
+                "CONSISTENT"
+                if consistent
+                else "INDETERMINATE"
+                if self._persistence_indeterminate
+                else "INCONSISTENT"
+            ),
         )
         return ReasonCode.RECONCILIATION_PASSED if consistent else ReasonCode.RECONCILIATION_FAILED
 
@@ -312,10 +366,71 @@ class ShadowRuntime:
     async def kill(self) -> None:
         await update_runtime_controls(self.state_path, killed=True, paused=True)
 
-    def block_for_indeterminate_persistence(self) -> None:
+    async def block_for_indeterminate_persistence(self) -> None:
         self._persistence_indeterminate = True
+        mark_persistence_indeterminate(self.state_path)
+
+    async def resolve_indeterminate_persistence(
+        self,
+        observed_active_ids: set[str],
+    ) -> ReasonCode:
+        async with self._portfolio_transition_lock:
+            return await self._resolve_indeterminate_persistence_locked(observed_active_ids)
+
+    async def _resolve_indeterminate_persistence_locked(
+        self,
+        observed_active_ids: set[str],
+    ) -> ReasonCode:
+        if not acquire_state_recovery_lease(self.state_path):
+            return ReasonCode.RECONCILIATION_FAILED
+        try:
+            try:
+                durable_tranches, durable_requests = await load_shadow_portfolio(
+                    self.state_path,
+                    busy_timeout_ms=50,
+                )
+            except (OSError, sqlite3.Error, ValueError):
+                return ReasonCode.RECONCILIATION_FAILED
+            expected = {
+                tranche.tranche_id
+                for tranche in self.tranches.values()
+                if tranche.state in ACTIVE_STATES
+            }
+            risk_ids = {request.tranche_id for request in self.risk.reservations}
+            structurally_valid = all(
+                self._tranche_is_consistent(self.tranches[tranche_id]) for tranche_id in expected
+            )
+            if (
+                not self._portfolio_restored_consistently
+                or tuple(sorted(self.tranches.values(), key=lambda item: item.tranche_id))
+                != durable_tranches
+                or tuple(sorted(self.risk.reservations, key=lambda item: item.reservation_id))
+                != durable_requests
+                or expected != observed_active_ids
+                or expected != risk_ids
+                or not structurally_valid
+            ):
+                await update_runtime_controls(
+                    self.state_path,
+                    reconciliation_state="INDETERMINATE",
+                )
+                return ReasonCode.RECONCILIATION_FAILED
+            await update_runtime_controls(self.state_path, reconciliation_state="CONSISTENT")
+            clear_persistence_indeterminate(self.state_path)
+            self._persistence_indeterminate = False
+            return ReasonCode.RECONCILIATION_PASSED
+        finally:
+            release_state_recovery_lease(self.state_path)
+
+    @property
+    def portfolio_restored_consistently(self) -> bool:
+        return self._portfolio_restored_consistently
 
     async def close_all_simulated(self) -> tuple[str, ...]:
+        async with self._portfolio_transition_lock:
+            return await self._close_all_simulated_locked()
+
+    async def _close_all_simulated_locked(self) -> tuple[str, ...]:
         persisted = await read_shadow_snapshot(self.state_path)
         opportunities = persisted.get("opportunities", []) if persisted is not None else []
         if not isinstance(opportunities, list):
@@ -370,9 +485,14 @@ class ShadowRuntime:
             try:
                 await save_tranche(self.state_path, tranche)
             except StateTransitionDeadlineError as error:
-                self.block_for_indeterminate_persistence()
+                await self.block_for_indeterminate_persistence()
                 raise RuntimeError(
                     "shadow close-all persistence outcome is indeterminate"
+                ) from error
+            except Exception as error:
+                await self.block_for_indeterminate_persistence()
+                raise RuntimeError(
+                    "shadow close-all persistence commit state is unknown"
                 ) from error
             with contextlib.suppress(KeyError):
                 self.risk.release(tranche.tranche_id)
@@ -383,6 +503,7 @@ class ShadowRuntime:
     async def snapshot(self) -> dict[str, object]:
         controls = await self.controls()
         persisted = await read_shadow_snapshot(self.state_path)
+        per_route_stress, portfolio_stress = self.risk.totals()
         return {
             "mode": self.settings.app.mode,
             "paused": controls.paused,
@@ -390,6 +511,13 @@ class ShadowRuntime:
             "reconciliation_state": controls.reconciliation_state,
             "overloaded": self.overload.overloaded,
             "persistence_indeterminate": self._persistence_indeterminate,
+            "risk": {
+                "reservation_count": len(self.risk.reservations),
+                "per_route_stress_usdt": {
+                    route: str(stress) for route, stress in sorted(per_route_stress.items())
+                },
+                "portfolio_stress_usdt": str(portfolio_stress),
+            },
             "positions": [
                 {
                     "tranche_id": tranche.tranche_id,
@@ -438,7 +566,15 @@ class ShadowTrader:
         self.runtime = runtime
         self._risk = runtime.risk
         self._coordinator = PairExecutionCoordinator()
-        self._managed_ids: set[str] = set()
+        self._managed_ids: set[str] = (
+            {
+                tranche.tranche_id
+                for tranche in runtime.tranches.values()
+                if tranche.state in ACTIVE_STATES
+            }
+            if runtime.portfolio_restored_consistently
+            else set()
+        )
 
     async def process(
         self,
@@ -454,34 +590,33 @@ class ShadowTrader:
             decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline
         ):
             return ()
-        restored_active = any(
-            tranche.state in ACTIVE_STATES and tranche.tranche_id not in self._managed_ids
-            for tranche in self.runtime.tranches.values()
-        )
-        if restored_active:
-            return ()
         decisions: list[SignalDecision] = []
-        for quote in result.quotes:
-            route = DirectedRouteKey(quote.key.base, quote.long_venue, quote.short_venue)
-            matches = tuple(
-                assessment
-                for assessment in result.route_calibration
-                if assessment.route == route
-                and assessment.latest_base_quantity == quote.base_quantity
-            )
-            if len(matches) != 1:
-                continue
-            decision = await self._evaluate_and_open(
-                quote,
-                matches[0],
-                decision_deadline=decision_deadline,
-            )
-            if decision is not None:
-                decisions.append(decision)
+        async with self.runtime._portfolio_transition_lock:
+            gate = await self.runtime.entry_gate()
+            if not gate.accepted:
+                return ()
+            for quote in result.quotes:
+                route = DirectedRouteKey(quote.key.base, quote.long_venue, quote.short_venue)
+                matches = tuple(
+                    assessment
+                    for assessment in result.route_calibration
+                    if assessment.route == route
+                    and assessment.latest_base_quantity == quote.base_quantity
+                )
+                if len(matches) != 1:
+                    continue
+                decision = await self._evaluate_and_open(
+                    quote,
+                    matches[0],
+                    decision_deadline=decision_deadline,
+                )
+                if decision is not None:
+                    decisions.append(decision)
         return tuple(decisions)
 
     async def close_active(self, quotes: tuple[DirectedRouteQuote, ...]) -> None:
-        await self._close_converged(quotes)
+        async with self.runtime._portfolio_transition_lock:
+            await self._close_converged(quotes)
 
     async def _evaluate_and_open(
         self,
@@ -686,6 +821,7 @@ class ShadowTrader:
                 self.runtime.state_path,
                 tranche,
                 deadline_monotonic=decision_deadline,
+                risk_reservation=request,
             ),
             name=f"shadow-save-tranche-{tranche_id}",
         )
@@ -699,7 +835,7 @@ class ShadowTrader:
         except StateTransitionDeadlineError as error:
             self.runtime.tranches[tranche_id] = tranche
             self._managed_ids.add(tranche_id)
-            self.runtime.block_for_indeterminate_persistence()
+            await self.runtime.block_for_indeterminate_persistence()
             raise RuntimeError("shadow tranche persistence outcome is indeterminate") from error
         except TimeoutError:
             self._coordinator.rollback_unpublished_open(tranche)
@@ -707,10 +843,14 @@ class ShadowTrader:
             if persistence_interrupted:
                 raise asyncio.CancelledError from None
             return None
-        except Exception:
-            self._coordinator.rollback_unpublished_open(tranche)
-            self._risk.release(tranche_id)
-            raise
+        except Exception as error:
+            # A storage exception can be raised before or after the native
+            # transaction commits.  Retain conservative ownership and block
+            # all new entries until durable truth is reconciled.
+            self.runtime.tranches[tranche_id] = tranche
+            self._managed_ids.add(tranche_id)
+            await self.runtime.block_for_indeterminate_persistence()
+            raise RuntimeError("shadow tranche persistence commit state is unknown") from error
         if persistence_interrupted:
             # Persistence succeeded despite caller cancellation.  Keep it
             # explicitly managed and risk-reserved before propagating cancel.
@@ -732,13 +872,14 @@ class ShadowTrader:
             except StateTransitionDeadlineError as error:
                 self.runtime.tranches[tranche_id] = tranche
                 self._managed_ids.add(tranche_id)
-                self.runtime.block_for_indeterminate_persistence()
+                await self.runtime.block_for_indeterminate_persistence()
                 raise RuntimeError("shadow tranche deletion outcome is indeterminate") from error
             except Exception:
                 # Persistence succeeded, so retain explicit in-memory/risk
                 # ownership if compensating deletion itself fails.
                 self.runtime.tranches[tranche_id] = tranche
                 self._managed_ids.add(tranche_id)
+                await self.runtime.block_for_indeterminate_persistence()
                 raise
             self._coordinator.rollback_unpublished_open(tranche)
             self._risk.release(tranche_id)
@@ -836,8 +977,11 @@ class ShadowTrader:
             try:
                 await save_tranche(self.runtime.state_path, tranche)
             except StateTransitionDeadlineError as error:
-                self.runtime.block_for_indeterminate_persistence()
+                await self.runtime.block_for_indeterminate_persistence()
                 raise RuntimeError("shadow close persistence outcome is indeterminate") from error
+            except Exception as error:
+                await self.runtime.block_for_indeterminate_persistence()
+                raise RuntimeError("shadow close persistence commit state is unknown") from error
             with contextlib.suppress(KeyError):
                 self._risk.release(tranche.tranche_id)
 
