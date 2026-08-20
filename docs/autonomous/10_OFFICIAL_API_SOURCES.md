@@ -24,10 +24,18 @@ Codex обязан перепроверять эти источники пере
 
 ## Bitget
 
-- https://www.bitget.com/api-doc/contract/websocket/public/Order-Book-Channel
+- Последняя перепроверка Classic USDT-FUTURES: 2026-08-20. UTA не квалифицирован.
+- https://www.bitget.com/api-doc/classic/contract/websocket/public/Tickers-Channel
+- https://www.bitget.com/api-doc/classic/contract/websocket/public/Order-Book-Channel
+- https://www.bitget.com/api-doc/classic/contract/trade/Get-Orders-Pending
+- https://www.bitget.com/api-doc/classic/contract/position/get-all-position
+- https://www.bitget.com/api-doc/classic/contract/trade/Place-Order
 - https://www.bitget.com/api-doc/contract/websocket/private/Order-Channel
 - https://www.bitget.com/api-doc/classic/contract/websocket/private/Positions-Channel
-- https://www.bitget.com/api-doc/contract/websocket/private/Place-Order-Channel
+
+Pinned CCXT Pro 4.5.58 не реализует matching unsubscribe для Classic batch ticker;
+локальный override обязан использовать официальный `op=unsubscribe` с теми же topics.
+Live остаётся disabled до независимых account/shadow/canary/reconciliation gates.
 
 ## KuCoin
 

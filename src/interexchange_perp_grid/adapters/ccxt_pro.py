@@ -9,6 +9,7 @@ from typing import Any
 import ccxt.pro as ccxtpro  # type: ignore[import-untyped]
 
 from interexchange_perp_grid.adapters.base import ExchangeAdapter
+from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.adapters.bybit_v5 import SequenceQualifiedBybitExchange
 from interexchange_perp_grid.domain import (
     BboQuote,
@@ -152,6 +153,8 @@ class CcxtProAdapter(ExchangeAdapter):
             return ccxtpro.binance(configuration)
         if venue == Venue.BYBIT:
             return SequenceQualifiedBybitExchange(configuration)
+        if venue == Venue.BITGET:
+            return ClassicBitgetExchange(configuration)
         exchange_class = getattr(ccxtpro, venue.value)
         return exchange_class(configuration)
 
@@ -171,10 +174,12 @@ class CcxtProAdapter(ExchangeAdapter):
 
     def _bbo_stream_kind(self) -> str | None:
         capabilities = _mapping(self._exchange.has)
-        pairs = (
+        pairs: tuple[tuple[str, str, str, str], ...] = (
             ("bids_asks", "watchBidsAsks", "unWatchBidsAsks", "un_watch_bids_asks"),
             ("tickers", "watchTickers", "unWatchTickers", "un_watch_tickers"),
         )
+        if self.venue == Venue.BITGET:
+            pairs = (pairs[1],)
         for kind, watch_capability, unwatch_capability, unwatch_method in pairs:
             declared_unwatch = capabilities.get(unwatch_capability)
             if (
@@ -314,6 +319,8 @@ class CcxtProAdapter(ExchangeAdapter):
                 None,
                 {"depth": "books"},
             )
+        elif self.venue == Venue.BITGET:
+            raw = await self._exchange.watch_order_book(instrument.symbol, 15)
         else:
             raw = await self._exchange.watch_order_book(instrument.symbol, limit)
         if not isinstance(raw, Mapping):
@@ -351,6 +358,11 @@ class CcxtProAdapter(ExchangeAdapter):
             await self._exchange.un_watch_order_book(
                 instrument.symbol,
                 {"limit": limit},
+            )
+        elif self.venue == Venue.BITGET:
+            await self._exchange.un_watch_order_book(
+                instrument.symbol,
+                {"limit": 15},
             )
         else:
             await self._exchange.un_watch_order_book(instrument.symbol, {})

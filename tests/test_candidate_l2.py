@@ -21,6 +21,7 @@ from interexchange_perp_grid.candidate_l2 import (
 )
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import (
+    WAVE1_VENUES,
     BboQuote,
     BookLevel,
     CapabilityReport,
@@ -487,7 +488,7 @@ async def test_candidate_l2_selects_top30_plus_active_and_deduplicates_books(
     tmp_path: Path,
 ) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: CandidateAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: CandidateAdapter(venue, clock) for venue in WAVE1_VENUES}
     engine = PublicMarketEngine(
         settings(tmp_path),
         adapter_factory=adapters.__getitem__,
@@ -994,7 +995,7 @@ async def test_decision_latency_p95_includes_worker_compute_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: CandidateAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: CandidateAdapter(venue, clock) for venue in WAVE1_VENUES}
     engine = PublicMarketEngine(
         settings(tmp_path, maximum_candidates=1),
         adapter_factory=adapters.__getitem__,
@@ -1028,7 +1029,7 @@ async def test_decision_latency_p95_includes_worker_compute_time(
 @pytest.mark.asyncio
 async def test_overload_sheds_candidate_l2_but_keeps_active_route_books(tmp_path: Path) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: CandidateAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: CandidateAdapter(venue, clock) for venue in WAVE1_VENUES}
     engine = PublicMarketEngine(
         settings(tmp_path),
         adapter_factory=adapters.__getitem__,
@@ -1056,7 +1057,7 @@ async def test_broad_overload_shed_unsubscribes_without_disrupting_active_l2(
     tmp_path: Path,
 ) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: CandidateAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: CandidateAdapter(venue, clock) for venue in WAVE1_VENUES}
     engine = PublicMarketEngine(
         settings(tmp_path),
         adapter_factory=adapters.__getitem__,
@@ -1165,7 +1166,7 @@ async def test_active_selected_scan_does_not_wait_for_shed_broad_bbo(
     tmp_path: Path,
 ) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in WAVE1_VENUES}
     engine = PublicMarketEngine(
         settings(tmp_path),
         adapter_factory=adapters.__getitem__,
@@ -1304,7 +1305,7 @@ async def test_candidate_books_are_reused_by_selected_route_scan_without_overlap
     tmp_path: Path,
 ) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in WAVE1_VENUES}
     engine = PublicMarketEngine(
         settings(tmp_path, maximum_candidates=1),
         adapter_factory=adapters.__getitem__,
@@ -1331,7 +1332,7 @@ async def test_concurrent_selected_scans_never_overlap_same_book_subscription(
     tmp_path: Path,
 ) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in WAVE1_VENUES}
     engine = PublicMarketEngine(
         settings(tmp_path),
         adapter_factory=adapters.__getitem__,
@@ -1355,7 +1356,7 @@ async def test_concurrent_candidate_and_selected_scans_share_book_transport_lock
     tmp_path: Path,
 ) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in WAVE1_VENUES}
     engine = PublicMarketEngine(
         settings(tmp_path, debounce_ms=1),
         adapter_factory=adapters.__getitem__,

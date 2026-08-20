@@ -12,6 +12,7 @@ import pytest
 from interexchange_perp_grid.adapters.base import ExchangeAdapter
 from interexchange_perp_grid.config import load_settings
 from interexchange_perp_grid.domain import (
+    WAVE1_VENUES,
     BboQuote,
     BookLevel,
     CapabilityReport,
@@ -565,7 +566,7 @@ async def test_broad_bbo_scans_100_common_instruments_and_isolates_one_venue(
             clock,
             fail_bbo=venue == Venue.OKX,
         )
-        for venue in Venue
+        for venue in WAVE1_VENUES
     }
     settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
     engine = PublicMarketEngine(
@@ -626,7 +627,7 @@ async def test_incremental_batch_updates_fill_bounded_cache_with_one_watcher_per
     tmp_path: Path,
 ) -> None:
     clock = 1_000_000_000
-    adapters = {venue: IncrementalBroadFakeAdapter(venue, clock) for venue in Venue}
+    adapters = {venue: IncrementalBroadFakeAdapter(venue, clock) for venue in WAVE1_VENUES}
     settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
     engine = PublicMarketEngine(
         settings,
@@ -762,7 +763,7 @@ async def test_one_late_batch_does_not_quarantine_an_otherwise_healthy_stream(
 ) -> None:
     clock = [1_000_000_000]
     adapters: dict[Venue, BroadFakeAdapter] = {
-        venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue
+        venue: BroadFakeAdapter(venue, clock[0]) for venue in WAVE1_VENUES
     }
     delayed = OneLateBatchBroadFakeAdapter(Venue.BYBIT, clock[0])
     adapters[Venue.BYBIT] = delayed
@@ -971,7 +972,7 @@ async def test_shutdown_waits_for_recycle_and_prevents_escaped_replacement(tmp_p
     assert len(created_okx_adapters) == 1
     assert hanging.close_calls == 2
     assert hanging.closed is True
-    assert all(adapters[venue].closed for venue in Venue if venue != Venue.OKX)
+    assert all(adapters[venue].closed for venue in WAVE1_VENUES if venue != Venue.OKX)
     assert not tuple(
         task
         for task in asyncio.all_tasks()
@@ -1208,7 +1209,7 @@ async def test_concurrent_cold_scans_wait_for_one_initialisation(tmp_path: Path)
 async def test_shutdown_during_initial_probe_closes_all_created_adapters(tmp_path: Path) -> None:
     clock = 1_000_000_000
     adapters: dict[Venue, BroadFakeAdapter] = {
-        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+        venue: BroadFakeAdapter(venue, clock) for venue in WAVE1_VENUES
     }
     probing = CoordinatedProbeBroadFakeAdapter(Venue.OKX, clock)
     adapters[Venue.OKX] = probing
@@ -1243,7 +1244,7 @@ async def test_late_initial_probe_cannot_mutate_state_after_shutdown_timeout(
 ) -> None:
     clock = 1_000_000_000
     adapters: dict[Venue, BroadFakeAdapter] = {
-        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+        venue: BroadFakeAdapter(venue, clock) for venue in WAVE1_VENUES
     }
     probing = CoordinatedProbeBroadFakeAdapter(Venue.OKX, clock)
     adapters[Venue.OKX] = probing
@@ -1278,7 +1279,7 @@ async def test_late_initial_discovery_cannot_mutate_state_after_shutdown_timeout
 ) -> None:
     clock = 1_000_000_000
     adapters: dict[Venue, BroadFakeAdapter] = {
-        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+        venue: BroadFakeAdapter(venue, clock) for venue in WAVE1_VENUES
     }
     discovering = CoordinatedDiscoveryBroadFakeAdapter(Venue.OKX, clock)
     adapters[Venue.OKX] = discovering
@@ -1313,7 +1314,7 @@ async def test_shutdown_waits_for_forced_refresh_and_blocks_late_state_mutation(
 ) -> None:
     clock = 1_000_000_000
     adapters: dict[Venue, BroadFakeAdapter] = {
-        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+        venue: BroadFakeAdapter(venue, clock) for venue in WAVE1_VENUES
     }
     probing = CoordinatedProbeBroadFakeAdapter(Venue.OKX, clock)
     probing.allow_probe.set()
@@ -1466,7 +1467,7 @@ async def test_close_reports_cancellation_resistant_transport_instead_of_false_s
 async def test_close_reports_adapter_teardown_failure(tmp_path: Path) -> None:
     clock = 1_000_000_000
     adapters: dict[Venue, BroadFakeAdapter] = {
-        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+        venue: BroadFakeAdapter(venue, clock) for venue in WAVE1_VENUES
     }
     failing = FailingCloseBroadFakeAdapter(Venue.OKX, clock)
     adapters[Venue.OKX] = failing
@@ -1493,7 +1494,7 @@ async def test_close_reports_adapter_teardown_failure(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_six_hour_refresh_resubscribes_watchers_to_new_symbols(tmp_path: Path) -> None:
     clock = [1_000_000_000]
-    adapters = {venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue}
+    adapters = {venue: BroadFakeAdapter(venue, clock[0]) for venue in WAVE1_VENUES}
     settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
     engine = PublicMarketEngine(
         settings,

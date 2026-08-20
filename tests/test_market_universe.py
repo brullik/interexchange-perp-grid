@@ -13,7 +13,7 @@ from interexchange_perp_grid.bbo_prefilter import (
     LatestBboCache,
     rank_bbo_prefilter,
 )
-from interexchange_perp_grid.domain import BboQuote, Instrument, ProductType, Venue
+from interexchange_perp_grid.domain import WAVE1_VENUES, BboQuote, Instrument, ProductType, Venue
 from interexchange_perp_grid.market_universe import (
     InstrumentRegistry,
     UniverseRoute,
@@ -52,12 +52,12 @@ def _instrument(
 
 @pytest.fixture
 def large_universe() -> dict[Venue, tuple[Instrument, ...]]:
-    by_venue: dict[Venue, list[Instrument]] = {venue: [] for venue in Venue}
+    by_venue: dict[Venue, list[Instrument]] = {venue: [] for venue in WAVE1_VENUES}
     for index in range(100):
         base = f"A{index:03d}"
-        for venue in Venue:
+        for venue in WAVE1_VENUES:
             by_venue[venue].append(_instrument(venue, base))
-    for venue in Venue:
+    for venue in WAVE1_VENUES:
         by_venue[venue].extend(
             (
                 _instrument(venue, "EXACT14", listed_days_ago=14),

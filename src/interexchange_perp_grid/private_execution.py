@@ -71,10 +71,22 @@ def translate_protected_order(
         params.update({"orderLinkId": intent.client_order_id, "positionIdx": 0})
     elif intent.venue == Venue.OKX:
         params.update({"clOrdId": intent.client_order_id, "tdMode": "cross"})
+    elif intent.venue == Venue.BITGET:
+        params.update(
+            {
+                "clientOid": intent.client_order_id,
+                "productType": "USDT-FUTURES",
+                "marginMode": "cross",
+                "marginCoin": "USDT",
+            }
+        )
     else:
         params["newClientOrderId"] = intent.client_order_id
     if time_in_force is not None:
-        params["timeInForce"] = time_in_force
+        if intent.venue == Venue.BITGET:
+            params["force"] = time_in_force
+        else:
+            params["timeInForce"] = time_in_force
     if intent.purpose in {
         OrderPurpose.NORMAL_CLOSE,
         OrderPurpose.EMERGENCY_CLOSE,
@@ -326,6 +338,19 @@ class LiveCanaryExecutor:
         policy_passed, policy_reason = self._policy.evaluate(action)
         if not policy_passed:
             return LivePairResult(False, policy_reason, None, None)
+        canary_venues = {
+            Venue(value)
+            for value in (
+                self._settings.venues.canary_primary + self._settings.venues.canary_alternate
+            )
+        }
+        if {
+            action.route.long_venue,
+            action.route.short_venue,
+            long_intent.venue,
+            short_intent.venue,
+        } - canary_venues:
+            return LivePairResult(False, ReasonCode.CANARY_POLICY_VIOLATION, None, None)
         decision = evaluate_live_order(self._settings, live_context)
         if not decision.allowed:
             return LivePairResult(False, decision.reason, None, None)

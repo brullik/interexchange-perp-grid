@@ -10,6 +10,10 @@ class Venue(StrEnum):
     BINANCE_USDM = "binanceusdm"
     BYBIT = "bybit"
     OKX = "okx"
+    BITGET = "bitget"
+
+
+WAVE1_VENUES = (Venue.BINANCE_USDM, Venue.BYBIT, Venue.OKX)
 
 
 class BookSide(StrEnum):

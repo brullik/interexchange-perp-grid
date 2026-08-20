@@ -625,7 +625,7 @@ def prune_history(config: ConfigPath = Path("config/defaults.yaml")) -> None:
 def private_probe(
     venue: Annotated[str, typer.Option("--venue")],
 ) -> None:
-    """Read-only probe of one Wave 1 venue's CCXT Pro private capabilities."""
+    """Read-only probe of one venue transport's declared private capabilities."""
     selected = Venue(venue)
 
     async def probe() -> PrivateCapabilityReport:

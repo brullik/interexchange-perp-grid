@@ -122,7 +122,12 @@ class FakePrivateExchange:
         del order_type, price
         self.create_calls += 1
         return self.order(
-            str(params.get("orderLinkId") or params.get("clOrdId") or "client-1"),
+            str(
+                params.get("orderLinkId")
+                or params.get("clOrdId")
+                or params.get("clientOid")
+                or "client-1"
+            ),
             amount=str(amount),
             filled=str(amount),
             status="closed",
@@ -200,7 +205,10 @@ class FakePrivateExchange:
         }
 
 
-@pytest.mark.parametrize("venue", [Venue.BYBIT, Venue.OKX, Venue.BINANCE_USDM])
+@pytest.mark.parametrize(
+    "venue",
+    [Venue.BYBIT, Venue.OKX, Venue.BINANCE_USDM, Venue.BITGET],
+)
 @pytest.mark.asyncio
 async def test_wave_one_private_capabilities_and_account_are_normalised(venue: Venue) -> None:
     exchange = FakePrivateExchange()
@@ -300,6 +308,12 @@ class LargeAccountWideExchange(FakePrivateExchange):
             50,
         ),
         (Venue.OKX, {"instType": "SWAP"}, {"instType": "SWAP"}, 100),
+        (
+            Venue.BITGET,
+            {"productType": "USDT-FUTURES"},
+            {"productType": "USDT-FUTURES", "marginCoin": "USDT"},
+            100,
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -426,6 +440,25 @@ class AccountWideStreamExchange(LargeAccountWideExchange):
                 ("orders", {"type": "swap"}),
                 ("positions", {"instType": "SWAP"}),
                 ("account", {}),
+            ],
+        ),
+        (
+            Venue.BITGET,
+            [
+                (
+                    "orders",
+                    {
+                        "type": "swap",
+                        "subType": "linear",
+                        "productType": "USDT-FUTURES",
+                        "uta": False,
+                    },
+                ),
+                ("positions", {"instType": "USDT-FUTURES", "uta": False}),
+                (
+                    "account",
+                    {"type": "swap", "instType": "USDT-FUTURES", "uta": False},
+                ),
             ],
         ),
     ],

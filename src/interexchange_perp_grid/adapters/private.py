@@ -344,8 +344,14 @@ class CcxtPrivateAdapter:
         order_limit, position_limit = _account_wide_snapshot_limits(self.venue)
 
         async def sample() -> tuple[tuple[object, ...], tuple[object, ...]]:
-            order_params = _account_wide_snapshot_params(self.venue)
-            position_params = _account_wide_snapshot_params(self.venue)
+            order_params = _account_wide_snapshot_params(
+                self.venue,
+                PrivateStreamKind.ORDERS,
+            )
+            position_params = _account_wide_snapshot_params(
+                self.venue,
+                PrivateStreamKind.POSITIONS,
+            )
             if position_limit is not None:
                 position_params["limit"] = position_limit
             raw_orders, raw_positions = await asyncio.gather(
@@ -730,7 +736,15 @@ def _require_sequence(raw: object, operation: str) -> tuple[object, ...]:
     return tuple(raw)
 
 
-def _account_wide_snapshot_params(venue: Venue) -> dict[str, object]:
+def _account_wide_snapshot_params(
+    venue: Venue,
+    kind: PrivateStreamKind,
+) -> dict[str, object]:
+    if venue == Venue.BITGET:
+        params: dict[str, object] = {"productType": "USDT-FUTURES"}
+        if kind == PrivateStreamKind.POSITIONS:
+            params["marginCoin"] = "USDT"
+        return params
     if venue == Venue.BYBIT:
         return {"category": "linear", "settleCoin": "USDT"}
     if venue == Venue.OKX:
@@ -741,6 +755,8 @@ def _account_wide_snapshot_params(venue: Venue) -> dict[str, object]:
 
 
 def _account_wide_snapshot_limits(venue: Venue) -> tuple[int | None, int | None]:
+    if venue == Venue.BITGET:
+        return 100, None
     if venue == Venue.BYBIT:
         return 50, 200
     if venue == Venue.OKX:
@@ -754,6 +770,17 @@ def _account_wide_stream_params(
     venue: Venue,
     kind: PrivateStreamKind,
 ) -> dict[str, object]:
+    if venue == Venue.BITGET:
+        if kind == PrivateStreamKind.ORDERS:
+            return {
+                "type": "swap",
+                "subType": "linear",
+                "productType": "USDT-FUTURES",
+                "uta": False,
+            }
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"instType": "USDT-FUTURES", "uta": False}
+        return {"type": "swap", "instType": "USDT-FUTURES", "uta": False}
     if venue == Venue.BYBIT:
         # The configured CCXT transport already selects swap/linear. Unconsumed params are
         # merged into Bybit's subscribe frame, whose schema only permits op/req_id/args.

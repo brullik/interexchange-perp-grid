@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from interexchange_perp_grid.domain import Instrument, Venue
+from interexchange_perp_grid.domain import WAVE1_VENUES, Instrument, Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_reconciliation import (
     FlatBarrierPolicy,
@@ -1137,7 +1137,7 @@ async def test_wave1_cache_restart_and_reconciliation_chaos() -> None:
                     ),
                 )
             )
-            for venue in Venue
+            for venue in WAVE1_VENUES
         }
     )
     assert all(view.ready for view in (await initial.startup()).values())
@@ -1165,7 +1165,7 @@ async def test_wave1_cache_restart_and_reconciliation_chaos() -> None:
                     ),
                 )
             )
-            for venue in Venue
+            for venue in WAVE1_VENUES
         }
     )
 
@@ -1180,7 +1180,7 @@ async def test_wave1_supervisor_restores_persistent_event_watermarks(tmp_path: P
     observed = datetime.now(UTC)
     initial_adapters = {
         venue: ScriptedSnapshotAdapter((_snapshot(0, observed_at=observed, venue=venue),))
-        for venue in Venue
+        for venue in WAVE1_VENUES
     }
     initial = Wave1PrivateStateSupervisor(initial_adapters, state_path=state_path)
     assert all(view.ready for view in (await initial.startup()).values())
@@ -1208,7 +1208,7 @@ async def test_wave1_supervisor_restores_persistent_event_watermarks(tmp_path: P
                 ),
             )
         )
-        for venue in Venue
+        for venue in WAVE1_VENUES
     }
     restarted = Wave1PrivateStateSupervisor(restarted_adapters, state_path=state_path)
 

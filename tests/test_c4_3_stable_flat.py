@@ -10,7 +10,7 @@ from typing import Protocol
 import pytest
 
 from interexchange_perp_grid.client_ids import venue_client_order_id
-from interexchange_perp_grid.domain import Instrument, Venue
+from interexchange_perp_grid.domain import WAVE1_VENUES, Instrument, Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_control import LiveControlService
 from interexchange_perp_grid.live_coordinator import (
@@ -93,7 +93,9 @@ def _instrument(venue: Venue) -> Instrument:
 
 
 def _adapters() -> dict[Venue, DeterministicPrivateExchange]:
-    return {venue: DeterministicPrivateExchange(venue, _instrument(venue), ()) for venue in Venue}
+    return {
+        venue: DeterministicPrivateExchange(venue, _instrument(venue), ()) for venue in WAVE1_VENUES
+    }
 
 
 class _BarrierPublicResult(Protocol):
@@ -138,7 +140,7 @@ def _watermarked_adapters(
     watermark: int,
 ) -> dict[Venue, _WatermarkedPrivateExchange]:
     adapters: dict[Venue, _WatermarkedPrivateExchange] = {}
-    for venue in Venue:
+    for venue in WAVE1_VENUES:
         adapter = _WatermarkedPrivateExchange(venue, _instrument(venue), ())
         adapter.private_event_watermark = watermark
         adapters[venue] = adapter
@@ -201,7 +203,7 @@ def _service(journal: LiveOrderJournal) -> LiveControlService:
     return LiveControlService(
         journal,
         _adapters(),
-        {venue: _instrument(venue) for venue in Venue},
+        {venue: _instrument(venue) for venue in WAVE1_VENUES},
         _ROUTE,
         "a" * 64,
     )
@@ -435,7 +437,7 @@ async def test_private_watermark_is_preserved_across_atomic_flat_commit(tmp_path
     service = LiveControlService(
         journal,
         adapters,
-        {venue: _instrument(venue) for venue in Venue},
+        {venue: _instrument(venue) for venue in WAVE1_VENUES},
         _ROUTE,
         "a" * 64,
         flat_barrier_policy=FlatBarrierPolicy(2, 0, 0.001, 0.5),

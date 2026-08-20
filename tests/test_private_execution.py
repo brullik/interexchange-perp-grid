@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import (
@@ -61,6 +62,7 @@ def instrument(venue: Venue) -> Instrument:
         (Venue.BYBIT, "orderLinkId"),
         (Venue.OKX, "clOrdId"),
         (Venue.BINANCE_USDM, "newClientOrderId"),
+        (Venue.BITGET, "clientOid"),
     ],
 )
 def test_protected_ioc_translation_is_contract_tested_per_venue(
@@ -81,9 +83,76 @@ def test_protected_ioc_translation_is_contract_tested_per_venue(
     assert request.price == Decimal("101")
     assert request.amount_contracts == Decimal("10")
     assert request.params[client_key] == "client-1"
-    assert request.params["timeInForce"] == "IOC"
+    if venue != Venue.BITGET:
+        assert request.params["timeInForce"] == "IOC"
     if venue == Venue.OKX:
         assert request.params["tdMode"] == "cross"
+    if venue == Venue.BITGET:
+        assert request.params["productType"] == "USDT-FUTURES"
+        assert request.params["marginMode"] == "cross"
+        assert request.params["marginCoin"] == "USDT"
+        assert request.params["force"] == "IOC"
+        assert "timeInForce" not in request.params
+
+
+def test_pinned_bitget_rest_request_maps_unified_cross_to_classic_crossed() -> None:
+    exchange = ClassicBitgetExchange({})
+    exchange.set_markets(
+        [
+            {
+                "id": "BTCUSDT",
+                "symbol": "BTC/USDT:USDT",
+                "base": "BTC",
+                "quote": "USDT",
+                "settle": "USDT",
+                "settleId": "USDT",
+                "type": "swap",
+                "spot": False,
+                "margin": False,
+                "swap": True,
+                "future": False,
+                "option": False,
+                "contract": True,
+                "linear": True,
+                "inverse": False,
+                "active": True,
+                "precision": {"amount": 1, "price": 0.1},
+                "limits": {
+                    "amount": {"min": 1, "max": None},
+                    "price": {"min": None, "max": None},
+                    "cost": {"min": None, "max": None},
+                    "leverage": {"min": None, "max": None},
+                },
+                "contractSize": 0.01,
+                "info": {},
+            }
+        ]
+    )
+    intent = ExecutionIntent(
+        "bitget-client",
+        Venue.BITGET,
+        Side.BUY,
+        OrderPurpose.NORMAL_OPEN,
+        Decimal("0.10"),
+        Decimal("101"),
+    )
+    translated = translate_protected_order(intent, instrument(Venue.BITGET))
+
+    request = exchange.create_order_request(
+        translated.symbol,
+        translated.order_type,
+        translated.side.value.lower(),
+        float(translated.amount_contracts),
+        float(translated.price) if translated.price is not None else None,
+        translated.params,
+    )
+
+    assert request["clientOid"] == "bitget-client"
+    assert request["marginMode"] == "crossed"
+    assert request["force"] == "IOC"
+    assert request["productType"] == "USDT-FUTURES"
+    assert request["marginCoin"] == "USDT"
+    assert "timeInForce" not in request
 
 
 def test_protected_price_uses_marginal_level_side_cap_and_tick_rounding() -> None:
@@ -423,3 +492,75 @@ async def test_live_canary_submission_is_physically_behind_every_guard() -> None
     assert submitted.short_order is not None
     assert long_adapter.submit_calls == 1
     assert short_adapter.submit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bitget_code_candidate_cannot_expand_live_canary_allowlist() -> None:
+    settings = load_settings(Path("config/defaults.yaml"))
+    raw = settings.model_dump(mode="json")
+    raw["app"]["mode"] = "live"
+    raw["live"]["enabled"] = True
+    live_settings = Settings.model_validate(raw)
+    route = DirectedRouteKey("BTC", Venue.BITGET, Venue.OKX)
+    long_adapter = FilledAdapter()
+    short_adapter = FilledAdapter()
+    executor = LiveCanaryExecutor(
+        live_settings,
+        CanaryPolicy("BTC", route),
+        IdempotentOrderExecutor(long_adapter),
+        IdempotentOrderExecutor(short_adapter),
+    )
+    action = CanaryAction(
+        route,
+        1,
+        Decimal("5"),
+        Decimal("5"),
+        Decimal("0.8"),
+        Decimal("2"),
+        Decimal("0.50"),
+        0,
+        0,
+    )
+    context = LiveContext(
+        ci_or_test=False,
+        simulation_or_replay=False,
+        local_unlock_present=True,
+        telegram_challenge_valid=True,
+        current_qualification_valid=True,
+        route_allowlisted=True,
+        canary_policy_passed=True,
+        capability_preflight_passed=True,
+        account_preflight_passed=True,
+        market_data_preflight_passed=True,
+        reconciliation_passed=True,
+        risk_preflight_passed=True,
+        pause_or_kill_active=False,
+        unknown_order_exists=False,
+    )
+
+    denied = await executor.submit_pair(
+        action,
+        context,
+        ExecutionIntent(
+            "bitget-long",
+            Venue.BITGET,
+            Side.BUY,
+            OrderPurpose.NORMAL_OPEN,
+            Decimal("0.10"),
+            Decimal("101"),
+        ),
+        ExecutionIntent(
+            "okx-short",
+            Venue.OKX,
+            Side.SELL,
+            OrderPurpose.NORMAL_OPEN,
+            Decimal("0.10"),
+            Decimal("99"),
+        ),
+        instrument(Venue.BITGET),
+        instrument(Venue.OKX),
+    )
+
+    assert denied.submitted is False
+    assert denied.reason == ReasonCode.CANARY_POLICY_VIOLATION
+    assert long_adapter.submit_calls == short_adapter.submit_calls == 0

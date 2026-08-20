@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 from interexchange_perp_grid.client_ids import venue_client_order_id
-from interexchange_perp_grid.domain import Instrument, Venue
+from interexchange_perp_grid.domain import WAVE1_VENUES, Instrument, Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_control import LiveControlResult, LiveControlService
 from interexchange_perp_grid.live_journal import (
@@ -252,7 +252,7 @@ async def run_private_transition_recovery_smoke(
     )
     instruments = {
         (venue, instrument.symbol): instrument
-        for venue in Venue
+        for venue in WAVE1_VENUES
         for instrument in (_instrument(venue, index) for index in range(action_count))
     }
     adapters = {
@@ -261,7 +261,7 @@ async def run_private_transition_recovery_smoke(
             tuple(instruments[(venue, f"A{index:03d}/USDT:USDT")] for index in range(action_count)),
             private_state_dir / f"{venue.value}.json",
         )
-        for venue in Venue
+        for venue in WAVE1_VENUES
     }
     if hold_after_active and not existing:
         for adapter in adapters.values():

@@ -10,6 +10,12 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from interexchange_perp_grid.domain import Venue
+
+KNOWN_VENUE_PROFILES = frozenset(
+    {venue.value for venue in Venue} | {"kucoinfutures", "bingx", "mexc"}
+)
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -50,6 +56,24 @@ class VenuesConfig(StrictModel):
         )
         if any(not venue.strip() for venue in all_venues):
             raise ValueError("venue identifiers must be non-empty")
+        unknown = sorted(set(all_venues) - KNOWN_VENUE_PROFILES)
+        if unknown:
+            raise ValueError(f"unknown venue profiles: {', '.join(unknown)}")
+        for name, values in (
+            ("wave1_public", self.wave1_public),
+            ("canary_primary", self.canary_primary),
+            ("canary_alternate", self.canary_alternate),
+            ("wave2", self.wave2),
+            ("wave3", self.wave3),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"duplicate venue profile in {name}")
+        if not set(self.canary_primary + self.canary_alternate) <= set(self.wave1_public):
+            raise ValueError("canary venues must be a subset of wave1_public")
+        if set(self.wave1_public) & set(self.wave2 + self.wave3):
+            raise ValueError("wave1, wave2, and wave3 venue profiles must not overlap")
+        if set(self.wave2) & set(self.wave3):
+            raise ValueError("wave2 and wave3 venue profiles must not overlap")
         return self
 
 
