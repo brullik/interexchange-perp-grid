@@ -80,6 +80,13 @@ def translate_protected_order(
                 "marginCoin": "USDT",
             }
         )
+    elif intent.venue == Venue.KUCOIN_FUTURES:
+        params.update(
+            {
+                "clientOid": intent.client_order_id,
+                "marginMode": "cross",
+            }
+        )
     else:
         params["newClientOrderId"] = intent.client_order_id
     if time_in_force is not None:

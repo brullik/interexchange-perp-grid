@@ -39,13 +39,23 @@ Live остаётся disabled до независимых account/shadow/canary
 
 ## KuCoin
 
+- Последняя перепроверка KuCoin Futures Classic: 2026-08-20. UTA не квалифицирован.
+- https://www.kucoin.com/docs-new/3470080w0
+- https://www.kucoin.com/docs-new/3470097w0
+- https://www.kucoin.com/docs-new/rest/futures-trading/orders/add-order
 - https://www.kucoin.com/docs-new/rest/futures-trading/orders/get-order-list
 - https://www.kucoin.com/docs-new/3470082w0
+- https://www.kucoin.com/docs-new/3470090w0
+- https://www.kucoin.com/docs-new/3470092w0
+- https://www.kucoin.com/docs-new/3470093w0
 - https://www.kucoin.com/docs-new/3470233w0
 - https://www.kucoin.com/docs-new/rest/ua/introduction
 
-UTA notice является hard gate: пока официальный текст запрещает production/live,
-использовать UTA для live нельзя.
+Pinned CCXT Pro 4.5.58 реализует batch Futures BBO subscribe, но не matching
+`unWatchBidsAsks`; локальный Classic-only override обязан отправлять тот же
+`/contractMarket/tickerV2:{symbols}` topic с `type=unsubscribe`, не более 100 symbols
+в одном batch. UTA notice является hard gate: пока официальный текст запрещает
+production/live, использовать UTA для live нельзя.
 
 ## MEXC
 

@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE5_1_BITGET_CLASSIC_COMPLETE_PHASE5_2_KUCOIN_PENDING
-- **Current checkpoint:** Phase 5.1 Bitget Classic public/read-only/private contract code is exact-head verified with P0/P1/P2=0 at `2bee950`; Phase 5.2 KuCoin Futures is next. Bitget live remains disabled and is not part of the Wave 1 canary allowlist
+- **State:** PHASE5_2_KUCOIN_CLASSIC_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
+- **Current checkpoint:** Phase 5.2 KuCoin Futures Classic public/read-only/private contract code is locally complete with P0/P1/P2=0 on the frozen dirty checkpoint; commit, exact-head CI/artifacts, and exact-head review remain required. KuCoin live remains disabled and is not part of the Wave 1 canary allowlist
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -35,7 +35,8 @@ This is the only mutable project-status document.
 | Phase 4.6 full priority scheduler and overload chaos | COMPLETE | Exact head `7458cf0`; one bounded in-process scheduler owns P0 emergency flatten, P1 unmatched hedge, P2 normal close, P3 private reconciliation, P4 new entry, P5 Candidate L2, and P6 broad/history. Four priority-reserved lanes plus two general workers prevent lower critical work or a full queue from blocking P0; exact-key single-flight survives caller cancellation; active keys, queued work, workers, and shutdown are bounded. Critical recovery atomically blocks P4 at the portfolio gate, sheds queued P4-P6, preserves active L2/risk reduction, and is exercised through the production supervisor mapping and 10-action restart smoke. Exact run `32405032176` passed all five jobs with replay `9420004626`, C4.3 `9419966478`, C4 critical `9419959185`, and security `9419950486`; independent exact review reported P0=0/P1=0/P2=0. PROD-10 is COMPLETE |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | Phase 5.1 Bitget Classic code candidate | COMPLETE | Bitget is now a typed venue profile with a Classic-only CCXT Pro transport, exact 4096-byte batch ticker framing and matching unsubscribe acknowledgement, raw books15 sequence propagation/regression rejection, exact linear-USDT discovery, split account-wide read-only snapshot/stream params, and final pinned protected IOC `clientOid`/crossed/force mapping. Wave 1 remains exactly Binance USD-M/Bybit/OKX; Bitget is explicitly denied at the live-canary submit boundary. Exact code head `2bee950`; local locked gate: lock64, Ruff96, mypy94, pytest547, doctor shadow/live=false, Bandit medium/high0, diff-check; exact run `32411553358` passed all five jobs and produced replay, C4 critical, C4.3, and security artifacts bound to the exact SHA; independent exact-head review P0=0/P1=0/P2=0. No credentials or network evidence were fabricated. |
-| C6 venue expansion | IN_PROGRESS | Bitget Classic Phase 5.1 code candidate is exact-head verified; KuCoin Futures, BingX, MEXC, seven-venue runtime matrix, FT-02 isolation, and final operations gates remain pending. |
+| Phase 5.2 KuCoin Futures Classic code candidate | LOCAL_TECHNICAL_PASS | KuCoin Futures is now a typed Classic-only venue profile with exact batch-BBO topic framing and matching unsubscribe, raw Level-50 sequence propagation, strict linear-USDT/no-fixed-notional proof, account-wide Classic position stream, read-only private snapshots/streams, and pinned protected cross/IOC `clientOid` request mapping. Raw `positionSide` preserves independent hedge sides when zero-position tombstones arrive; ambiguous side-less records fail closed. Wave 1 remains exactly Binance USD-M/Bybit/OKX and KuCoin is denied at the live-canary boundary. Frozen local gate: lock64, Ruff97, mypy95, pytest566, doctor shadow/live=false, Bandit medium/high0, diff-check; independent dirty-checkpoint review P0/P1/P2=0. Commit and exact-head CI/artifacts/review remain pending. |
+| C6 venue expansion | IN_PROGRESS | Bitget Classic is exact-head verified and KuCoin Futures Classic is locally complete; BingX, MEXC, seven-venue runtime matrix, FT-02 isolation, and final operations gates remain pending. |
 
 ## Decisions made during implementation
 
@@ -57,6 +58,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-20 — Reconcile killed-process client IDs through one bounded owned lookup and require private stable-FLAT after every active durable transition — restart chaos must exercise production private recovery at the 10-action ceiling without turning an unknown submit into a retry — live control, private reconciliation, supervisor smoke, CI Docker proof
 2026-08-20 — Schedule every public/private workload class through bounded P0-P6 ownership with one reserved critical lane per P0-P3 priority and atomic P4 portfolio admission — emergency flatten, hedge, close, and reconciliation must remain runnable while entry, Candidate L2, and broad/history work are shed under overload — priority scheduler, supervisor, shadow runtime, service, Docker smoke
 2026-08-20 — Add Bitget only through the Classic USDT-FUTURES profile and keep the live canary allowlist unchanged — pinned CCXT supports Classic data/private primitives but its batch ticker unsubscribe stub and unqualified UTA require an explicit matching override and fail-closed separation — public/private adapters, config, execution boundary, CLI
+2026-08-20 — Add KuCoin Futures only through the Classic contract profile and preserve hedge tombstones from raw `positionSide` — pinned CCXT normalisation loses the side of a zero contract position, so Classic raw identity is required to avoid erasing the independent opposite hedge — public/private adapters, universe/routes/economics, config, execution boundary
 2026-08-14 — Calibrate median/MAD grids independently per directed route and size bucket with a 20% update bound — outliers and abrupt parameter jumps must not destabilise entries — `strategy.py`
 2026-08-14 — Reserve route, portfolio, and venue risk atomically before simulated submission — every accepted action must preserve the 5/50 USDT, local-margin, leverage, route, and tranche limits — `risk.py`, `execution.py`
 2026-08-15 — Start the real public evaluator beside the persisted heartbeat and isolate network failures — Docker health and risk controls must remain responsive while a venue is slow or quarantined — `service.py`, `shadow.py`
@@ -193,4 +195,21 @@ five jobs on `7458cf0f8fbaf241933b4c58eb04f06ff03fbe7c`; replay artifact `942000
 reports 79/79 scenarios, C4 critical `9419959185` reports 30/30 scenarios and zero production
 submits, C4.3 `9419966478` reports 8/8 scenarios and zero false success/production submits, and
 security artifact `9419950486` is exact-head-bound. PROD-10 is complete.
+```
+
+```text
+2026-08-20 Phase 5.2 KuCoin Futures Classic frozen local checkpoint: PASS
+- exact main lock validation: PASS (64 packages)
+- ruff format --check + ruff check: PASS (97 files)
+- mypy --strict: PASS (95 source/test files)
+- pytest: 566 passed
+- interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false; Wave 1 unchanged
+- Bandit medium/high: 0; git diff --check: PASS
+
+The Classic-only adapter proves matching BBO/L2 subscribe-unsubscribe contracts, propagates raw
+order-book sequence, rejects uncertain instrument economics, and keeps read-only account-wide
+position/order/account state fail closed. Zero-position hedge events use raw `positionSide`, so a
+LONG or SHORT tombstone cannot erase the independent opposite side. No credential, production
+submit authority, or live-canary allowlist expansion was added. Independent frozen-tree review
+reported P0=0, P1=0, P2=0. Commit and exact-head CI/artifact/review evidence remain pending.
 ```

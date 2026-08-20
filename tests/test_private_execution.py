@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
+from interexchange_perp_grid.adapters.kucoin_classic import ClassicKucoinFuturesExchange
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import (
@@ -63,6 +64,7 @@ def instrument(venue: Venue) -> Instrument:
         (Venue.OKX, "clOrdId"),
         (Venue.BINANCE_USDM, "newClientOrderId"),
         (Venue.BITGET, "clientOid"),
+        (Venue.KUCOIN_FUTURES, "clientOid"),
     ],
 )
 def test_protected_ioc_translation_is_contract_tested_per_venue(
@@ -93,6 +95,60 @@ def test_protected_ioc_translation_is_contract_tested_per_venue(
         assert request.params["marginCoin"] == "USDT"
         assert request.params["force"] == "IOC"
         assert "timeInForce" not in request.params
+    if venue == Venue.KUCOIN_FUTURES:
+        assert request.params["marginMode"] == "cross"
+
+
+def test_pinned_kucoin_futures_rest_request_keeps_cross_ioc_client_id() -> None:
+    exchange = ClassicKucoinFuturesExchange({})
+    exchange.set_markets(
+        [
+            {
+                "id": "XBTUSDTM",
+                "symbol": "BTC/USDT:USDT",
+                "base": "BTC",
+                "quote": "USDT",
+                "settle": "USDT",
+                "settleId": "USDT",
+                "type": "swap",
+                "spot": False,
+                "margin": False,
+                "swap": True,
+                "future": False,
+                "option": False,
+                "contract": True,
+                "linear": True,
+                "inverse": False,
+                "active": True,
+                "precision": {"amount": 1, "price": 0.1},
+                "limits": {"amount": {"min": 1}, "cost": {"min": 1}},
+                "contractSize": 0.01,
+                "info": {},
+            }
+        ]
+    )
+    intent = ExecutionIntent(
+        "kucoin-client",
+        Venue.KUCOIN_FUTURES,
+        Side.BUY,
+        OrderPurpose.NORMAL_OPEN,
+        Decimal("0.10"),
+        Decimal("101"),
+    )
+    translated = translate_protected_order(intent, instrument(Venue.KUCOIN_FUTURES))
+
+    request = exchange.create_contract_order_request(
+        translated.symbol,
+        translated.order_type,
+        translated.side.value.lower(),
+        float(translated.amount_contracts),
+        float(translated.price) if translated.price is not None else None,
+        translated.params,
+    )
+
+    assert request["clientOid"] == "kucoin-client"
+    assert request["marginMode"] == "CROSS"
+    assert request["timeInForce"] == "IOC"
 
 
 def test_pinned_bitget_rest_request_maps_unified_cross_to_classic_crossed() -> None:
@@ -495,13 +551,16 @@ async def test_live_canary_submission_is_physically_behind_every_guard() -> None
 
 
 @pytest.mark.asyncio
-async def test_bitget_code_candidate_cannot_expand_live_canary_allowlist() -> None:
+@pytest.mark.parametrize("candidate_venue", [Venue.BITGET, Venue.KUCOIN_FUTURES])
+async def test_expansion_code_candidate_cannot_expand_live_canary_allowlist(
+    candidate_venue: Venue,
+) -> None:
     settings = load_settings(Path("config/defaults.yaml"))
     raw = settings.model_dump(mode="json")
     raw["app"]["mode"] = "live"
     raw["live"]["enabled"] = True
     live_settings = Settings.model_validate(raw)
-    route = DirectedRouteKey("BTC", Venue.BITGET, Venue.OKX)
+    route = DirectedRouteKey("BTC", candidate_venue, Venue.OKX)
     long_adapter = FilledAdapter()
     short_adapter = FilledAdapter()
     executor = LiveCanaryExecutor(
@@ -542,8 +601,8 @@ async def test_bitget_code_candidate_cannot_expand_live_canary_allowlist() -> No
         action,
         context,
         ExecutionIntent(
-            "bitget-long",
-            Venue.BITGET,
+            "candidate-long",
+            candidate_venue,
             Side.BUY,
             OrderPurpose.NORMAL_OPEN,
             Decimal("0.10"),
@@ -557,7 +616,7 @@ async def test_bitget_code_candidate_cannot_expand_live_canary_allowlist() -> No
             Decimal("0.10"),
             Decimal("99"),
         ),
-        instrument(Venue.BITGET),
+        instrument(candidate_venue),
         instrument(Venue.OKX),
     )
 

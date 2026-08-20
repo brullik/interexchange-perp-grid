@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 
 from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter, normalize_market
+from interexchange_perp_grid.adapters.kucoin_classic import ClassicKucoinFuturesExchange
 from interexchange_perp_grid.domain import WAVE1_VENUES, Instrument, Venue
 from interexchange_perp_grid.market_data import BookRegistry
 from interexchange_perp_grid.market_universe import InstrumentRegistry
@@ -368,6 +370,108 @@ def test_pinned_wave1_broad_bbo_transport_has_matching_unsubscribe(venue: Venue)
     assert adapter._bbo_stream_kind() == "tickers"
 
 
+def test_pinned_kucoin_futures_bbo_transport_has_matching_unsubscribe() -> None:
+    adapter = CcxtProAdapter(Venue.KUCOIN_FUTURES)
+
+    assert adapter._bbo_stream_kind() == "bids_asks"
+    assert adapter._exchange.has["watchPositions"] is True
+
+
+class KucoinPositionClient:
+    def __init__(self) -> None:
+        self.resolved: tuple[object, str] | None = None
+
+    def resolve(self, value: object, message_hash: str) -> None:
+        self.resolved = (value, message_hash)
+
+
+def test_kucoin_classic_account_wide_position_topic_resolves_normalized_event() -> None:
+    exchange = ClassicKucoinFuturesExchange({})
+    exchange.set_markets(
+        [
+            {
+                "id": "XBTUSDTM",
+                "symbol": "BTC/USDT:USDT",
+                "base": "BTC",
+                "quote": "USDT",
+                "settle": "USDT",
+                "settleId": "USDT",
+                "type": "swap",
+                "spot": False,
+                "margin": False,
+                "swap": True,
+                "future": False,
+                "option": False,
+                "contract": True,
+                "linear": True,
+                "inverse": False,
+                "active": True,
+                "precision": {"amount": 1, "price": 0.1},
+                "limits": {"amount": {"min": 1}, "cost": {"min": 1}},
+                "contractSize": 0.001,
+                "info": {},
+            }
+        ]
+    )
+    client = KucoinPositionClient()
+
+    exchange.handle_position(
+        client,
+        {
+            "topic": "/contract/positionAll",
+            "subject": "position.change",
+            "data": {
+                "symbol": "XBTUSDTM",
+                "currentQty": 2,
+                "avgEntryPrice": 100,
+                "markPrice": 101,
+                "unrealisedPnl": 1,
+                "liquidationPrice": 50,
+                "currentTimestamp": 1_700_000_000_000,
+            },
+        },
+    )
+
+    assert client.resolved is not None
+    values, message_hash = client.resolved
+    assert message_hash == "positions"
+    assert isinstance(values, list)
+    assert values[0]["symbol"] == "BTC/USDT:USDT"
+
+
+def test_kucoin_futures_contract_metadata_explicitly_has_no_fixed_notional() -> None:
+    raw = {
+        "id": "XBTUSDTM",
+        "symbol": "BTC/USDT:USDT",
+        "base": "BTC",
+        "quote": "USDT",
+        "settle": "USDT",
+        "active": True,
+        "contract": True,
+        "swap": True,
+        "linear": True,
+        "inverse": False,
+        "expiry": None,
+        "contractSize": "0.001",
+        "taker": "0.0006",
+        "precision": {"amount": "1", "price": "0.1"},
+        "limits": {"amount": {"min": "1"}, "cost": {"min": None}},
+        "info": {
+            "symbol": "XBTUSDTM",
+            "status": "Open",
+            "settleCurrency": "USDT",
+            "lotSize": 1,
+            "multiplier": "0.001",
+        },
+    }
+
+    normalized = normalize_market(Venue.KUCOIN_FUTURES, raw)
+
+    assert normalized is not None
+    assert normalized.minimum_notional is None
+    assert normalized.no_fixed_minimum_notional is True
+
+
 @pytest.mark.asyncio
 async def test_ccxt_book_carries_native_non_contiguous_sequence_evidence() -> None:
     adapter = CcxtProAdapter(Venue.BYBIT, exchange=SequenceBookExchange())
@@ -402,6 +506,7 @@ async def test_ccxt_book_carries_native_non_contiguous_sequence_evidence() -> No
         (Venue.BYBIT, {"limit": 50}),
         (Venue.OKX, {"depth": "books"}),
         (Venue.BITGET, {"limit": 15}),
+        (Venue.KUCOIN_FUTURES, {"limit": 50}),
     ),
 )
 async def test_wave1_candidate_l2_unsubscribe_matches_subscription_contract(
@@ -429,6 +534,105 @@ async def test_wave1_candidate_l2_unsubscribe_matches_subscription_contract(
     await adapter.unwatch_order_book(instrument)
 
     assert exchange.calls == [(instrument.symbol, expected_params)]
+
+
+class CapturingClassicKucoinFuturesExchange(ClassicKucoinFuturesExchange):
+    def __init__(self) -> None:
+        super().__init__({"newUpdates": True})
+        self.watch_batches: list[tuple[str, ...]] = []
+        self.unsubscribe_topics: list[str] = []
+        markets = []
+        for index in range(205):
+            base = f"A{index}"
+            markets.append(
+                {
+                    "id": f"{base}USDTM",
+                    "symbol": f"{base}/USDT:USDT",
+                    "base": base,
+                    "quote": "USDT",
+                    "settle": "USDT",
+                    "settleId": "USDT",
+                    "type": "swap",
+                    "spot": False,
+                    "margin": False,
+                    "swap": True,
+                    "future": False,
+                    "option": False,
+                    "contract": True,
+                    "linear": True,
+                    "inverse": False,
+                    "active": True,
+                    "precision": {"amount": 1, "price": 0.1},
+                    "limits": {"amount": {"min": 1}, "cost": {"min": 1}},
+                    "contractSize": 0.001,
+                    "info": {},
+                }
+            )
+        self.set_markets(markets)
+
+    async def load_markets(self, reload: bool = False, params: object = None) -> object:
+        del reload, params
+        return self.markets
+
+    async def watch_multi_helper(
+        self,
+        method_name: str,
+        channel_name: str,
+        is_futures_channel: bool,
+        symbols: list[str],
+        params: dict[str, object],
+    ) -> dict[str, object]:
+        assert (method_name, channel_name, is_futures_channel, params) == (
+            "watchBidsAsks",
+            "/contractMarket/tickerV2:",
+            True,
+            {},
+        )
+        self.watch_batches.append(tuple(symbols))
+        symbol = symbols[0]
+        return {
+            "symbol": symbol,
+            "bid": 100,
+            "ask": 101,
+            "timestamp": 1_700_000_000_000,
+        }
+
+    async def negotiate(self, private: bool, futures: bool) -> str:
+        assert (private, futures) == (False, True)
+        return "wss://fixture"
+
+    async def un_subscribe_multiple(
+        self,
+        url: str,
+        message_hashes: list[str],
+        topic: str,
+        subscription_hashes: list[str],
+        params: dict[str, object],
+        subscription: dict[str, object],
+    ) -> object:
+        assert url == "wss://fixture"
+        assert message_hashes == subscription_hashes
+        assert params == {}
+        assert subscription["unsubscribe"] is True
+        self.unsubscribe_topics.append(topic)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_kucoin_futures_bbo_batches_at_100_with_exact_matching_unsubscribe() -> None:
+    exchange = CapturingClassicKucoinFuturesExchange()
+    symbols = [f"A{index}/USDT:USDT" for index in range(205)]
+
+    result = await exchange.watch_bids_asks(symbols)
+    await exchange.un_watch_bids_asks(symbols)
+
+    assert [len(batch) for batch in exchange.watch_batches] == [100, 100, 5]
+    assert len(result) == 3
+    assert len(exchange.unsubscribe_topics) == 3
+    assert all(
+        topic.startswith("/contractMarket/tickerV2:") for topic in exchange.unsubscribe_topics
+    )
+    assert sum(topic.count(",") + 1 for topic in exchange.unsubscribe_topics) == 205
 
 
 class BitgetBookExchange:
@@ -576,6 +780,84 @@ async def test_bitget_books15_sequence_regression_fails_closed() -> None:
         Decimal(5),
         Decimal("0.0005"),
         "fixture",
+    )
+    registry = BookRegistry()
+
+    first = await adapter.watch_order_book(selected)
+    second = await adapter.watch_order_book(selected)
+
+    assert registry.accept(first, max_age_ms=1000, max_clock_skew_ms=1000).accepted is True
+    rejected = registry.accept(second, max_age_ms=1000, max_clock_skew_ms=1000)
+    assert rejected.accepted is False
+    assert rejected.reason == ReasonCode.BOOK_SEQUENCE_GAP
+
+
+class KucoinOrderBookClient:
+    def __init__(self) -> None:
+        self.subscriptions: dict[str, object] = {}
+        self.values: list[dict[str, object]] = []
+
+    def resolve(self, value: object, message_hash: str) -> None:
+        assert message_hash == "orderbook:A0/USDT:USDT"
+        assert isinstance(value, Mapping)
+        self.values.append(dict(value))
+
+
+def test_pinned_kucoin_level50_handler_propagates_raw_sequence() -> None:
+    exchange = CapturingClassicKucoinFuturesExchange()
+    client = KucoinOrderBookClient()
+
+    exchange.handle_order_book(
+        client,
+        {
+            "topic": "/contractMarket/level2Depth50:A0USDTM",
+            "type": "message",
+            "subject": "level2",
+            "data": {
+                "symbol": "A0USDTM",
+                "sequence": 7,
+                "timestamp": 1_700_000_000_000,
+                "bids": [["100", "2"]],
+                "asks": [["101", "3"]],
+            },
+        },
+    )
+
+    assert client.values[0]["nonce"] == 7
+
+
+@pytest.mark.asyncio
+async def test_kucoin_level50_sequence_regression_fails_closed() -> None:
+    class RegressingKucoinBookExchange(RegressingBitgetBookExchange):
+        async def watch_order_book(self, symbol: str, limit: int) -> dict[str, object]:
+            assert (symbol, limit) == ("BTC/USDT:USDT", 50)
+            return {
+                "bids": [["100", "2"]],
+                "asks": [["101", "3"]],
+                "nonce": next(self.sequences),
+                "timestamp": 1_700_000_000_000,
+            }
+
+    adapter = CcxtProAdapter(
+        Venue.KUCOIN_FUTURES,
+        exchange=RegressingKucoinBookExchange(),
+    )
+    adapter._clock_skew_ms = 0
+    selected = Instrument(
+        Venue.KUCOIN_FUTURES,
+        "BTC/USDT:USDT",
+        "XBTUSDTM",
+        "BTC",
+        "USDT",
+        "USDT",
+        Decimal("0.001"),
+        Decimal(1),
+        Decimal("0.1"),
+        Decimal(1),
+        None,
+        Decimal("0.0006"),
+        "fixture",
+        no_fixed_minimum_notional=True,
     )
     registry = BookRegistry()
 

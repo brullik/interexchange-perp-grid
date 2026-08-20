@@ -11,9 +11,11 @@ class Venue(StrEnum):
     BYBIT = "bybit"
     OKX = "okx"
     BITGET = "bitget"
+    KUCOIN_FUTURES = "kucoinfutures"
 
 
 WAVE1_VENUES = (Venue.BINANCE_USDM, Venue.BYBIT, Venue.OKX)
+NO_FIXED_MINIMUM_NOTIONAL_VENUES = frozenset({Venue.OKX, Venue.KUCOIN_FUTURES})
 
 
 class BookSide(StrEnum):

@@ -172,6 +172,26 @@ def test_registry_rejects_cross_quote_and_incomplete_contract_metadata() -> None
     assert valid.key.quote == valid.quote == "USDT"
 
 
+def test_registry_accepts_kucoin_proven_absence_of_fixed_minimum_notional() -> None:
+    registry = InstrumentRegistry(minimum_listing_age_days=14, enforce_listing_age=True)
+    bybit = _instrument(Venue.BYBIT, "BTC")
+    kucoin = replace(
+        _instrument(Venue.KUCOIN_FUTURES, "BTC"),
+        minimum_notional=None,
+        no_fixed_minimum_notional=True,
+    )
+
+    snapshot = registry.build(
+        {Venue.BYBIT: (bybit,), Venue.KUCOIN_FUTURES: (kucoin,)},
+        now=NOW,
+        monotonic_ns=1,
+        generation=1,
+    )
+
+    assert len(snapshot.common) == 1
+    assert len(snapshot.routes) == 2
+
+
 def test_universe_refreshes_only_on_six_hour_expiry_or_reconnect(
     large_universe: dict[Venue, tuple[Instrument, ...]],
 ) -> None:

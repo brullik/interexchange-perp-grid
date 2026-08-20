@@ -6,6 +6,7 @@ from decimal import Decimal
 from math import gcd
 
 from interexchange_perp_grid.domain import (
+    NO_FIXED_MINIMUM_NOTIONAL_VENUES,
     FundingSnapshot,
     Instrument,
     OrderBookSnapshot,
@@ -414,7 +415,10 @@ def _quantity_is_executable(
     if not isinstance(instrument.no_fixed_minimum_notional, bool):
         return False
     if instrument.minimum_notional is None:
-        return instrument.no_fixed_minimum_notional and instrument.venue == Venue.OKX
+        return (
+            instrument.no_fixed_minimum_notional
+            and instrument.venue in NO_FIXED_MINIMUM_NOTIONAL_VENUES
+        )
     if (
         not isinstance(instrument.minimum_notional, Decimal)
         or not instrument.minimum_notional.is_finite()

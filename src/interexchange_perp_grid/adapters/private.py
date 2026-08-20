@@ -647,12 +647,19 @@ def _normalise_account_position_updates(
         contracts = _decimal(value.get("contracts"))
         side_value = str(value.get("side", "")).lower()
         side = Side.BUY if side_value == "long" else Side.SELL if side_value == "short" else None
-        closes_one_way_position = (
-            contracts == 0
-            and side is None
-            and (venue == Venue.BYBIT or (venue == Venue.BINANCE_USDM and side_value == "both"))
-        )
-        if closes_one_way_position:
+        tombstone_sides: tuple[Side, ...] = ()
+        if contracts == 0 and side is None:
+            if venue == Venue.KUCOIN_FUTURES:
+                position_side = str(_mapping(value.get("info")).get("positionSide", "")).upper()
+                if position_side == "LONG":
+                    tombstone_sides = (Side.BUY,)
+                elif position_side == "SHORT":
+                    tombstone_sides = (Side.SELL,)
+                elif position_side == "BOTH":
+                    tombstone_sides = (Side.BUY, Side.SELL)
+            elif venue == Venue.BYBIT or (venue == Venue.BINANCE_USDM and side_value == "both"):
+                tombstone_sides = (Side.BUY, Side.SELL)
+        if tombstone_sides:
             positions.extend(
                 PositionSnapshot(
                     venue,
@@ -663,7 +670,7 @@ def _normalise_account_position_updates(
                     _decimal(value.get("markPrice")),
                     datetime.now(UTC),
                 )
-                for tombstone_side in (Side.BUY, Side.SELL)
+                for tombstone_side in tombstone_sides
             )
             continue
         if contracts is None or side is None:
@@ -745,6 +752,10 @@ def _account_wide_snapshot_params(
         if kind == PrivateStreamKind.POSITIONS:
             params["marginCoin"] = "USDT"
         return params
+    if venue == Venue.KUCOIN_FUTURES:
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"uta": False}
+        return {"type": "swap", "uta": False}
     if venue == Venue.BYBIT:
         return {"category": "linear", "settleCoin": "USDT"}
     if venue == Venue.OKX:
@@ -757,6 +768,8 @@ def _account_wide_snapshot_params(
 def _account_wide_snapshot_limits(venue: Venue) -> tuple[int | None, int | None]:
     if venue == Venue.BITGET:
         return 100, None
+    if venue == Venue.KUCOIN_FUTURES:
+        return 50, None
     if venue == Venue.BYBIT:
         return 50, 200
     if venue == Venue.OKX:
@@ -781,6 +794,10 @@ def _account_wide_stream_params(
         if kind == PrivateStreamKind.POSITIONS:
             return {"instType": "USDT-FUTURES", "uta": False}
         return {"type": "swap", "instType": "USDT-FUTURES", "uta": False}
+    if venue == Venue.KUCOIN_FUTURES:
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"uta": False}
+        return {"type": "swap", "uta": False}
     if venue == Venue.BYBIT:
         # The configured CCXT transport already selects swap/linear. Unconsumed params are
         # merged into Bybit's subscribe frame, whose schema only permits op/req_id/args.

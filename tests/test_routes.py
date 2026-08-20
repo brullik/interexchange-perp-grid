@@ -174,10 +174,13 @@ def test_unknown_minimum_notional_blocks_route() -> None:
     assert quote.reason == ReasonCode.CONTRACT_METADATA_UNKNOWN
 
 
-def test_venue_proven_absence_of_fixed_notional_uses_amount_floor() -> None:
+@pytest.mark.parametrize("no_fixed_venue", [Venue.OKX, Venue.KUCOIN_FUTURES])
+def test_venue_proven_absence_of_fixed_notional_uses_amount_floor(
+    no_fixed_venue: Venue,
+) -> None:
     bybit = instrument(Venue.BYBIT, "1", "0.001", "0.0006")
-    okx = replace(
-        instrument(Venue.OKX, "0.01", "0.01", "0.0005"),
+    no_fixed = replace(
+        instrument(no_fixed_venue, "0.01", "0.01", "0.0005"),
         minimum_notional=None,
         no_fixed_minimum_notional=True,
     )
@@ -185,11 +188,11 @@ def test_venue_proven_absence_of_fixed_notional_uses_amount_floor() -> None:
 
     quote = evaluate_directed_route(
         bybit,
-        okx,
+        no_fixed,
         book(Venue.BYBIT, "100", "101"),
-        book(Venue.OKX, "103", "104"),
+        book(no_fixed_venue, "103", "104"),
         funding(Venue.BYBIT, "0.0001"),
-        funding(Venue.OKX, "0.0002"),
+        funding(no_fixed_venue, "0.0002"),
         accepted,
         accepted,
         Decimal("0.001"),

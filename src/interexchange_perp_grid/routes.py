@@ -6,6 +6,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from itertools import permutations
 
 from interexchange_perp_grid.domain import (
+    NO_FIXED_MINIMUM_NOTIONAL_VENUES,
     BookLevel,
     CommonInstrument,
     FundingSnapshot,
@@ -155,7 +156,10 @@ def minimum_common_base_quantity(
             raise ValueError("minimum notional absence flag must be boolean")
         notional = instrument.minimum_notional
         if notional is None:
-            if instrument.venue != Venue.OKX or not instrument.no_fixed_minimum_notional:
+            if (
+                instrument.venue not in NO_FIXED_MINIMUM_NOTIONAL_VENUES
+                or not instrument.no_fixed_minimum_notional
+            ):
                 raise ValueError("fixed minimum notional is unknown")
             return Decimal(0)
         if (
@@ -290,7 +294,10 @@ def _meets_notional(instrument: Instrument, price: Decimal, quantity: Decimal) -
     if not isinstance(instrument.no_fixed_minimum_notional, bool):
         return False
     if instrument.minimum_notional is None:
-        return instrument.no_fixed_minimum_notional and instrument.venue == Venue.OKX
+        return (
+            instrument.no_fixed_minimum_notional
+            and instrument.venue in NO_FIXED_MINIMUM_NOTIONAL_VENUES
+        )
     return (
         isinstance(instrument.minimum_notional, Decimal)
         and not instrument.no_fixed_minimum_notional

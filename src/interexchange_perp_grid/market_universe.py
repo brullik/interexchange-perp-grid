@@ -4,7 +4,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from interexchange_perp_grid.domain import CommonInstrument, Instrument, ProductType, Venue
+from interexchange_perp_grid.domain import (
+    NO_FIXED_MINIMUM_NOTIONAL_VENUES,
+    CommonInstrument,
+    Instrument,
+    ProductType,
+    Venue,
+)
 from interexchange_perp_grid.routes import directed_pairs, match_common_instruments
 
 
@@ -103,7 +109,10 @@ class InstrumentRegistry:
             or not isinstance(instrument.no_fixed_minimum_notional, bool)
             or (instrument.minimum_notional is None and not instrument.no_fixed_minimum_notional)
             or (instrument.minimum_notional is not None and instrument.no_fixed_minimum_notional)
-            or (instrument.no_fixed_minimum_notional and instrument.venue != Venue.OKX)
+            or (
+                instrument.no_fixed_minimum_notional
+                and instrument.venue not in NO_FIXED_MINIMUM_NOTIONAL_VENUES
+            )
             or (
                 instrument.minimum_notional is not None
                 and (

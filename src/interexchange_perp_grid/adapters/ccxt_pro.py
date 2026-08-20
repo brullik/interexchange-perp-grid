@@ -11,6 +11,7 @@ import ccxt.pro as ccxtpro  # type: ignore[import-untyped]
 from interexchange_perp_grid.adapters.base import ExchangeAdapter
 from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.adapters.bybit_v5 import SequenceQualifiedBybitExchange
+from interexchange_perp_grid.adapters.kucoin_classic import ClassicKucoinFuturesExchange
 from interexchange_perp_grid.domain import (
     BboQuote,
     BookLevel,
@@ -103,12 +104,20 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
     minimum_notional = _decimal(cost_limits.get("min"))
     if minimum_notional is None and venue == Venue.BYBIT:
         minimum_notional = _decimal(_mapping(info.get("lotSizeFilter")).get("minNotionalValue"))
-    no_fixed_minimum_notional = (
-        venue == Venue.OKX
-        and minimum_notional is None
-        and info.get("instType") == "SWAP"
-        and info.get("ctType") == "linear"
-        and _decimal(info.get("minSz")) == minimum_amount
+    no_fixed_minimum_notional = minimum_notional is None and (
+        (
+            venue == Venue.OKX
+            and info.get("instType") == "SWAP"
+            and info.get("ctType") == "linear"
+            and _decimal(info.get("minSz")) == minimum_amount
+        )
+        or (
+            venue == Venue.KUCOIN_FUTURES
+            and info.get("status") == "Open"
+            and info.get("settleCurrency") == "USDT"
+            and _decimal(info.get("lotSize")) == minimum_amount
+            and _decimal(info.get("multiplier")) == contract_size
+        )
     )
     return Instrument(
         venue=venue,
@@ -155,6 +164,8 @@ class CcxtProAdapter(ExchangeAdapter):
             return SequenceQualifiedBybitExchange(configuration)
         if venue == Venue.BITGET:
             return ClassicBitgetExchange(configuration)
+        if venue == Venue.KUCOIN_FUTURES:
+            return ClassicKucoinFuturesExchange(configuration)
         exchange_class = getattr(ccxtpro, venue.value)
         return exchange_class(configuration)
 
@@ -321,6 +332,8 @@ class CcxtProAdapter(ExchangeAdapter):
             )
         elif self.venue == Venue.BITGET:
             raw = await self._exchange.watch_order_book(instrument.symbol, 15)
+        elif self.venue == Venue.KUCOIN_FUTURES:
+            raw = await self._exchange.watch_order_book(instrument.symbol, 50)
         else:
             raw = await self._exchange.watch_order_book(instrument.symbol, limit)
         if not isinstance(raw, Mapping):
@@ -363,6 +376,11 @@ class CcxtProAdapter(ExchangeAdapter):
             await self._exchange.un_watch_order_book(
                 instrument.symbol,
                 {"limit": 15},
+            )
+        elif self.venue == Venue.KUCOIN_FUTURES:
+            await self._exchange.un_watch_order_book(
+                instrument.symbol,
+                {"limit": 50},
             )
         else:
             await self._exchange.un_watch_order_book(instrument.symbol, {})
