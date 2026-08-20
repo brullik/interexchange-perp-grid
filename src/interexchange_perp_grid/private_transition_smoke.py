@@ -5,19 +5,25 @@ import json
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 from typing import TypedDict, cast
 
 from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
-from interexchange_perp_grid.live_control import LiveControlService
+from interexchange_perp_grid.live_control import LiveControlResult, LiveControlService
 from interexchange_perp_grid.live_journal import (
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
 )
 from interexchange_perp_grid.live_reconciliation import shutdown_private_requests
+from interexchange_perp_grid.priority_scheduler import (
+    PriorityWorkScheduler,
+    WorkPriority,
+    WorkRejected,
+)
 from interexchange_perp_grid.private_domain import (
     AccountSnapshot,
     PositionSnapshot,
@@ -28,6 +34,7 @@ from interexchange_perp_grid.private_domain import (
     VenueOrderRequest,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
+from interexchange_perp_grid.supervisor import LiveSafetySupervisor, SupervisorMode
 from interexchange_perp_grid.supervisor_smoke import RecoverySmokeTransition
 
 
@@ -278,9 +285,69 @@ async def run_private_transition_recovery_smoke(
         raise RuntimeError("unreachable")
 
     service = LiveControlService(journal, adapters, instruments)
+    scheduler = PriorityWorkScheduler(pending_limit=16, worker_count=6)
+    low_release = asyncio.Event()
+    low_started = (asyncio.Event(), asyncio.Event())
+
+    async def held_lower_work(index: int) -> None:
+        low_started[index].set()
+        await low_release.wait()
+
+    lower_tasks = tuple(
+        asyncio.create_task(
+            scheduler.run(
+                WorkPriority.BROAD_BBO_HISTORY,
+                f"restart-broad-{index}",
+                partial(held_lower_work, index),
+            )
+        )
+        for index in range(2)
+    )
+    await asyncio.gather(*(asyncio.wait_for(event.wait(), timeout=1) for event in low_started))
+    recovery_started = asyncio.Event()
+    recovery_release = asyncio.Event()
+    control_result: LiveControlResult | None = None
+    dispatch_lock = asyncio.Lock()
+
+    async def priority_recovery(_action: LiveJournalAction) -> object:
+        nonlocal control_result
+        async with dispatch_lock:
+            current = await journal.active_actions()
+            if not current:
+                return object()
+            recovery_started.set()
+            await recovery_release.wait()
+            control_result = await service.emergency_flatten()
+            return control_result
+
+    supervisor = LiveSafetySupervisor(
+        journal,
+        priority_recovery,
+        recovery_timeout_seconds=30,
+        priority_scheduler=scheduler,
+    )
+    recovery_task = asyncio.create_task(supervisor.reconcile_once())
+    await asyncio.wait_for(recovery_started.wait(), timeout=1)
+    entry_shed = False
     try:
-        result = await service.emergency_flatten()
+        try:
+            await scheduler.run(
+                WorkPriority.NEW_ENTRY,
+                "restart-new-entry",
+                _unexpected_entry,
+            )
+        except WorkRejected:
+            entry_shed = True
+        recovery_release.set()
+        health = await recovery_task
+        if health.mode != SupervisorMode.IDLE or control_result is None:
+            raise RuntimeError("priority supervisor did not complete account recovery")
+        result = control_result
     finally:
+        recovery_release.set()
+        low_release.set()
+        await asyncio.gather(*lower_tasks, return_exceptions=True)
+        await scheduler.close()
         await shutdown_private_requests(adapters)
     snapshots = await asyncio.gather(
         *(adapter.fetch_active_snapshot() for adapter in adapters.values())
@@ -300,7 +367,13 @@ async def run_private_transition_recovery_smoke(
         ),
         "production_exchange_transports_opened": 0,
         "flat_barrier_verified": result.flat_barrier_verified,
+        "priority_scheduler_restart_proof": True,
+        "new_entry_shed_while_p0_active": entry_shed,
     }
+
+
+async def _unexpected_entry() -> None:
+    raise RuntimeError("new entry ran while emergency recovery was active")
 
 
 async def _seed_action(

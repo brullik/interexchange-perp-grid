@@ -228,7 +228,7 @@ jobs:
             docker run --rm --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
               interexchange-grid private-transition-recovery-smoke --state "$state_path" \
               --transition-state "$state" --private-state-dir "$private_state_dir" \
-              | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["restarted_transition_state"] == sys.argv[1]; assert p["expected_action_count"] == 10; assert p["recovered_action_count"] == 10; assert p["flat_barrier_verified"] is True; assert p["production_exchange_transports_opened"] == 0' "$state"
+              | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["restarted_transition_state"] == sys.argv[1]; assert p["expected_action_count"] == 10; assert p["recovered_action_count"] == 10; assert p["flat_barrier_verified"] is True; assert p["priority_scheduler_restart_proof"] is True; assert p["new_entry_shed_while_p0_active"] is True; assert p["production_exchange_transports_opened"] == 0' "$state"
           done
           docker volume rm "$SMOKE_VOLUME"
       - name: Validate deployment scripts

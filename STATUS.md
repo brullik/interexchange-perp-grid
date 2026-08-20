@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE4_5_COMPLETE_STARTING_PHASE4_6
-- **Current checkpoint:** Phase 4.5 transition-complete 10-action process-kill/private-transport recovery is exact-gated; Phase 4.6 will close the remaining full PROD-10 priority-scheduler/overload chaos boundary
+- **State:** PHASE4_6_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
+- **Current checkpoint:** Phase 4.6 full P0-P6 priority scheduling and overload chaos is locally complete; commit, exact-head CI/artifacts, and independent exact-head review remain required before starting the final software-completeness audit
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -32,6 +32,7 @@ This is the only mutable project-status document.
 | Phase 4.3 bounded 10-action supervisor smoke | COMPLETE | Exact head `e8d12cc`; the journal-level supervisor process-kill smoke persists 10 unique-base labels at the locked 5 USDT each/50 USDT portfolio boundary, supports repeated restart after a subset is already FLAT, rejects non-finite durable stress, and requires a fresh process to recover every remaining action with zero production exchange transports. Exact run `32383862119` passed all five jobs with replay `9412151140`, C4.3 `9412127393`, C4 critical `9412127632`, and security `9412115391`; independent review P0/P1/P2=0 |
 | Phase 4.4 multi-symbol private emergency recovery | COMPLETE | Exact code head `c7cfa9f`; production `LiveControlService` reconciles and atomically stable-FLAT-closes 10 routes/20 positions across exact venue-symbol histories; one rejected route does not block the other reductions; durable account-wide ownership is restart-adoptable by verified process identity and reusable across one-shot control objects; accepted journaled client IDs are reconciled without duplicate submit; an unobservable attempted submit retains the exclusive lease and requires explicit external resolution rather than unsafe retry. Private reconciliation owns and coalesces bounded cached/forced account, fee, and history requests across caller timeouts and exposes explicit bounded shutdown failure. Exact run `32390979997` passed all five jobs with replay `9414849317`, C4 critical `9414831961`, C4.3 `9414824434`, and security `9414822131`; independent review P0/P1/P2=0. PROD-08 remains PARTIAL pending transition-complete process-kill/private-transport chaos evidence |
 | Phase 4.5 transition-complete private restart chaos | COMPLETE | Exact head `f67afc4`; a fresh process recovers the maximum 10-action set independently from every active durable state (`PREPARED`, `SUBMITTING`, `ACKNOWLEDGED`, `PARTIAL`, `FILLED`, `REJECTED`, `UNKNOWN`, `RECOVERING`, `HEDGED`, `CLOSING`, `QUARANTINED`) through a separately persisted account-wide private simulator, production `LiveControlService`, exact client-ID reconciliation, and stable-FLAT. Exchange-visible outcomes missing from the killed process journal are ingested idempotently; missing/UNKNOWN outcomes never authorize retry or FLAT. Client-ID lookup is single-flight, bounded to one second, retained for explicit shutdown, and isolated so one normal lookup failure does not block other risk reductions. Exact run `32397471622` passed all five jobs, including the 11-state × 10-action Docker kill/restart loop, with replay `9417235987`, C4 critical `9417217665`, C4.3 `9417206863`, and security `9417198123`; independent review P0/P1/P2=0. PROD-08 is COMPLETE; PROD-10 remains PARTIAL pending Phase 4.6 |
+| Phase 4.6 full priority scheduler and overload chaos | LOCAL_TECHNICAL_PASS | One bounded in-process scheduler owns P0 emergency flatten, P1 unmatched hedge, P2 normal close, P3 private reconciliation, P4 new entry, P5 Candidate L2, and P6 broad/history. Four priority-reserved lanes plus two general workers prevent lower critical work or a full queue from blocking P0; exact-key single-flight survives caller cancellation; active keys, queued work, workers, and shutdown are bounded. Critical recovery atomically blocks P4 at the portfolio gate, sheds queued P4-P6, preserves active L2/risk reduction, and is exercised through the production supervisor mapping and 10-action restart smoke. Local locked gate passed 532 tests plus 20/20 scheduler stress; independent dirty-tree review reported P0=0/P1=0/P2=0. PROD-10 is technically COMPLETE, pending checkpoint commit and fresh exact-head evidence |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -53,6 +54,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-20 — Run the process-kill recovery smoke at the maximum 10-route/50-USDT durable boundary by default — exact Docker evidence must exercise the product ceiling rather than infer it from a one-action restart — supervisor smoke, CLI, CI Docker job
 2026-08-20 — Adopt account-wide emergency ownership only across a proven dead process incarnation and never resubmit an exchange-unobservable attempted client ID — restart recovery must close all known positions without duplicating an unknown live order — live journal, reconciliation, live control
 2026-08-20 — Reconcile killed-process client IDs through one bounded owned lookup and require private stable-FLAT after every active durable transition — restart chaos must exercise production private recovery at the 10-action ceiling without turning an unknown submit into a retry — live control, private reconciliation, supervisor smoke, CI Docker proof
+2026-08-20 — Schedule every public/private workload class through bounded P0-P6 ownership with one reserved critical lane per P0-P3 priority and atomic P4 portfolio admission — emergency flatten, hedge, close, and reconciliation must remain runnable while entry, Candidate L2, and broad/history work are shed under overload — priority scheduler, supervisor, shadow runtime, service, Docker smoke
 2026-08-14 — Calibrate median/MAD grids independently per directed route and size bucket with a 20% update bound — outliers and abrupt parameter jumps must not destabilise entries — `strategy.py`
 2026-08-14 — Reserve route, portfolio, and venue risk atomically before simulated submission — every accepted action must preserve the 5/50 USDT, local-margin, leverage, route, and tranche limits — `risk.py`, `execution.py`
 2026-08-15 — Start the real public evaluator beside the persisted heartbeat and isolate network failures — Docker health and risk controls must remain responsive while a venue is slow or quarantined — `service.py`, `shadow.py`
@@ -166,4 +168,24 @@ no production exchange transport or real order was used.
 Exact-head run `32397471622` passed verify, Docker smoke, security, C4 critical, and C4.3.
 All four uploaded artifacts bind `f67afc41f6a2368899f0eb91499c37296bf63594`; independent
 final review reported P0=0, P1=0, P2=0. PROD-08 is complete. Full PROD-10 remains pending.
+```
+
+```text
+2026-08-20 Phase 4.6 local Windows equivalent of every Makefile verify target: PASS
+- exact main lock validation: PASS (64 packages)
+- ruff format --check + ruff check: PASS (95 files)
+- mypy --strict: PASS (93 source/test files)
+- pytest: 532 passed; priority-scheduler stress: 20/20 passed
+- interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
+- Bandit medium/high: 0; git diff --check: PASS
+
+The bounded scheduler preserves a separately reserved execution lane for each P0-P3 class, sheds
+P4-P6 before critical recovery is degraded, coalesces exact action keys, and retains explicit bounded
+shutdown ownership. The shadow portfolio gate rechecks current scheduler state before each route and
+before risk reservation, so a newly arrived critical action stops further P4 mutation. The production
+10-action restart smoke asserts scheduler ownership, P0 recovery, P4 shedding, and stable-FLAT.
+
+Independent review of the frozen dirty snapshot reported P0=0, P1=0, P2=0. No production
+credentials were used, live_orders_allowed remains false, and no real order was submitted. A checkpoint
+commit, fresh exact-head Linux CI/artifacts, and exact-head final review are still required.
 ```

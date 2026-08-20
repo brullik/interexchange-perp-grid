@@ -13,6 +13,7 @@ from interexchange_perp_grid.live_journal import (
     LiveJournalAction,
     LiveOrderJournal,
 )
+from interexchange_perp_grid.priority_scheduler import PriorityWorkScheduler, WorkPriority
 
 
 class SupervisorMode(StrEnum):
@@ -88,6 +89,7 @@ class LiveSafetySupervisor:
         *,
         poll_interval_seconds: float = 1.0,
         recovery_timeout_seconds: float = 5.0,
+        priority_scheduler: PriorityWorkScheduler | None = None,
     ) -> None:
         if poll_interval_seconds <= 0:
             raise ValueError("supervisor poll interval must be positive")
@@ -97,6 +99,7 @@ class LiveSafetySupervisor:
         self._recovery_runner = recovery_runner
         self._poll_interval_seconds = poll_interval_seconds
         self._recovery_timeout_seconds = recovery_timeout_seconds
+        self._priority_scheduler = priority_scheduler
         self._recovery_lock = asyncio.Lock()
         self._initialise_lock = asyncio.Lock()
         self._recovery_tasks: dict[str, asyncio.Task[object]] = {}
@@ -151,11 +154,24 @@ class LiveSafetySupervisor:
                 None,
             )
             tasks: dict[str, asyncio.Task[object]] = {}
+            account_wide_recovery = len(active) > 1
             for action in active:
                 recovery_task = self._recovery_tasks.get(action.pair_action_id)
                 if recovery_task is None:
                     recovery_task = asyncio.create_task(
-                        self._run_recovery(action),
+                        self._run_recovery(
+                            action,
+                            (
+                                WorkPriority.EMERGENCY_FLATTEN
+                                if account_wide_recovery
+                                else _recovery_priority(action)
+                            ),
+                            (
+                                "live-recovery:account"
+                                if account_wide_recovery
+                                else f"live-recovery:{action.pair_action_id}"
+                            ),
+                        ),
                         name=f"live-recovery-{action.pair_action_id}",
                     )
                     self._recovery_tasks[action.pair_action_id] = recovery_task
@@ -350,8 +366,19 @@ class LiveSafetySupervisor:
             raise RuntimeError("supervisor health is not initialised")
         return _health_from_row(row)
 
-    async def _run_recovery(self, action: LiveJournalAction) -> object:
-        return await self._recovery_runner(action)
+    async def _run_recovery(
+        self,
+        action: LiveJournalAction,
+        priority: WorkPriority,
+        work_key: str,
+    ) -> object:
+        if self._priority_scheduler is None:
+            return await self._recovery_runner(action)
+        return await self._priority_scheduler.run(
+            priority,
+            work_key,
+            lambda: self._recovery_runner(action),
+        )
 
     @staticmethod
     def _consume_recovery_task(task: asyncio.Task[object]) -> None:
@@ -361,3 +388,35 @@ class LiveSafetySupervisor:
             task.exception()
         except asyncio.CancelledError:
             return
+
+
+def _recovery_priority(action: LiveJournalAction) -> WorkPriority:
+    emergency_actions = {
+        "EMERGENCY_FLATTEN",
+        "KILL_CANCEL_FLATTEN",
+        "CLOSE_ALL_LIVE",
+    }
+    risk_action = action.risk_reservation.get("action")
+    if action.recovery_action in emergency_actions or (
+        isinstance(risk_action, str) and risk_action in emergency_actions
+    ):
+        return WorkPriority.EMERGENCY_FLATTEN
+    if (
+        action.state == LiveActionState.PREPARED
+        and action.risk_reservation.get("supervisor_intent") == "LIVE_CANARY"
+        and action.risk_reservation.get("supervisor_queued") is True
+    ):
+        return WorkPriority.NEW_ENTRY
+    if action.state in {
+        LiveActionState.SUBMITTING,
+        LiveActionState.ACKNOWLEDGED,
+        LiveActionState.PARTIAL,
+        LiveActionState.FILLED,
+        LiveActionState.REJECTED,
+        LiveActionState.UNKNOWN,
+        LiveActionState.RECOVERING,
+    }:
+        return WorkPriority.UNMATCHED_HEDGE
+    if action.state in {LiveActionState.HEDGED, LiveActionState.CLOSING}:
+        return WorkPriority.NORMAL_CLOSE
+    return WorkPriority.PRIVATE_RECONCILE

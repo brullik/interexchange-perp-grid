@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -281,6 +282,7 @@ class OneScanEngine:
         self.broad_admissions: list[bool] = []
         self.candidate_admissions: list[bool] = []
         self.calibration_calls = 0
+        self.entry_admissions: list[bool] = []
         self.events = events
         self.workload_after_scan = workload_after_scan
 
@@ -293,7 +295,8 @@ class OneScanEngine:
         active_route_keys: frozenset[tuple[str, str, str]] = frozenset(),
         entry_work_admitted: bool = True,
     ) -> ScanResult:
-        del quantity, timeout, active_route_keys, entry_work_admitted
+        del quantity, timeout, active_route_keys
+        self.entry_admissions.append(entry_work_admitted)
         if self.workload_after_scan is not None:
             self.workload = self.workload_after_scan
         self.stop_event.set()
@@ -385,6 +388,36 @@ async def test_continuous_evaluator_applies_runtime_overload_before_public_work(
     assert engine.broad_admissions == [False]
     assert engine.candidate_admissions == [False]
     assert engine.calibration_calls == 0
+    assert evaluator.runtime.overload.admit(WorkClass.NEW_ENTRY).reason == (
+        ReasonCode.OVERLOAD_ENTRY_DISABLED
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_critical_scheduler_backlog_disables_shadow_entry(tmp_path: Path) -> None:
+    stop = asyncio.Event()
+    loaded = load_settings(
+        CONFIG,
+        {
+            "IPEG_STATE_PATH": str(tmp_path / "critical-overload.sqlite3"),
+            "IPEG_PARQUET_DIR": str(tmp_path / "market"),
+        },
+    )
+    settings = loaded.model_copy(
+        update={"shadow": loaded.shadow.model_copy(update={"overload_pending_limit": 100})}
+    )
+    engine = OneScanEngine(stop)
+    evaluator = ContinuousShadowEvaluator(
+        settings,
+        engine=engine,
+        critical_work_count=lambda: 3,
+    )
+
+    await evaluator.run(stop)
+
+    assert engine.entry_admissions == [False]
+    assert engine.broad_admissions == [False]
+    assert engine.candidate_admissions == [False]
     assert evaluator.runtime.overload.admit(WorkClass.NEW_ENTRY).reason == (
         ReasonCode.OVERLOAD_ENTRY_DISABLED
     )
@@ -1378,3 +1411,83 @@ async def test_shadow_trader_deadline_expires_before_any_open_mutation(
 
     assert decisions == ()
     assert runtime.tranches == {}
+
+
+@pytest.mark.asyncio
+async def test_shadow_runtime_rechecks_critical_scheduler_at_entry_gate(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "critical-entry-gate.sqlite3"
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    runtime = ShadowRuntime(settings)
+    critical_count = 0
+    runtime.set_critical_work_count(lambda: critical_count)
+    await runtime.start()
+    await runtime.reconcile(set())
+
+    assert (await runtime.entry_gate()).accepted is True
+    critical_count = 1
+    gate = await runtime.entry_gate()
+    assert gate.accepted is False
+    assert gate.reason == ReasonCode.OVERLOAD_ENTRY_DISABLED
+
+
+@pytest.mark.asyncio
+async def test_shadow_trader_stops_remaining_routes_when_critical_work_arrives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "critical-between-routes.sqlite3"
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    runtime = ShadowRuntime(settings)
+    critical_count = 0
+    runtime.set_critical_work_count(lambda: critical_count)
+    await runtime.start()
+    await runtime.reconcile(set())
+    trader = ShadowTrader(settings, runtime)
+    quote = DirectedRouteQuote(
+        key=InstrumentKey("BTC", "USDT"),
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.OKX,
+        base_quantity=Decimal("1"),
+        eligible=True,
+        reason=ReasonCode.QUOTE_READY,
+        entry_long_vwap=Decimal("100"),
+        entry_short_vwap=Decimal("110"),
+        exit_long_vwap=Decimal("104"),
+        exit_short_vwap=Decimal("105"),
+        entry_spread=Decimal("10"),
+        exit_spread=Decimal("1"),
+        entry_spread_bps=Decimal("1000"),
+        four_leg_fee_estimate=Decimal("0.4"),
+        funding_rate_delta=Decimal(0),
+    )
+    assessment = cast(
+        RouteCalibrationAssessment,
+        SimpleNamespace(
+            route=DirectedRouteKey("BTC", Venue.BYBIT, Venue.OKX),
+            latest_base_quantity=Decimal("1"),
+        ),
+    )
+    evaluation_calls = 0
+
+    async def observe_route(*args: Any, **kwargs: Any) -> None:
+        nonlocal critical_count, evaluation_calls
+        evaluation_calls += 1
+        critical_count = 1
+
+    monkeypatch.setattr(trader, "_evaluate_and_open", observe_route)
+    scan = ScanResult(
+        "BTC",
+        1,
+        (),
+        (),
+        (),
+        (quote, quote),
+        (),
+        (),
+        route_calibration=(assessment,),
+    )
+
+    assert await trader.process(scan) == ()
+    assert evaluation_calls == 1

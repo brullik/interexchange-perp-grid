@@ -18,6 +18,7 @@ from interexchange_perp_grid.observability import (
     SERVICE_UP,
     get_logger,
 )
+from interexchange_perp_grid.priority_scheduler import PriorityWorkScheduler
 from interexchange_perp_grid.shadow import ContinuousShadowEvaluator, ShadowRuntime
 from interexchange_perp_grid.state import (
     initialise_state,
@@ -54,6 +55,12 @@ class BootstrapService:
             state_path=str(self.state_path),
         )
         background_tasks: list[asyncio.Task[None]] = []
+        priority_scheduler = PriorityWorkScheduler(
+            pending_limit=self.settings.shadow.overload_pending_limit,
+            worker_count=6,
+            shutdown_timeout_seconds=5.0,
+        )
+        await priority_scheduler.start()
         journal = LiveOrderJournal(self.state_path)
         await journal.initialise()
         recovery_runner = self.recovery_runner
@@ -67,8 +74,6 @@ class BootstrapService:
                         return object()
                     if action.pair_action_id not in {item.pair_action_id for item in current}:
                         return object()
-                    if len(current) > 1 and action.pair_action_id != current[0].pair_action_id:
-                        return object()
                     return await recover_active_actions(self.settings, journal, current)
 
             recovery_runner = default_recovery_runner
@@ -77,6 +82,7 @@ class BootstrapService:
             journal,
             recovery_runner,
             poll_interval_seconds=self.supervisor_poll_interval_seconds,
+            priority_scheduler=priority_scheduler,
         )
         background_tasks.append(
             asyncio.create_task(supervisor.run(stop_event), name="live-safety-supervisor")
@@ -86,7 +92,11 @@ class BootstrapService:
             await runtime.start()
             background_tasks.append(
                 asyncio.create_task(
-                    ContinuousShadowEvaluator(self.settings, runtime=runtime).run(stop_event),
+                    ContinuousShadowEvaluator(
+                        self.settings,
+                        runtime=runtime,
+                        critical_work_count=priority_scheduler.critical_work_count,
+                    ).run(stop_event),
                     name="continuous-shadow-evaluator",
                 )
             )
@@ -118,9 +128,12 @@ class BootstrapService:
             for task in background_tasks:
                 if not task.done():
                     task.cancel()
-            for task in background_tasks:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            try:
+                for task in background_tasks:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+            finally:
+                await priority_scheduler.close()
             await record_service_stopped(self.state_path)
             SERVICE_UP.set(0)
             logger.info("service_stopped")

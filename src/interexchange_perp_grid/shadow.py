@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import sqlite3
 from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -161,6 +162,7 @@ class OverloadController:
         self._pending_limit = pending_limit
         self._pending = 0
         self._pending_by_class: dict[WorkClass, int] = {}
+        self._critical_active = False
 
     @property
     def overloaded(self) -> bool:
@@ -178,6 +180,9 @@ class OverloadController:
         self._pending_by_class = {work: count for work, count in pending.items() if count}
         self._pending = sum(self._pending_by_class.values())
 
+    def update_critical_active(self, active: bool) -> None:
+        self._critical_active = active
+
     def shed_plan(self) -> tuple[WorkClass, ...]:
         excess = max(0, self._pending - self._pending_limit)
         shed: list[WorkClass] = []
@@ -194,6 +199,12 @@ class OverloadController:
     def admit(self, work: WorkClass) -> AdmissionDecision:
         if work in CRITICAL_WORK:
             return AdmissionDecision(True, ReasonCode.SHADOW_EVALUATED)
+        if self._critical_active:
+            if work == WorkClass.BROAD_BBO:
+                return AdmissionDecision(False, ReasonCode.OVERLOAD_BROAD_SHED)
+            if work == WorkClass.CANDIDATE_L2:
+                return AdmissionDecision(False, ReasonCode.OVERLOAD_CANDIDATE_SHED)
+            return AdmissionDecision(False, ReasonCode.OVERLOAD_ENTRY_DISABLED)
         if self._pending + 1 <= self._pending_limit:
             return AdmissionDecision(True, ReasonCode.SHADOW_EVALUATED)
         if work == WorkClass.BROAD_BBO:
@@ -252,6 +263,13 @@ class ShadowRuntime:
         self._persistence_indeterminate = False
         self._portfolio_restored_consistently = False
         self._portfolio_transition_lock = asyncio.Lock()
+        self._critical_work_count: Callable[[], int] = lambda: 0
+
+    def set_critical_work_count(self, callback: Callable[[], int]) -> None:
+        self._critical_work_count = callback
+
+    def critical_work_active(self) -> bool:
+        return max(0, self._critical_work_count()) > 0
 
     async def start(self) -> None:
         if self._started:
@@ -346,9 +364,13 @@ class ShadowRuntime:
         return await read_runtime_controls(self.state_path)
 
     async def entry_gate(self) -> AdmissionDecision:
+        if self.critical_work_active():
+            return AdmissionDecision(False, ReasonCode.OVERLOAD_ENTRY_DISABLED)
         if self._persistence_indeterminate:
             return AdmissionDecision(False, ReasonCode.RECONCILIATION_REQUIRED)
         controls = await self.controls()
+        if self.critical_work_active():
+            return AdmissionDecision(False, ReasonCode.OVERLOAD_ENTRY_DISABLED)
         if controls.killed:
             return AdmissionDecision(False, ReasonCode.KILL_SWITCH_ACTIVE)
         if controls.paused:
@@ -596,6 +618,8 @@ class ShadowTrader:
             if not gate.accepted:
                 return ()
             for quote in result.quotes:
+                if self.runtime.critical_work_active():
+                    break
                 route = DirectedRouteKey(quote.key.base, quote.long_venue, quote.short_venue)
                 matches = tuple(
                     assessment
@@ -745,7 +769,10 @@ class ShadowTrader:
             ),
             exit_depth_sufficient=True,
         )
-        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+        gate = await self.runtime.entry_gate()
+        if not gate.accepted or (
+            decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline
+        ):
             return None
         risk = self._risk.reserve(request)
         if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
@@ -810,6 +837,10 @@ class ShadowTrader:
             ),
         )
         if not submitted:
+            self._risk.release(tranche_id)
+            return None
+        if self.runtime.critical_work_active():
+            self._coordinator.rollback_unpublished_open(tranche)
             self._risk.release(tranche_id)
             return None
         if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
@@ -1043,6 +1074,7 @@ class ContinuousShadowEvaluator:
         runtime: ShadowRuntime | None = None,
         trader: ShadowTrader | None = None,
         route_calibrator: PersistentRouteCalibrator | None = None,
+        critical_work_count: Callable[[], int] | None = None,
     ) -> None:
         self.settings = settings
         self.runtime = runtime or ShadowRuntime(settings)
@@ -1082,6 +1114,9 @@ class ContinuousShadowEvaluator:
         self._route_calibration_persistence_healthy = False
         self._route_calibration_persistence_failure: str | None = None
         self._decision_latency_samples: deque[Decimal] = deque(maxlen=4096)
+        self._critical_work_count = critical_work_count or (lambda: 0)
+        self.runtime.set_critical_work_count(self._critical_work_count)
+        self._critical_recovery_active = False
 
     def _decision_latency_p95(self) -> Decimal | None:
         if not self._decision_latency_samples:
@@ -1122,16 +1157,22 @@ class ContinuousShadowEvaluator:
         active_route_keys: frozenset[RouteStableKey],
     ) -> tuple[bool, bool]:
         workload = self._engine.public_workload()
+        critical_work_count = max(0, self._critical_work_count())
+        self._critical_recovery_active = critical_work_count > 0
+        self.runtime.overload.update_critical_active(self._critical_recovery_active)
         self.runtime.overload.update_pending_by_class(
             {
                 WorkClass.RECONCILE: max(
                     workload.active_l2_tasks,
                     len(active_route_keys) * 2,
+                    critical_work_count,
                 ),
                 WorkClass.CANDIDATE_L2: workload.candidate_l2_demand,
                 WorkClass.BROAD_BBO: workload.broad_bbo_demand,
             }
         )
+        if self._critical_recovery_active:
+            return False, False
         shed = set(self.runtime.overload.shed_plan())
         return WorkClass.BROAD_BBO not in shed, WorkClass.CANDIDATE_L2 not in shed
 
@@ -1186,7 +1227,10 @@ class ContinuousShadowEvaluator:
                             preserve_existing_candidates=True,
                         )
                     await self._engine.set_broad_bbo_admitted(broad_admitted)
-                    entry_work_admitted = self.runtime.overload.admit(WorkClass.NEW_ENTRY).accepted
+                    entry_work_admitted = (
+                        not self._critical_recovery_active
+                        and self.runtime.overload.admit(WorkClass.NEW_ENTRY).accepted
+                    )
                     result = await self._engine.scan_once(
                         self.settings.shadow.base,
                         self.settings.shadow.quantity,

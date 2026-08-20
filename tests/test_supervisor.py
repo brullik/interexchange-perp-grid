@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from decimal import Decimal
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,11 @@ from interexchange_perp_grid.live_journal import (
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
+)
+from interexchange_perp_grid.priority_scheduler import (
+    PriorityWorkScheduler,
+    WorkPriority,
+    WorkRejected,
 )
 from interexchange_perp_grid.private_domain import VenueOrderRequest
 from interexchange_perp_grid.strategy import DirectedRouteKey
@@ -336,3 +342,105 @@ async def test_supervisor_shutdown_reports_cancellation_resistant_recovery(
         asyncio.gather(*supervisor._recovery_tasks.values()),
         timeout=1,
     )
+
+
+@pytest.mark.asyncio
+async def test_priority_scheduler_recovers_ten_actions_while_p4_p6_are_shed(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "priority-overload.sqlite3")
+    actions = tuple(
+        [
+            await _prepare_named(journal, f"action-{index:02d}", f"B{index:02d}")
+            for index in range(10)
+        ]
+    )
+    scheduler = PriorityWorkScheduler(pending_limit=16, worker_count=6)
+    low_release = asyncio.Event()
+    low_started = [asyncio.Event() for _ in range(2)]
+
+    async def held_low(index: int) -> None:
+        low_started[index].set()
+        await low_release.wait()
+
+    low_tasks = tuple(
+        asyncio.create_task(
+            scheduler.run(
+                WorkPriority.BROAD_BBO_HISTORY,
+                f"broad-{index}",
+                partial(held_low, index),
+            )
+        )
+        for index in range(2)
+    )
+    await asyncio.gather(*(asyncio.wait_for(started.wait(), timeout=1) for started in low_started))
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def recover(action: LiveJournalAction) -> object:
+        assert action.pair_action_id in {item.pair_action_id for item in actions}
+        first_started.set()
+        await release_first.wait()
+        for current in await journal.active_actions():
+            await _force_exchange_verified_flat(journal, current)
+        return object()
+
+    supervisor = LiveSafetySupervisor(
+        journal,
+        recover,
+        recovery_timeout_seconds=2,
+        priority_scheduler=scheduler,
+    )
+    reconciliation = asyncio.create_task(supervisor.reconcile_once())
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert scheduler.snapshot().critical_work_count == 1
+    with pytest.raises(WorkRejected, match="critical work"):
+        await scheduler.run(
+            WorkPriority.NEW_ENTRY,
+            "new-entry",
+            lambda: asyncio.sleep(0),
+        )
+
+    release_first.set()
+    health = await asyncio.wait_for(reconciliation, timeout=2)
+    assert health.mode == SupervisorMode.IDLE
+    assert health.active_action_count == 0
+    assert await journal.active_actions() == ()
+    assert all(not task.done() for task in low_tasks)
+
+    low_release.set()
+    await asyncio.gather(*low_tasks)
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_live_canary_is_scheduled_as_p4_new_entry(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "prepared-entry.sqlite3")
+    action = await _prepare(journal)
+    scheduler = PriorityWorkScheduler(pending_limit=16, worker_count=6)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def recover(current: LiveJournalAction) -> object:
+        assert current.pair_action_id == action.pair_action_id
+        started.set()
+        await release.wait()
+        await _force_exchange_verified_flat(journal, current)
+        return object()
+
+    supervisor = LiveSafetySupervisor(
+        journal,
+        recover,
+        recovery_timeout_seconds=2,
+        priority_scheduler=scheduler,
+    )
+    reconciliation = asyncio.create_task(supervisor.reconcile_once())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    snapshot = scheduler.snapshot()
+    assert snapshot.running_by_priority[int(WorkPriority.NEW_ENTRY)] == 1
+    assert snapshot.critical_work_count == 0
+
+    release.set()
+    assert (await reconciliation).mode == SupervisorMode.IDLE
+    await scheduler.close()
