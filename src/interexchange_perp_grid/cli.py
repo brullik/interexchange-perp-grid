@@ -25,6 +25,9 @@ from interexchange_perp_grid.maintenance import (
 )
 from interexchange_perp_grid.observability import configure_logging, render_metrics
 from interexchange_perp_grid.private_domain import PrivateCapabilityReport
+from interexchange_perp_grid.private_transition_smoke import (
+    run_private_transition_recovery_smoke,
+)
 from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
 from interexchange_perp_grid.qualification import (
     QualificationPolicy,
@@ -53,7 +56,10 @@ from interexchange_perp_grid.state import (
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
 from interexchange_perp_grid.supervisor import SupervisorHealth, read_supervisor_health
-from interexchange_perp_grid.supervisor_smoke import run_supervisor_recovery_smoke
+from interexchange_perp_grid.supervisor_smoke import (
+    RecoverySmokeTransition,
+    run_supervisor_recovery_smoke,
+)
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 ConfigPath = Annotated[
@@ -517,12 +523,43 @@ def supervisor_recovery_smoke(
     hold_after_active: Annotated[bool, typer.Option("--hold-after-active")] = False,
     ready: Annotated[Path | None, typer.Option("--ready")] = None,
     action_count: Annotated[int, typer.Option("--action-count", min=1, max=10)] = 10,
+    transition_state: Annotated[
+        RecoverySmokeTransition,
+        typer.Option("--transition-state", case_sensitive=False),
+    ] = RecoverySmokeTransition.PARTIAL,
 ) -> None:
     """Run deterministic Docker process-kill/restart recovery proof without exchange I/O."""
     result = asyncio.run(
         run_supervisor_recovery_smoke(
             state.resolve(),
             hold_after_active=hold_after_active,
+            ready_path=ready.resolve() if ready is not None else None,
+            action_count=action_count,
+            transition_state=transition_state,
+        )
+    )
+    typer.echo(json.dumps(result, default=str, sort_keys=True))
+
+
+@app.command("private-transition-recovery-smoke")
+def private_transition_recovery_smoke(
+    state: Annotated[Path, typer.Option("--state")],
+    private_state_dir: Annotated[Path, typer.Option("--private-state-dir")],
+    transition_state: Annotated[
+        RecoverySmokeTransition,
+        typer.Option("--transition-state", case_sensitive=False),
+    ],
+    hold_after_active: Annotated[bool, typer.Option("--hold-after-active")] = False,
+    ready: Annotated[Path | None, typer.Option("--ready")] = None,
+    action_count: Annotated[int, typer.Option("--action-count", min=1, max=10)] = 10,
+) -> None:
+    """Prove killed-process recovery through production private reconciliation."""
+    result = asyncio.run(
+        run_private_transition_recovery_smoke(
+            state.resolve(),
+            private_state_dir.resolve(),
+            hold_after_active=hold_after_active,
+            transition_state=transition_state,
             ready_path=ready.resolve() if ready is not None else None,
             action_count=action_count,
         )

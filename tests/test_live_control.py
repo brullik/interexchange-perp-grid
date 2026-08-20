@@ -18,6 +18,7 @@ from interexchange_perp_grid.live_control import (
     emergency_unlock_valid,
 )
 from interexchange_perp_grid.live_journal import LiveActionState, LiveOrderJournal
+from interexchange_perp_grid.live_reconciliation import shutdown_private_requests
 from interexchange_perp_grid.live_simulator import (
     DeterministicPrivateExchange,
     ScriptedOrderOutcome,
@@ -318,6 +319,8 @@ class PortfolioEmergencyExchange:
 async def _seed_portfolio_recovery(
     path: Path,
     action_count: int,
+    *,
+    action_state: LiveActionState = LiveActionState.HEDGED,
 ) -> tuple[
     LiveOrderJournal,
     dict[Venue, PortfolioEmergencyExchange],
@@ -372,22 +375,45 @@ async def _seed_portfolio_recovery(
             {"projected_stress_usdt": "5"},
             "a" * 64,
         )
+        if action_state == LiveActionState.PREPARED:
+            continue
         await journal.mark_submit_attempted(
             action_id,
             (long_request.client_order_id, short_request.client_order_id),
         )
-        for request in (long_request, short_request):
+        filled_requests = (
+            ((long_request, Decimal("0.001"), PrivateOrderStatus.FILLED),)
+            if action_state == LiveActionState.PARTIAL
+            else (
+                (
+                    request,
+                    Decimal("0.001"),
+                    PrivateOrderStatus.FILLED,
+                )
+                for request in (long_request, short_request)
+            )
+            if action_state
+            in {
+                LiveActionState.FILLED,
+                LiveActionState.RECOVERING,
+                LiveActionState.HEDGED,
+                LiveActionState.CLOSING,
+                LiveActionState.QUARANTINED,
+            }
+            else ()
+        )
+        for request, filled_quantity, order_status in filled_requests:
             seed_order = PrivateOrder(
                 request.venue,
                 f"seed-{request.client_order_id}",
                 request.client_order_id,
                 request.symbol,
                 request.side,
-                PrivateOrderStatus.FILLED,
+                order_status,
                 Decimal("0.001"),
-                Decimal("0.001"),
+                filled_quantity,
                 Decimal("100"),
-                Decimal("0.00005"),
+                filled_quantity * Decimal("0.05"),
                 observed,
                 request.price,
             )
@@ -397,10 +423,72 @@ async def _seed_portfolio_recovery(
                 f"seed-{request.client_order_id}",
             )
             adapters[request.venue].seed_order(seed_order)
-        await journal.transition(action_id, LiveActionState.FILLED)
-        await journal.transition(action_id, LiveActionState.HEDGED, residual_delta=Decimal(0))
-        adapters[Venue.BINANCE_USDM].seed_position(symbol, Decimal("0.001"))
-        adapters[Venue.OKX].seed_position(symbol, Decimal("-0.001"))
+            adapters[request.venue].seed_position(
+                symbol,
+                filled_quantity if request.side == Side.BUY else -filled_quantity,
+            )
+        if action_state in {
+            LiveActionState.SUBMITTING,
+            LiveActionState.ACKNOWLEDGED,
+            LiveActionState.REJECTED,
+            LiveActionState.UNKNOWN,
+            LiveActionState.PARTIAL,
+        }:
+            resolved_requests = (
+                (short_request,)
+                if action_state == LiveActionState.PARTIAL
+                else (long_request, short_request)
+            )
+            for request in resolved_requests:
+                resolved_order = PrivateOrder(
+                    request.venue,
+                    f"resolved-{request.client_order_id}",
+                    request.client_order_id,
+                    request.symbol,
+                    request.side,
+                    PrivateOrderStatus.REJECTED,
+                    Decimal("0.001"),
+                    Decimal(0),
+                    None,
+                    Decimal(0),
+                    observed,
+                    request.price,
+                )
+                adapters[request.venue].seed_order(resolved_order)
+                if action_state in {
+                    LiveActionState.REJECTED,
+                    LiveActionState.UNKNOWN,
+                    LiveActionState.PARTIAL,
+                }:
+                    journal_order = (
+                        resolved_order
+                        if action_state in {LiveActionState.REJECTED, LiveActionState.PARTIAL}
+                        else replace(resolved_order, status=PrivateOrderStatus.UNKNOWN)
+                    )
+                    await journal.record_order_event(
+                        action_id,
+                        journal_order,
+                        f"seed-{request.client_order_id}",
+                    )
+        if action_state == LiveActionState.SUBMITTING:
+            continue
+        if action_state == LiveActionState.HEDGED:
+            await journal.transition(action_id, LiveActionState.FILLED)
+            await journal.transition(
+                action_id,
+                LiveActionState.HEDGED,
+                residual_delta=Decimal(0),
+            )
+        elif action_state == LiveActionState.CLOSING:
+            await journal.transition(action_id, LiveActionState.FILLED)
+            await journal.transition(
+                action_id,
+                LiveActionState.HEDGED,
+                residual_delta=Decimal(0),
+            )
+            await journal.transition(action_id, LiveActionState.CLOSING)
+        else:
+            await journal.transition(action_id, action_state)
     return journal, adapters, instruments
 
 
@@ -784,6 +872,138 @@ async def test_ten_route_private_reconciliation_closes_twenty_positions_atomical
         *(adapter.fetch_active_snapshot() for adapter in adapters.values())
     )
     assert all(not snapshot.positions for snapshot in snapshots)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restart_state",
+    [
+        LiveActionState.PREPARED,
+        LiveActionState.SUBMITTING,
+        LiveActionState.ACKNOWLEDGED,
+        LiveActionState.PARTIAL,
+        LiveActionState.FILLED,
+        LiveActionState.REJECTED,
+        LiveActionState.UNKNOWN,
+        LiveActionState.RECOVERING,
+        LiveActionState.HEDGED,
+        LiveActionState.CLOSING,
+        LiveActionState.QUARANTINED,
+    ],
+)
+async def test_ten_route_private_recovery_is_transition_complete(
+    tmp_path: Path,
+    restart_state: LiveActionState,
+) -> None:
+    journal, adapters, instruments = await _seed_portfolio_recovery(
+        tmp_path / f"transition-{restart_state.value}.sqlite3",
+        10,
+        action_state=restart_state,
+    )
+
+    result = await LiveControlService(journal, adapters, instruments).emergency_flatten()
+
+    assert result.success is True
+    assert result.terminal_state == LiveActionState.FLAT
+    assert result.flat_barrier_verified is True
+    assert await journal.active_actions() == ()
+    snapshots = await asyncio.gather(
+        *(adapter.fetch_active_snapshot() for adapter in adapters.values())
+    )
+    assert all(not snapshot.positions for snapshot in snapshots)
+    expected_submits = (
+        10
+        if restart_state == LiveActionState.PARTIAL
+        else 20
+        if restart_state
+        in {
+            LiveActionState.FILLED,
+            LiveActionState.RECOVERING,
+            LiveActionState.HEDGED,
+            LiveActionState.CLOSING,
+            LiveActionState.QUARANTINED,
+        }
+        else 0
+    )
+    assert sum(adapter.submit_calls for adapter in adapters.values()) == expected_submits
+
+
+@pytest.mark.asyncio
+async def test_restart_never_infers_missing_submit_outcomes_from_flat_positions(
+    tmp_path: Path,
+) -> None:
+    journal, adapters, instruments = await _seed_portfolio_recovery(
+        tmp_path / "missing-submit-outcome.sqlite3",
+        10,
+        action_state=LiveActionState.SUBMITTING,
+    )
+    for adapter in adapters.values():
+        adapter._recent.clear()
+
+    result = await LiveControlService(journal, adapters, instruments).emergency_flatten()
+
+    assert result.success is False
+    assert result.reason == ReasonCode.FLAT_BARRIER_PRIVATE_STATE_UNKNOWN
+    assert all(adapter.submit_calls == 0 for adapter in adapters.values())
+    active = await journal.active_actions()
+    assert len(active) == 10
+    assert all(action.state == LiveActionState.QUARANTINED for action in active)
+
+
+@pytest.mark.asyncio
+async def test_hung_restart_lookup_is_bounded_and_other_routes_still_flatten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, adapters, instruments = await _seed_portfolio_recovery(
+        tmp_path / "hung-restart-lookup.sqlite3",
+        10,
+    )
+    action = (await journal.active_actions())[0]
+    symbol = "A000/USDT:USDT"
+    unresolved = VenueOrderRequest(
+        Venue.BYBIT,
+        venue_client_order_id(action.pair_action_id, "unresolved"),
+        symbol,
+        Side.BUY,
+        "limit",
+        Decimal("1"),
+        Decimal("100"),
+        "IOC",
+        {"timeInForce": "IOC"},
+    )
+    await journal.append_order_leg(
+        action.pair_action_id,
+        unresolved,
+        Decimal("0.001"),
+        Decimal("100"),
+    )
+    await journal.mark_leg_submit_attempted(
+        action.pair_action_id,
+        unresolved.client_order_id,
+    )
+    release_lookup = asyncio.Event()
+
+    async def hung_lookup(client_order_id: str, instrument: Instrument) -> PrivateOrder | None:
+        del client_order_id, instrument
+        await release_lookup.wait()
+        return None
+
+    monkeypatch.setattr(adapters[Venue.BYBIT], "find_order_by_client_id", hung_lookup)
+    started = asyncio.get_running_loop().time()
+
+    result = await LiveControlService(journal, adapters, instruments).emergency_flatten()
+
+    assert asyncio.get_running_loop().time() - started < 3.5
+    assert result.success is False
+    assert result.orders_sent == 20
+    snapshots = await asyncio.gather(
+        *(adapter.fetch_active_snapshot() for adapter in adapters.values())
+    )
+    assert all(not snapshot.positions for snapshot in snapshots)
+    release_lookup.set()
+    await asyncio.sleep(0)
+    await shutdown_private_requests(adapters)
 
 
 @pytest.mark.asyncio

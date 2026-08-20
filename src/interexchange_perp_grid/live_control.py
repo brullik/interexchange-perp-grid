@@ -30,6 +30,7 @@ from interexchange_perp_grid.live_reconciliation import (
     ReconciliationReport,
     collect_private_states,
     combined_event_watermark,
+    find_private_order_by_client_id,
     flat_barrier_failure_reason,
     reconcile_private_states,
     wait_for_stable_flat,
@@ -255,6 +256,7 @@ class LiveControlService:
                     reason=ReasonCode.RECONCILIATION_INCOMPLETE,
                 )
             try:
+                await self._reconcile_attempted_legs_from_exchange()
                 resumed_submits = await self._resume_attempted_emergency_legs()
                 result = await self._flatten_owned(action_name)
                 if resumed_submits:
@@ -268,6 +270,46 @@ class LiveControlService:
                 raise
             await self._journal.release_account_flatten_lease(lease_token)
             return result
+
+    async def _reconcile_attempted_legs_from_exchange(self) -> None:
+        """Persist exchange-visible outcomes that a killed process did not journal locally."""
+        active = await self._journal.active_actions()
+        unresolved = tuple(
+            (action.pair_action_id, leg)
+            for action in active
+            for leg in action.legs
+            if leg.submit_attempted and leg.status in {None, PrivateOrderStatus.UNKNOWN}
+        )
+        await asyncio.gather(
+            *(
+                self._reconcile_attempted_leg(pair_action_id, leg)
+                for pair_action_id, leg in unresolved
+            ),
+            return_exceptions=True,
+        )
+
+    async def _reconcile_attempted_leg(
+        self,
+        pair_action_id: str,
+        leg: JournalLeg,
+    ) -> None:
+        instrument = self._instrument(leg.venue, leg.symbol)
+        order = await find_private_order_by_client_id(
+            self._adapters[leg.venue],
+            leg.venue,
+            leg.client_order_id,
+            instrument,
+        )
+        if order is None:
+            return
+        await self._journal.record_order_event(
+            pair_action_id,
+            order,
+            (
+                f"restart:{order.order_id or 'none'}:{order.status.value}:"
+                f"{order.filled_base_quantity}:{order.observed_at.isoformat()}"
+            ),
+        )
 
     async def _resume_attempted_emergency_legs(self) -> int:
         active = await self._journal.active_actions()
@@ -309,7 +351,12 @@ class LiveControlService:
         if request_payload_hash(request) != leg.request_payload_hash:
             raise RuntimeError("journaled emergency request cannot be reconstructed exactly")
         adapter = self._adapters[leg.venue]
-        order = await adapter.find_order_by_client_id(leg.client_order_id, instrument)
+        order = await find_private_order_by_client_id(
+            adapter,
+            leg.venue,
+            leg.client_order_id,
+            instrument,
+        )
         if order is None:
             raise RuntimeError("journaled emergency order remains unknown")
         await self._journal.record_order_event(

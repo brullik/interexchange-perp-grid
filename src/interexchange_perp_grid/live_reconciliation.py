@@ -55,6 +55,14 @@ class PrivateStateAdapter(Protocol):
     async def fetch_trading_fee(self, instrument: Instrument) -> Decimal | None: ...
 
 
+class ClientOrderLookupAdapter(PrivateStateAdapter, Protocol):
+    async def find_order_by_client_id(
+        self,
+        client_order_id: str,
+        instrument: Instrument,
+    ) -> PrivateOrder | None: ...
+
+
 @runtime_checkable
 class ReconcilingPrivateStateAdapter(Protocol):
     async def reconcile_active_snapshot(self, trigger: str) -> PrivateActiveSnapshot: ...
@@ -145,6 +153,25 @@ async def shutdown_private_requests(
             }
         )
         raise RuntimeError("private request shutdown deadline exceeded: " + ",".join(venues))
+
+
+async def find_private_order_by_client_id(
+    adapter: ClientOrderLookupAdapter,
+    venue: Venue,
+    client_order_id: str,
+    instrument: Instrument,
+    *,
+    timeout_seconds: float = 1.0,
+) -> PrivateOrder | None:
+    """Bound and retain ownership of one restart client-ID lookup."""
+    if timeout_seconds <= 0:
+        raise ValueError("private order lookup timeout must be positive")
+    task = _owned_private_request(
+        (venue, "find", client_order_id),
+        adapter,
+        lambda: adapter.find_order_by_client_id(client_order_id, instrument),
+    )
+    return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
 
 
 @dataclass(frozen=True, slots=True)

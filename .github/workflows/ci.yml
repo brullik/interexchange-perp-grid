@@ -204,24 +204,32 @@ jobs:
       - name: Kill process and prove automatic supervisor recovery in simulator
         run: |
           IMAGE_ID="$(docker compose images -q app)"
-          SMOKE_NAME="ipeg-c4-recovery-${GITHUB_RUN_ID}"
           SMOKE_VOLUME="ipeg-c4-recovery-${GITHUB_RUN_ID}"
           docker volume create "$SMOKE_VOLUME"
           docker run --rm --user 0:0 --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
             chown ipeg:ipeg /smoke
-          docker run --detach --name "$SMOKE_NAME" --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
-            interexchange-grid supervisor-recovery-smoke \
-            --state /smoke/state.sqlite3 --ready /smoke/ready --hold-after-active
-          for attempt in $(seq 1 60); do
-            docker exec "$SMOKE_NAME" test -f /smoke/ready && break
-            sleep 1
+          for state in PREPARED SUBMITTING ACKNOWLEDGED PARTIAL FILLED REJECTED UNKNOWN RECOVERING HEDGED CLOSING QUARANTINED; do
+            state_slug="$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')"
+            SMOKE_NAME="ipeg-c4-recovery-${GITHUB_RUN_ID}-${state_slug}"
+            state_path="/smoke/${state_slug}.sqlite3"
+            private_state_dir="/smoke/${state_slug}-private"
+            ready_path="/smoke/${state_slug}.ready"
+            docker run --detach --name "$SMOKE_NAME" --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+              interexchange-grid private-transition-recovery-smoke \
+              --state "$state_path" --ready "$ready_path" --hold-after-active \
+              --transition-state "$state" --private-state-dir "$private_state_dir"
+            for attempt in $(seq 1 60); do
+              docker exec "$SMOKE_NAME" test -f "$ready_path" && break
+              sleep 1
+            done
+            docker exec "$SMOKE_NAME" test -f "$ready_path"
+            docker kill "$SMOKE_NAME"
+            docker rm "$SMOKE_NAME"
+            docker run --rm --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+              interexchange-grid private-transition-recovery-smoke --state "$state_path" \
+              --transition-state "$state" --private-state-dir "$private_state_dir" \
+              | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["restarted_transition_state"] == sys.argv[1]; assert p["expected_action_count"] == 10; assert p["recovered_action_count"] == 10; assert p["flat_barrier_verified"] is True; assert p["production_exchange_transports_opened"] == 0' "$state"
           done
-          docker exec "$SMOKE_NAME" test -f /smoke/ready
-          docker kill "$SMOKE_NAME"
-          docker rm "$SMOKE_NAME"
-          docker run --rm --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
-            interexchange-grid supervisor-recovery-smoke --state /smoke/state.sqlite3 \
-            | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["production_exchange_transports_opened"] == 0'
           docker volume rm "$SMOKE_VOLUME"
       - name: Validate deployment scripts
         run: bash -n scripts/release-build.sh scripts/shadow-deploy.sh scripts/shadow-upgrade.sh scripts/shadow-rollback.sh
