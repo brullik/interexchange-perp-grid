@@ -16,6 +16,7 @@ from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.route_calibration import (
     PersistentRouteCalibrator,
     RouteCalibrationAssessment,
+    RouteCalibrationEpisodeSample,
     RouteCalibrationObservation,
     RouteCalibrationSamplingPolicy,
     calibrate_route_size,
@@ -461,6 +462,148 @@ async def test_persistent_calibrator_restores_identical_parameters_and_bounds_ro
 
 
 @pytest.mark.asyncio
+async def test_bounded_retention_preserves_truthful_window_coverage_at_fast_cadence(
+    tmp_path: Path,
+) -> None:
+    started = datetime(2026, 8, 16, tzinfo=UTC)
+    route = DirectedRouteKey("FAST", Venue.BYBIT, Venue.OKX)
+    path = tmp_path / "fast-retention.sqlite3"
+    calibrator = PersistentRouteCalibrator(
+        path,
+        minimum_samples=5,
+        minimum_observation_period=timedelta(seconds=20),
+        minimum_profit_usdt=Decimal("0.01"),
+        parameter_change_limit_ratio_per_day=Decimal("0.20"),
+        maximum_inter_observation_gap=timedelta(seconds=2),
+        maximum_observations_per_key=5,
+    )
+    await calibrator.initialise()
+    observations = tuple(
+        observation(
+            route,
+            "1",
+            started + timedelta(seconds=index),
+            str(10 + index % 3),
+        )
+        for index in range(21)
+    )
+
+    assessment = (await calibrator.record_many(observations, now=observations[-1].observed_at))[0]
+
+    assert assessment.ready is True
+    with sqlite3.connect(path) as database:
+        retained = database.execute(
+            """
+            SELECT observed_at FROM route_calibration_observations
+            WHERE route = ? ORDER BY observed_at
+            """,
+            (route.value,),
+        ).fetchall()
+    assert len(retained) == 5
+    assert datetime.fromisoformat(str(retained[-1][0])) - datetime.fromisoformat(
+        str(retained[0][0])
+    ) == timedelta(seconds=20)
+
+
+@pytest.mark.asyncio
+async def test_bounded_retention_reserves_recent_day_coverage_in_long_history(
+    tmp_path: Path,
+) -> None:
+    started = datetime(2026, 8, 1, tzinfo=UTC)
+    route = DirectedRouteKey("LONG", Venue.BYBIT, Venue.OKX)
+    path = tmp_path / "long-retention.sqlite3"
+    calibrator = PersistentRouteCalibrator(
+        path,
+        minimum_samples=5,
+        minimum_observation_period=timedelta(hours=20),
+        minimum_profit_usdt=Decimal("0.01"),
+        parameter_change_limit_ratio_per_day=Decimal("0.20"),
+        maximum_inter_observation_gap=timedelta(hours=3),
+        maximum_observations_per_key=30,
+    )
+    await calibrator.initialise()
+    observations = tuple(
+        observation(
+            route,
+            "1",
+            started + timedelta(hours=index),
+            "10",
+        )
+        for index in range(241)
+    )
+
+    first = (await calibrator.record_many(observations, now=observations[-1].observed_at))[0]
+    assert first.ready is True
+    with sqlite3.connect(path) as database:
+        retained = tuple(
+            datetime.fromisoformat(str(row[0]))
+            for row in database.execute(
+                """
+                SELECT observed_at FROM route_calibration_observations
+                WHERE route = ? ORDER BY observed_at
+                """,
+                (route.value,),
+            )
+        )
+    assert len(retained) == 30
+    recent_cutoff = observations[-1].observed_at - timedelta(hours=24)
+    assert sum(item >= recent_cutoff for item in retained) >= 5
+    assert retained[-1] - retained[0] >= timedelta(days=9)
+
+    next_observation = observation(
+        route,
+        "1",
+        observations[-1].observed_at + timedelta(hours=1),
+        "11",
+    )
+    resumed = (await calibrator.record_many((next_observation,), now=next_observation.observed_at))[
+        0
+    ]
+    assert resumed.ready is True
+
+
+@pytest.mark.asyncio
+async def test_retention_hard_bound_prioritises_ready_recent_samples(
+    tmp_path: Path,
+) -> None:
+    started = datetime(2026, 8, 16, tzinfo=UTC)
+    route = DirectedRouteKey("BOUND", Venue.BYBIT, Venue.OKX)
+    path = tmp_path / "hard-bound.sqlite3"
+    calibrator = PersistentRouteCalibrator(
+        path,
+        minimum_samples=5,
+        minimum_observation_period=timedelta(seconds=4),
+        minimum_profit_usdt=Decimal("0.01"),
+        parameter_change_limit_ratio_per_day=Decimal("0.20"),
+        maximum_inter_observation_gap=timedelta(seconds=2),
+        maximum_observations_per_key=5,
+    )
+    await calibrator.initialise()
+    old = observation(route, "1", started - timedelta(days=2), "10")
+    gap = observation(
+        route,
+        "1",
+        started - timedelta(seconds=1),
+        "0",
+        reason=ReasonCode.BOOK_SEQUENCE_GAP,
+    )
+    recent = tuple(
+        observation(route, "1", started + timedelta(seconds=index), str(10 + index % 2))
+        for index in range(5)
+    )
+
+    assessment = (await calibrator.record_many((old, gap, *recent), now=recent[-1].observed_at))[0]
+
+    assert assessment.ready is True
+    with sqlite3.connect(path) as database:
+        retained = database.execute(
+            "SELECT count(*) FROM route_calibration_observations WHERE route = ?",
+            (route.value,),
+        ).fetchone()
+    assert retained == (5,)
+
+
+@pytest.mark.asyncio
 async def test_episode_tracking_survives_restart_and_quality_gap_resets_current_epoch(
     tmp_path: Path,
 ) -> None:
@@ -547,6 +690,94 @@ async def test_episode_tracking_survives_restart_and_quality_gap_resets_current_
     )
     with pytest.raises(ValueError, match="cannot regress"):
         await restarted.record_many((regressed,), now=started + timedelta(seconds=18))
+
+
+@pytest.mark.asyncio
+async def test_gradual_divergence_records_convergence_for_every_crossed_grid_bucket(
+    tmp_path: Path,
+) -> None:
+    started = datetime(2026, 8, 16, tzinfo=UTC)
+    route = DirectedRouteKey("MULTIBUCKET", Venue.BYBIT, Venue.OKX)
+    path = tmp_path / "multi-bucket-episodes.sqlite3"
+    calibrator = PersistentRouteCalibrator(
+        path,
+        minimum_samples=5,
+        minimum_observation_period=timedelta(0),
+        minimum_profit_usdt=Decimal("0.01"),
+        parameter_change_limit_ratio_per_day=Decimal("0.20"),
+        maximum_inter_observation_gap=timedelta(seconds=30),
+        minimum_convergence_samples_per_spread_bucket=3,
+    )
+    await calibrator.initialise()
+    baseline = tuple(
+        observation(
+            route,
+            "1",
+            started + timedelta(seconds=index),
+            str(10 + index),
+            adverse="1",
+            convergence="5",
+        )
+        for index in range(5)
+    )
+    ready = (await calibrator.record_many(baseline, now=baseline[-1].observed_at))[0]
+    assert ready.parameters is not None
+    levels = ready.parameters.entry_levels_bps
+
+    for cycle in range(3):
+        cycle_start = 5 + cycle * 6
+        crossed = tuple(
+            observation(
+                route,
+                "1",
+                started + timedelta(seconds=cycle_start + index),
+                str(level + Decimal("0.1")),
+                adverse=None,
+                convergence=None,
+            )
+            for index, level in enumerate(levels)
+        )
+        converged = observation(
+            route,
+            "1",
+            started + timedelta(seconds=cycle_start + 5),
+            "0",
+            adverse=None,
+            convergence=None,
+        )
+        await calibrator.record_many((*crossed, converged), now=converged.observed_at)
+
+    with sqlite3.connect(path) as database:
+        rows = database.execute(
+            """
+            SELECT payload_json FROM route_calibration_observations
+            WHERE route = ? ORDER BY observed_at, observation_id
+            """,
+            (route.value,),
+        ).fetchall()
+    history = tuple(route_calibration_module._observation_from_payload(str(row[0])) for row in rows)
+    completed = tuple(item for item in history if item.episode_samples)
+    assert len(completed) == 3
+    assert all(len(item.episode_samples) == 5 for item in completed)
+    assert all(
+        tuple(sample.entry_spread_bps for sample in item.episode_samples) == levels
+        for item in completed
+    )
+
+    assessment = calibrate_route_size(
+        history,
+        now=history[-1].observed_at,
+        minimum_samples=5,
+        minimum_observation_period=timedelta(0),
+        minimum_profit_usdt=Decimal("0.01"),
+        parameter_change_limit_ratio_per_day=Decimal("0.20"),
+        minimum_convergence_samples_per_spread_bucket=3,
+    )
+    assert assessment.parameters is not None
+    assert tuple(
+        bucket.sample_count for bucket in assessment.parameters.convergence_by_spread_bucket
+    ) == (3, 3, 3, 3, 3)
+    assert all(bucket.ready for bucket in assessment.parameters.convergence_by_spread_bucket)
 
 
 @pytest.mark.asyncio
@@ -640,6 +871,8 @@ async def test_non_converging_episode_times_out_and_invalidates_current_paramete
     recorded = route_calibration_module._observation_from_payload(str(payload[0]))
     assert recorded.convergence_seconds == Decimal(11)
     assert recorded.episode_peak_spread_bps == Decimal(24)
+    assert recorded.episode_samples
+    assert any(sample.censored for sample in recorded.episode_samples)
 
     recovered_observations = tuple(
         observation(
@@ -658,9 +891,158 @@ async def test_non_converging_episode_times_out_and_invalidates_current_paramete
             now=recovered_observations[-1].observed_at,
         )
     )[0]
-    assert recovered.parameters is not None
-    assert recovered.parameters.long_tail_q999_spread_bps >= Decimal(24)
-    assert recovered.parameters.convergence_p90_seconds > Decimal(5)
+    # The censored multi-bucket episode is retained as stress evidence.  Its
+    # larger adverse envelope cannot be published through the 20%/24h cap in
+    # one step, so the safe outcome is an inactive staged candidate rather
+    # than an immediately READY parameter set.
+    assert recovered.parameters is None
+    assert recovered.reason == ReasonCode.CALIBRATION_REGIME_SHIFT
+    assert recovered.staged_parameters is not None
+    assert recovered.staged_parameters.long_tail_q999_spread_bps >= Decimal(24)
+    # A timeout remains adverse/long-tail evidence but is not a successful
+    # convergence observation.
+    assert recovered.staged_parameters.convergence_p90_seconds == Decimal(5)
+
+
+def test_censored_timeout_samples_never_count_as_successful_convergence() -> None:
+    levels = (
+        Decimal(10),
+        Decimal(12),
+        Decimal(14),
+        Decimal(16),
+        Decimal(18),
+    )
+    route = DirectedRouteKey("CENSOR", Venue.BYBIT, Venue.OKX)
+    item = observation(
+        route,
+        "1",
+        datetime(2026, 8, 16, tzinfo=UTC),
+        "20",
+        adverse=None,
+        convergence=None,
+    )
+    item = replace(
+        item,
+        episode_samples=tuple(
+            RouteCalibrationEpisodeSample(
+                level,
+                level + Decimal(3),
+                Decimal(index + 1),
+                index,
+                True,
+            )
+            for index, level in enumerate(levels)
+        ),
+    )
+
+    buckets = route_calibration_module._convergence_by_spread_bucket((item,), levels, 3)
+
+    assert tuple(bucket.sample_count for bucket in buckets) == (0, 0, 0, 0, 0)
+    assert all(bucket.convergence_p90_seconds is None for bucket in buckets)
+
+
+@pytest.mark.asyncio
+async def test_v10_episode_migration_preserves_overdue_timeout_gate(tmp_path: Path) -> None:
+    started = datetime(2026, 8, 16, tzinfo=UTC)
+    route = DirectedRouteKey("MIGRATE", Venue.BYBIT, Venue.OKX)
+    path = tmp_path / "episode-v10.sqlite3"
+    policy = RouteCalibrationSamplingPolicy(
+        (Decimal(1),),
+        10,
+        60,
+        Decimal(2),
+        Decimal(0),
+        Decimal(0),
+        Decimal(0),
+        Decimal(0),
+    )
+
+    def new_calibrator() -> PersistentRouteCalibrator:
+        return PersistentRouteCalibrator(
+            path,
+            minimum_samples=3,
+            minimum_observation_period=timedelta(0),
+            minimum_profit_usdt=Decimal("0.01"),
+            parameter_change_limit_ratio_per_day=Decimal("0.20"),
+            maximum_inter_observation_gap=timedelta(seconds=20),
+            sampling_policy=policy,
+        )
+
+    calibrator = new_calibrator()
+    await calibrator.initialise()
+    baseline = tuple(
+        observation(
+            route,
+            "1",
+            started + timedelta(seconds=index),
+            str(10 + index),
+            adverse="1",
+            convergence="5",
+        )
+        for index in range(3)
+    )
+    assert (await calibrator.record_many(baseline, now=baseline[-1].observed_at))[0].ready
+    opened = observation(
+        route,
+        "1",
+        started + timedelta(seconds=3),
+        "20",
+        adverse=None,
+        convergence=None,
+    )
+    await calibrator.record_many((opened,), now=opened.observed_at)
+    await calibrator.close()
+
+    # Recreate the v10 one-episode layout while retaining the real current
+    # parameter payload.  Migration must not erase the already-running timer.
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "ALTER TABLE route_calibration_episodes RENAME TO episodes_v11_before_test"
+        )
+        database.execute(
+            """
+            CREATE TABLE route_calibration_episodes (
+                route TEXT NOT NULL,
+                size_bucket_multiplier TEXT NOT NULL,
+                epoch_id TEXT NOT NULL,
+                entry_spread_bps TEXT NOT NULL,
+                convergence_target_bps TEXT NOT NULL,
+                peak_spread_bps TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                PRIMARY KEY(route, size_bucket_multiplier, epoch_id)
+            )
+            """
+        )
+        database.execute(
+            """
+            INSERT INTO route_calibration_episodes
+            SELECT route, size_bucket_multiplier, epoch_id, entry_spread_bps,
+                   convergence_target_bps, peak_spread_bps, started_at
+            FROM episodes_v11_before_test
+            WHERE spread_bucket_index = 0
+            """
+        )
+        database.execute("DROP TABLE episodes_v11_before_test")
+        database.execute("UPDATE metadata SET value = '10' WHERE key = 'schema_version'")
+        database.commit()
+
+    restarted = new_calibrator()
+    await restarted.initialise()
+    timed_out = observation(
+        route,
+        "1",
+        started + timedelta(seconds=14),
+        "18",
+        adverse=None,
+        convergence=None,
+    )
+
+    current_gate = (await restarted.assess_current((timed_out,)))[0]
+    persisted = (await restarted.record_many((timed_out,), now=timed_out.observed_at))[0]
+
+    assert current_gate.reason == ReasonCode.CALIBRATION_REGIME_SHIFT
+    assert persisted.reason == ReasonCode.CALIBRATION_REGIME_SHIFT
+    assert await restarted.latest(route, Decimal(1)) is None
 
 
 @pytest.mark.asyncio

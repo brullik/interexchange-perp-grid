@@ -44,6 +44,8 @@ from interexchange_perp_grid.route_calibration import (
 from interexchange_perp_grid.routes import DirectedRouteQuote
 from interexchange_perp_grid.state import (
     RuntimeControls,
+    StateTransitionDeadlineError,
+    delete_tranche,
     initialise_state,
     load_tranches,
     read_active_qualification_epoch,
@@ -62,6 +64,19 @@ from interexchange_perp_grid.strategy import (
     SignalDecision,
     evaluate_entry_signal,
 )
+
+
+async def _await_owned_task(task: asyncio.Task[None]) -> bool:
+    """Wait through caller cancellation and report whether it was requested."""
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+        except Exception:
+            break
+    return interrupted
 
 
 class WorkClass(StrEnum):
@@ -215,8 +230,20 @@ class ShadowRuntime:
         self.settings = settings
         self.state_path = Path(settings.storage.sqlite_path)
         self.overload = OverloadController(settings.shadow.overload_pending_limit)
+        self.risk = RiskBook(
+            RiskLimits(
+                pair_stress_usdt=settings.risk.pair_stressed_loss_limit_usdt,
+                portfolio_stress_usdt=settings.risk.portfolio_stressed_loss_limit_usdt,
+                max_active_routes=settings.risk.max_active_routes,
+                max_routes_per_base=settings.risk.max_routes_per_base,
+                max_tranches_per_route=settings.risk.max_tranches_per_route,
+                local_free_margin_floor_ratio=settings.risk.local_free_margin_floor_ratio,
+                effective_leverage_cap=settings.risk.initial_effective_leverage_cap,
+            )
+        )
         self.tranches: dict[str, Tranche] = {}
         self._started = False
+        self._persistence_indeterminate = False
 
     async def start(self) -> None:
         if self._started:
@@ -265,6 +292,8 @@ class ShadowRuntime:
         return await read_runtime_controls(self.state_path)
 
     async def entry_gate(self) -> AdmissionDecision:
+        if self._persistence_indeterminate:
+            return AdmissionDecision(False, ReasonCode.RECONCILIATION_REQUIRED)
         controls = await self.controls()
         if controls.killed:
             return AdmissionDecision(False, ReasonCode.KILL_SWITCH_ACTIVE)
@@ -282,6 +311,9 @@ class ShadowRuntime:
 
     async def kill(self) -> None:
         await update_runtime_controls(self.state_path, killed=True, paused=True)
+
+    def block_for_indeterminate_persistence(self) -> None:
+        self._persistence_indeterminate = True
 
     async def close_all_simulated(self) -> tuple[str, ...]:
         persisted = await read_shadow_snapshot(self.state_path)
@@ -335,7 +367,15 @@ class ShadowRuntime:
                 "short",
             )
             coordinator.force_close(tranche, long_result, short_result)
-            await save_tranche(self.state_path, tranche)
+            try:
+                await save_tranche(self.state_path, tranche)
+            except StateTransitionDeadlineError as error:
+                self.block_for_indeterminate_persistence()
+                raise RuntimeError(
+                    "shadow close-all persistence outcome is indeterminate"
+                ) from error
+            with contextlib.suppress(KeyError):
+                self.risk.release(tranche.tranche_id)
             closed.append(tranche.tranche_id)
         await self.pause()
         return tuple(closed)
@@ -349,6 +389,7 @@ class ShadowRuntime:
             "killed": controls.killed,
             "reconciliation_state": controls.reconciliation_state,
             "overloaded": self.overload.overloaded,
+            "persistence_indeterminate": self._persistence_indeterminate,
             "positions": [
                 {
                     "tranche_id": tranche.tranche_id,
@@ -395,17 +436,7 @@ class ShadowTrader:
     def __init__(self, settings: Settings, runtime: ShadowRuntime) -> None:
         self.settings = settings
         self.runtime = runtime
-        self._risk = RiskBook(
-            RiskLimits(
-                pair_stress_usdt=settings.risk.pair_stressed_loss_limit_usdt,
-                portfolio_stress_usdt=settings.risk.portfolio_stressed_loss_limit_usdt,
-                max_active_routes=settings.risk.max_active_routes,
-                max_routes_per_base=settings.risk.max_routes_per_base,
-                max_tranches_per_route=settings.risk.max_tranches_per_route,
-                local_free_margin_floor_ratio=settings.risk.local_free_margin_floor_ratio,
-                effective_leverage_cap=settings.risk.initial_effective_leverage_cap,
-            )
-        )
+        self._risk = runtime.risk
         self._coordinator = PairExecutionCoordinator()
         self._managed_ids: set[str] = set()
 
@@ -615,7 +646,7 @@ class ShadowTrader:
             self._risk.release(tranche_id)
             return None
         entry_fee = quote.four_leg_fee_estimate / 4
-        self._coordinator.submit_open(
+        submitted = self._coordinator.submit_open(
             tranche,
             _shadow_fill_result(
                 tranche_id,
@@ -637,13 +668,85 @@ class ShadowTrader:
                 quote.entry_short_vwap,
                 entry_fee,
             ),
+            mutation_guard=(
+                None
+                if decision_deadline is None
+                else lambda: asyncio.get_running_loop().time() < decision_deadline
+            ),
         )
-        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+        if not submitted:
             self._risk.release(tranche_id)
+            return None
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            self._coordinator.rollback_unpublished_open(tranche)
+            self._risk.release(tranche_id)
+            return None
+        persistence = asyncio.create_task(
+            save_tranche(
+                self.runtime.state_path,
+                tranche,
+                deadline_monotonic=decision_deadline,
+            ),
+            name=f"shadow-save-tranche-{tranche_id}",
+        )
+        persistence_interrupted = await _await_owned_task(persistence)
+        if persistence.cancelled():
+            self._coordinator.rollback_unpublished_open(tranche)
+            self._risk.release(tranche_id)
+            raise asyncio.CancelledError
+        try:
+            persistence.result()
+        except StateTransitionDeadlineError as error:
+            self.runtime.tranches[tranche_id] = tranche
+            self._managed_ids.add(tranche_id)
+            self.runtime.block_for_indeterminate_persistence()
+            raise RuntimeError("shadow tranche persistence outcome is indeterminate") from error
+        except TimeoutError:
+            self._coordinator.rollback_unpublished_open(tranche)
+            self._risk.release(tranche_id)
+            if persistence_interrupted:
+                raise asyncio.CancelledError from None
+            return None
+        except Exception:
+            self._coordinator.rollback_unpublished_open(tranche)
+            self._risk.release(tranche_id)
+            raise
+        if persistence_interrupted:
+            # Persistence succeeded despite caller cancellation.  Keep it
+            # explicitly managed and risk-reserved before propagating cancel.
+            self.runtime.tranches[tranche_id] = tranche
+            self._managed_ids.add(tranche_id)
+            raise asyncio.CancelledError
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            deletion = asyncio.create_task(
+                delete_tranche(self.runtime.state_path, tranche_id),
+                name=f"shadow-delete-tranche-{tranche_id}",
+            )
+            deletion_interrupted = await _await_owned_task(deletion)
+            if deletion.cancelled():
+                self.runtime.tranches[tranche_id] = tranche
+                self._managed_ids.add(tranche_id)
+                raise asyncio.CancelledError
+            try:
+                deletion.result()
+            except StateTransitionDeadlineError as error:
+                self.runtime.tranches[tranche_id] = tranche
+                self._managed_ids.add(tranche_id)
+                self.runtime.block_for_indeterminate_persistence()
+                raise RuntimeError("shadow tranche deletion outcome is indeterminate") from error
+            except Exception:
+                # Persistence succeeded, so retain explicit in-memory/risk
+                # ownership if compensating deletion itself fails.
+                self.runtime.tranches[tranche_id] = tranche
+                self._managed_ids.add(tranche_id)
+                raise
+            self._coordinator.rollback_unpublished_open(tranche)
+            self._risk.release(tranche_id)
+            if deletion_interrupted:
+                raise asyncio.CancelledError
             return None
         self.runtime.tranches[tranche_id] = tranche
         self._managed_ids.add(tranche_id)
-        await save_tranche(self.runtime.state_path, tranche)
         return decision
 
     def _venue_projection(
@@ -730,7 +833,11 @@ class ShadowTrader:
                     close_fee,
                 ),
             )
-            await save_tranche(self.runtime.state_path, tranche)
+            try:
+                await save_tranche(self.runtime.state_path, tranche)
+            except StateTransitionDeadlineError as error:
+                self.runtime.block_for_indeterminate_persistence()
+                raise RuntimeError("shadow close persistence outcome is indeterminate") from error
             with contextlib.suppress(KeyError):
                 self._risk.release(tranche.tranche_id)
 

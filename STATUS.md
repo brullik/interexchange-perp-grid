@@ -5,7 +5,7 @@ This is the only mutable project-status document.
 ## Current state
 
 - **State:** PHASE3_3_LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE
-- **Current checkpoint:** Phase 3.3 persistent public-shadow route/size adaptive calibration is locally complete with 415 tests and two independent P0=0/P1=0/P2=0 reviews; commit, exact-head CI/artifacts, and exact-head release review are still required
+- **Current checkpoint:** Phase 3.3 persistent public-shadow route/size adaptive calibration is locally complete with 424 tests and an independent final P0=0/P1=0/P2=0 review; remediation commit, exact-head CI/artifacts, and exact-head release review are still required
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -24,7 +24,7 @@ This is the only mutable project-status document.
 | Phase 2 Wave 1 data/private core | COMPLETE | PR #4 was independently verified with P0/P1/P2=0 and squash-merged as `0e87a1e`; post-merge [run 31904798345](https://github.com/brullik/interexchange-perp-grid/actions/runs/31904798345) passed all five jobs |
 | Phase 3.1 multi-instrument broad BBO | COMPLETE | Draft PR #5 exact code checkpoint `64e5c86e` and evidence-only head `18ae1b1`; real Wave 1 fixture qualifies one common instrument/six routes without fabricated OKX notional; malformed typed records are isolated through registry, route, and canary sizing; 102-safe-common/608-route synthetic boundary; one watchdog-protected batch watcher per venue; cancellation-safe retirement, idempotent transactional startup, single-flight refresh/recycle, tracked broad and selected-route scans, one bounded lifecycle shutdown barrier, explicit shutdown/teardown failure, cancellation-safe partial-factory rollback, and cancellation-aware two-phase Parquet publication with partial-write and event-loop-shutdown cleanup; six-hour resubscription; jittered 1→30 s reconnect; bounded cache with stale provenance; actual quote-receipt-to-prefilter latency; restart-identical proof; stable non-executable prefilter; exact run 31913700713 and independent P0/P1/P2=0 review passed |
 | Phase 3.2 bounded Candidate L2 + public overload admission | COMPLETE | Exact code checkpoint `f4d1f3e` and evidence head `de3a870`; deterministic top-30 QUOTE_READY directed candidates plus every active route; one deduplicated venue-symbol L2 subscription with matching Wave 1 unsubscribe; 100 ms coalescing/debounce; active P2 before candidate P5; broad/history P6 then candidate P5 shedding before P4; P0-P3 preserved; exact BookRegistry quality, venue outage, generation, freshness, and receipt-to-decision p95 checks; bounded tasks/cache/locks under 100k churn; restart/recycle/shutdown proof; `execution_authorized=false`; exact runs 31918092230 and 31918436474 plus four exact-head artifacts passed; independent final review P0=0/P1=0/P2=0. PROD-05 is COMPLETE; PROD-10 remains only narrow PARTIAL |
-| Phase 3.3 persistent public-shadow adaptive calibration | LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE | Persistent SQLite-WAL parameters per directed route and stable size multiplier; truthful 24h/7d/30d robust windows and long-tail stress; funding/depth/quality/regime gates; five contiguous grid spread buckets with 30-episode production support for bucket-specific convergence p90; 20%/24h staged parameter changes; bounded retention/rebuild/funding workers; restart, stale/outage, timeout, overload, deadline, and shutdown fail-close; ShadowTrader consumes only current persisted bucket-qualified parameters; public estimate scope and `execution_authorized=false`; local lock/Ruff/mypy/415-test/doctor/security gates and two independent dirty-snapshot reviews passed P0=0/P1=0/P2=0. PROD-06 is technically complete only for the Candidate-L2/public-shadow boundary; commit and exact-head evidence remain pending |
+| Phase 3.3 persistent public-shadow adaptive calibration | LOCAL_TECHNICAL_PASS_AWAITING_EXACT_GATE | Persistent SQLite-WAL parameters per directed route and stable size multiplier; truthful 24h/7d/30d robust windows and long-tail stress; generation-bound funding/depth/quality/regime gates; five parallel grid-aligned episodes with censored timeout evidence and 30-episode production support for bucket-specific convergence p90; 20%/24h staged parameter changes; hard-bounded retention with reserved recent-window coverage; restart, migration, stale/outage, overload, true decision-deadline, cancellation, and bounded daemon-persistence shutdown fail-close; indeterminate save/delete/close outcomes retain runtime/risk ownership and latch entry; ShadowTrader consumes only current persisted bucket-qualified parameters; public estimate scope and `execution_authorized=false`; local lock/Ruff/mypy/424-test/doctor/security gates and independent final review passed P0=0/P1=0/P2=0. PROD-06 is technically complete only for the Candidate-L2/public-shadow boundary; remediation commit and exact-head evidence remain pending |
 | C5 owner-operated canary | FORBIDDEN | Must not start until corrected C4 passes every P0 criterion and independent review |
 | C6 venue expansion | NOT_STARTED | — |
 
@@ -102,6 +102,7 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-16 — Bind Phase 3.1 checkpoint evidence to the last exact independently reviewed code head — status must distinguish a proven technical checkpoint from its subsequent evidence-only commit — status
 2026-08-16 — Keep one bounded event-driven L2 owner per venue-symbol and gate public work by P2/P5/P6 priority without execution authority — active routes must survive overload while candidate churn, stale data, unsubscribe, reconnect, and adapter-generation races remain fail-closed — candidate L2, public engine, public adapters, shadow evaluator
 2026-08-16 — Persist public-shadow adaptive parameters per directed route and stable size multiplier with five grid-aligned convergence buckets requiring 30 episodes each — restart-safe robust windows must never substitute aggregate or under-supported convergence evidence for the current entry spread — route calibration, public engine, shadow evaluator, SQLite state
+2026-08-20 — Treat every simulated tranche SQLite write as a bounded ownership transition and retain runtime/risk ownership behind an entry latch when its terminal outcome is unknowable — cancellation, slow native storage, and shutdown may neither create an unowned durable tranche nor block process exit — shadow runtime/trader, execution coordinator, SQLite state
 
 ## Active blockers / owner actions
 
@@ -112,15 +113,19 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 ## Last verified command
 
 ```text
-2026-08-16 Phase 3.3 local Windows equivalent of every Makefile verify target: PASS
+2026-08-20 Phase 3.3 remediation local Windows equivalent of every Makefile verify target: PASS
 - exact main lock validation: PASS (64 packages)
 - ruff format --check + ruff check: PASS (92 files)
 - mypy --strict: PASS (90 source/test files)
-- pytest: 415 passed
+- pytest: 424 passed
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
-- detect-secrets: 0 result files; Bandit medium/high: 0
+- Bandit medium/high: 0; exact-head CI secret/dependency/SBOM evidence remains pending
 
-The frozen dirty Phase 3.3 snapshot passed two independent read-only reviews with P0=0/P1=0/P2=0.
+The frozen dirty Phase 3.3 remediation snapshot passed independent final read-only review with
+P0=0/P1=0/P2=0. Regression evidence covers stale funding generations, gradual five-level episodes,
+v10 open-episode migration, censored timeout statistics, 24-hour bounded retention, repeated
+cancellation, pre/post-submit deadlines, indeterminate save/delete/close ownership, and bounded
+process shutdown with a non-terminal daemon SQLite worker.
 PROD-06 is technically complete only for Candidate-L2/public-shadow calibration; private-account
 fees, executable third-venue/liquidation economics, PROD-07+, full PROD-10, and live qualification
 remain outside this checkpoint. Commit, exact-head CI/artifacts, and exact-head final review are

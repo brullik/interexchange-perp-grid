@@ -627,6 +627,40 @@ async def test_route_calibration_revalidates_silent_l2_freshness_after_funding(
 
 
 @pytest.mark.asyncio
+async def test_route_calibration_never_reuses_funding_from_prior_adapter_generation(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+    qualified = await engine.scan_route_calibration_observations(2)
+    assert len(qualified) == 3
+    assert {item.reason for item in qualified} == {ReasonCode.QUOTE_READY}
+
+    # Simulate a venue-adapter generation transition while preventing an
+    # immediate cache refill.  The prior snapshots remain physically present
+    # but must be invisible to the observation boundary.
+    for venue in Venue:
+        engine._venue_refresh_generations[venue] = (
+            engine._venue_refresh_generations.get(venue, 0) + 1
+        )
+    for key in tuple(engine._route_calibration_funding):
+        engine._route_calibration_funding_retry_after_ns[key] = 10**30
+
+    stale_generation = await engine.scan_route_calibration_observations(2)
+
+    assert len(stale_generation) == 3
+    assert {item.reason for item in stale_generation} == {ReasonCode.FUNDING_UNKNOWN}
+    await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_route_plan_removal_emits_invalid_marker_before_reentry(
     tmp_path: Path,
 ) -> None:

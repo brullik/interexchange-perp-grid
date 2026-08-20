@@ -29,6 +29,30 @@ MINIMUM_SPREAD_BUCKET_CONVERGENCE_SAMPLES = 30
 
 
 @dataclass(frozen=True, slots=True)
+class RouteCalibrationEpisodeSample:
+    entry_spread_bps: Decimal
+    peak_spread_bps: Decimal
+    convergence_seconds: Decimal
+    spread_bucket_index: int | None = None
+    censored: bool = False
+
+    def __post_init__(self) -> None:
+        values = (
+            self.entry_spread_bps,
+            self.peak_spread_bps,
+            self.convergence_seconds,
+        )
+        if any(not value.is_finite() or value < 0 for value in values):
+            raise ValueError("calibration episode samples must be finite and non-negative")
+        if self.peak_spread_bps < self.entry_spread_bps:
+            raise ValueError("calibration episode peak cannot precede its entry spread")
+        if self.spread_bucket_index is not None and not 0 <= self.spread_bucket_index < 5:
+            raise ValueError("calibration episode spread bucket must be within [0, 4]")
+        if not isinstance(self.censored, bool):
+            raise ValueError("calibration episode censored flag must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
 class RouteCalibrationObservation:
     route: DirectedRouteKey
     size_bucket_multiplier: Decimal
@@ -46,6 +70,7 @@ class RouteCalibrationObservation:
     reason: ReasonCode
     episode_peak_spread_bps: Decimal | None = None
     episode_entry_spread_bps: Decimal | None = None
+    episode_samples: tuple[RouteCalibrationEpisodeSample, ...] = ()
 
     def __post_init__(self) -> None:
         if self.size_bucket_multiplier <= 0 or not self.size_bucket_multiplier.is_finite():
@@ -101,6 +126,49 @@ def _effective_observation_reason(observation: RouteCalibrationObservation) -> R
     if observation.exit_depth_multiple is not None and observation.exit_depth_multiple < Decimal(3):
         return ReasonCode.DEPTH_INSUFFICIENT
     return ReasonCode.QUOTE_READY
+
+
+def _episode_samples_for_observation(
+    observation: RouteCalibrationObservation,
+) -> tuple[RouteCalibrationEpisodeSample, ...]:
+    if observation.episode_samples:
+        return observation.episode_samples
+    if observation.episode_entry_spread_bps is None or observation.convergence_seconds is None:
+        return ()
+    peak = observation.episode_peak_spread_bps
+    if peak is None:
+        peak = observation.episode_entry_spread_bps + (
+            observation.adverse_excursion_after_entry_bps or Decimal(0)
+        )
+    return (
+        RouteCalibrationEpisodeSample(
+            observation.episode_entry_spread_bps,
+            peak,
+            observation.convergence_seconds,
+        ),
+    )
+
+
+def _episode_adverse_values(observation: RouteCalibrationObservation) -> tuple[Decimal, ...]:
+    samples = _episode_samples_for_observation(observation)
+    if samples:
+        return tuple(
+            max(Decimal(0), sample.peak_spread_bps - sample.entry_spread_bps) for sample in samples
+        )
+    return (
+        (observation.adverse_excursion_after_entry_bps,)
+        if observation.adverse_excursion_after_entry_bps is not None
+        else ()
+    )
+
+
+def _episode_convergence_values(
+    observation: RouteCalibrationObservation,
+) -> tuple[Decimal, ...]:
+    samples = _episode_samples_for_observation(observation)
+    if samples:
+        return tuple(sample.convergence_seconds for sample in samples if not sample.censored)
+    return (observation.convergence_seconds,) if observation.convergence_seconds is not None else ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,19 +383,21 @@ def _convergence_by_spread_bucket(
 ]:
     samples: list[list[Decimal]] = [[], [], [], [], []]
     for observation in observations:
-        entry_spread = observation.episode_entry_spread_bps
-        convergence = observation.convergence_seconds
-        if entry_spread is None or convergence is None:
-            continue
-        if entry_spread < entry_levels_bps[0]:
-            continue
-        bucket_index = 0
-        for index, lower_bound in enumerate(entry_levels_bps):
-            if entry_spread >= lower_bound:
-                bucket_index = index
-            else:
-                break
-        samples[bucket_index].append(convergence)
+        for episode in _episode_samples_for_observation(observation):
+            if episode.censored:
+                continue
+            entry_spread = episode.entry_spread_bps
+            bucket_index = episode.spread_bucket_index
+            if bucket_index is None:
+                if entry_spread < entry_levels_bps[0]:
+                    continue
+                bucket_index = 0
+                for index, lower_bound in enumerate(entry_levels_bps):
+                    if entry_spread >= lower_bound:
+                        bucket_index = index
+                    else:
+                        break
+            samples[bucket_index].append(episode.convergence_seconds)
     buckets = tuple(
         SpreadBucketConvergence(
             bucket_index=index,
@@ -842,12 +912,12 @@ def calibrate_route_size(
         )
     historical_30d = tuple(item for item in ordered if item.observed_at >= now - timedelta(days=30))
     adverse = tuple(
-        item.adverse_excursion_after_entry_bps
-        for item in historical_30d
-        if item.adverse_excursion_after_entry_bps is not None
+        adverse_value for item in historical_30d for adverse_value in _episode_adverse_values(item)
     )
     convergence = tuple(
-        item.convergence_seconds for item in historical_30d if item.convergence_seconds is not None
+        convergence_value
+        for item in historical_30d
+        for convergence_value in _episode_convergence_values(item)
     )
     if len(adverse) < 3 or len(convergence) < 3:
         return RouteCalibrationAssessment(
@@ -922,12 +992,14 @@ def calibrate_route_size(
         raise ValueError("calibration notional must be positive")
     minimum_profit_bps = minimum_profit_usdt / notional * Decimal(10_000)
     q90 = _quantile(spreads_24h, Decimal("0.90"))
-    long_tail_spreads = tuple(
-        item.spread_bps for item in current_30d if item.spread_bps is not None
-    ) + tuple(
-        item.episode_peak_spread_bps
+    episode_peaks = tuple(
+        episode.peak_spread_bps
         for item in historical_30d
-        if item.episode_peak_spread_bps is not None
+        for episode in _episode_samples_for_observation(item)
+    )
+    long_tail_spreads = (
+        tuple(item.spread_bps for item in current_30d if item.spread_bps is not None)
+        + episode_peaks
     )
     q999 = _quantile(long_tail_spreads, Decimal("0.999"))
     q75_adverse = _quantile(adverse, Decimal("0.75"))
@@ -944,14 +1016,7 @@ def calibrate_route_size(
         normalized_tick,
     )
     prior_long_tail = previous.long_tail_q999_spread_bps if previous is not None else q999
-    episode_peak = max(
-        (
-            item.episode_peak_spread_bps
-            for item in historical_30d
-            if item.episode_peak_spread_bps is not None
-        ),
-        default=q999,
-    )
+    episode_peak = max(episode_peaks, default=q999)
     long_tail = max(q999, episode_peak, prior_long_tail)
     raw_stop = max(long_tail, raw_entry + Decimal(5) * raw_step) + Decimal("0.5") * raw_step
     if previous is None:
@@ -1054,6 +1119,23 @@ def _route_from_value(value: str) -> DirectedRouteKey:
 
 def _observation_from_payload(payload: str) -> RouteCalibrationObservation:
     value = json.loads(payload)
+    parsed_episode_samples: list[RouteCalibrationEpisodeSample] = []
+    for item in value.get("episode_samples", ()):
+        censored = item.get("censored", False)
+        if not isinstance(censored, bool):
+            raise ValueError("calibration episode censored flag must be boolean")
+        parsed_episode_samples.append(
+            RouteCalibrationEpisodeSample(
+                Decimal(str(item["entry_spread_bps"])),
+                Decimal(str(item["peak_spread_bps"])),
+                Decimal(str(item["convergence_seconds"])),
+                int(item["spread_bucket_index"])
+                if item.get("spread_bucket_index") is not None
+                else None,
+                censored,
+            )
+        )
+    episode_samples = tuple(parsed_episode_samples)
     return RouteCalibrationObservation(
         _route_from_value(
             str(value["route"]["base"])
@@ -1093,6 +1175,7 @@ def _observation_from_payload(payload: str) -> RouteCalibrationObservation:
         Decimal(str(value["episode_entry_spread_bps"]))
         if value.get("episode_entry_spread_bps") is not None
         else None,
+        episode_samples,
     )
 
 
@@ -1132,6 +1215,7 @@ def _is_idempotent_observation_retry(
             incoming.convergence_seconds is None
             or stored.convergence_seconds == incoming.convergence_seconds
         )
+        and (not incoming.episode_samples or stored.episode_samples == incoming.episode_samples)
     )
 
 
@@ -1679,22 +1763,25 @@ class PersistentRouteCalibrator:
                                 self._minimum_profit,
                             )
                     else:
-                        episode = database.execute(
+                        episodes = database.execute(
                             """
                             SELECT convergence_target_bps, started_at
                             FROM route_calibration_episodes
                             WHERE route = ? AND size_bucket_multiplier = ? AND epoch_id = ?
                             """,
                             (route.value, str(size), observation.epoch_id),
-                        ).fetchone()
+                        ).fetchall()
                         if (
-                            episode is not None
+                            episodes
                             and self._maximum_holding_seconds is not None
                             and observation.spread_bps is not None
-                            and observation.spread_bps > Decimal(str(episode[0]))
-                            and observation.observed_at
-                            - datetime.fromisoformat(str(episode[1])).astimezone(UTC)
-                            >= timedelta(seconds=self._maximum_holding_seconds)
+                            and any(
+                                observation.spread_bps > Decimal(str(episode[0]))
+                                and observation.observed_at
+                                - datetime.fromisoformat(str(episode[1])).astimezone(UTC)
+                                >= timedelta(seconds=self._maximum_holding_seconds)
+                                for episode in episodes
+                            )
                         ):
                             reason = ReasonCode.CALIBRATION_REGIME_SHIFT
                         else:
@@ -2099,16 +2186,10 @@ class PersistentRouteCalibrator:
                     """,
                     (route.value, str(size), cutoff_24h),
                 )
-                database.execute(
-                    """
-                    DELETE FROM route_calibration_observations
-                    WHERE observation_id IN (
-                        SELECT observation_id FROM route_calibration_observations
-                        WHERE route = ? AND size_bucket_multiplier = ?
-                        ORDER BY observed_at DESC, observation_id DESC LIMIT -1 OFFSET ?
-                    )
-                    """,
-                    (route.value, str(size), self._maximum_observations),
+                self._thin_route_observations_to_bound(
+                    database,
+                    route.value,
+                    str(size),
                 )
                 previous = previous_by_key[(route, size, epoch_id)]
                 previous_active, previous_transient = previous_status_by_key[
@@ -2443,6 +2524,114 @@ class PersistentRouteCalibrator:
             key,
         )
 
+    def _thin_route_observations_to_bound(
+        self,
+        database: sqlite3.Connection,
+        route_value: str,
+        size_value: str,
+    ) -> None:
+        count_row = database.execute(
+            """
+            SELECT count(*) FROM route_calibration_observations
+            WHERE route = ? AND size_bucket_multiplier = ?
+            """,
+            (route_value, size_value),
+        ).fetchone()
+        if count_row is None or int(count_row[0]) <= self._maximum_observations:
+            return
+        rows = database.execute(
+            """
+            SELECT observation_id, payload_json
+            FROM route_calibration_observations
+            WHERE route = ? AND size_bucket_multiplier = ?
+            ORDER BY observed_at, observation_id
+            """,
+            (route_value, size_value),
+        ).fetchall()
+
+        # Keeping only the newest N rows shortens a 24-hour window whenever
+        # the observation cadence is faster than N/24h.  Instead retain a
+        # deterministic, approximately uniform time sample, while preserving
+        # the endpoints, explicit quality boundaries, and completed episode
+        # evidence.  A 10% hysteresis avoids an O(N) rebuild on every steady
+        # one-row append at production cardinality.
+        target = max(
+            self._minimum_samples,
+            3,
+            (
+                self._maximum_observations
+                if self._maximum_observations < 100
+                else int(self._maximum_observations * 0.9)
+            ),
+        )
+        target = min(target, self._maximum_observations)
+
+        def uniformly_select(indices: tuple[int, ...], count: int) -> set[int]:
+            if count <= 0 or not indices:
+                return set()
+            if count >= len(indices):
+                return set(indices)
+            if count == 1:
+                return {indices[len(indices) // 2]}
+            return {
+                indices[round(position * (len(indices) - 1) / (count - 1))]
+                for position in range(count)
+            }
+
+        parsed = tuple(_observation_from_payload(str(row[1])) for row in rows)
+        recent_cutoff = parsed[-1].observed_at - timedelta(hours=24)
+        recent_indices = tuple(
+            index
+            for index, observation in enumerate(parsed)
+            if observation.observed_at >= recent_cutoff
+        )
+        recent_budget = min(
+            len(recent_indices),
+            max(self._minimum_samples, target // 3),
+        )
+        recent_ready_indices = tuple(
+            index for index in recent_indices if parsed[index].reason == ReasonCode.QUOTE_READY
+        )
+        recent_keep = uniformly_select(
+            recent_ready_indices,
+            min(len(recent_ready_indices), self._minimum_samples, target),
+        )
+        remaining_recent = tuple(index for index in recent_indices if index not in recent_keep)
+        recent_keep.update(
+            uniformly_select(
+                remaining_recent,
+                min(len(remaining_recent), recent_budget - len(recent_keep)),
+            )
+        )
+        must_keep = {len(rows) - 1, *recent_keep}
+        if len(must_keep) < target:
+            must_keep.add(0)
+        required = set(must_keep)
+        for index, observation in enumerate(parsed):
+            if observation.reason != ReasonCode.QUOTE_READY or _episode_samples_for_observation(
+                observation
+            ):
+                required.add(index)
+
+        if len(required) > target:
+            keep = set(must_keep)
+            optional_required = tuple(sorted(required - must_keep))
+            keep.update(
+                uniformly_select(
+                    optional_required,
+                    target - len(keep),
+                )
+            )
+        else:
+            keep = set(required)
+            candidates = tuple(index for index in range(len(rows)) if index not in keep)
+            keep.update(uniformly_select(candidates, target - len(keep)))
+        delete_ids = tuple((int(row[0]),) for index, row in enumerate(rows) if index not in keep)
+        database.executemany(
+            "DELETE FROM route_calibration_observations WHERE observation_id = ?",
+            delete_ids,
+        )
+
     def _enrich_episode(
         self,
         database: sqlite3.Connection,
@@ -2468,62 +2657,62 @@ class PersistentRouteCalibrator:
             and observation.convergence_seconds is not None
         ):
             return observation
-        episode = database.execute(
+        episodes = database.execute(
             """
-            SELECT entry_spread_bps, convergence_target_bps, peak_spread_bps, started_at
+            SELECT spread_bucket_index, entry_spread_bps, convergence_target_bps,
+                   peak_spread_bps, started_at
             FROM route_calibration_episodes
             WHERE route = ? AND size_bucket_multiplier = ? AND epoch_id = ?
+            ORDER BY spread_bucket_index
             """,
             key,
-        ).fetchone()
-        if episode is not None:
-            entry = Decimal(str(episode[0]))
-            target = Decimal(str(episode[1]))
-            peak = max(Decimal(str(episode[2])), observation.spread_bps)
-            started = datetime.fromisoformat(str(episode[3])).astimezone(UTC)
+        ).fetchall()
+        completed_samples: list[RouteCalibrationEpisodeSample] = []
+        timed_out = self._maximum_holding_seconds is not None and any(
+            observation.spread_bps > Decimal(str(episode[2]))
+            and observation.observed_at - datetime.fromisoformat(str(episode[4])).astimezone(UTC)
+            >= timedelta(seconds=self._maximum_holding_seconds)
+            for episode in episodes
+        )
+        open_buckets: set[int] = set()
+        for episode in episodes:
+            bucket_index = int(episode[0])
+            open_buckets.add(bucket_index)
+            entry = Decimal(str(episode[1]))
+            target = Decimal(str(episode[2]))
+            peak = max(Decimal(str(episode[3])), observation.spread_bps)
+            started = datetime.fromisoformat(str(episode[4])).astimezone(UTC)
             elapsed_seconds = max(0, int((observation.observed_at - started).total_seconds()))
-            if observation.spread_bps <= target:
+            converged = observation.spread_bps <= target
+            episode_timed_out = timed_out and not converged
+            if converged or episode_timed_out:
                 database.execute(
                     """
                     DELETE FROM route_calibration_episodes
                     WHERE route = ? AND size_bucket_multiplier = ? AND epoch_id = ?
+                      AND spread_bucket_index = ?
                     """,
-                    key,
+                    (*key, bucket_index),
                 )
-                return replace(
-                    observation,
-                    adverse_excursion_after_entry_bps=max(Decimal(0), peak - entry),
-                    convergence_seconds=Decimal(elapsed_seconds),
-                    episode_peak_spread_bps=peak,
-                    episode_entry_spread_bps=entry,
+                open_buckets.discard(bucket_index)
+                completed_samples.append(
+                    RouteCalibrationEpisodeSample(
+                        entry,
+                        peak,
+                        Decimal(elapsed_seconds),
+                        bucket_index,
+                        episode_timed_out,
+                    )
                 )
-            if (
-                self._maximum_holding_seconds is not None
-                and elapsed_seconds >= self._maximum_holding_seconds
-            ):
+            else:
                 database.execute(
                     """
-                    DELETE FROM route_calibration_episodes
+                    UPDATE route_calibration_episodes SET peak_spread_bps = ?
                     WHERE route = ? AND size_bucket_multiplier = ? AND epoch_id = ?
+                      AND spread_bucket_index = ?
                     """,
-                    key,
+                    (str(peak), *key, bucket_index),
                 )
-                return replace(
-                    observation,
-                    adverse_excursion_after_entry_bps=max(Decimal(0), peak - entry),
-                    convergence_seconds=Decimal(elapsed_seconds),
-                    reason=ReasonCode.CALIBRATION_REGIME_SHIFT,
-                    episode_peak_spread_bps=peak,
-                    episode_entry_spread_bps=entry,
-                )
-            database.execute(
-                """
-                UPDATE route_calibration_episodes SET peak_spread_bps = ?
-                WHERE route = ? AND size_bucket_multiplier = ? AND epoch_id = ?
-                """,
-                (str(peak), *key),
-            )
-            return observation
         last_invalid = max(
             (index for index, item in enumerate(history) if item.reason != ReasonCode.QUOTE_READY),
             default=-1,
@@ -2538,33 +2727,67 @@ class PersistentRouteCalibrator:
             for item in history[last_invalid + 1 :]
             if item.reason == ReasonCode.QUOTE_READY and item.spread_bps is not None
         )
+        entry_thresholds: tuple[Decimal, ...]
+        convergence_targets: tuple[Decimal, ...]
         if previous is not None and previous.epoch_id == observation.epoch_id:
-            entry_threshold = previous.entry_levels_bps[0]
-            convergence_target = previous.target_close_reference_bps
+            grid_aligned = True
+            entry_thresholds = previous.entry_levels_bps
+            convergence_targets = tuple(
+                previous.target_close_bps(threshold) for threshold in entry_thresholds
+            )
         elif len(segment) >= 5:
-            entry_threshold = _quantile(segment, Decimal("0.90"))
-            convergence_target = _quantile(segment, Decimal("0.50"))
+            grid_aligned = False
+            entry_thresholds = (_quantile(segment, Decimal("0.90")),)
+            convergence_targets = (_quantile(segment, Decimal("0.50")),)
         else:
-            return observation
-        if observation.spread_bps >= entry_threshold:
+            grid_aligned = False
+            entry_thresholds = ()
+            convergence_targets = ()
+        if timed_out:
             database.execute(
                 """
-                INSERT INTO route_calibration_episodes(
-                    route, size_bucket_multiplier, epoch_id,
-                    entry_spread_bps, convergence_target_bps, peak_spread_bps, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(route, size_bucket_multiplier, epoch_id) DO UPDATE SET
-                    entry_spread_bps = excluded.entry_spread_bps,
-                    convergence_target_bps = excluded.convergence_target_bps,
-                    peak_spread_bps = excluded.peak_spread_bps,
-                    started_at = excluded.started_at
+                DELETE FROM route_calibration_episodes
+                WHERE route = ? AND size_bucket_multiplier = ? AND epoch_id = ?
                 """,
-                (
-                    *key,
-                    str(observation.spread_bps),
-                    str(convergence_target),
-                    str(observation.spread_bps),
-                    observation.observed_at.isoformat(),
-                ),
+                key,
             )
-        return observation
+        else:
+            for bucket_index, (entry_threshold, convergence_target) in enumerate(
+                zip(entry_thresholds, convergence_targets, strict=True)
+            ):
+                if bucket_index in open_buckets or observation.spread_bps < entry_threshold:
+                    continue
+                database.execute(
+                    """
+                    INSERT INTO route_calibration_episodes(
+                        route, size_bucket_multiplier, epoch_id, spread_bucket_index,
+                        entry_spread_bps, convergence_target_bps, peak_spread_bps, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(
+                        route, size_bucket_multiplier, epoch_id, spread_bucket_index
+                    ) DO NOTHING
+                    """,
+                    (
+                        *key,
+                        bucket_index,
+                        str(entry_threshold if grid_aligned else observation.spread_bps),
+                        str(convergence_target),
+                        str(observation.spread_bps),
+                        observation.observed_at.isoformat(),
+                    ),
+                )
+        if not completed_samples:
+            return observation
+        representative = completed_samples[-1]
+        return replace(
+            observation,
+            adverse_excursion_after_entry_bps=max(
+                max(Decimal(0), sample.peak_spread_bps - sample.entry_spread_bps)
+                for sample in completed_samples
+            ),
+            convergence_seconds=max(sample.convergence_seconds for sample in completed_samples),
+            reason=(ReasonCode.CALIBRATION_REGIME_SHIFT if timed_out else observation.reason),
+            episode_peak_spread_bps=max(sample.peak_spread_bps for sample in completed_samples),
+            episode_entry_spread_bps=representative.entry_spread_bps,
+            episode_samples=tuple(completed_samples),
+        )

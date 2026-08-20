@@ -1278,7 +1278,30 @@ class PublicMarketEngine:
         for _ in range(4):
             await asyncio.sleep(0)
         self._process_route_calibration_funding_tasks(instruments)
-        return dict(self._route_calibration_funding)
+        # The cache may still contain a snapshot from the adapter generation
+        # that was current at the beginning of this scan.  A reconnect can
+        # advance the venue generation while an asynchronous refresh is still
+        # pending; returning that older snapshot would mix pre-reconnect
+        # funding with post-reconnect L2.  Expose only cache entries that are
+        # current at this exact read boundary.  Everything else remains
+        # retained solely as an implementation detail until the worker
+        # replaces it, while the observation builder fails closed with
+        # FUNDING_UNKNOWN.
+        qualified: dict[BookKey, FundingSnapshot] = {}
+        read_ns = self._monotonic_ns()
+        for key, snapshot in self._route_calibration_funding.items():
+            observed_ns = self._route_calibration_funding_observed_ns.get(key)
+            if (
+                key in instruments
+                and key[0] not in self._quarantined
+                and self._route_calibration_funding_generation.get(key)
+                == self._venue_refresh_generations.get(key[0], 0)
+                and observed_ns is not None
+                and observed_ns <= read_ns
+                and read_ns - observed_ns <= maximum_age_ns
+            ):
+                qualified[key] = snapshot
+        return qualified
 
     def _retire_route_calibration_funding_task(
         self,

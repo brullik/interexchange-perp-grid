@@ -139,6 +139,52 @@ async def test_version_seven_route_calibration_schema_migrates_before_indexes(
 
 
 @pytest.mark.asyncio
+async def test_version_ten_open_episode_migrates_fail_closed_to_bucket_schema(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-v10.sqlite3"
+    with sqlite3.connect(path) as database:
+        database.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        database.execute("INSERT INTO metadata VALUES ('schema_version', '10')")
+        database.execute(
+            """
+            CREATE TABLE route_calibration_episodes (
+                route TEXT NOT NULL,
+                size_bucket_multiplier TEXT NOT NULL,
+                epoch_id TEXT NOT NULL,
+                entry_spread_bps TEXT NOT NULL,
+                convergence_target_bps TEXT NOT NULL,
+                peak_spread_bps TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                PRIMARY KEY(route, size_bucket_multiplier, epoch_id)
+            )
+            """
+        )
+        database.execute(
+            """
+            INSERT INTO route_calibration_episodes VALUES (
+                'BTC:bybit>okx', '1', 'legacy', '10', '5', '12',
+                '2026-08-16T00:00:00+00:00'
+            )
+            """
+        )
+
+    await initialise_state(path)
+
+    with sqlite3.connect(path) as database:
+        columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(route_calibration_episodes)")
+        }
+        assert "spread_bucket_index" in columns
+        assert database.execute(
+            "SELECT spread_bucket_index FROM route_calibration_episodes"
+        ).fetchone() == (0,)
+        assert database.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == (SCHEMA_VERSION,)
+
+
+@pytest.mark.asyncio
 async def test_version_nine_adds_transient_calibration_gate(tmp_path: Path) -> None:
     path = tmp_path / "legacy-v9.sqlite3"
     with sqlite3.connect(path) as database:

@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -22,7 +25,8 @@ from interexchange_perp_grid.execution import (
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
+STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS = 1.0
 SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
@@ -184,11 +188,12 @@ SCHEMA_STATEMENTS = (
         route TEXT NOT NULL,
         size_bucket_multiplier TEXT NOT NULL,
         epoch_id TEXT NOT NULL,
+        spread_bucket_index INTEGER NOT NULL CHECK (spread_bucket_index BETWEEN 0 AND 4),
         entry_spread_bps TEXT NOT NULL,
         convergence_target_bps TEXT NOT NULL,
         peak_spread_bps TEXT NOT NULL,
         started_at TEXT NOT NULL,
-        PRIMARY KEY(route, size_bucket_multiplier, epoch_id)
+        PRIMARY KEY(route, size_bucket_multiplier, epoch_id, spread_bucket_index)
     )
     """,
     """
@@ -287,6 +292,59 @@ class CommandAudit:
     created_at: datetime
 
 
+class StateTransitionDeadlineError(RuntimeError):
+    """A daemon SQLite transition did not reach a knowable terminal state."""
+
+
+class _DaemonStateWorker:
+    def __init__(self, operation: Callable[[], None], *, name: str) -> None:
+        self._operation = operation
+        self._done = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def _run(self) -> None:
+        try:
+            self._operation()
+        except BaseException as error:
+            self._error = error
+        finally:
+            self._done.set()
+
+    def result(self) -> None:
+        if not self.done:
+            raise RuntimeError("state transition worker is not terminal")
+        if self._error is not None:
+            raise self._error
+
+
+async def _await_daemon_state_worker(
+    worker: _DaemonStateWorker,
+    *,
+    deadline_monotonic: float,
+) -> None:
+    loop = asyncio.get_running_loop()
+    while not worker.done:
+        remaining = deadline_monotonic - loop.time()
+        if remaining <= 0:
+            raise StateTransitionDeadlineError(
+                "SQLite state transition did not finish before its terminal deadline"
+            )
+        try:
+            await asyncio.sleep(min(0.005, remaining))
+        except asyncio.CancelledError:
+            # The native thread cannot be cancelled.  Continue only until the
+            # fixed terminal deadline, then surface an explicit indeterminate
+            # transition while the daemon worker cannot block process exit.
+            continue
+    worker.result()
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     database = sqlite3.connect(path, timeout=30)
     database.execute("PRAGMA busy_timeout=30000")
@@ -317,6 +375,7 @@ def _initialise_state_sync(path: Path) -> None:
             "7",
             "8",
             "9",
+            "10",
             SCHEMA_VERSION,
         }:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
@@ -337,6 +396,98 @@ def _initialise_state_sync(path: Path) -> None:
                 database.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy_v7")
             for statement in SCHEMA_STATEMENTS:
                 database.execute(statement)
+        episode_columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(route_calibration_episodes)")
+        }
+        if "spread_bucket_index" not in episode_columns:
+            # Schema v10 allowed only one open episode per route/size.  Preserve
+            # its timeout/adverse evidence across the migration when the
+            # persisted entry levels identify its bucket.  If that mapping is
+            # unavailable, retain the row in bucket zero but deactivate the
+            # parameter so it cannot be exposed until a fresh calibration.
+            database.execute(
+                "ALTER TABLE route_calibration_episodes "
+                "RENAME TO route_calibration_episodes_legacy_v10"
+            )
+            database.execute(
+                """
+                CREATE TABLE route_calibration_episodes (
+                    route TEXT NOT NULL,
+                    size_bucket_multiplier TEXT NOT NULL,
+                    epoch_id TEXT NOT NULL,
+                    spread_bucket_index INTEGER NOT NULL
+                        CHECK (spread_bucket_index BETWEEN 0 AND 4),
+                    entry_spread_bps TEXT NOT NULL,
+                    convergence_target_bps TEXT NOT NULL,
+                    peak_spread_bps TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    PRIMARY KEY(
+                        route, size_bucket_multiplier, epoch_id, spread_bucket_index
+                    )
+                )
+                """
+            )
+            legacy_episodes = database.execute(
+                """
+                SELECT route, size_bucket_multiplier, epoch_id, entry_spread_bps,
+                       convergence_target_bps, peak_spread_bps, started_at
+                FROM route_calibration_episodes_legacy_v10
+                """
+            ).fetchall()
+            for episode in legacy_episodes:
+                route_value = str(episode[0])
+                size_value = str(episode[1])
+                entry_spread = Decimal(str(episode[3]))
+                bucket_index = 0
+                mapped = False
+                parameter_row = database.execute(
+                    """
+                    SELECT payload_json FROM route_calibration_parameters
+                    WHERE route = ? AND size_bucket_multiplier = ?
+                    """,
+                    (route_value, size_value),
+                ).fetchone()
+                if parameter_row is not None:
+                    try:
+                        payload = json.loads(str(parameter_row[0]))
+                        levels = tuple(Decimal(str(value)) for value in payload["entry_levels_bps"])
+                        if len(levels) == 5 and entry_spread >= levels[0]:
+                            bucket_index = max(
+                                index
+                                for index, lower_bound in enumerate(levels)
+                                if entry_spread >= lower_bound
+                            )
+                            mapped = True
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        mapped = False
+                database.execute(
+                    """
+                    INSERT INTO route_calibration_episodes(
+                        route, size_bucket_multiplier, epoch_id, spread_bucket_index,
+                        entry_spread_bps, convergence_target_bps, peak_spread_bps, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        route_value,
+                        size_value,
+                        str(episode[2]),
+                        bucket_index,
+                        str(episode[3]),
+                        str(episode[4]),
+                        str(episode[5]),
+                        str(episode[6]),
+                    ),
+                )
+                if not mapped:
+                    database.execute(
+                        """
+                        UPDATE route_calibration_parameters
+                        SET active = 0, transient_blocked = 1
+                        WHERE route = ? AND size_bucket_multiplier = ?
+                        """,
+                        (route_value, size_value),
+                    )
+            database.execute("DROP TABLE route_calibration_episodes_legacy_v10")
         calibration_columns = {
             str(row[1])
             for row in database.execute("PRAGMA table_info(route_calibration_observations)")
@@ -972,7 +1123,14 @@ def _tranche_from_payload(payload: dict[str, Any]) -> Tranche:
     )
 
 
-def _save_tranche_sync(path: Path, tranche: Tranche, now: datetime) -> None:
+def _save_tranche_sync(
+    path: Path,
+    tranche: Tranche,
+    now: datetime,
+    deadline_monotonic: float | None,
+) -> None:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise TimeoutError("simulated tranche persistence deadline expired")
     payload = json.dumps(_tranche_to_payload(tranche), sort_keys=True, separators=(",", ":"))
     with _connect(path) as database:
         database.execute("BEGIN IMMEDIATE")
@@ -987,11 +1145,59 @@ def _save_tranche_sync(path: Path, tranche: Tranche, now: datetime) -> None:
             """,
             (tranche.tranche_id, tranche.state.value, payload, now.isoformat()),
         )
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            database.rollback()
+            raise TimeoutError("simulated tranche persistence deadline expired")
         database.commit()
 
 
-async def save_tranche(path: Path, tranche: Tranche, now: datetime | None = None) -> None:
-    await asyncio.to_thread(_save_tranche_sync, path, tranche, now or datetime.now(UTC))
+async def save_tranche(
+    path: Path,
+    tranche: Tranche,
+    now: datetime | None = None,
+    *,
+    deadline_monotonic: float | None = None,
+) -> None:
+    loop = asyncio.get_running_loop()
+    if deadline_monotonic is not None and loop.time() >= deadline_monotonic:
+        raise TimeoutError("simulated tranche persistence deadline expired")
+    terminal_deadline = min(
+        deadline_monotonic or float("inf"),
+        loop.time() + STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS,
+    )
+    worker = _DaemonStateWorker(
+        lambda: _save_tranche_sync(path, tranche, now or datetime.now(UTC), deadline_monotonic),
+        name=f"state-save-tranche-{tranche.tranche_id}",
+    )
+    await _await_daemon_state_worker(worker, deadline_monotonic=terminal_deadline)
+
+
+def _delete_tranche_sync(path: Path, tranche_id: str) -> None:
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        database.execute(
+            "DELETE FROM simulated_tranches WHERE tranche_id = ?",
+            (tranche_id,),
+        )
+        database.commit()
+
+
+async def delete_tranche(
+    path: Path,
+    tranche_id: str,
+    *,
+    timeout_seconds: float = STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS,
+) -> None:
+    if timeout_seconds <= 0:
+        raise ValueError("tranche deletion timeout must be positive")
+    worker = _DaemonStateWorker(
+        lambda: _delete_tranche_sync(path, tranche_id),
+        name=f"state-delete-tranche-{tranche_id}",
+    )
+    await _await_daemon_state_worker(
+        worker,
+        deadline_monotonic=asyncio.get_running_loop().time() + timeout_seconds,
+    )
 
 
 def _load_tranches_sync(path: Path) -> tuple[Tranche, ...]:

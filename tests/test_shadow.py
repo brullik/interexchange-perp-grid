@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,8 @@ from typing import Any, cast
 
 import pytest
 
+import interexchange_perp_grid.shadow as shadow_module
+import interexchange_perp_grid.state as state_module
 from interexchange_perp_grid.bbo_prefilter import BboPrefilterObservation
 from interexchange_perp_grid.candidate_l2 import CandidateL2Result, CandidateL2Stats
 from interexchange_perp_grid.config import load_settings
@@ -37,8 +40,11 @@ from interexchange_perp_grid.shadow import (
     WorkClass,
 )
 from interexchange_perp_grid.state import (
+    delete_tranche,
     initialise_state,
+    load_tranches,
     read_shadow_snapshot,
+    save_shadow_snapshot,
     save_tranche,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
@@ -261,6 +267,68 @@ async def test_active_close_is_evaluated_before_calibration_work(
     await evaluator.run(stop)
 
     assert events[:2] == ["close", "calibration"]
+
+
+@pytest.mark.asyncio
+async def test_indeterminate_close_persistence_latches_entry_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "indeterminate-close.sqlite3"
+    await initialise_state(state_path)
+    await save_tranche(state_path, hedged_tranche())
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    await runtime.reconcile({"T1"})
+    trader = ShadowTrader(settings, runtime)
+    quote = DirectedRouteQuote(
+        key=InstrumentKey("BTC", "USDT"),
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.OKX,
+        base_quantity=Decimal("0.1"),
+        eligible=True,
+        reason=ReasonCode.QUOTE_READY,
+        entry_long_vwap=Decimal(100),
+        entry_short_vwap=Decimal(110),
+        exit_long_vwap=Decimal(100),
+        exit_short_vwap=Decimal(100),
+        entry_spread=Decimal(10),
+        exit_spread=Decimal(0),
+        entry_spread_bps=Decimal(1000),
+        four_leg_fee_estimate=Decimal("0.4"),
+        funding_rate_delta=Decimal(0),
+    )
+    state_any = cast(Any, state_module)
+    original_sync_save = state_any._save_tranche_sync
+    writer_started = threading.Event()
+    writer_release = threading.Event()
+
+    def held_sync_save(*args: Any, **kwargs: Any) -> None:
+        writer_started.set()
+        writer_release.wait()
+        original_sync_save(*args, **kwargs)
+
+    monkeypatch.setattr(state_any, "_save_tranche_sync", held_sync_save)
+    closing = asyncio.create_task(trader.close_active((quote,)))
+    assert await asyncio.to_thread(writer_started.wait, 1)
+
+    with pytest.raises(RuntimeError, match="close persistence outcome is indeterminate"):
+        await asyncio.wait_for(closing, timeout=1.3)
+
+    assert runtime.tranches["T1"].state == PairActionState.CLOSED
+    assert (await load_tranches(state_path))[0].state == PairActionState.HEDGED
+    gate = await runtime.entry_gate()
+    assert gate.accepted is False
+    assert gate.reason == ReasonCode.RECONCILIATION_REQUIRED
+
+    writer_release.set()
+    for _ in range(100):
+        persisted = await load_tranches(state_path)
+        if persisted[0].state == PairActionState.CLOSED:
+            break
+        await asyncio.sleep(0.01)
+    assert persisted[0].state == PairActionState.CLOSED
 
 
 @pytest.mark.asyncio
@@ -655,20 +723,208 @@ async def test_shadow_trader_runs_calibration_risk_and_paired_fill_pipeline(
     original_reserve = trader._risk.reserve
 
     def delayed_reserve(request: Any) -> Any:
-        time.sleep(0.03)
+        time.sleep(0.06)
         return original_reserve(request)
 
     monkeypatch.setattr(trader._risk, "reserve", delayed_reserve)
     assert (
         await trader.process(
             scan,
-            decision_deadline=asyncio.get_running_loop().time() + 0.01,
+            decision_deadline=asyncio.get_running_loop().time() + 0.05,
         )
         == ()
     )
     assert runtime.tranches == {}
     assert trader._risk.reservations == ()
     monkeypatch.setattr(trader._risk, "reserve", original_reserve)
+
+    original_submit = trader._coordinator.submit_open
+    captured_tranches: list[Tranche] = []
+
+    def delayed_submit(
+        tranche: Tranche,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        time.sleep(0.06)
+        submitted = original_submit(tranche, *args, **kwargs)
+        captured_tranches.append(tranche)
+        return submitted
+
+    monkeypatch.setattr(trader._coordinator, "submit_open", delayed_submit)
+    assert (
+        await trader.process(
+            scan,
+            decision_deadline=asyncio.get_running_loop().time() + 0.05,
+        )
+        == ()
+    )
+    assert len(captured_tranches) == 1
+    assert captured_tranches[0].state == PairActionState.RISK_RESERVED
+    assert captured_tranches[0].all_fills == ()
+    assert runtime.tranches == {}
+    assert trader._risk.reservations == ()
+    monkeypatch.setattr(trader._coordinator, "submit_open", original_submit)
+
+    captured_after_mutation: list[Tranche] = []
+
+    def delayed_return_after_submit(
+        tranche: Tranche,
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        submitted = original_submit(tranche, *args, **kwargs)
+        captured_after_mutation.append(tranche)
+        time.sleep(0.06)
+        return submitted
+
+    monkeypatch.setattr(trader._coordinator, "submit_open", delayed_return_after_submit)
+    assert (
+        await trader.process(
+            scan,
+            decision_deadline=asyncio.get_running_loop().time() + 0.05,
+        )
+        == ()
+    )
+    assert len(captured_after_mutation) == 1
+    assert captured_after_mutation[0].state == PairActionState.RISK_RESERVED
+    assert captured_after_mutation[0].all_fills == ()
+    assert runtime.tranches == {}
+    assert trader._risk.reservations == ()
+    monkeypatch.setattr(trader._coordinator, "submit_open", original_submit)
+
+    original_save = save_tranche
+
+    async def save_only_after_deadline(*args: Any, **kwargs: Any) -> None:
+        deadline = cast(float, kwargs["deadline_monotonic"])
+        await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()) + 0.01)
+        await original_save(*args, **kwargs)
+
+    monkeypatch.setattr(shadow_module, "save_tranche", save_only_after_deadline)
+    assert (
+        await trader.process(
+            scan,
+            decision_deadline=asyncio.get_running_loop().time() + 0.02,
+        )
+        == ()
+    )
+    assert runtime.tranches == {}
+    assert trader._risk.reservations == ()
+    assert await load_tranches(state_path) == ()
+
+    async def return_only_after_persisted_deadline(*args: Any, **kwargs: Any) -> None:
+        await original_save(*args, **kwargs)
+        deadline = cast(float, kwargs["deadline_monotonic"])
+        await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()) + 0.01)
+
+    monkeypatch.setattr(shadow_module, "save_tranche", return_only_after_persisted_deadline)
+    assert (
+        await trader.process(
+            scan,
+            decision_deadline=asyncio.get_running_loop().time() + 0.05,
+        )
+        == ()
+    )
+    assert runtime.tranches == {}
+    assert trader._risk.reservations == ()
+    assert await load_tranches(state_path) == ()
+    monkeypatch.setattr(shadow_module, "save_tranche", original_save)
+
+    state_any = cast(Any, state_module)
+    original_sync_save = state_any._save_tranche_sync
+    writer_started = threading.Event()
+    writer_release = threading.Event()
+
+    def held_sync_save(*args: Any, **kwargs: Any) -> None:
+        writer_started.set()
+        if not writer_release.wait(2):
+            raise TimeoutError("test did not release tranche writer")
+        original_sync_save(*args, **kwargs)
+
+    monkeypatch.setattr(state_any, "_save_tranche_sync", held_sync_save)
+    cancelled_process = asyncio.create_task(
+        trader.process(
+            scan,
+            decision_deadline=asyncio.get_running_loop().time() + 2,
+        )
+    )
+    assert await asyncio.to_thread(writer_started.wait, 1)
+    cancelled_process.cancel()
+    await asyncio.sleep(0)
+    writer_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_process
+    assert len(runtime.tranches) == 1
+    assert len(trader._risk.reservations) == 1
+    persisted_after_cancellation = await load_tranches(state_path)
+    assert len(persisted_after_cancellation) == 1
+    cancelled_tranche_id = persisted_after_cancellation[0].tranche_id
+    assert cancelled_tranche_id in runtime.tranches
+
+    await delete_tranche(state_path, cancelled_tranche_id)
+    runtime.tranches.pop(cancelled_tranche_id)
+    trader._managed_ids.discard(cancelled_tranche_id)
+    trader._risk.release(cancelled_tranche_id)
+    monkeypatch.setattr(state_any, "_save_tranche_sync", original_sync_save)
+
+    failing_writer_started = threading.Event()
+    failing_writer_release = threading.Event()
+
+    def held_failing_sync_save(*_args: Any, **_kwargs: Any) -> None:
+        failing_writer_started.set()
+        if not failing_writer_release.wait(2):
+            raise TimeoutError("test did not release failing tranche writer")
+        raise OSError("simulated SQLite write failure")
+
+    monkeypatch.setattr(state_any, "_save_tranche_sync", held_failing_sync_save)
+    twice_cancelled_process = asyncio.create_task(
+        trader.process(
+            scan,
+            decision_deadline=asyncio.get_running_loop().time() + 2,
+        )
+    )
+    assert await asyncio.to_thread(failing_writer_started.wait, 1)
+    twice_cancelled_process.cancel()
+    await asyncio.sleep(0)
+    twice_cancelled_process.cancel()
+    failing_writer_release.set()
+    with pytest.raises(OSError, match="simulated SQLite write failure"):
+        await twice_cancelled_process
+    assert runtime.tranches == {}
+    assert trader._risk.reservations == ()
+    assert await load_tranches(state_path) == ()
+    monkeypatch.setattr(state_any, "_save_tranche_sync", original_sync_save)
+
+    original_sync_delete = state_any._delete_tranche_sync
+    delete_started = threading.Event()
+    delete_release = threading.Event()
+
+    def held_sync_delete(*args: Any, **kwargs: Any) -> None:
+        delete_started.set()
+        if not delete_release.wait(2):
+            raise TimeoutError("test did not release tranche deletion")
+        original_sync_delete(*args, **kwargs)
+
+    monkeypatch.setattr(shadow_module, "save_tranche", return_only_after_persisted_deadline)
+    monkeypatch.setattr(state_any, "_delete_tranche_sync", held_sync_delete)
+    cancelled_deletion_process = asyncio.create_task(
+        trader.process(
+            scan,
+            decision_deadline=asyncio.get_running_loop().time() + 0.05,
+        )
+    )
+    assert await asyncio.to_thread(delete_started.wait, 1)
+    cancelled_deletion_process.cancel()
+    await asyncio.sleep(0)
+    cancelled_deletion_process.cancel()
+    delete_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_deletion_process
+    assert runtime.tranches == {}
+    assert trader._risk.reservations == ()
+    assert await load_tranches(state_path) == ()
+    monkeypatch.setattr(state_any, "_delete_tranche_sync", original_sync_delete)
+    monkeypatch.setattr(shadow_module, "save_tranche", original_save)
 
     decisions = await trader.process(scan)
     assert len(decisions) == 1
@@ -679,6 +935,70 @@ async def test_shadow_trader_runs_calibration_risk_and_paired_fill_pipeline(
     assert opened.actual_long_entry_quantity == Decimal("1")
     assert opened.actual_short_entry_quantity == Decimal("1")
     assert opened.projected_stress_usdt <= Decimal("5")
+
+    await save_shadow_snapshot(
+        state_path,
+        {
+            "opportunities": [
+                {
+                    "key": {"base": "BTC"},
+                    "long_venue": Venue.BYBIT.value,
+                    "short_venue": Venue.OKX.value,
+                    "exit_long_vwap": "104",
+                    "exit_short_vwap": "105",
+                }
+            ]
+        },
+    )
+    assert await runtime.close_all_simulated() == (opened.tranche_id,)
+    assert trader._risk.reservations == ()
+    assert (await load_tranches(state_path))[0].state == PairActionState.FORCED_CLOSED
+    await runtime.resume()
+    await delete_tranche(state_path, opened.tranche_id)
+    runtime.tranches.pop(opened.tranche_id)
+    trader._managed_ids.discard(opened.tranche_id)
+
+    hung_writer_started = threading.Event()
+    hung_writer_release = threading.Event()
+
+    def hung_sync_save(*args: Any, **kwargs: Any) -> None:
+        hung_writer_started.set()
+        hung_writer_release.wait()
+        original_sync_save(*args, **kwargs)
+
+    monkeypatch.setattr(state_any, "_save_tranche_sync", hung_sync_save)
+    hung_process = asyncio.create_task(
+        trader.process(
+            scan,
+            decision_deadline=asyncio.get_running_loop().time() + 2,
+        )
+    )
+    assert await asyncio.to_thread(hung_writer_started.wait, 1)
+    hung_process.cancel()
+    await asyncio.sleep(0)
+    hung_process.cancel()
+    bounded_started = asyncio.get_running_loop().time()
+    with pytest.raises(RuntimeError, match="persistence outcome is indeterminate"):
+        await asyncio.wait_for(hung_process, timeout=1.3)
+    assert asyncio.get_running_loop().time() - bounded_started < 1.3
+    assert len(runtime.tranches) == 1
+    assert len(trader._risk.reservations) == 1
+    assert (await runtime.entry_gate()).reason == ReasonCode.RECONCILIATION_REQUIRED
+
+    hung_writer_release.set()
+    for _ in range(100):
+        persisted_hung = await load_tranches(state_path)
+        if persisted_hung:
+            break
+        await asyncio.sleep(0.01)
+    assert len(persisted_hung) == 1
+    hung_tranche_id = persisted_hung[0].tranche_id
+    assert hung_tranche_id in runtime.tranches
+    await delete_tranche(state_path, hung_tranche_id)
+    runtime.tranches.pop(hung_tranche_id)
+    trader._managed_ids.discard(hung_tranche_id)
+    trader._risk.release(hung_tranche_id)
+    monkeypatch.setattr(state_any, "_save_tranche_sync", original_sync_save)
 
 
 @pytest.mark.asyncio
