@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -57,22 +59,23 @@ async def _prepare(
     pair_id: str = "pair-1",
     long_client_id: str = "pair-1-long",
     short_client_id: str = "pair-1-short",
+    route: DirectedRouteKey = _ROUTE,
 ) -> LiveJournalAction:
-    long_request = _request(Venue.BINANCE_USDM, long_client_id, Side.BUY)
-    short_request = _request(Venue.OKX, short_client_id, Side.SELL)
+    long_request = _request(route.long_venue, long_client_id, Side.BUY)
+    short_request = _request(route.short_venue, short_client_id, Side.SELL)
     return await journal.prepare(
         pair_id,
-        _ROUTE,
+        route,
         "tranche-1",
         long_request,
         short_request,
         {
-            Venue.BINANCE_USDM: Decimal("0.001"),
-            Venue.OKX: Decimal("0.001"),
+            route.long_venue: Decimal("0.001"),
+            route.short_venue: Decimal("0.001"),
         },
         {
-            Venue.BINANCE_USDM: Decimal("100.1"),
-            Venue.OKX: Decimal("99.9"),
+            route.long_venue: Decimal("100.1"),
+            route.short_venue: Decimal("99.9"),
         },
         {"reservation_id": "risk-1", "projected_stress_usdt": "0.8"},
         _QUALIFICATION,
@@ -80,7 +83,7 @@ async def _prepare(
 
 
 @pytest.mark.asyncio
-async def test_prepare_is_atomic_durable_and_blocks_restart_entry(tmp_path: Path) -> None:
+async def test_prepare_is_atomic_durable_and_blocks_same_base_restart_entry(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     journal = LiveOrderJournal(path)
     await journal.initialise()
@@ -96,13 +99,332 @@ async def test_prepare_is_atomic_durable_and_blocks_restart_entry(tmp_path: Path
     active = await restarted.active()
     assert active is not None
     assert active.state == LiveActionState.PREPARED
-    with pytest.raises(RuntimeError, match="unreconciled live action"):
+    with pytest.raises(RuntimeError, match="lease is already held"):
         await _prepare(
             restarted,
             "pair-2",
             "pair-2-long",
             "pair-2-short",
         )
+
+
+@pytest.mark.asyncio
+async def test_journal_allows_ten_distinct_bases_and_releases_durable_leases(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    for index in range(10):
+        await _prepare(
+            journal,
+            f"pair-{index}",
+            f"pair-{index}-long",
+            f"pair-{index}-short",
+            DirectedRouteKey(f"A{index:03d}", Venue.BINANCE_USDM, Venue.OKX),
+        )
+    active = await journal.active_actions()
+    assert tuple(action.pair_action_id for action in active) == tuple(
+        f"pair-{index}" for index in range(10)
+    )
+    with pytest.raises(RuntimeError, match="multiple live actions"):
+        await journal.active()
+
+    restarted = LiveOrderJournal(journal.path)
+    await restarted.initialise()
+    assert len(await restarted.active_actions()) == 10
+    with pytest.raises(RuntimeError, match="lease is already held"):
+        await _prepare(
+            restarted,
+            "same-base-after-restart",
+            "same-base-after-restart-long",
+            "same-base-after-restart-short",
+            DirectedRouteKey("A000", Venue.BYBIT, Venue.OKX),
+        )
+    journal = restarted
+    with pytest.raises(RuntimeError, match="maximum active live action"):
+        await _prepare(
+            journal,
+            "pair-10",
+            "pair-10-long",
+            "pair-10-short",
+            DirectedRouteKey("A010", Venue.BINANCE_USDM, Venue.OKX),
+        )
+
+    await journal.transition("pair-0", LiveActionState.QUARANTINED)
+    await journal.transition("pair-0", LiveActionState.FLAT)
+    replacement = await _prepare(
+        journal,
+        "pair-replacement",
+        "pair-replacement-long",
+        "pair-replacement-short",
+        DirectedRouteKey("A000", Venue.BYBIT, Venue.OKX),
+    )
+    assert replacement.route.base == "A000"
+
+
+@pytest.mark.asyncio
+async def test_initialise_rebuilds_missing_leases_for_legacy_active_action(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    await _prepare(journal)
+    with sqlite3.connect(path) as database:
+        database.execute("DELETE FROM live_action_leases")
+
+    restarted = LiveOrderJournal(path)
+    await restarted.initialise()
+    with pytest.raises(RuntimeError, match="lease is already held"):
+        await _prepare(
+            restarted,
+            "pair-conflict",
+            "pair-conflict-long",
+            "pair-conflict-short",
+        )
+
+
+@pytest.mark.asyncio
+async def test_initialise_rejects_more_than_ten_legacy_active_actions(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    for index in range(10):
+        await _prepare(
+            journal,
+            f"pair-{index}",
+            f"pair-{index}-long",
+            f"pair-{index}-short",
+            DirectedRouteKey(f"A{index:03d}", Venue.BINANCE_USDM, Venue.OKX),
+        )
+    with sqlite3.connect(path) as database:
+        database.execute(
+            """
+            INSERT INTO live_pair_actions (
+                pair_action_id, route_base, long_venue, short_venue, tranche_id,
+                state, risk_reservation_json, qualification_hash, residual_delta,
+                recovery_action, created_at, updated_at
+            ) SELECT ?, ?, long_venue, short_venue, tranche_id, state,
+                     risk_reservation_json, qualification_hash, residual_delta,
+                     recovery_action, created_at, updated_at
+              FROM live_pair_actions WHERE pair_action_id = ?
+            """,
+            ("legacy-over-limit", "A010", "pair-0"),
+        )
+
+    restarted = LiveOrderJournal(path)
+    with pytest.raises(RuntimeError, match="legacy active live actions exceed"):
+        await restarted.initialise()
+
+
+@pytest.mark.asyncio
+async def test_initialise_rejects_legacy_emergency_beside_normal_action(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    await _prepare(
+        journal,
+        "normal-eth",
+        "normal-eth-long",
+        "normal-eth-short",
+        DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+    )
+    with sqlite3.connect(path) as database:
+        database.execute(
+            """
+            INSERT INTO live_pair_actions (
+                pair_action_id, route_base, long_venue, short_venue, tranche_id,
+                state, risk_reservation_json, qualification_hash, residual_delta,
+                recovery_action, created_at, updated_at
+            ) SELECT ?, ?, long_venue, short_venue, tranche_id, state,
+                     risk_reservation_json, qualification_hash, residual_delta,
+                     'EMERGENCY_FLATTEN', created_at, updated_at
+              FROM live_pair_actions WHERE pair_action_id = ?
+            """,
+            ("legacy-emergency", "BTC", "normal-eth"),
+        )
+        database.execute("DELETE FROM live_action_leases")
+
+    restarted = LiveOrderJournal(path)
+    with pytest.raises(RuntimeError, match="requires exclusive active ownership"):
+        await restarted.initialise()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_base_prepare_has_exactly_one_durable_winner(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    results = await asyncio.gather(
+        _prepare(
+            journal,
+            "pair-left",
+            "pair-left-long",
+            "pair-left-short",
+            DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX),
+        ),
+        _prepare(
+            journal,
+            "pair-right",
+            "pair-right-long",
+            "pair-right-short",
+            DirectedRouteKey("BTC", Venue.BYBIT, Venue.OKX),
+        ),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, LiveJournalAction) for result in results) == 1
+    assert sum(isinstance(result, RuntimeError) for result in results) == 1
+    assert len(await journal.active_actions()) == 1
+
+
+@pytest.mark.asyncio
+async def test_emergency_action_holds_same_durable_route_leases(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    requests = tuple(
+        replace(
+            _request(venue, f"emergency-{venue.value}", side),
+            order_type="market",
+            price=None,
+            time_in_force=None,
+        )
+        for venue, side in (
+            (Venue.BINANCE_USDM, Side.SELL),
+            (Venue.OKX, Side.BUY),
+        )
+    )
+    await journal.prepare_emergency(
+        "emergency-pair",
+        _ROUTE,
+        "emergency-tranche",
+        requests,
+        {request.client_order_id: Decimal("0.001") for request in requests},
+        {"action": "EMERGENCY_FLATTEN"},
+        _QUALIFICATION,
+    )
+    with pytest.raises(RuntimeError, match="lease is already held"):
+        await _prepare(
+            journal,
+            "normal-pair",
+            "normal-pair-long",
+            "normal-pair-short",
+        )
+    with pytest.raises(RuntimeError, match="global emergency"):
+        await _prepare(
+            journal,
+            "different-base",
+            "different-base-long",
+            "different-base-short",
+            DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+        )
+
+
+@pytest.mark.asyncio
+async def test_flat_action_cannot_reactivate_over_replacement_base_lease(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal, "old", "old-long", "old-short")
+    await journal.transition("old", LiveActionState.QUARANTINED)
+    await journal.transition("old", LiveActionState.FLAT)
+    await _prepare(journal, "replacement", "replacement-long", "replacement-short")
+
+    with pytest.raises(RuntimeError, match="lease conflict"):
+        await journal.transition("old", LiveActionState.QUARANTINED)
+    old = await journal.load("old")
+    assert old is not None and old.state == LiveActionState.FLAT
+    assert tuple(action.pair_action_id for action in await journal.active_actions()) == (
+        "replacement",
+    )
+
+
+@pytest.mark.asyncio
+async def test_flat_emergency_cannot_reactivate_beside_different_base(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    requests = tuple(
+        replace(
+            _request(venue, f"emergency-{venue.value}", side),
+            order_type="market",
+            price=None,
+            time_in_force=None,
+        )
+        for venue, side in (
+            (Venue.BINANCE_USDM, Side.SELL),
+            (Venue.OKX, Side.BUY),
+        )
+    )
+    await journal.prepare_emergency(
+        "emergency-pair",
+        _ROUTE,
+        "emergency-tranche",
+        requests,
+        {request.client_order_id: Decimal("0.001") for request in requests},
+        {"action": "EMERGENCY_FLATTEN"},
+        _QUALIFICATION,
+    )
+    await journal.transition("emergency-pair", LiveActionState.QUARANTINED)
+    await journal.transition("emergency-pair", LiveActionState.FLAT)
+    await _prepare(
+        journal,
+        "normal-eth",
+        "normal-eth-long",
+        "normal-eth-short",
+        DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+    )
+
+    with pytest.raises(RuntimeError, match="requires exclusive active ownership"):
+        await journal.transition("emergency-pair", LiveActionState.QUARANTINED)
+    emergency = await journal.load("emergency-pair")
+    assert emergency is not None and emergency.state == LiveActionState.FLAT
+    assert tuple(action.pair_action_id for action in await journal.active_actions()) == (
+        "normal-eth",
+    )
+
+
+@pytest.mark.asyncio
+async def test_noncanonical_route_base_is_rejected_before_lease_creation(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    with pytest.raises(ValueError, match="canonical uppercase"):
+        await _prepare(
+            journal,
+            "lowercase",
+            "lowercase-long",
+            "lowercase-short",
+            DirectedRouteKey("btc", Venue.BINANCE_USDM, Venue.OKX),
+        )
+    assert await journal.active_actions() == ()
+
+
+@pytest.mark.asyncio
+async def test_active_actions_returns_one_consistent_read_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal)
+    loaded = threading.Event()
+    release = threading.Event()
+    original = LiveOrderJournal._load_in_transaction
+
+    def pause_after_snapshot_load(
+        self: LiveOrderJournal,
+        database: sqlite3.Connection,
+        pair_action_id: str,
+    ) -> LiveJournalAction | None:
+        action = original(self, database, pair_action_id)
+        loaded.set()
+        release.wait(timeout=2)
+        return action
+
+    monkeypatch.setattr(LiveOrderJournal, "_load_in_transaction", pause_after_snapshot_load)
+    reader = asyncio.create_task(journal.active_actions())
+    assert await asyncio.to_thread(loaded.wait, 2)
+    await journal.transition("pair-1", LiveActionState.QUARANTINED)
+    await journal.transition("pair-1", LiveActionState.FLAT)
+    release.set()
+    snapshot = await reader
+
+    assert len(snapshot) == 1 and snapshot[0].state == LiveActionState.PREPARED
+    assert await journal.active_actions() == ()
 
 
 @pytest.mark.asyncio
@@ -189,6 +511,24 @@ async def test_reusing_a_client_id_after_flat_is_rejected(tmp_path: Path) -> Non
             "pair-1-long",
             "pair-2-short",
         )
+
+
+@pytest.mark.asyncio
+async def test_late_event_after_flat_is_audited_without_reactivating_action(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal)
+    await journal.mark_submit_attempted("pair-1", ("pair-1-long", "pair-1-short"))
+    await journal.transition("pair-1", LiveActionState.REJECTED)
+    await journal.transition("pair-1", LiveActionState.FLAT)
+
+    with pytest.raises(JournalEventQuarantinedError, match="EVENT_AFTER_FLAT"):
+        await journal.record_order_event("pair-1", _event(), "late-after-flat")
+
+    action = await journal.load("pair-1")
+    assert action is not None and action.state == LiveActionState.FLAT
+    assert await journal.active_actions() == ()
+    assert await journal.event_watermark() == 1
 
 
 def test_request_hash_changes_with_exact_payload() -> None:

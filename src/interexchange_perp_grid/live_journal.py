@@ -130,6 +130,9 @@ class JournalEventQuarantinedError(RuntimeError):
     pass
 
 
+MAX_ACTIVE_LIVE_ACTIONS = 10
+
+
 @dataclass(frozen=True, slots=True)
 class JournalLeg:
     client_order_id: str
@@ -252,6 +255,15 @@ class LiveOrderJournal:
                     payload_json TEXT NOT NULL,
                     observed_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS live_action_leases (
+                    lease_key TEXT PRIMARY KEY,
+                    lease_kind TEXT NOT NULL CHECK (lease_kind IN ('BASE', 'ROUTE')),
+                    pair_action_id TEXT NOT NULL REFERENCES live_pair_actions(pair_action_id)
+                        ON DELETE CASCADE,
+                    acquired_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_action_leases_pair
+                    ON live_action_leases(pair_action_id);
                 """
             )
             columns = {
@@ -259,6 +271,37 @@ class LiveOrderJournal:
             }
             if "last_event_at" not in columns:
                 database.execute("ALTER TABLE live_order_legs ADD COLUMN last_event_at TEXT")
+            database.execute("BEGIN IMMEDIATE")
+            try:
+                active_rows = database.execute(
+                    """
+                SELECT pair_action_id, route_base, long_venue, short_venue, created_at,
+                       recovery_action
+                    FROM live_pair_actions WHERE state <> ? ORDER BY created_at, pair_action_id
+                    """,
+                    (LiveActionState.FLAT.value,),
+                ).fetchall()
+                if len(active_rows) > MAX_ACTIVE_LIVE_ACTIONS:
+                    raise RuntimeError("legacy active live actions exceed the maximum limit")
+                for row in active_rows:
+                    route = DirectedRouteKey(
+                        str(row["route_base"]),
+                        Venue(str(row["long_venue"])),
+                        Venue(str(row["short_venue"])),
+                    )
+                    self._acquire_leases_in_transaction(
+                        database,
+                        str(row["pair_action_id"]),
+                        route,
+                        str(row["created_at"]),
+                        idempotent=True,
+                        emergency_exclusive=str(row["recovery_action"] or "")
+                        == "EMERGENCY_FLATTEN",
+                    )
+                database.commit()
+            except Exception:
+                database.rollback()
+                raise
 
     async def prepare(
         self,
@@ -302,6 +345,7 @@ class LiveOrderJournal:
     ) -> LiveJournalAction:
         if not pair_action_id.strip() or not tranche_id.strip():
             raise ValueError("pair action and tranche IDs must be non-empty")
+        self._require_canonical_route_base(route)
         requests = (long_request, short_request)
         if {request.venue for request in requests} != {
             route.long_venue,
@@ -314,14 +358,24 @@ class LiveOrderJournal:
             raise ValueError("qualification hash must be a SHA-256 hex digest")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
-            active = database.execute(
-                "SELECT pair_action_id, state FROM live_pair_actions WHERE state <> ? LIMIT 1",
-                (LiveActionState.FLAT.value,),
+            conflicting = database.execute(
+                "SELECT pair_action_id FROM live_action_leases WHERE lease_key IN (?, ?) LIMIT 1",
+                (f"base:{route.base}", f"route:{route.value}"),
             ).fetchone()
-            if active is not None:
+            if conflicting is not None:
                 database.rollback()
-                active_identity = f"{active['pair_action_id']}:{active['state']}"
-                raise RuntimeError(f"unreconciled live action blocks entry: {active_identity}")
+                raise RuntimeError(
+                    f"live route lease is already held by {conflicting['pair_action_id']}"
+                )
+            active_count = int(
+                database.execute(
+                    "SELECT count(*) FROM live_pair_actions WHERE state <> ?",
+                    (LiveActionState.FLAT.value,),
+                ).fetchone()[0]
+            )
+            if active_count >= MAX_ACTIVE_LIVE_ACTIONS:
+                database.rollback()
+                raise RuntimeError("maximum active live action limit reached")
             created = now.isoformat()
             database.execute(
                 """
@@ -343,6 +397,12 @@ class LiveOrderJournal:
                     created,
                     created,
                 ),
+            )
+            self._acquire_leases_in_transaction(
+                database,
+                pair_action_id,
+                route,
+                created,
             )
             for request in requests:
                 quantity = intended_base_quantities[request.venue]
@@ -475,6 +535,7 @@ class LiveOrderJournal:
     ) -> LiveJournalAction:
         if not requests or len({request.client_order_id for request in requests}) != len(requests):
             raise ValueError("emergency journal requires distinct non-empty order requests")
+        self._require_canonical_route_base(route)
         if any(request.order_type != "market" for request in requests):
             raise ValueError("standalone emergency journal only accepts emergency market requests")
         if len(qualification_hash) != 64:
@@ -509,6 +570,13 @@ class LiveOrderJournal:
                     observed,
                     observed,
                 ),
+            )
+            self._acquire_leases_in_transaction(
+                database,
+                pair_action_id,
+                route,
+                observed,
+                emergency_exclusive=True,
             )
             for request in requests:
                 quantity = intended_base_quantities[request.client_order_id]
@@ -782,7 +850,8 @@ class LiveOrderJournal:
         recovery_action: str | None = None,
     ) -> None:
         row = database.execute(
-            "SELECT state, residual_delta, recovery_action FROM live_pair_actions "
+            "SELECT state, residual_delta, recovery_action, route_base, long_venue, "
+            "short_venue FROM live_pair_actions "
             "WHERE pair_action_id = ?",
             (pair_action_id,),
         ).fetchone()
@@ -791,6 +860,27 @@ class LiveOrderJournal:
         previous = LiveActionState(str(row["state"]))
         if state not in _TRANSITIONS[previous]:
             raise ValueError(f"invalid live action transition {previous.value}->{state.value}")
+        if previous == LiveActionState.FLAT and state != LiveActionState.FLAT:
+            active_count = int(
+                database.execute(
+                    "SELECT count(*) FROM live_pair_actions WHERE state <> ?",
+                    (LiveActionState.FLAT.value,),
+                ).fetchone()[0]
+            )
+            if active_count >= MAX_ACTIVE_LIVE_ACTIONS:
+                raise RuntimeError("maximum active live action limit reached")
+            route = DirectedRouteKey(
+                str(row["route_base"]),
+                Venue(str(row["long_venue"])),
+                Venue(str(row["short_venue"])),
+            )
+            self._acquire_leases_in_transaction(
+                database,
+                pair_action_id,
+                route,
+                now.isoformat(),
+                emergency_exclusive=str(row["recovery_action"] or "") == "EMERGENCY_FLATTEN",
+            )
         next_delta = (
             str(residual_delta) if residual_delta is not None else str(row["residual_delta"])
         )
@@ -804,6 +894,11 @@ class LiveOrderJournal:
             """,
             (state.value, next_delta, next_recovery, observed, pair_action_id),
         )
+        if state == LiveActionState.FLAT:
+            database.execute(
+                "DELETE FROM live_action_leases WHERE pair_action_id = ?",
+                (pair_action_id,),
+            )
         database.execute(
             """
             INSERT INTO live_action_transitions (
@@ -989,7 +1084,7 @@ class LiveOrderJournal:
         if row is None:
             raise KeyError(pair_action_id)
         previous = LiveActionState(str(row["state"]))
-        if previous != LiveActionState.QUARANTINED:
+        if previous not in {LiveActionState.FLAT, LiveActionState.QUARANTINED}:
             database.execute(
                 """
                 UPDATE live_pair_actions
@@ -1037,6 +1132,9 @@ class LiveOrderJournal:
     async def active(self) -> LiveJournalAction | None:
         return await asyncio.to_thread(self._active_sync)
 
+    async def active_actions(self) -> tuple[LiveJournalAction, ...]:
+        return await asyncio.to_thread(self._active_actions_sync)
+
     async def known_client_order_ids(self) -> set[str]:
         return await asyncio.to_thread(self._known_client_order_ids_sync)
 
@@ -1046,16 +1144,88 @@ class LiveOrderJournal:
         return {str(row["client_order_id"]) for row in rows}
 
     def _active_sync(self) -> LiveJournalAction | None:
+        active = self._active_actions_sync()
+        if len(active) > 1:
+            raise RuntimeError("multiple live actions require active_actions()")
+        return active[0] if active else None
+
+    def _active_actions_sync(self) -> tuple[LiveJournalAction, ...]:
         with self._connect() as database:
-            row = database.execute(
+            database.execute("BEGIN")
+            rows = database.execute(
                 """
                 SELECT pair_action_id FROM live_pair_actions
                 WHERE state <> ?
-                ORDER BY created_at LIMIT 1
+                ORDER BY created_at, pair_action_id
                 """,
                 (LiveActionState.FLAT.value,),
+            ).fetchall()
+            actions = tuple(
+                self._load_in_transaction(database, str(row["pair_action_id"])) for row in rows
+            )
+        return tuple(action for action in actions if action is not None)
+
+    @staticmethod
+    def _require_canonical_route_base(route: DirectedRouteKey) -> None:
+        if route.base != route.base.strip().upper():
+            raise ValueError("route base must be canonical uppercase")
+
+    @staticmethod
+    def _acquire_leases_in_transaction(
+        database: sqlite3.Connection,
+        pair_action_id: str,
+        route: DirectedRouteKey,
+        acquired_at: str,
+        *,
+        idempotent: bool = False,
+        emergency_exclusive: bool = False,
+    ) -> None:
+        emergency_owner = database.execute(
+            "SELECT pair_action_id FROM live_action_leases WHERE lease_key = 'global:emergency'"
+        ).fetchone()
+        if emergency_owner is not None and str(emergency_owner["pair_action_id"]) != pair_action_id:
+            raise RuntimeError("global emergency live action lease is already held")
+        if emergency_exclusive:
+            other_active = database.execute(
+                "SELECT pair_action_id FROM live_pair_actions "
+                "WHERE state <> ? AND pair_action_id <> ? LIMIT 1",
+                (LiveActionState.FLAT.value, pair_action_id),
             ).fetchone()
-        return self._load_sync(str(row["pair_action_id"])) if row is not None else None
+            if other_active is not None:
+                raise RuntimeError(
+                    "global emergency live action requires exclusive active ownership"
+                )
+        leases = [
+            (f"base:{route.base.strip().upper()}", "BASE"),
+            (f"route:{route.value}", "ROUTE"),
+        ]
+        if emergency_exclusive:
+            leases.insert(0, ("global:emergency", "ROUTE"))
+        for lease_key, lease_kind in leases:
+            if idempotent:
+                database.execute(
+                    """
+                    INSERT OR IGNORE INTO live_action_leases (
+                        lease_key, lease_kind, pair_action_id, acquired_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (lease_key, lease_kind, pair_action_id, acquired_at),
+                )
+            else:
+                database.execute(
+                    """
+                    INSERT OR IGNORE INTO live_action_leases (
+                        lease_key, lease_kind, pair_action_id, acquired_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (lease_key, lease_kind, pair_action_id, acquired_at),
+                )
+            owner = database.execute(
+                "SELECT pair_action_id FROM live_action_leases WHERE lease_key = ?",
+                (lease_key,),
+            ).fetchone()
+            if owner is None or str(owner["pair_action_id"]) != pair_action_id:
+                raise RuntimeError(f"live action lease conflict: {lease_key}")
 
     def _load_sync(self, pair_action_id: str) -> LiveJournalAction | None:
         with self._connect() as database:
