@@ -49,11 +49,18 @@ from interexchange_perp_grid.market_universe import (
     UniverseSnapshot,
 )
 from interexchange_perp_grid.reason_codes import ReasonCode
+from interexchange_perp_grid.route_calibration import (
+    RouteCalibrationAssessment,
+    RouteCalibrationObservation,
+    RouteCalibrationSamplingPolicy,
+    build_route_calibration_observations,
+)
 from interexchange_perp_grid.routes import (
     DirectedRouteQuote,
     directed_pairs,
     evaluate_directed_route,
 )
+from interexchange_perp_grid.strategy import DirectedRouteKey
 
 AdapterFactory = Callable[[Venue], ExchangeAdapter]
 ReconnectJitter = Callable[[Venue, int], Decimal]
@@ -98,6 +105,7 @@ class ScanResult:
     bbo_cache: BboCacheStats | None = None
     prefilter_latency_ms: Decimal | None = None
     candidate_l2: CandidateL2Result | None = None
+    route_calibration: tuple[RouteCalibrationAssessment, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +223,29 @@ class PublicMarketEngine:
         self._candidate_l2_observations: tuple[CandidateL2RouteObservation, ...] = ()
         self._candidate_l2_decision_latency_ms = Decimal(0)
         self._candidate_l2_latency_samples: deque[Decimal] = deque(maxlen=2048)
+        self._route_calibration_funding: dict[BookKey, FundingSnapshot] = {}
+        self._route_calibration_funding_observed_ns: dict[BookKey, int] = {}
+        self._route_calibration_funding_generation: dict[BookKey, int] = {}
+        self._route_calibration_funding_tasks: dict[
+            BookKey, asyncio.Task[tuple[FundingSnapshot, int]]
+        ] = {}
+        self._route_calibration_funding_task_generation: dict[BookKey, int] = {}
+        self._route_calibration_funding_task_started_ns: dict[BookKey, int] = {}
+        self._retiring_route_calibration_funding_tasks: dict[
+            BookKey, asyncio.Task[tuple[FundingSnapshot, int]]
+        ] = {}
+        self._retiring_route_calibration_funding_started_ns: dict[BookKey, int] = {}
+        self._route_calibration_funding_transports: dict[
+            BookKey, asyncio.Task[FundingSnapshot]
+        ] = {}
+        self._retiring_route_calibration_funding_transports: dict[
+            BookKey, asyncio.Task[FundingSnapshot]
+        ] = {}
+        self._retiring_route_calibration_funding_transport_started_ns: dict[BookKey, int] = {}
+        self._retiring_route_calibration_funding_watchdogs: dict[BookKey, asyncio.Task[None]] = {}
+        self._route_calibration_funding_retry_after_ns: dict[BookKey, int] = {}
+        self._route_calibration_funding_cursor = 0
+        self._route_calibration_previous_routes: frozenset[DirectedRouteKey] = frozenset()
         self._candidate_l2_candidate_demand = settings.universe.max_dynamic_l2_candidates * 2
         self._last_candidate_l2_prefilter: tuple[BboPrefilterObservation, ...] = ()
         self._broad_bbo_admitted = True
@@ -224,6 +255,7 @@ class PublicMarketEngine:
             1.0,
             self._candidate_l2_watch_timeout_seconds,
         )
+        self._route_calibration_funding_timeout_ns = 1_000_000_000
         self._bbo_unsubscribe_timeout_seconds = self._candidate_l2_unsubscribe_timeout_seconds
         self._bbo_retirement_grace_seconds = min(
             0.1,
@@ -494,6 +526,7 @@ class PublicMarketEngine:
                 and venue not in self._bbo_unsubscribe_failures
                 and venue not in self._retiring_adapter_closers
                 and not self._venue_has_retiring_candidate_l2(venue)
+                and not self._venue_has_retiring_route_calibration_funding(venue)
             ):
                 return True
             recycled = await self._recycle_retired_venue_adapter_locked(venue, timeout_seconds)
@@ -536,6 +569,9 @@ class PublicMarketEngine:
             else:
                 l2_watcher.cancel()
                 self._retiring_candidate_l2_watchers[key] = l2_watcher
+        for key, funding_worker in tuple(self._route_calibration_funding_tasks.items()):
+            if key[0] == venue:
+                self._retire_route_calibration_funding_task(key, funding_worker)
         closer = self._retiring_adapter_closers.get(venue)
         if closer is None:
             closer = asyncio.create_task(
@@ -569,6 +605,16 @@ class PublicMarketEngine:
                 self._retiring_bbo_transports.get(venue),
                 self._retiring_bbo_unsubscribes.get(venue),
                 *self._retiring_candidate_l2_tasks_for_venue(venue),
+                *(
+                    task
+                    for key, task in self._retiring_route_calibration_funding_tasks.items()
+                    if key[0] == venue
+                ),
+                *(
+                    task
+                    for key, task in self._retiring_route_calibration_funding_transports.items()
+                    if key[0] == venue
+                ),
             )
             if task is not None and not task.done()
         )
@@ -576,6 +622,8 @@ class PublicMarketEngine:
             await asyncio.wait(retiring, timeout=self._bbo_retirement_grace_seconds)
         self._cleanup_retired_bbo_tasks()
         self._cleanup_retired_candidate_l2_tasks()
+        self._cleanup_retired_route_calibration_funding_tasks()
+        self._cleanup_retired_route_calibration_funding_tasks()
         self._bbo_subscription_started.discard(venue)
         self._candidate_l2_subscription_started = {
             key for key in self._candidate_l2_subscription_started if key[0] != venue
@@ -587,6 +635,7 @@ class PublicMarketEngine:
             or venue in self._retiring_bbo_transports
             or venue in self._retiring_bbo_unsubscribes
             or self._venue_has_retiring_candidate_l2(venue)
+            or self._venue_has_retiring_route_calibration_funding(venue)
         ):
             self._defer_retired_venue_reconnect(
                 venue,
@@ -859,6 +908,7 @@ class PublicMarketEngine:
                     or venue in self._bbo_unsubscribe_failures
                     or venue in self._retiring_adapter_closers
                     or self._venue_has_retiring_candidate_l2(venue)
+                    or self._venue_has_retiring_route_calibration_funding(venue)
                 },
                 key=str,
             )
@@ -903,6 +953,7 @@ class PublicMarketEngine:
                 and venue not in self._bbo_unsubscribe_failures
                 and venue not in self._retiring_adapter_closers
                 and not self._venue_has_retiring_candidate_l2(venue)
+                and not self._venue_has_retiring_route_calibration_funding(venue)
             )
             if force or due
             else tuple(venue for venue in reconnect_targets if venue not in recycled_targets)
@@ -1039,6 +1090,427 @@ class PublicMarketEngine:
                 )
         finally:
             self._finish_public_scan(task)
+
+    async def scan_route_calibration_observations(
+        self,
+        timeout_seconds: int,
+        *,
+        epoch_id: str | None = None,
+    ) -> tuple[RouteCalibrationObservation, ...]:
+        """Sample every applied active/candidate route without authorizing execution."""
+        task = self._begin_public_scan()
+        try:
+            async with self._candidate_l2_scan_lock:
+                self._require_open()
+                if not self._initialised:
+                    await self.initialise(timeout_seconds)
+                plan = self._candidate_l2_plan
+                generation = {
+                    venue: self._venue_refresh_generations.get(venue, 0)
+                    for venue in {book.instrument.venue for book in plan.books}
+                }
+                funding = await self._refresh_route_calibration_funding(
+                    plan,
+                    timeout_seconds,
+                )
+                self._require_open()
+                if plan.signature != self._candidate_l2_plan.signature or any(
+                    self._venue_refresh_generations.get(venue, 0) != observed
+                    for venue, observed in generation.items()
+                ):
+                    return ()
+                unavailable = frozenset(self._quarantined)
+                plan_keys = {book.key for book in plan.books}
+                states = {
+                    key: CandidateL2BookState(
+                        state.book,
+                        self._current_candidate_l2_quality(state),
+                        state.priority,
+                    )
+                    for key, state in self._candidate_l2_states.items()
+                    if key in plan_keys
+                }
+                policy = RouteCalibrationSamplingPolicy(
+                    self.settings.strategy.calibration_size_multipliers,
+                    self.settings.risk.max_hold_seconds,
+                    self.settings.strategy.calibration_funding_refresh_seconds,
+                    self.settings.execution.funding_stress_multiplier,
+                    self.settings.execution.latency_reserve_bps,
+                    self.settings.execution.partial_fill_reserve_bps,
+                    self.settings.execution.emergency_hedge_reserve_bps,
+                    self.settings.execution.reconciliation_forced_exit_reserve_bps,
+                )
+                current_routes = frozenset(
+                    DirectedRouteKey(
+                        route.long_instrument.base,
+                        route.long_instrument.venue,
+                        route.short_instrument.venue,
+                    )
+                    for route in plan.routes
+                )
+                removed_routes = tuple(
+                    sorted(
+                        self._route_calibration_previous_routes - current_routes,
+                        key=lambda item: item.value,
+                    )
+                )
+                observations = build_route_calibration_observations(
+                    plan.routes,
+                    states,
+                    funding,
+                    policy=policy,
+                    epoch_id=epoch_id or "ephemeral-public-session",
+                    observed_at=self._now_factory(),
+                    unavailable_venues=unavailable,
+                    missing_active_routes=plan.missing_active_routes,
+                    removed_routes=removed_routes,
+                )
+                self._route_calibration_previous_routes = current_routes
+                return observations
+        finally:
+            self._finish_public_scan(task)
+
+    async def _refresh_route_calibration_funding(
+        self,
+        plan: CandidateL2Plan,
+        timeout_seconds: int,
+    ) -> dict[BookKey, FundingSnapshot]:
+        del timeout_seconds
+        instruments = {book.key: book.instrument for book in plan.books}
+        self._route_calibration_funding = {
+            key: snapshot
+            for key, snapshot in self._route_calibration_funding.items()
+            if key in instruments
+        }
+        self._route_calibration_funding_observed_ns = {
+            key: observed
+            for key, observed in self._route_calibration_funding_observed_ns.items()
+            if key in instruments
+        }
+        self._route_calibration_funding_generation = {
+            key: generation
+            for key, generation in self._route_calibration_funding_generation.items()
+            if key in instruments
+        }
+        self._route_calibration_funding_retry_after_ns = {
+            key: retry_at
+            for key, retry_at in self._route_calibration_funding_retry_after_ns.items()
+            if key in instruments
+        }
+        for key, worker in tuple(self._route_calibration_funding_tasks.items()):
+            if key not in instruments:
+                self._retire_route_calibration_funding_task(key, worker)
+        self._cleanup_retired_route_calibration_funding_tasks()
+        self._process_route_calibration_funding_tasks(instruments)
+        now_ns = self._monotonic_ns()
+        maximum_age_ns = self.settings.strategy.calibration_funding_refresh_seconds * 1_000_000_000
+        keys_by_venue = {
+            venue: tuple(
+                sorted(
+                    (key for key in instruments if key[0] == venue),
+                    key=lambda item: item[1],
+                )
+            )
+            for venue in sorted({key[0] for key in instruments}, key=lambda item: item.value)
+        }
+        fair_keys = tuple(
+            key
+            for index in range(max((len(keys) for keys in keys_by_venue.values()), default=0))
+            for keys in keys_by_venue.values()
+            if index < len(keys)
+            for key in (keys[index],)
+        )
+        stale = tuple(
+            key
+            for key in fair_keys
+            if key not in self._route_calibration_funding
+            or self._route_calibration_funding_generation.get(key)
+            != self._venue_refresh_generations.get(key[0], 0)
+            or now_ns < self._route_calibration_funding_observed_ns.get(key, 0)
+            or now_ns - self._route_calibration_funding_observed_ns.get(key, 0) > maximum_age_ns
+        )
+        eligible = tuple(
+            key
+            for key in stale
+            if key not in self._route_calibration_funding_tasks
+            and self._route_calibration_funding_retry_after_ns.get(key, 0) <= now_ns
+            and key[0] not in self._quarantined
+            and not self._venue_has_retiring_route_calibration_funding(key[0])
+        )
+        if eligible:
+            start = self._route_calibration_funding_cursor % len(eligible)
+            rotated = (*eligible[start:], *eligible[:start])
+            venue_capacities = self._route_calibration_funding_capacity_by_venue(instruments)
+            inflight_by_venue = {
+                venue: sum(1 for key in self._route_calibration_funding_tasks if key[0] == venue)
+                for venue in venue_capacities
+            }
+            available_slots = max(
+                0,
+                sum(venue_capacities.values()) - len(self._route_calibration_funding_tasks),
+            )
+            selected_list: list[BookKey] = []
+            for key in rotated:
+                if len(selected_list) >= available_slots:
+                    break
+                venue = key[0]
+                if inflight_by_venue.get(venue, 0) >= venue_capacities.get(venue, 0):
+                    continue
+                selected_list.append(key)
+                inflight_by_venue[venue] = inflight_by_venue.get(venue, 0) + 1
+            selected = tuple(selected_list)
+            self._route_calibration_funding_cursor = (start + len(selected)) % len(eligible)
+            for key in selected:
+                instrument = instruments[key]
+                generation = self._venue_refresh_generations.get(instrument.venue, 0)
+                worker = asyncio.create_task(
+                    self._fetch_route_calibration_funding(key, instrument),
+                    name=f"route-funding-{instrument.venue.value}-{instrument.symbol}",
+                )
+                self._route_calibration_funding_tasks[key] = worker
+                self._route_calibration_funding_task_generation[key] = generation
+                self._route_calibration_funding_task_started_ns[key] = now_ns
+        # Funding is P5/P6 calibration input and must never consume the
+        # Candidate-L2 receipt-to-decision budget.  Give immediately-complete
+        # adapters one scheduler turn, retain all other workers under the
+        # engine shutdown/lifecycle barrier, and fail this scan closed with
+        # FUNDING_UNKNOWN until a later scan harvests the cache.
+        for _ in range(4):
+            await asyncio.sleep(0)
+        self._process_route_calibration_funding_tasks(instruments)
+        return dict(self._route_calibration_funding)
+
+    def _retire_route_calibration_funding_task(
+        self,
+        key: BookKey,
+        worker: asyncio.Task[tuple[FundingSnapshot, int]],
+    ) -> None:
+        self._route_calibration_funding_tasks.pop(key, None)
+        self._route_calibration_funding_task_generation.pop(key, None)
+        started_ns = self._route_calibration_funding_task_started_ns.pop(
+            key,
+            self._monotonic_ns(),
+        )
+        worker.cancel()
+        existing = self._retiring_route_calibration_funding_tasks.get(key)
+        if existing is not None and existing is not worker and not existing.done():
+            raise RuntimeError("multiple retiring funding transports for one book")
+        self._retiring_route_calibration_funding_tasks[key] = worker
+        self._retiring_route_calibration_funding_started_ns[key] = started_ns
+
+    def _cleanup_retired_route_calibration_funding_tasks(self) -> None:
+        now_ns = self._monotonic_ns()
+        for key, worker in tuple(self._retiring_route_calibration_funding_tasks.items()):
+            if not worker.done():
+                started_ns = self._retiring_route_calibration_funding_started_ns.get(key, now_ns)
+                if (
+                    not self._closed
+                    and now_ns - started_ns >= self._route_calibration_funding_timeout_ns
+                    and key[0] not in self._quarantined
+                ):
+                    self._quarantine(
+                        key[0],
+                        f"retired funding snapshot did not terminate for {key[1]}",
+                    )
+                continue
+            self._retiring_route_calibration_funding_tasks.pop(key, None)
+            self._retiring_route_calibration_funding_started_ns.pop(key, None)
+            with suppress(asyncio.CancelledError, Exception):
+                worker.result()
+        for key, transport in tuple(self._retiring_route_calibration_funding_transports.items()):
+            if not transport.done():
+                started_ns = self._retiring_route_calibration_funding_transport_started_ns.get(
+                    key,
+                    now_ns,
+                )
+                if (
+                    not self._closed
+                    and now_ns - started_ns >= self._route_calibration_funding_timeout_ns
+                    and key[0] not in self._quarantined
+                ):
+                    self._quarantine(
+                        key[0],
+                        f"retired funding transport did not terminate for {key[1]}",
+                    )
+                continue
+            self._retiring_route_calibration_funding_transports.pop(key, None)
+            self._retiring_route_calibration_funding_transport_started_ns.pop(key, None)
+            watchdog = self._retiring_route_calibration_funding_watchdogs.pop(key, None)
+            if watchdog is not None and watchdog is not asyncio.current_task():
+                watchdog.cancel()
+                watchdog.add_done_callback(self._consume_watcher)
+            self._consume_funding_transport(transport)
+
+    def _venue_has_retiring_route_calibration_funding(self, venue: Venue) -> bool:
+        return any(
+            key[0] == venue and not task.done()
+            for key, task in (
+                *self._retiring_route_calibration_funding_tasks.items(),
+                *self._retiring_route_calibration_funding_transports.items(),
+            )
+        )
+
+    def _route_calibration_funding_capacity_by_venue(
+        self,
+        instruments: dict[BookKey, Instrument],
+    ) -> dict[Venue, int]:
+        counts = {
+            venue: sum(1 for key in instruments if key[0] == venue)
+            for venue in {key[0] for key in instruments}
+        }
+        refresh_seconds = self.settings.strategy.calibration_funding_refresh_seconds
+        scan_seconds = self.settings.shadow.scan_interval_seconds
+        cycles_before_refresh_lead = max(
+            1,
+            (refresh_seconds * 3 // 4) // scan_seconds,
+        )
+        return {
+            venue: min(
+                count,
+                max(1, (count + cycles_before_refresh_lead - 1) // cycles_before_refresh_lead),
+            )
+            for venue, count in counts.items()
+        }
+
+    async def _fetch_route_calibration_funding(
+        self,
+        key: BookKey,
+        instrument: Instrument,
+    ) -> tuple[FundingSnapshot, int]:
+        transport = asyncio.create_task(
+            self._adapters[instrument.venue].fetch_funding(instrument),
+            name=f"route-funding-transport-{instrument.venue.value}-{instrument.symbol}",
+        )
+        self._route_calibration_funding_transports[key] = transport
+        started_ns = self._monotonic_ns()
+        try:
+            done, _pending = await asyncio.wait(
+                (transport,),
+                timeout=self._route_calibration_funding_timeout_ns / 1_000_000_000,
+            )
+            observed_ns = self._monotonic_ns()
+            if (
+                transport not in done
+                or observed_ns - started_ns > self._route_calibration_funding_timeout_ns
+            ):
+                self._retire_route_calibration_funding_transport(key, transport)
+                if not self._closed and instrument.venue not in self._quarantined:
+                    self._quarantine(
+                        instrument.venue,
+                        f"funding snapshot timed out for {instrument.symbol}",
+                    )
+                raise TimeoutError("funding snapshot exceeded its one-second deadline")
+            self._route_calibration_funding_transports.pop(key, None)
+            return transport.result(), observed_ns
+        except asyncio.CancelledError:
+            self._retire_route_calibration_funding_transport(key, transport)
+            raise
+
+    def _retire_route_calibration_funding_transport(
+        self,
+        key: BookKey,
+        transport: asyncio.Task[FundingSnapshot],
+    ) -> None:
+        self._route_calibration_funding_transports.pop(key, None)
+        if transport.done():
+            self._consume_funding_transport(transport)
+            return
+        transport.cancel()
+        existing = self._retiring_route_calibration_funding_transports.get(key)
+        if existing is not None and existing is not transport and not existing.done():
+            raise RuntimeError("multiple retiring funding transports for one book")
+        self._retiring_route_calibration_funding_transports[key] = transport
+        self._retiring_route_calibration_funding_transport_started_ns[key] = self._monotonic_ns()
+        watchdog = self._retiring_route_calibration_funding_watchdogs.get(key)
+        if watchdog is None or watchdog.done():
+            self._retiring_route_calibration_funding_watchdogs[key] = asyncio.create_task(
+                self._watch_retired_route_calibration_funding_transport(key, transport),
+                name=f"route-funding-retirement-{key[0].value}-{key[1]}",
+            )
+
+    async def _watch_retired_route_calibration_funding_transport(
+        self,
+        key: BookKey,
+        transport: asyncio.Task[FundingSnapshot],
+    ) -> None:
+        try:
+            await asyncio.sleep(self._route_calibration_funding_timeout_ns / 1_000_000_000)
+            if self._retiring_route_calibration_funding_transports.get(key) is not transport:
+                return
+            if transport.done():
+                self._cleanup_retired_route_calibration_funding_tasks()
+                return
+            if not self._closed and key[0] not in self._quarantined:
+                self._quarantine(
+                    key[0],
+                    f"retired funding transport did not terminate for {key[1]}",
+                )
+        finally:
+            current = self._retiring_route_calibration_funding_watchdogs.get(key)
+            if current is asyncio.current_task():
+                self._retiring_route_calibration_funding_watchdogs.pop(key, None)
+
+    def _process_route_calibration_funding_tasks(
+        self,
+        instruments: dict[BookKey, Instrument],
+    ) -> None:
+        now_ns = self._monotonic_ns()
+        self._cleanup_retired_route_calibration_funding_tasks()
+        for key, worker in tuple(self._route_calibration_funding_tasks.items()):
+            started_ns = self._route_calibration_funding_task_started_ns.get(key, now_ns)
+            if worker.done() or now_ns - started_ns < self._route_calibration_funding_timeout_ns:
+                continue
+            self._retire_route_calibration_funding_task(key, worker)
+            self._route_calibration_funding_retry_after_ns[key] = now_ns + 30_000_000_000
+            self._route_calibration_funding.pop(key, None)
+            self._route_calibration_funding_observed_ns.pop(key, None)
+            self._route_calibration_funding_generation.pop(key, None)
+            if not self._closed and key[0] not in self._quarantined:
+                self._quarantine(
+                    key[0],
+                    f"funding snapshot timed out for {key[1]}",
+                )
+        for key, worker in tuple(self._route_calibration_funding_tasks.items()):
+            if not worker.done():
+                continue
+            self._route_calibration_funding_tasks.pop(key, None)
+            generation = self._route_calibration_funding_task_generation.pop(key, -1)
+            self._route_calibration_funding_task_started_ns.pop(key, None)
+            instrument = instruments.get(key)
+            try:
+                snapshot, observed_ns = worker.result()
+            except (asyncio.CancelledError, Exception):
+                if key in instruments:
+                    self._route_calibration_funding_retry_after_ns[key] = now_ns + 30_000_000_000
+                else:
+                    self._route_calibration_funding_retry_after_ns.pop(key, None)
+                self._route_calibration_funding.pop(key, None)
+                self._route_calibration_funding_observed_ns.pop(key, None)
+                self._route_calibration_funding_generation.pop(key, None)
+                continue
+            if (
+                instrument is None
+                or key[0] in self._quarantined
+                or generation != self._venue_refresh_generations.get(key[0], 0)
+                or snapshot.venue != key[0]
+                or snapshot.symbol != key[1]
+            ):
+                if instrument is not None and (
+                    key[0] in self._quarantined
+                    or snapshot.venue != key[0]
+                    or snapshot.symbol != key[1]
+                ):
+                    self._route_calibration_funding_retry_after_ns[key] = now_ns + 30_000_000_000
+                else:
+                    self._route_calibration_funding_retry_after_ns.pop(key, None)
+                self._route_calibration_funding.pop(key, None)
+                self._route_calibration_funding_observed_ns.pop(key, None)
+                self._route_calibration_funding_generation.pop(key, None)
+                continue
+            self._route_calibration_funding[key] = snapshot
+            self._route_calibration_funding_observed_ns[key] = observed_ns
+            self._route_calibration_funding_generation[key] = generation
+            self._route_calibration_funding_retry_after_ns.pop(key, None)
 
     async def _run_candidate_l2_request(
         self,
@@ -1998,6 +2470,14 @@ class PublicMarketEngine:
     async def close(self) -> None:
         self._closed = True
         self._bbo_changed.set()
+        for key, funding_worker in tuple(self._route_calibration_funding_tasks.items()):
+            self._retire_route_calibration_funding_task(key, funding_worker)
+        for funding_worker in self._retiring_route_calibration_funding_tasks.values():
+            funding_worker.cancel()
+        for watchdog in self._retiring_route_calibration_funding_watchdogs.values():
+            watchdog.cancel()
+            watchdog.add_done_callback(self._consume_watcher)
+        self._retiring_route_calibration_funding_watchdogs.clear()
         loop = asyncio.get_running_loop()
         shutdown_deadline = loop.time() + 1
         public_scans_blocked = False
@@ -2086,6 +2566,8 @@ class PublicMarketEngine:
             l2_transport_task.cancel()
         for unsubscribe_task in self._retiring_candidate_l2_unsubscribes.values():
             unsubscribe_task.cancel()
+        for key, funding_worker in tuple(self._route_calibration_funding_tasks.items()):
+            self._retire_route_calibration_funding_task(key, funding_worker)
         for venue, adapter in self._adapters.items():
             if venue not in self._retiring_adapter_closers:
                 self._retiring_adapter_closers[venue] = asyncio.create_task(
@@ -2127,6 +2609,10 @@ class PublicMarketEngine:
         retiring_l2_watchers = tuple(set(self._retiring_candidate_l2_watchers.values()))
         retiring_l2_transports = tuple(set(self._retiring_candidate_l2_transports.values()))
         retiring_l2_unsubscribes = tuple(set(self._retiring_candidate_l2_unsubscribes.values()))
+        retiring_funding = tuple(set(self._retiring_route_calibration_funding_tasks.values()))
+        retiring_funding_transports = tuple(
+            set(self._retiring_route_calibration_funding_transports.values())
+        )
         for watcher in retiring_watchers:
             watcher.cancel()
         for bbo_transport in retiring_transports:
@@ -2139,6 +2625,10 @@ class PublicMarketEngine:
             l2_transport.cancel()
         for l2_unsubscribe in retiring_l2_unsubscribes:
             l2_unsubscribe.cancel()
+        for funding_worker in retiring_funding:
+            funding_worker.cancel()
+        for funding_transport in retiring_funding_transports:
+            funding_transport.cancel()
         if retiring_watchers:
             await asyncio.wait(
                 retiring_watchers,
@@ -2169,6 +2659,16 @@ class PublicMarketEngine:
                 retiring_l2_unsubscribes,
                 timeout=max(0, shutdown_deadline - asyncio.get_running_loop().time()),
             )
+        if retiring_funding:
+            await asyncio.wait(
+                retiring_funding,
+                timeout=max(0, shutdown_deadline - asyncio.get_running_loop().time()),
+            )
+        if retiring_funding_transports:
+            await asyncio.wait(
+                retiring_funding_transports,
+                timeout=max(0, shutdown_deadline - asyncio.get_running_loop().time()),
+            )
         if retiring_watchers or retiring_transports:
             for watcher in retiring_watchers:
                 if not watcher.done():
@@ -2188,8 +2688,15 @@ class PublicMarketEngine:
         for l2_unsubscribe in retiring_l2_unsubscribes:
             if not l2_unsubscribe.done():
                 l2_unsubscribe.add_done_callback(self._consume_watcher)
+        for funding_worker in retiring_funding:
+            if not funding_worker.done():
+                funding_worker.add_done_callback(self._consume_funding_worker)
+        for funding_transport in retiring_funding_transports:
+            if not funding_transport.done():
+                funding_transport.add_done_callback(self._consume_funding_transport)
         self._cleanup_retired_bbo_tasks()
         self._cleanup_retired_candidate_l2_tasks()
+        self._cleanup_retired_route_calibration_funding_tasks()
         pending_venues = tuple(
             sorted(
                 {venue for venue, task in self._retiring_bbo_watchers.items() if not task.done()}
@@ -2223,6 +2730,16 @@ class PublicMarketEngine:
                     for key, task in self._retiring_candidate_l2_unsubscribes.items()
                     if not task.done()
                 }
+                | {
+                    key[0]
+                    for key, task in self._retiring_route_calibration_funding_tasks.items()
+                    if not task.done()
+                }
+                | {
+                    key[0]
+                    for key, task in self._retiring_route_calibration_funding_transports.items()
+                    if not task.done()
+                }
                 | timed_out_closer_venues
                 | blocked_recycle_venues,
                 key=str,
@@ -2250,6 +2767,18 @@ class PublicMarketEngine:
 
     @staticmethod
     def _consume_transport(task: asyncio.Task[tuple[BboQuote, ...]]) -> None:
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+    @staticmethod
+    def _consume_funding_worker(
+        task: asyncio.Task[tuple[FundingSnapshot, int]],
+    ) -> None:
+        with suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+    @staticmethod
+    def _consume_funding_transport(task: asyncio.Task[FundingSnapshot]) -> None:
         with suppress(asyncio.CancelledError, Exception):
             task.result()
 

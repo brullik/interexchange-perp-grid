@@ -227,16 +227,22 @@ class OneThenSilentCandidateAdapter(CandidateAdapter):
 
 
 class FundingCandidateAdapter(CandidateAdapter):
+    def __init__(self, venue: Venue, clock: list[int]) -> None:
+        super().__init__(venue, clock)
+        self.funding_calls = 0
+
     async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        self.funding_calls += 1
+        observed_ms = int(datetime.now(UTC).timestamp() * 1000)
         return FundingSnapshot(
             instrument.venue,
             instrument.symbol,
             Decimal("0.0001"),
-            1_700_000_100_000,
+            observed_ms + 8 * 60 * 60 * 1000,
             "8h",
             Decimal(101),
             Decimal("100.9"),
-            1_700_000_000_000,
+            observed_ms,
         )
 
 
@@ -252,6 +258,142 @@ class GenerationChangingFundingAdapter(FundingCandidateAdapter):
             self.on_funding = None
             callback()
         return result
+
+
+class OneThenSilentFundingAdapter(OneThenSilentCandidateAdapter):
+    def __init__(self, venue: Venue, clock: list[int]) -> None:
+        super().__init__(venue, clock)
+        self.funding_calls = 0
+
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        self.funding_calls += 1
+        observed_ms = int(datetime.now(UTC).timestamp() * 1000)
+        return FundingSnapshot(
+            instrument.venue,
+            instrument.symbol,
+            Decimal("0.0001"),
+            observed_ms + 8 * 60 * 60 * 1000,
+            "8h",
+            Decimal(101),
+            Decimal("100.9"),
+            observed_ms,
+        )
+
+
+class FailingFundingAdapter(FundingCandidateAdapter):
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        self.funding_calls += 1
+        raise RuntimeError(f"funding unavailable for {instrument.symbol}")
+
+
+class HeldFundingAdapter(FundingCandidateAdapter):
+    def __init__(self, venue: Venue, clock: list[int]) -> None:
+        super().__init__(venue, clock)
+        self.funding_started = asyncio.Event()
+        self.funding_release = asyncio.Event()
+
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        self.funding_started.set()
+        await self.funding_release.wait()
+        return await super().fetch_funding(instrument)
+
+
+class WrongIdentityFundingAdapter(FundingCandidateAdapter):
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        result = await super().fetch_funding(instrument)
+        return FundingSnapshot(
+            Venue.BINANCE_USDM if instrument.venue != Venue.BINANCE_USDM else Venue.OKX,
+            f"WRONG-{instrument.symbol}",
+            result.rate,
+            result.next_funding_timestamp_ms,
+            result.interval,
+            result.mark_price,
+            result.index_price,
+            result.exchange_timestamp_ms,
+        )
+
+
+class CancellationResistantFundingAdapter(FundingCandidateAdapter):
+    def __init__(self, venue: Venue, clock: list[int]) -> None:
+        super().__init__(venue, clock)
+        self.funding_started = asyncio.Event()
+        self.funding_release = asyncio.Event()
+
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        self.funding_calls += 1
+        self.funding_started.set()
+        while not self.funding_release.is_set():
+            try:
+                await self.funding_release.wait()
+            except asyncio.CancelledError:
+                continue
+        observed_ms = int(datetime.now(UTC).timestamp() * 1000)
+        return FundingSnapshot(
+            instrument.venue,
+            instrument.symbol,
+            Decimal("0.0001"),
+            observed_ms + 8 * 60 * 60 * 1000,
+            "8h",
+            Decimal(101),
+            Decimal("100.9"),
+            observed_ms,
+        )
+
+
+class LateSuccessfulFundingAdapter(FundingCandidateAdapter):
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        self.funding_calls += 1
+        deadline = asyncio.get_running_loop().time() + 1.1
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.sleep(remaining)
+            except asyncio.CancelledError:
+                continue
+        observed_ms = int(datetime.now(UTC).timestamp() * 1000)
+        return FundingSnapshot(
+            instrument.venue,
+            instrument.symbol,
+            Decimal("0.0001"),
+            observed_ms + 8 * 60 * 60 * 1000,
+            "8h",
+            Decimal(101),
+            Decimal("100.9"),
+            observed_ms,
+        )
+
+
+class StaleFundingAdapter(FundingCandidateAdapter):
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        result = await super().fetch_funding(instrument)
+        assert result.exchange_timestamp_ms is not None
+        return FundingSnapshot(
+            result.venue,
+            result.symbol,
+            result.rate,
+            result.next_funding_timestamp_ms,
+            result.interval,
+            result.mark_price,
+            result.index_price,
+            result.exchange_timestamp_ms - 365 * 24 * 60 * 60 * 1000,
+        )
+
+
+class InvalidMarkFundingAdapter(FundingCandidateAdapter):
+    async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+        result = await super().fetch_funding(instrument)
+        return FundingSnapshot(
+            result.venue,
+            result.symbol,
+            result.rate,
+            result.next_funding_timestamp_ms,
+            result.interval,
+            Decimal(-1),
+            Decimal("NaN"),
+            result.exchange_timestamp_ms,
+        )
 
 
 class DelayedUnwatchCandidateAdapter(CandidateAdapter):
@@ -382,6 +524,434 @@ async def test_candidate_l2_selects_top30_plus_active_and_deduplicates_books(
         and task.get_name().startswith("candidate-l2-")
         and not task.done()
     )
+
+
+@pytest.mark.asyncio
+async def test_candidate_l2_feeds_three_route_size_calibration_buckets_from_cached_funding(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+
+    first = await engine.scan_route_calibration_observations(2)
+    funding_calls = sum(adapter.funding_calls for adapter in adapters.values())
+    second = await engine.scan_route_calibration_observations(2)
+
+    assert len(first) == 3
+    assert {item.size_bucket_multiplier for item in first} == {
+        Decimal("1"),
+        Decimal("2"),
+        Decimal("5"),
+    }
+    assert {item.base_quantity for item in first} == {
+        Decimal("0.05"),
+        Decimal("0.1"),
+        Decimal("0.25"),
+    }
+    assert all(item.stressed_cost_floor_bps is not None for item in first)
+    assert all(item.normalized_tick_bps is not None for item in first)
+    assert all(item.funding_rate_delta is not None for item in first)
+    assert all(item.reason == ReasonCode.QUOTE_READY for item in first)
+    assert tuple(
+        (item.route, item.size_bucket_multiplier, item.base_quantity, item.reason) for item in first
+    ) == tuple(
+        (item.route, item.size_bucket_multiplier, item.base_quantity, item.reason)
+        for item in second
+    )
+    assert funding_calls == 2
+    assert sum(adapter.funding_calls for adapter in adapters.values()) == funding_calls
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_route_calibration_never_mixes_funding_across_adapter_generation(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: GenerationChangingFundingAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+    for venue, adapter in adapters.items():
+        adapter.on_funding = lambda venue=venue: engine._venue_refresh_generations.__setitem__(
+            venue,
+            engine._venue_refresh_generations.get(venue, 0) + 1,
+        )
+
+    raced = await engine.scan_route_calibration_observations(2)
+    recovered = await engine.scan_route_calibration_observations(2)
+
+    assert raced == ()
+    assert len(recovered) == 3
+    assert all(item.reason == ReasonCode.QUOTE_READY for item in recovered)
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_route_calibration_revalidates_silent_l2_freshness_after_funding(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: OneThenSilentFundingAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+    assert all(
+        item.reason == ReasonCode.QUOTE_READY
+        for item in await engine.scan_route_calibration_observations(2)
+    )
+
+    clock[0] += 2_000_000_000
+    stale = await engine.scan_route_calibration_observations(2)
+
+    assert len(stale) == 3
+    assert {item.reason for item in stale} == {ReasonCode.BOOK_STALE}
+    assert all(item.base_quantity is None for item in stale)
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_route_plan_removal_emits_invalid_marker_before_reentry(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+    assert len(await engine.scan_route_calibration_observations(2)) == 3
+
+    await engine.scan_candidate_l2(2, candidates_admitted=False)
+    removed = await engine.scan_route_calibration_observations(2)
+    await engine.scan_candidate_l2(2)
+    restored = await engine.scan_route_calibration_observations(2)
+
+    assert len(removed) == 3
+    assert {item.reason for item in removed} == {ReasonCode.BOOK_EMPTY}
+    assert len(restored) == 3
+    assert {item.reason for item in restored} == {ReasonCode.QUOTE_READY}
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_route_calibration_quarantine_during_funding_is_persistently_invalid(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters: dict[Venue, CandidateAdapter] = {
+        venue: FundingCandidateAdapter(venue, clock) for venue in Venue
+    }
+    held = HeldFundingAdapter(Venue.OKX, clock)
+    adapters[Venue.OKX] = held
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+    sampling = asyncio.create_task(engine.scan_route_calibration_observations(2))
+    await asyncio.wait_for(held.funding_started.wait(), timeout=1)
+    engine._quarantine(Venue.OKX, "test funding race")
+    held.funding_release.set()
+
+    observations = await sampling
+
+    assert len(observations) == 3
+    assert {item.reason for item in observations} == {ReasonCode.VENUE_OUTAGE}
+    after_quarantine = await engine.scan_route_calibration_observations(2)
+    assert {item.reason for item in after_quarantine} == {ReasonCode.VENUE_OUTAGE}
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_route_funding_scheduler_is_fair_when_one_venue_fails(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters: dict[Venue, FundingCandidateAdapter] = {
+        Venue.BINANCE_USDM: FailingFundingAdapter(Venue.BINANCE_USDM, clock),
+        Venue.BYBIT: FundingCandidateAdapter(Venue.BYBIT, clock),
+        Venue.OKX: FundingCandidateAdapter(Venue.OKX, clock),
+    }
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=30),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+
+    await engine.scan_route_calibration_observations(2)
+
+    planned_venues = {book.instrument.venue for book in engine._candidate_l2_plan.books}
+    assert adapters[Venue.BINANCE_USDM].funding_calls > 0
+    assert all(
+        adapters[venue].funding_calls > 0 for venue in planned_venues - {Venue.BINANCE_USDM}
+    ), {venue: adapter.funding_calls for venue, adapter in adapters.items()}
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_wrong_identity_funding_is_never_qualified(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: WrongIdentityFundingAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+
+    observations = await engine.scan_route_calibration_observations(2)
+
+    assert len(observations) == 3
+    assert {item.reason for item in observations} == {ReasonCode.FUNDING_UNKNOWN}
+    assert engine._route_calibration_funding_retry_after_ns
+    retired_key = (Venue.OKX, "RETIRED-USDT")
+    engine._route_calibration_funding_retry_after_ns[retired_key] = 10**30
+    await engine.scan_route_calibration_observations(2)
+    assert retired_key not in engine._route_calibration_funding_retry_after_ns
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_year_stale_funding_is_never_qualified(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: StaleFundingAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+
+    observations = await engine.scan_route_calibration_observations(2)
+
+    assert len(observations) == 3
+    assert {item.reason for item in observations} == {ReasonCode.FUNDING_UNKNOWN}
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_nonfinite_or_nonpositive_mark_index_is_never_qualified(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: InvalidMarkFundingAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+
+    observations = await engine.scan_route_calibration_observations(2)
+
+    assert len(observations) == 3
+    assert {item.reason for item in observations} == {ReasonCode.FUNDING_UNKNOWN}
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_route_funding_hard_deadline_does_not_starve_other_venues(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    held = CancellationResistantFundingAdapter(Venue.BINANCE_USDM, clock)
+    adapters: dict[Venue, FundingCandidateAdapter] = {
+        Venue.BINANCE_USDM: held,
+        Venue.BYBIT: FundingCandidateAdapter(Venue.BYBIT, clock),
+        Venue.OKX: FundingCandidateAdapter(Venue.OKX, clock),
+    }
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=30),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        await engine.scan_route_calibration_observations(2)
+        planned_venues = {book.instrument.venue for book in engine._candidate_l2_plan.books}
+        assert loop.time() - started < 0.25
+        assert all(
+            adapters[venue].funding_calls > 0 for venue in planned_venues - {Venue.BINANCE_USDM}
+        )
+        healthy_calls = {
+            venue: adapters[venue].funding_calls for venue in planned_venues - {Venue.BINANCE_USDM}
+        }
+        clock[0] += 1_100_000_000
+        await engine.scan_route_calibration_observations(2)
+        assert all(
+            adapters[venue].funding_calls >= previous for venue, previous in healthy_calls.items()
+        )
+        assert sum(adapters[venue].funding_calls for venue in healthy_calls) > sum(
+            healthy_calls.values()
+        )
+        assert Venue.BINANCE_USDM in engine._quarantined
+        assert engine._retiring_route_calibration_funding_transports
+        instruments = {book.key: book.instrument for book in engine._candidate_l2_plan.books}
+        venue_capacities = engine._route_calibration_funding_capacity_by_venue(instruments)
+        assert (
+            sum(key[0] == Venue.BINANCE_USDM for key in engine._route_calibration_funding_tasks)
+            <= venue_capacities[Venue.BINANCE_USDM]
+        )
+        held.funding_release.set()
+        await asyncio.sleep(0.01)
+        engine._cleanup_retired_route_calibration_funding_tasks()
+        assert not engine._retiring_route_calibration_funding_tasks
+        assert not engine._retiring_route_calibration_funding_transports
+        prior_calls = held.funding_calls
+        clock[0] += 31_000_000_000
+        await engine.refresh_universe(2, reconnected=(Venue.BINANCE_USDM,))
+        await engine.scan_candidate_l2(2)
+        await engine.scan_route_calibration_observations(2)
+        assert held.funding_calls > prior_calls
+    finally:
+        held.funding_release.set()
+        await asyncio.sleep(0.01)
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_route_funding_watchdog_rejects_late_success_without_followup_scan(
+    tmp_path: Path,
+) -> None:
+    clock = [time.monotonic_ns()]
+    adapters: dict[Venue, FundingCandidateAdapter] = {
+        Venue.BINANCE_USDM: LateSuccessfulFundingAdapter(Venue.BINANCE_USDM, clock),
+        Venue.BYBIT: FundingCandidateAdapter(Venue.BYBIT, clock),
+        Venue.OKX: FundingCandidateAdapter(Venue.OKX, clock),
+    }
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=time.monotonic_ns,
+    )
+    await engine.scan_candidate_l2(2)
+    await engine.scan_route_calibration_observations(2)
+
+    await asyncio.sleep(1.2)
+
+    assert Venue.BINANCE_USDM in engine._quarantined
+    assert not any(key[0] == Venue.BINANCE_USDM for key in engine._route_calibration_funding)
+    await asyncio.sleep(0.1)
+    engine._cleanup_retired_route_calibration_funding_tasks()
+    assert not engine._retiring_route_calibration_funding_transports
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_removed_funding_transport_is_reaped_without_followup_scan(
+    tmp_path: Path,
+) -> None:
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        recorder=ParquetMarketRecorder(tmp_path),
+    )
+    release = asyncio.Event()
+    key = (Venue.OKX, "BTC/USDT:USDT")
+
+    async def resistant_transport() -> FundingSnapshot:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        observed_ms = int(datetime.now(UTC).timestamp() * 1000)
+        return FundingSnapshot(
+            key[0],
+            key[1],
+            Decimal("0.0001"),
+            observed_ms + 8 * 60 * 60 * 1000,
+            "8h",
+            Decimal(101),
+            Decimal("100.9"),
+            observed_ms,
+        )
+
+    transport = asyncio.create_task(resistant_transport())
+    await asyncio.sleep(0)
+    engine._retire_route_calibration_funding_transport(key, transport)
+
+    await asyncio.sleep(1.1)
+
+    assert Venue.OKX in engine._quarantined
+    assert transport.done() is False
+    release.set()
+    await asyncio.sleep(0.01)
+    engine._cleanup_retired_route_calibration_funding_tasks()
+    assert not engine._retiring_route_calibration_funding_transports
+    assert not engine._retiring_route_calibration_funding_watchdogs
+    await engine.close()
+
+
+def test_funding_scheduler_capacity_covers_maximum_supported_plan_before_stale(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    configured = settings(tmp_path, maximum_candidates=30)
+    engine = PublicMarketEngine(
+        configured,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    maximum_books = 2 * (
+        configured.universe.max_dynamic_l2_candidates + configured.risk.max_active_routes
+    )
+    distribution = {
+        Venue.BINANCE_USDM: 40,
+        Venue.BYBIT: 20,
+        Venue.OKX: 20,
+    }
+    instruments = {
+        (venue, instrument.symbol): instrument
+        for venue, count in distribution.items()
+        for instrument in adapters[venue].instruments[:count]
+    }
+    capacities = engine._route_calibration_funding_capacity_by_venue(instruments)
+    cycles_before_refresh_lead = (
+        configured.strategy.calibration_funding_refresh_seconds
+        * 3
+        // 4
+        // configured.shadow.scan_interval_seconds
+    )
+
+    assert maximum_books == 80
+    assert len(instruments) == maximum_books
+    assert all(
+        capacities[venue] * cycles_before_refresh_lead >= count
+        for venue, count in distribution.items()
+    )
+    assert sum(capacities.values()) * cycles_before_refresh_lead >= maximum_books
+    assert sum(capacities.values()) < maximum_books
 
 
 @pytest.mark.asyncio

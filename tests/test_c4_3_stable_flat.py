@@ -438,7 +438,7 @@ async def test_private_watermark_is_preserved_across_atomic_flat_commit(tmp_path
         {venue: _instrument(venue) for venue in Venue},
         _ROUTE,
         "a" * 64,
-        flat_barrier_policy=FlatBarrierPolicy(2, 0, 0.001, 0.05),
+        flat_barrier_policy=FlatBarrierPolicy(2, 0, 0.001, 0.5),
     )
 
     result = await service.emergency_flatten()

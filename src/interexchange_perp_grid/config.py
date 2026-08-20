@@ -89,6 +89,20 @@ class StrategyConfig(StrictModel):
     stressed_cost_multiplier: Decimal = Field(ge=Decimal("1"))
     minimum_profit_usdt: Decimal | None = Field(default=None, ge=0)
     grid_parameter_change_limit_ratio: Decimal = Field(gt=0, le=Decimal("0.50"))
+    calibration_size_multipliers: tuple[Decimal, ...]
+    calibration_funding_refresh_seconds: int = Field(ge=30, le=3600)
+
+    @model_validator(mode="after")
+    def calibration_buckets_are_bounded(self) -> StrategyConfig:
+        if not self.calibration_size_multipliers or len(self.calibration_size_multipliers) > 5:
+            raise ValueError("strategy requires between one and five calibration size buckets")
+        if tuple(
+            sorted(set(self.calibration_size_multipliers))
+        ) != self.calibration_size_multipliers or any(
+            value <= 0 for value in self.calibration_size_multipliers
+        ):
+            raise ValueError("calibration size multipliers must be unique, positive, and sorted")
+        return self
 
 
 class ExecutionConfig(StrictModel):
@@ -205,6 +219,11 @@ class Settings(StrictModel):
             and self.telegram.owner_chat_id is None
         ):
             raise ValueError("live Telegram control requires an owner chat ID")
+        if (
+            self.shadow.scan_interval_seconds * 2
+            > self.strategy.calibration_funding_refresh_seconds
+        ):
+            raise ValueError("shadow scan interval must leave a 50% funding refresh safety margin")
         return self
 
 
@@ -250,6 +269,12 @@ def _require_mapping(value: object, name: str) -> dict[str, object]:
     return value
 
 
+def _require_sequence(value: object, name: str) -> tuple[object, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"configuration {name!r} must be a sequence")
+    return tuple(value)
+
+
 def _validate_locked_runtime_policy(raw: dict[str, object], path: Path) -> None:
     policy_path = path.parent / "RUNTIME_POLICY.yaml"
     policy = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
@@ -259,6 +284,16 @@ def _validate_locked_runtime_policy(raw: dict[str, object], path: Path) -> None:
     locked_universe = _require_mapping(policy.get("universe"), "runtime_policy.universe")
     configured_data = _require_mapping(raw.get("market_data"), "market_data")
     locked_data = _require_mapping(policy.get("data"), "runtime_policy.data")
+    configured_strategy = _require_mapping(raw.get("strategy"), "strategy")
+    locked_strategy = _require_mapping(policy.get("strategy"), "runtime_policy.strategy")
+    configured_size_multipliers = _require_sequence(
+        configured_strategy.get("calibration_size_multipliers"),
+        "strategy.calibration_size_multipliers",
+    )
+    locked_size_multipliers = _require_sequence(
+        locked_strategy.get("calibration_size_multipliers"),
+        "runtime_policy.strategy.calibration_size_multipliers",
+    )
     comparisons = {
         "live_min_listing_age_days": (
             configured_universe.get("live_min_listing_age_days"),
@@ -280,10 +315,32 @@ def _validate_locked_runtime_policy(raw: dict[str, object], path: Path) -> None:
             configured_data.get("max_bbo_age_ms"),
             locked_data.get("max_bbo_age_ms"),
         ),
+        "max_l2_age_ms": (
+            configured_data.get("max_l2_age_ms"),
+            locked_data.get("max_l2_age_ms"),
+        ),
+        "calibration_size_multipliers": (
+            tuple(str(value) for value in configured_size_multipliers),
+            tuple(str(value) for value in locked_size_multipliers),
+        ),
+        "calibration_funding_refresh_seconds": (
+            configured_strategy.get("calibration_funding_refresh_seconds"),
+            locked_strategy.get("calibration_funding_refresh_seconds"),
+        ),
     }
     for name, (configured, locked) in comparisons.items():
         if configured != locked:
             raise ValueError(f"configuration {name} differs from locked runtime policy")
+    configured_change_limit = Decimal(
+        str(configured_strategy.get("grid_parameter_change_limit_ratio"))
+    )
+    locked_change_limit = Decimal(str(locked_strategy.get("max_parameter_change_ratio_per_day")))
+    if configured_change_limit > locked_change_limit:
+        raise ValueError("configuration grid parameter change limit exceeds locked policy")
+    configured_stress_multiplier = Decimal(str(configured_strategy.get("stressed_cost_multiplier")))
+    locked_stress_multiplier = Decimal(str(locked_strategy.get("stressed_cost_multiplier")))
+    if configured_stress_multiplier < locked_stress_multiplier:
+        raise ValueError("configuration stressed cost multiplier is below locked policy")
     if (
         str(configured_data.get("broad_feed", "")).upper()
         != str(locked_universe.get("broad_feed", "")).upper()

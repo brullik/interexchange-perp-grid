@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import deque
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -34,6 +35,12 @@ from interexchange_perp_grid.risk import (
     RiskRequest,
     VenueProjection,
 )
+from interexchange_perp_grid.route_calibration import (
+    PersistentRouteCalibrator,
+    RouteCalibrationAssessment,
+    RouteCalibrationObservation,
+    RouteCalibrationSamplingPolicy,
+)
 from interexchange_perp_grid.routes import DirectedRouteQuote
 from interexchange_perp_grid.state import (
     RuntimeControls,
@@ -49,10 +56,9 @@ from interexchange_perp_grid.state import (
     update_runtime_controls,
 )
 from interexchange_perp_grid.strategy import (
-    AdaptiveGridCalibrator,
-    CalibrationObservation,
     CostInputs,
     DirectedRouteKey,
+    GridParameters,
     SignalDecision,
     evaluate_entry_signal,
 )
@@ -88,6 +94,13 @@ class MarketEngine(Protocol):
         prefilter: tuple[BboPrefilterObservation, ...] | None = None,
         preserve_existing_candidates: bool = False,
     ) -> CandidateL2Result: ...
+
+    async def scan_route_calibration_observations(
+        self,
+        timeout_seconds: int,
+        *,
+        epoch_id: str | None = None,
+    ) -> tuple[RouteCalibrationObservation, ...]: ...
 
     def public_workload(self) -> PublicWorkload: ...
 
@@ -382,10 +395,6 @@ class ShadowTrader:
     def __init__(self, settings: Settings, runtime: ShadowRuntime) -> None:
         self.settings = settings
         self.runtime = runtime
-        self._calibrator = AdaptiveGridCalibrator(
-            minimum_samples=5,
-            parameter_change_limit_ratio=settings.strategy.grid_parameter_change_limit_ratio,
-        )
         self._risk = RiskBook(
             RiskLimits(
                 pair_stress_usdt=settings.risk.pair_stressed_loss_limit_usdt,
@@ -398,15 +407,21 @@ class ShadowTrader:
             )
         )
         self._coordinator = PairExecutionCoordinator()
-        self._observations: dict[
-            tuple[DirectedRouteKey, Decimal], list[CalibrationObservation]
-        ] = {}
         self._managed_ids: set[str] = set()
 
-    async def process(self, result: ScanResult) -> tuple[SignalDecision, ...]:
-        await self._close_converged(result.quotes)
+    async def process(
+        self,
+        result: ScanResult,
+        *,
+        decision_deadline: float | None = None,
+    ) -> tuple[SignalDecision, ...]:
+        await self.close_active(result.quotes)
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            return ()
         gate = await self.runtime.entry_gate()
-        if not gate.accepted:
+        if not gate.accepted or (
+            decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline
+        ):
             return ()
         restored_active = any(
             tranche.state in ACTIVE_STATES and tranche.tranche_id not in self._managed_ids
@@ -416,15 +431,36 @@ class ShadowTrader:
             return ()
         decisions: list[SignalDecision] = []
         for quote in result.quotes:
-            decision = await self._evaluate_and_open(quote)
+            route = DirectedRouteKey(quote.key.base, quote.long_venue, quote.short_venue)
+            matches = tuple(
+                assessment
+                for assessment in result.route_calibration
+                if assessment.route == route
+                and assessment.latest_base_quantity == quote.base_quantity
+            )
+            if len(matches) != 1:
+                continue
+            decision = await self._evaluate_and_open(
+                quote,
+                matches[0],
+                decision_deadline=decision_deadline,
+            )
             if decision is not None:
                 decisions.append(decision)
         return tuple(decisions)
 
+    async def close_active(self, quotes: tuple[DirectedRouteQuote, ...]) -> None:
+        await self._close_converged(quotes)
+
     async def _evaluate_and_open(
         self,
         quote: DirectedRouteQuote,
+        calibration: RouteCalibrationAssessment,
+        *,
+        decision_deadline: float | None = None,
     ) -> SignalDecision | None:
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            return None
         values = (
             quote.entry_long_vwap,
             quote.entry_short_vwap,
@@ -444,11 +480,12 @@ class ShadowTrader:
         assert quote.four_leg_fee_estimate is not None
         assert quote.funding_rate_delta is not None
         route = DirectedRouteKey(quote.key.base, quote.long_venue, quote.short_venue)
-        calibration_key = (route, quote.base_quantity)
-        window = self._observations.setdefault(calibration_key, [])
-        window.append(CalibrationObservation(quote.entry_spread_bps, None))
-        del window[:-500]
-        if len(window) < 5:
+        if (
+            not calibration.ready
+            or calibration.parameters is None
+            or calibration.route != route
+            or calibration.latest_base_quantity != quote.base_quantity
+        ):
             return None
 
         midpoint_notional = (
@@ -456,20 +493,33 @@ class ShadowTrader:
         )
         if midpoint_notional <= 0:
             return None
-        cost_floor_bps = quote.four_leg_fee_estimate / midpoint_notional * Decimal(10_000)
-        minimum_profit = self.settings.strategy.minimum_profit_usdt or Decimal("0.01")
-        parameters = self._calibrator.calibrate(
-            route,
-            quote.base_quantity,
-            tuple(window),
-            cost_floor_bps,
-            Decimal("0.5"),
-            minimum_profit,
+        calibrated = calibration.parameters
+        bucket_convergence_p90 = calibrated.convergence_p90_for_spread(quote.entry_spread_bps)
+        if bucket_convergence_p90 is None:
+            return None
+        parameters = GridParameters(
+            route=route,
+            size_bucket=quote.base_quantity,
+            version=calibrated.version,
+            sample_count=calibrated.sample_count,
+            median_spread_bps=calibrated.window_24h.median_spread_bps,
+            mad_spread_bps=calibrated.window_24h.mad_spread_bps,
+            entry_quantile_bps=calibrated.entry_levels_bps[0],
+            exit_quantile_bps=calibrated.target_close_bps(quote.entry_spread_bps),
+            convergence_p90_seconds=bucket_convergence_p90,
+            grid_step_bps=calibrated.grid_step_bps,
+            minimum_profit_usdt=calibrated.minimum_profit_usdt,
         )
-        reserve_unit = midpoint_notional * Decimal("0.0002")
         expected_funding_cost = max(
             Decimal(0),
             -quote.funding_rate_delta * midpoint_notional,
+        )
+        calibrated_stress_usdt = (
+            midpoint_notional * calibrated.stressed_cost_floor_bps / Decimal(10_000)
+        )
+        residual_stress = max(
+            Decimal(0),
+            calibrated_stress_usdt - quote.four_leg_fee_estimate - expected_funding_cost,
         )
         inputs = CostInputs(
             quantity=quote.base_quantity,
@@ -482,12 +532,13 @@ class ShadowTrader:
             entry_impact_usdt=Decimal(0),
             exit_impact_usdt=Decimal(0),
             expected_funding_cost_usdt=expected_funding_cost,
-            funding_stress_usdt=abs(quote.funding_rate_delta) * midpoint_notional * 2,
-            latency_reserve_usdt=reserve_unit,
-            unmatched_hedge_reserve_usdt=reserve_unit * 2,
-            reconciliation_forced_exit_reserve_usdt=reserve_unit,
-            liquidation_distance_reserve_usdt=reserve_unit,
+            funding_stress_usdt=Decimal(0),
+            latency_reserve_usdt=Decimal(0),
+            unmatched_hedge_reserve_usdt=Decimal(0),
+            reconciliation_forced_exit_reserve_usdt=Decimal(0),
+            liquidation_distance_reserve_usdt=Decimal(0),
             precomputed_four_leg_fee_usdt=quote.four_leg_fee_estimate,
+            emergency_hedge_reserve_usdt=residual_stress,
         )
         preliminary = evaluate_entry_signal(
             inputs,
@@ -501,10 +552,9 @@ class ShadowTrader:
             return preliminary
 
         tranche_id = uuid4().hex
-        projected_stress = (
-            preliminary.cost.stressed_total_cost_usdt
-            + midpoint_notional * parameters.grid_step_bps * 5 / Decimal(10_000)
-        )
+        projected_stress = preliminary.cost.stressed_total_cost_usdt + midpoint_notional * max(
+            Decimal(0), calibrated.route_stop_bps - quote.entry_spread_bps
+        ) / Decimal(10_000)
         equity = self.settings.risk.reference_capital_usdt / 2
         venue_stress = projected_stress / 2
         request = RiskRequest(
@@ -529,7 +579,13 @@ class ShadowTrader:
             ),
             exit_depth_sufficient=True,
         )
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            return None
         risk = self._risk.reserve(request)
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            if risk.accepted:
+                self._risk.release(tranche_id)
+            return None
         decision = evaluate_entry_signal(
             inputs,
             parameters,
@@ -539,6 +595,8 @@ class ShadowTrader:
             risk.breakdown,
         )
         if not decision.accepted:
+            if risk.accepted:
+                self._risk.release(tranche_id)
             return decision
 
         tranche = Tranche(
@@ -546,10 +604,16 @@ class ShadowTrader:
             route=route,
             requested_quantity=quote.base_quantity,
             target_close_spread=parameters.exit_quantile_bps,
-            stop_spread=quote.entry_spread_bps + parameters.grid_step_bps * 5,
+            stop_spread=calibrated.route_stop_bps,
             projected_stress_usdt=projected_stress,
         )
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            self._risk.release(tranche_id)
+            return None
         self._coordinator.precheck_and_reserve(tranche, risk)
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            self._risk.release(tranche_id)
+            return None
         entry_fee = quote.four_leg_fee_estimate / 4
         self._coordinator.submit_open(
             tranche,
@@ -574,6 +638,9 @@ class ShadowTrader:
                 entry_fee,
             ),
         )
+        if decision_deadline is not None and asyncio.get_running_loop().time() >= decision_deadline:
+            self._risk.release(tranche_id)
+            return None
         self.runtime.tranches[tranche_id] = tranche
         self._managed_ids.add(tranche_id)
         await save_tranche(self.runtime.state_path, tranche)
@@ -709,6 +776,7 @@ def _scan_payload(
             str(result.prefilter_latency_ms) if result.prefilter_latency_ms is not None else None
         ),
         "candidate_l2": asdict(result.candidate_l2) if result.candidate_l2 is not None else None,
+        "route_calibration": [asdict(assessment) for assessment in result.route_calibration],
         "opportunities": [asdict(quote) for quote in result.quotes],
         "data_health": [asdict(quality) for quality in result.data_quality],
         "quarantined": [asdict(record) for record in result.quarantined],
@@ -723,12 +791,80 @@ class ContinuousShadowEvaluator:
         engine: MarketEngine | None = None,
         runtime: ShadowRuntime | None = None,
         trader: ShadowTrader | None = None,
+        route_calibrator: PersistentRouteCalibrator | None = None,
     ) -> None:
         self.settings = settings
         self.runtime = runtime or ShadowRuntime(settings)
         self._engine = engine or PublicMarketEngine(settings)
         self._trader = trader or ShadowTrader(settings, self.runtime)
+        self._route_calibrator = route_calibrator or PersistentRouteCalibrator(
+            Path(settings.storage.sqlite_path),
+            minimum_samples=(settings.shadow.qualification_min_synchronised_snapshots_per_venue),
+            minimum_observation_period=timedelta(
+                seconds=settings.shadow.qualification_min_duration_seconds
+            ),
+            minimum_profit_usdt=settings.strategy.minimum_profit_usdt or Decimal("0.01"),
+            parameter_change_limit_ratio_per_day=(
+                settings.strategy.grid_parameter_change_limit_ratio
+            ),
+            maximum_inter_observation_gap=timedelta(
+                seconds=settings.shadow.qualification_max_inter_snapshot_gap_seconds
+            ),
+            sampling_policy=RouteCalibrationSamplingPolicy(
+                settings.strategy.calibration_size_multipliers,
+                settings.risk.max_hold_seconds,
+                settings.strategy.calibration_funding_refresh_seconds,
+                settings.execution.funding_stress_multiplier,
+                settings.execution.latency_reserve_bps,
+                settings.execution.partial_fill_reserve_bps,
+                settings.execution.emergency_hedge_reserve_bps,
+                settings.execution.reconciliation_forced_exit_reserve_bps,
+            ),
+            maximum_l2_age_ms=settings.market_data.max_l2_age_ms,
+        )
         self._last_prefilter: tuple[BboPrefilterObservation, ...] = ()
+        self._pending_route_calibration: (
+            asyncio.Task[tuple[RouteCalibrationAssessment, ...]] | None
+        ) = None
+        self._pending_route_calibration_observed_at: datetime | None = None
+        self._route_calibration_persisted_at: datetime | None = None
+        self._route_calibration_persistence_healthy = False
+        self._route_calibration_persistence_failure: str | None = None
+        self._decision_latency_samples: deque[Decimal] = deque(maxlen=4096)
+
+    def _decision_latency_p95(self) -> Decimal | None:
+        if not self._decision_latency_samples:
+            return None
+        ordered = tuple(sorted(self._decision_latency_samples))
+        position = Decimal("0.95") * Decimal(len(ordered) - 1)
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = position - Decimal(lower)
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+    def _harvest_route_calibration_task(self) -> None:
+        task = self._pending_route_calibration
+        if task is None or not task.done():
+            return
+        observed_at = self._pending_route_calibration_observed_at
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception) as error:
+            self._route_calibration_persistence_healthy = False
+            self._route_calibration_persistence_failure = f"{type(error).__name__}: {error}"
+        else:
+            self._route_calibration_persistence_healthy = True
+            self._route_calibration_persistence_failure = None
+            self._route_calibration_persisted_at = observed_at
+        self._pending_route_calibration = None
+        self._pending_route_calibration_observed_at = None
+
+    @staticmethod
+    def _consume_route_calibration_task(
+        task: asyncio.Task[tuple[RouteCalibrationAssessment, ...]],
+    ) -> None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.result()
 
     def _apply_public_workload(
         self,
@@ -751,6 +887,7 @@ class ContinuousShadowEvaluator:
     async def run(self, stop_event: asyncio.Event) -> None:
         logger = get_logger()
         await self.runtime.start()
+        await self._route_calibrator.initialise()
         active_ids = {
             tranche.tranche_id
             for tranche in self.runtime.tranches.values()
@@ -804,6 +941,16 @@ class ContinuousShadowEvaluator:
                         active_route_keys=active_route_keys,
                         entry_work_admitted=entry_work_admitted,
                     )
+                    await self._trader.close_active(result.quotes)
+                    active_route_keys = frozenset(
+                        (
+                            tranche.route.base,
+                            tranche.route.long_venue.value,
+                            tranche.route.short_venue.value,
+                        )
+                        for tranche in self.runtime.tranches.values()
+                        if tranche.state in ACTIVE_STATES
+                    )
                     self._last_prefilter = result.prefilter
                     candidate_l2 = await self._engine.scan_candidate_l2(
                         self.settings.shadow.scan_timeout_seconds,
@@ -823,8 +970,119 @@ class ContinuousShadowEvaluator:
                             candidates_admitted=False,
                             prefilter=result.prefilter,
                         )
+                    candidate_completed_at = asyncio.get_running_loop().time()
+                    calibration_observations: tuple[RouteCalibrationObservation, ...] = ()
+                    if active_route_keys or next_candidates_admitted:
+                        calibration_epoch = await self._route_calibrator.current_epoch_id(
+                            datetime.now(UTC)
+                        )
+                        calibration_observations = (
+                            await self._engine.scan_route_calibration_observations(
+                                self.settings.shadow.scan_timeout_seconds,
+                                epoch_id=calibration_epoch,
+                            )
+                        )
+                    route_calibration: tuple[RouteCalibrationAssessment, ...] = ()
+                    self._harvest_route_calibration_task()
+                    if self._route_calibration_persistence_failure is not None:
+                        logger.error(
+                            "route_calibration_persistence_failed",
+                            reason=self._route_calibration_persistence_failure,
+                        )
+                    pending_calibration = self._pending_route_calibration
+                    current_observed_at = (
+                        max(item.observed_at for item in calibration_observations)
+                        if calibration_observations
+                        else None
+                    )
+                    if calibration_observations and pending_calibration is None:
+                        calibration_task = asyncio.create_task(
+                            self._route_calibrator.record_many(
+                                calibration_observations,
+                                now=current_observed_at,
+                            ),
+                            name="shadow-route-calibration",
+                        )
+                        self._pending_route_calibration = calibration_task
+                        self._pending_route_calibration_observed_at = current_observed_at
+                    loop = asyncio.get_running_loop()
+                    elapsed_after_candidate = loop.time() - candidate_completed_at
+                    remaining_decision_budget = max(
+                        0.0,
+                        0.240
+                        - float(candidate_l2.decision_latency_ms) / 1000
+                        - elapsed_after_candidate,
+                    )
+                    if calibration_observations and remaining_decision_budget > 0:
+                        point_gate = asyncio.create_task(
+                            self._route_calibrator.assess_current(calibration_observations),
+                            name="shadow-route-calibration-current-gate",
+                        )
+                        done, _pending = await asyncio.wait(
+                            (point_gate,),
+                            timeout=remaining_decision_budget,
+                        )
+                        if point_gate in done:
+                            route_calibration = point_gate.result()
+                        else:
+                            point_gate.cancel()
+                            point_gate.add_done_callback(self._consume_route_calibration_task)
+                    self._harvest_route_calibration_task()
+                    persistence_fresh = (
+                        self._route_calibration_persistence_healthy
+                        and current_observed_at is not None
+                        and self._route_calibration_persisted_at is not None
+                        and current_observed_at >= self._route_calibration_persisted_at
+                        and current_observed_at - self._route_calibration_persisted_at
+                        <= timedelta(
+                            seconds=(
+                                self.settings.shadow.qualification_max_inter_snapshot_gap_seconds
+                            )
+                        )
+                    )
+                    pre_decision_latency_ms = max(
+                        candidate_l2.decision_latency_ms,
+                        candidate_l2.decision_latency_ms
+                        + Decimal(
+                            str((asyncio.get_running_loop().time() - candidate_completed_at) * 1000)
+                        ),
+                    )
+                    receipt_started_at = candidate_completed_at - (
+                        float(candidate_l2.decision_latency_ms) / 1000
+                    )
+                    decision_deadline = receipt_started_at + 0.250
+                    if (
+                        pre_decision_latency_ms > Decimal(250)
+                        or not persistence_fresh
+                        or asyncio.get_running_loop().time() >= decision_deadline
+                    ):
+                        route_calibration = ()
+                    candidate_l2 = replace(
+                        candidate_l2,
+                        decision_latency_ms=pre_decision_latency_ms,
+                    )
+                    result = replace(
+                        result,
+                        candidate_l2=candidate_l2,
+                        route_calibration=route_calibration,
+                    )
+                    decisions = await self._trader.process(
+                        result,
+                        decision_deadline=decision_deadline,
+                    )
+                    actual_decision_latency_ms = Decimal(
+                        str((asyncio.get_running_loop().time() - receipt_started_at) * 1000)
+                    )
+                    self._decision_latency_samples.append(actual_decision_latency_ms)
+                    candidate_l2 = replace(
+                        candidate_l2,
+                        decision_latency_ms=actual_decision_latency_ms,
+                        stats=replace(
+                            candidate_l2.stats,
+                            decision_latency_p95_ms=self._decision_latency_p95(),
+                        ),
+                    )
                     result = replace(result, candidate_l2=candidate_l2)
-                    decisions = await self._trader.process(result)
                     await save_shadow_snapshot(
                         self.runtime.state_path,
                         _scan_payload(result, decisions),
@@ -871,4 +1129,45 @@ class ContinuousShadowEvaluator:
                 except TimeoutError:
                     continue
         finally:
-            await self._engine.close()
+            failures: list[str] = []
+            try:
+                await self._engine.close()
+            except Exception as error:
+                failures.append(f"public engine: {type(error).__name__}: {error}")
+            pending_calibration = self._pending_route_calibration
+            if pending_calibration is not None:
+                if not pending_calibration.done():
+                    done, _pending = await asyncio.wait((pending_calibration,), timeout=1)
+                    if pending_calibration not in done:
+                        pending_calibration.cancel()
+                        cancelled, _still_pending = await asyncio.wait(
+                            (pending_calibration,),
+                            timeout=0.1,
+                        )
+                        if pending_calibration in cancelled:
+                            if pending_calibration.cancelled():
+                                self._pending_route_calibration = None
+                                self._pending_route_calibration_observed_at = None
+                            else:
+                                self._harvest_route_calibration_task()
+                        else:
+                            self._pending_route_calibration = None
+                            self._pending_route_calibration_observed_at = None
+                            pending_calibration.add_done_callback(
+                                self._consume_route_calibration_task
+                            )
+                            failures.append(
+                                "route calibration persistence: shutdown deadline exceeded"
+                            )
+                if pending_calibration.done():
+                    self._harvest_route_calibration_task()
+            try:
+                await self._route_calibrator.close()
+            except Exception as error:
+                failures.append(f"route calibrator: {type(error).__name__}: {error}")
+            if self._route_calibration_persistence_failure is not None:
+                failures.append(
+                    f"route calibration persistence: {self._route_calibration_persistence_failure}"
+                )
+            if failures:
+                raise RuntimeError(f"shadow shutdown failed: {'; '.join(failures)}")

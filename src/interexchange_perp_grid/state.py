@@ -22,7 +22,7 @@ from interexchange_perp_grid.execution import (
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "10"
 SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
@@ -156,6 +156,80 @@ SCHEMA_STATEMENTS = (
         updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_observations (
+        observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route TEXT NOT NULL,
+        size_bucket_multiplier TEXT NOT NULL,
+        epoch_id TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        UNIQUE(route, size_bucket_multiplier, epoch_id, observed_at)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_parameters (
+        route TEXT NOT NULL,
+        size_bucket_multiplier TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        transient_blocked INTEGER NOT NULL DEFAULT 0 CHECK (transient_blocked IN (0, 1)),
+        PRIMARY KEY(route, size_bucket_multiplier)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_episodes (
+        route TEXT NOT NULL,
+        size_bucket_multiplier TEXT NOT NULL,
+        epoch_id TEXT NOT NULL,
+        entry_spread_bps TEXT NOT NULL,
+        convergence_target_bps TEXT NOT NULL,
+        peak_spread_bps TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        PRIMARY KEY(route, size_bucket_multiplier, epoch_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_segments (
+        route TEXT NOT NULL,
+        size_bucket_multiplier TEXT NOT NULL,
+        epoch_id TEXT NOT NULL,
+        ready_sample_count INTEGER NOT NULL CHECK (ready_sample_count >= 0),
+        segment_started_at TEXT,
+        last_observed_at TEXT NOT NULL,
+        last_reason TEXT NOT NULL,
+        PRIMARY KEY(route, size_bucket_multiplier, epoch_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_runtime (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        epoch_id TEXT NOT NULL,
+        policy_fingerprint TEXT NOT NULL,
+        last_observed_at TEXT
+    )
+    """,
+)
+
+_SCHEMA_INDEX_STATEMENTS = (
+    """
+    CREATE INDEX IF NOT EXISTS route_calibration_observations_key_time_v8
+    ON route_calibration_observations(
+        route, size_bucket_multiplier, epoch_id, observed_at
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS route_calibration_observations_key_observed_v9
+    ON route_calibration_observations(
+        route, size_bucket_multiplier, observed_at
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS route_calibration_observations_observed_v9
+    ON route_calibration_observations(observed_at)
+    """,
 )
 
 _EPOCH_OBSERVATION_TABLES = (
@@ -239,9 +313,62 @@ def _initialise_state_sync(path: Path) -> None:
             "3",
             "4",
             "5",
+            "6",
+            "7",
+            "8",
+            "9",
             SCHEMA_VERSION,
         }:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
+        calibration_columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_observations)")
+        }
+        if (
+            existing is not None
+            and existing[0] == "7"
+            and "size_bucket_base_quantity" in calibration_columns
+        ):
+            for table in (
+                "route_calibration_observations",
+                "route_calibration_parameters",
+                "route_calibration_episodes",
+            ):
+                database.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy_v7")
+            for statement in SCHEMA_STATEMENTS:
+                database.execute(statement)
+        calibration_columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_observations)")
+        }
+        if "reason" not in calibration_columns:
+            database.execute(
+                """
+                ALTER TABLE route_calibration_observations
+                ADD COLUMN reason TEXT NOT NULL DEFAULT 'CALIBRATION_INSUFFICIENT'
+                """
+            )
+        parameter_columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_parameters)")
+        }
+        if "active" not in parameter_columns:
+            database.execute(
+                """
+                ALTER TABLE route_calibration_parameters
+                ADD COLUMN active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+                """
+            )
+        if "transient_blocked" not in parameter_columns:
+            database.execute(
+                """
+                ALTER TABLE route_calibration_parameters
+                ADD COLUMN transient_blocked INTEGER NOT NULL DEFAULT 0
+                    CHECK (transient_blocked IN (0, 1))
+                """
+            )
+        for statement in _SCHEMA_INDEX_STATEMENTS:
+            database.execute(statement)
         for table in _EPOCH_OBSERVATION_TABLES:
             columns = {str(row[1]) for row in database.execute(f"PRAGMA table_info({table})")}
             if "epoch_id" not in columns:

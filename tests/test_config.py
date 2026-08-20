@@ -44,6 +44,76 @@ def test_runtime_universe_policy_is_typed_and_locked() -> None:
     )
     assert settings.universe.decision_debounce_ms == policy["universe"]["decision_debounce_ms"]
     assert settings.market_data.max_bbo_age_ms == policy["data"]["max_bbo_age_ms"]
+    assert list(settings.strategy.calibration_size_multipliers) == [
+        Decimal(value) for value in policy["strategy"]["calibration_size_multipliers"]
+    ]
+    assert (
+        settings.strategy.calibration_funding_refresh_seconds
+        == policy["strategy"]["calibration_funding_refresh_seconds"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("calibration_size_multipliers", ["1", "3", "5"]),
+        ("calibration_funding_refresh_seconds", 61),
+    ),
+)
+def test_calibration_policy_drift_fails_startup(
+    tmp_path: Path,
+    key: str,
+    value: object,
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw["strategy"][key] = value
+    config = tmp_path / "defaults.yaml"
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    (tmp_path / "RUNTIME_POLICY.yaml").write_text(
+        Path("config/RUNTIME_POLICY.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=f"configuration {key} differs"):
+        load_settings(config)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    (
+        (
+            "strategy",
+            "grid_parameter_change_limit_ratio",
+            "0.50",
+            "change limit exceeds",
+        ),
+        (
+            "strategy",
+            "stressed_cost_multiplier",
+            "1.0",
+            "stressed cost multiplier is below",
+        ),
+        ("market_data", "max_l2_age_ms", 1001, "max_l2_age_ms differs"),
+    ),
+)
+def test_locked_calibration_safety_cannot_be_weakened(
+    tmp_path: Path,
+    section: str,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw[section][key] = value
+    config = tmp_path / "defaults.yaml"
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    (tmp_path / "RUNTIME_POLICY.yaml").write_text(
+        Path("config/RUNTIME_POLICY.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_settings(config)
 
 
 def test_risk_budget_relationship_is_enforced() -> None:
@@ -51,6 +121,15 @@ def test_risk_budget_relationship_is_enforced() -> None:
     raw = settings.model_dump(mode="json")
     raw["risk"]["portfolio_stressed_loss_limit_usdt"] = "20"
     with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+def test_scan_cadence_must_leave_funding_refresh_safety_margin() -> None:
+    settings = load_settings(CONFIG)
+    raw = settings.model_dump(mode="json")
+    raw["shadow"]["scan_interval_seconds"] = 31
+
+    with pytest.raises(ValidationError, match="funding refresh safety margin"):
         Settings.model_validate(raw)
 
 

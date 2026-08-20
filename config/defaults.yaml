@@ -44,6 +44,8 @@ strategy:
   stressed_cost_multiplier: "2.0"
   minimum_profit_usdt: null
   grid_parameter_change_limit_ratio: "0.20"
+  calibration_size_multipliers: ["1", "2", "5"]
+  calibration_funding_refresh_seconds: 60
 
 execution:
   normal_intent: PROTECTED_AGGRESSIVE_TAKER

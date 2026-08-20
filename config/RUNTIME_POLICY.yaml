@@ -27,6 +27,8 @@ data:
 strategy:
   stressed_cost_multiplier: '2.0'
   max_parameter_change_ratio_per_day: '0.20'
+  calibration_size_multipliers: ['1', '2', '5']
+  calibration_funding_refresh_seconds: 60
   max_tranches: 5
   hard_max_hold_seconds: 86400
 risk_stages:
