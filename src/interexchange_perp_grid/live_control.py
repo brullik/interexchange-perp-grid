@@ -7,7 +7,7 @@ import os
 import secrets
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, DecimalException
 
 from interexchange_perp_grid.client_ids import (
@@ -18,9 +18,11 @@ from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import ExecutionIntent, OrderPurpose, Side
 from interexchange_perp_grid.live_coordinator import CanaryVenueAdapter
 from interexchange_perp_grid.live_journal import (
+    JournalLeg,
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
+    request_payload_hash,
 )
 from interexchange_perp_grid.live_reconciliation import (
     FlatBarrierPolicy,
@@ -44,6 +46,7 @@ from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 EMERGENCY_CONFIRMATION = "I_CONFIRM_EMERGENCY_FLATTEN_ALL_LIVE_EXPOSURE"
+_ACCOUNT_FLATTEN_LOCKS: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,26 +241,88 @@ class LiveControlService:
         return await self._flatten("KILL_CANCEL_FLATTEN")
 
     async def _flatten(self, action_name: str) -> LiveControlResult:
-        lease_token = await self._journal.acquire_account_flatten_lease()
-        if lease_token is None:
-            return LiveControlResult(
-                False,
-                action_name,
-                0,
-                0,
-                None,
-                None,
-                "Another account-wide flatten is in progress; keep live disabled.",
-                reason=ReasonCode.RECONCILIATION_INCOMPLETE,
-            )
-        try:
-            result = await self._flatten_owned(action_name)
-        except BaseException:
-            # An interrupted network operation has an unknown terminal state. Keep the
-            # durable lease so another caller cannot submit a contradictory close.
-            raise
-        await self._journal.release_account_flatten_lease(lease_token)
-        return result
+        async with _account_flatten_lock(self._journal):
+            lease_token = await self._journal.acquire_account_flatten_lease()
+            if lease_token is None:
+                return LiveControlResult(
+                    False,
+                    action_name,
+                    0,
+                    0,
+                    None,
+                    None,
+                    "Another account-wide flatten is in progress; keep live disabled.",
+                    reason=ReasonCode.RECONCILIATION_INCOMPLETE,
+                )
+            try:
+                resumed_submits = await self._resume_attempted_emergency_legs()
+                result = await self._flatten_owned(action_name)
+                if resumed_submits:
+                    result = replace(
+                        result,
+                        orders_sent=result.orders_sent + resumed_submits,
+                    )
+            except BaseException:
+                # Indeterminate network work keeps exclusive ownership. A restarted process
+                # may adopt only after the old process incarnation is no longer live.
+                raise
+            await self._journal.release_account_flatten_lease(lease_token)
+            return result
+
+    async def _resume_attempted_emergency_legs(self) -> int:
+        active = await self._journal.active_actions()
+        submissions = 0
+        for action in active:
+            for leg in action.legs:
+                if (
+                    not leg.submit_attempted
+                    or leg.protected_price is not None
+                    or leg.status
+                    in {
+                        PrivateOrderStatus.FILLED,
+                        PrivateOrderStatus.CANCELLED,
+                        PrivateOrderStatus.REJECTED,
+                    }
+                ):
+                    continue
+                submissions += await self._resume_attempted_emergency_leg(action, leg)
+        return submissions
+
+    async def _resume_attempted_emergency_leg(
+        self,
+        action: LiveJournalAction,
+        leg: JournalLeg,
+    ) -> int:
+        instrument = self._instrument(leg.venue, leg.symbol)
+        request = translate_protected_order(
+            ExecutionIntent(
+                client_order_id=leg.client_order_id,
+                venue=leg.venue,
+                side=leg.side,
+                purpose=OrderPurpose.EMERGENCY_CLOSE,
+                quantity=leg.intended_base_quantity,
+                worst_acceptable_price=None,
+                unbounded_market=True,
+            ),
+            instrument,
+        )
+        if request_payload_hash(request) != leg.request_payload_hash:
+            raise RuntimeError("journaled emergency request cannot be reconstructed exactly")
+        adapter = self._adapters[leg.venue]
+        order = await adapter.find_order_by_client_id(leg.client_order_id, instrument)
+        if order is None:
+            raise RuntimeError("journaled emergency order remains unknown")
+        await self._journal.record_order_event(
+            action.pair_action_id,
+            order,
+            (
+                f"{order.order_id or 'none'}:{order.status.value}:"
+                f"{order.filled_base_quantity}:{order.observed_at.isoformat()}"
+            ),
+        )
+        if order.status == PrivateOrderStatus.UNKNOWN:
+            raise RuntimeError("journaled emergency order remains unknown")
+        return 0
 
     async def _flatten_owned(self, action_name: str) -> LiveControlResult:
         cancellation = await self._cancel_orders(bot_only=False)
@@ -387,6 +452,7 @@ class LiveControlService:
             ),
             return_exceptions=True,
         )
+        _raise_on_indeterminate_submit(submitted)
         orders_sent = len(requests)
         if active is not None and active.state == LiveActionState.SUBMITTING:
             active = await self._journal.transition(
@@ -552,13 +618,14 @@ class LiveControlService:
                 current_owner.pair_action_id,
                 request.client_order_id,
             )
-        await asyncio.gather(
+        submitted = await asyncio.gather(
             *(
                 self._submit_emergency(recovering_by_id[owner.pair_action_id], request)
                 for owner, request in zip(owners, requests, strict=True)
             ),
             return_exceptions=True,
         )
+        _raise_on_indeterminate_submit(submitted)
         barrier = await self._stable_report_many(recovering)
         if barrier.verified:
             recovered, barrier = await self._mark_flat_many(recovering, action_name, barrier)
@@ -633,6 +700,7 @@ class LiveControlService:
             self._adapters,
             self._account_instruments,
             reconciliation_trigger="TERMINAL_FLAT",
+            recent_instruments=self._recent_instruments((active,) if active is not None else ()),
         )
         return reconcile_private_states(
             active,
@@ -667,6 +735,7 @@ class LiveControlService:
             self._adapters,
             self._account_instruments,
             reconciliation_trigger="TERMINAL_FLAT",
+            recent_instruments=self._recent_instruments(current),
         )
         return reconcile_private_states(
             current,
@@ -700,6 +769,21 @@ class LiveControlService:
         if instrument is None:
             raise RuntimeError(f"instrument registry has no {venue.value}:{symbol}")
         return instrument
+
+    def _recent_instruments(
+        self,
+        active: Sequence[LiveJournalAction],
+    ) -> dict[Venue, tuple[Instrument, ...]]:
+        symbols_by_venue: dict[Venue, set[str]] = {venue: set() for venue in self._adapters}
+        for action in active:
+            for leg in action.legs:
+                if leg.submit_attempted:
+                    symbols_by_venue.setdefault(leg.venue, set()).add(leg.symbol)
+        return {
+            venue: tuple(self._instrument(venue, symbol) for symbol in sorted(symbols))
+            or (self._account_instruments[venue],)
+            for venue, symbols in symbols_by_venue.items()
+        }
 
     def _emergency_route(self) -> DirectedRouteKey:
         if self._route is not None:
@@ -888,6 +972,27 @@ class LiveControlService:
                 *(self._quarantine(action, report, action_name) for action in active)
             )
         )
+
+
+def _raise_on_indeterminate_submit(results: Sequence[object]) -> None:
+    failure = next((result for result in results if isinstance(result, BaseException)), None)
+    if failure is not None:
+        raise RuntimeError(
+            "emergency submit is indeterminate; exclusive flatten ownership retained"
+        ) from failure
+
+
+def _account_flatten_lock(journal: LiveOrderJournal) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = str(journal.path.resolve())
+    existing = _ACCOUNT_FLATTEN_LOCKS.get(key)
+    if existing is not None and existing[0] is loop:
+        return existing[1]
+    if existing is not None and existing[1].locked():
+        raise RuntimeError("account-wide flatten remains active on another event loop")
+    lock = asyncio.Lock()
+    _ACCOUNT_FLATTEN_LOCKS[key] = (loop, lock)
+    return lock
 
 
 def emergency_unlock_valid(

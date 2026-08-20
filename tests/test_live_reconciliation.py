@@ -20,6 +20,7 @@ from interexchange_perp_grid.live_reconciliation import (
     collect_private_states,
     evaluate_canary_risk_from_private_state,
     reconcile_private_states,
+    shutdown_private_requests,
     wait_for_stable_flat,
 )
 from interexchange_perp_grid.private_domain import (
@@ -437,23 +438,41 @@ async def test_private_state_collection_has_a_hard_deadline() -> None:
 
 
 class SlowCancellationAdapter(HangingPrivateStateAdapter):
+    def __init__(self, venue: Venue) -> None:
+        self.venue = venue
+        self.active_calls = 0
+        self.release = asyncio.Event()
+
     async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            await asyncio.sleep(0.2)
-            raise
-        raise AssertionError("unreachable")
+        self.active_calls += 1
+        await self.release.wait()
+        return PrivateActiveSnapshot(
+            self.venue,
+            0,
+            0,
+            (),
+            (),
+            (),
+            SnapshotCompleteness.COMPLETE,
+            datetime.now(UTC),
+            account_wide=True,
+        )
 
 
 @pytest.mark.asyncio
 async def test_private_state_deadline_does_not_wait_for_slow_child_cancellation() -> None:
     venue = Venue.BYBIT
+    adapter = SlowCancellationAdapter(venue)
     loop = asyncio.get_running_loop()
     started = loop.time()
 
     states = await collect_private_states(
-        {venue: SlowCancellationAdapter()},
+        {venue: adapter},
+        {venue: _instrument(venue)},
+        timeout_seconds=0.01,
+    )
+    repeated = await collect_private_states(
+        {venue: adapter},
         {venue: _instrument(venue)},
         timeout_seconds=0.01,
     )
@@ -461,7 +480,18 @@ async def test_private_state_deadline_does_not_wait_for_slow_child_cancellation(
 
     assert elapsed < 0.05
     assert states[venue].error == "TimeoutError:"
-    await asyncio.sleep(0.21)
+    assert repeated[venue].error == "TimeoutError:"
+    assert adapter.active_calls == 1
+
+    adapter.release.set()
+    await asyncio.sleep(0)
+    recovered = await collect_private_states(
+        {venue: adapter},
+        {venue: _instrument(venue)},
+        timeout_seconds=0.1,
+    )
+    assert recovered[venue].error is None
+    assert adapter.active_calls == 2
 
 
 class RecordingReconcilingAdapter(HangingPrivateStateAdapter):
@@ -501,3 +531,106 @@ async def test_qualified_consumer_can_force_immediate_account_wide_reconciliatio
     assert states[venue].error is None
     assert states[venue].account_wide is True
     assert adapter.triggers == ["PRE_SUBMIT:bybit"]
+
+
+class SplitReconciliationAdapter(RecordingReconcilingAdapter):
+    def __init__(self, venue: Venue) -> None:
+        super().__init__(venue)
+        self.cached_started = asyncio.Event()
+        self.cached_release = asyncio.Event()
+        self.cached_calls = 0
+
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
+        self.cached_calls += 1
+        self.cached_started.set()
+        await self.cached_release.wait()
+        return PrivateActiveSnapshot(
+            self.venue,
+            0,
+            0,
+            (),
+            (),
+            (),
+            SnapshotCompleteness.COMPLETE,
+            datetime.now(UTC),
+            account_wide=True,
+        )
+
+    async def reconcile_active_snapshot(self, trigger: str) -> PrivateActiveSnapshot:
+        self.triggers.append(trigger)
+        return PrivateActiveSnapshot(
+            self.venue,
+            0,
+            1,
+            (),
+            (_position(self.venue, Side.BUY, "0.001"),),
+            (),
+            SnapshotCompleteness.COMPLETE,
+            datetime.now(UTC),
+            account_wide=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_forced_reconciliation_never_reuses_an_inflight_cached_snapshot() -> None:
+    venue = Venue.BYBIT
+    adapter = SplitReconciliationAdapter(venue)
+    instruments = {venue: _instrument(venue)}
+
+    cached = await collect_private_states(
+        {venue: adapter},
+        instruments,
+        timeout_seconds=0.01,
+    )
+    forced = await collect_private_states(
+        {venue: adapter},
+        instruments,
+        timeout_seconds=0.1,
+        reconciliation_trigger="TERMINAL_FLAT",
+    )
+
+    assert cached[venue].error == "TimeoutError:"
+    assert forced[venue].error is None
+    assert len(forced[venue].positions) == 1
+    assert adapter.cached_calls == 1
+    assert adapter.triggers == ["TERMINAL_FLAT:bybit"]
+    adapter.cached_release.set()
+    await shutdown_private_requests({venue: adapter})
+
+
+class CancellationResistantPrivateAdapter(SlowCancellationAdapter):
+    async def fetch_active_snapshot(self) -> PrivateActiveSnapshot:
+        self.active_calls += 1
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await self.release.wait()
+        return PrivateActiveSnapshot(
+            self.venue,
+            0,
+            0,
+            (),
+            (),
+            (),
+            SnapshotCompleteness.COMPLETE,
+            datetime.now(UTC),
+            account_wide=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_private_request_shutdown_is_bounded_and_explicit() -> None:
+    venue = Venue.BYBIT
+    adapter = CancellationResistantPrivateAdapter(venue)
+    states = await collect_private_states(
+        {venue: adapter},
+        {venue: _instrument(venue)},
+        timeout_seconds=0.01,
+    )
+    assert states[venue].error == "TimeoutError:"
+
+    with pytest.raises(RuntimeError, match="shutdown deadline exceeded"):
+        await shutdown_private_requests({venue: adapter}, timeout_seconds=0.01)
+
+    adapter.release.set()
+    await shutdown_private_requests({venue: adapter}, timeout_seconds=0.1)

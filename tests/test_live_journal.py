@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import threading
 from dataclasses import replace
@@ -548,6 +549,66 @@ async def test_account_flatten_lease_blocks_a_new_normal_live_action(tmp_path: P
     await journal.release_account_flatten_lease(token)
     created = await _prepare(journal)
     assert created.state == LiveActionState.PREPARED
+
+
+@pytest.mark.asyncio
+async def test_dead_process_account_flatten_lease_can_be_adopted(tmp_path: Path) -> None:
+    path = tmp_path / "stale-flatten.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    original = await journal.acquire_account_flatten_lease()
+    assert original is not None
+    assert await LiveOrderJournal(path).acquire_account_flatten_lease() == original
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "UPDATE live_control_leases SET owner_pid = ? WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'",
+            (2_147_483_647,),
+        )
+
+    adopted = await LiveOrderJournal(path).acquire_account_flatten_lease()
+
+    assert adopted is not None and adopted != original
+    await journal.release_account_flatten_lease(adopted)
+
+
+@pytest.mark.asyncio
+async def test_reused_pid_with_new_process_identity_can_adopt_lease(tmp_path: Path) -> None:
+    path = tmp_path / "pid-reuse.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    original = await journal.acquire_account_flatten_lease()
+    assert original is not None
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "UPDATE live_control_leases SET owner_pid = ?, owner_incarnation = ?, "
+            "owner_process_identity = ? "
+            "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'",
+            (os.getpid(), "prior-process-with-reused-pid", "prior-process-identity"),
+        )
+
+    adopted = await LiveOrderJournal(path).acquire_account_flatten_lease()
+
+    assert adopted is not None and adopted != original
+    await journal.release_account_flatten_lease(adopted)
+
+
+@pytest.mark.asyncio
+async def test_legacy_flatten_lease_requires_external_flat_verification(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-owner.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    original = await journal.acquire_account_flatten_lease()
+    assert original is not None
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "UPDATE live_control_leases SET owner_pid = 0, owner_incarnation = '', "
+            "owner_process_identity = '' "
+            "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+        )
+
+    assert await LiveOrderJournal(path).acquire_account_flatten_lease() is None
 
 
 @pytest.mark.asyncio

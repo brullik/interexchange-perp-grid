@@ -58,6 +58,7 @@ from interexchange_perp_grid.live_reconciliation import (
     collect_private_states,
     evaluate_canary_risk_from_private_state,
     reconcile_private_states,
+    shutdown_private_requests,
 )
 from interexchange_perp_grid.market_data import BookRegistry, DataQualityAssessment
 from interexchange_perp_grid.private_cache import Wave1PrivateStateSupervisor
@@ -360,6 +361,7 @@ class OnDemandLiveControlPlane:
         active = active_actions[0] if len(active_actions) == 1 else None
         venues = {Venue(value) for value in self._settings.venues.wave1_public}
         private: dict[Venue, CcxtPrivateAdapter] = {}
+        cached_private: dict[Venue, CanaryVenueAdapter] = {}
         private_stop: asyncio.Event | None = None
         private_task: asyncio.Task[None] | None = None
         try:
@@ -404,6 +406,7 @@ class OnDemandLiveControlPlane:
                 *(adapter.close() for adapter in private.values()),
                 return_exceptions=True,
             )
+            await shutdown_private_requests(cached_private)
 
 
 def _wave1_emergency_venue(settings: Settings, route: DirectedRouteKey) -> Venue:
@@ -528,6 +531,7 @@ async def _resume_active_canary(
     venues = {active.route.long_venue, active.route.short_venue, emergency_venue}
     public_adapters = {venue: CcxtProAdapter(venue) for venue in venues}
     private_adapters: dict[Venue, CcxtPrivateAdapter] = {}
+    typed_adapters: dict[Venue, CanaryVenueAdapter] = {}
     private_stop: asyncio.Event | None = None
     private_task: asyncio.Task[None] | None = None
     try:
@@ -632,6 +636,7 @@ async def _resume_active_canary(
             *(adapter.close() for adapter in private_adapters.values()),
             return_exceptions=True,
         )
+        await shutdown_private_requests(typed_adapters)
 
 
 async def recover_active_canary(
@@ -716,6 +721,7 @@ async def run_canary_once(
     required_venues = {route.long_venue, route.short_venue, emergency_venue}
     public_adapters = {venue: CcxtProAdapter(venue) for venue in required_venues}
     private_adapters: dict[Venue, CcxtPrivateAdapter] = {}
+    typed_adapters: dict[Venue, CanaryVenueAdapter] = {}
     private_stop: asyncio.Event | None = None
     private_task: asyncio.Task[None] | None = None
     try:
@@ -1048,6 +1054,7 @@ async def run_canary_once(
             *(adapter.close() for adapter in private_adapters.values()),
             return_exceptions=True,
         )
+        await shutdown_private_requests(typed_adapters)
 
 
 async def run_emergency_flatten(
@@ -1093,6 +1100,7 @@ async def run_emergency_flatten(
             *(adapter.close() for adapter in private.values()),
             return_exceptions=True,
         )
+        await shutdown_private_requests(cast(dict[Venue, CanaryVenueAdapter], private))
 
 
 async def _discover_instruments(

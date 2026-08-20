@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -20,6 +21,8 @@ from interexchange_perp_grid.private_domain import (
     VenueOrderRequest,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
+
+_PROCESS_INCARCATION = secrets.token_hex(32)
 
 
 class LiveActionState(StrEnum):
@@ -275,6 +278,9 @@ class LiveOrderJournal:
                 CREATE TABLE IF NOT EXISTS live_control_leases (
                     lease_key TEXT PRIMARY KEY,
                     owner_token TEXT NOT NULL,
+                    owner_pid INTEGER NOT NULL,
+                    owner_incarnation TEXT NOT NULL,
+                    owner_process_identity TEXT NOT NULL,
                     acquired_at TEXT NOT NULL
                 );
                 """
@@ -284,6 +290,24 @@ class LiveOrderJournal:
             }
             if "last_event_at" not in columns:
                 database.execute("ALTER TABLE live_order_legs ADD COLUMN last_event_at TEXT")
+            control_columns = {
+                str(row[1]) for row in database.execute("PRAGMA table_info(live_control_leases)")
+            }
+            if "owner_pid" not in control_columns:
+                database.execute(
+                    "ALTER TABLE live_control_leases ADD COLUMN owner_pid "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            if "owner_incarnation" not in control_columns:
+                database.execute(
+                    "ALTER TABLE live_control_leases ADD COLUMN owner_incarnation "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            if "owner_process_identity" not in control_columns:
+                database.execute(
+                    "ALTER TABLE live_control_leases ADD COLUMN owner_process_identity "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
             database.execute("BEGIN IMMEDIATE")
             try:
                 active_rows = database.execute(
@@ -1227,21 +1251,68 @@ class LiveOrderJournal:
 
     def _acquire_account_flatten_lease_sync(self) -> str | None:
         owner_token = secrets.token_hex(32)
+        owner_pid = os.getpid()
+        owner_process_identity = _process_identity(owner_pid)
+        if owner_process_identity is None:
+            raise RuntimeError("cannot establish account-flatten process identity")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             existing = database.execute(
-                "SELECT owner_token FROM live_control_leases "
+                "SELECT owner_token, owner_pid, owner_incarnation, owner_process_identity "
+                "FROM live_control_leases "
                 "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
             ).fetchone()
             if existing is not None:
-                database.rollback()
-                return None
+                existing_pid = int(existing["owner_pid"])
+                existing_incarnation = str(existing["owner_incarnation"])
+                existing_process_identity = str(existing["owner_process_identity"])
+                if not existing_process_identity:
+                    database.rollback()
+                    return None
+                same_live_process = (
+                    existing_pid == owner_pid and existing_incarnation == _PROCESS_INCARCATION
+                )
+                if same_live_process:
+                    database.commit()
+                    return str(existing["owner_token"])
+                other_live_process = (
+                    bool(existing_process_identity)
+                    and _process_identity(existing_pid) == existing_process_identity
+                )
+                if other_live_process:
+                    database.rollback()
+                    return None
+                database.execute(
+                    """
+                    UPDATE live_control_leases
+                    SET owner_token = ?, owner_pid = ?, owner_incarnation = ?,
+                        owner_process_identity = ?, acquired_at = ?
+                    WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'
+                    """,
+                    (
+                        owner_token,
+                        owner_pid,
+                        _PROCESS_INCARCATION,
+                        owner_process_identity,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+                database.commit()
+                return owner_token
             database.execute(
                 """
-                INSERT INTO live_control_leases (lease_key, owner_token, acquired_at)
-                VALUES ('ACCOUNT_WIDE_FLATTEN', ?, ?)
+                INSERT INTO live_control_leases (
+                    lease_key, owner_token, owner_pid, owner_incarnation,
+                    owner_process_identity, acquired_at
+                ) VALUES ('ACCOUNT_WIDE_FLATTEN', ?, ?, ?, ?, ?)
                 """,
-                (owner_token, datetime.now(UTC).isoformat()),
+                (
+                    owner_token,
+                    owner_pid,
+                    _PROCESS_INCARCATION,
+                    owner_process_identity,
+                    datetime.now(UTC).isoformat(),
+                ),
             )
             database.commit()
         return owner_token
@@ -1424,3 +1495,51 @@ class LiveOrderJournal:
                 for leg in legs
             ),
         )
+
+
+def _process_identity(process_id: int) -> str | None:
+    if process_id <= 0:
+        return None
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    except OSError as error:
+        if getattr(error, "winerror", None) in {87, 1168}:
+            return None
+    if os.name == "nt":
+        return _windows_process_identity(process_id)
+    try:
+        stat = (Path("/proc") / str(process_id) / "stat").read_text(encoding="utf-8")
+        fields = stat[stat.rfind(")") + 2 :].split()
+        return f"proc:{process_id}:{fields[19]}"
+    except (OSError, IndexError):
+        return None
+
+
+def _windows_process_identity(process_id: int) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    process = ctypes.windll.kernel32.OpenProcess(0x1000, False, process_id)
+    if not process:
+        return None
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not ctypes.windll.kernel32.GetProcessTimes(
+            process,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return f"win:{process_id}:{ticks}"
+    finally:
+        ctypes.windll.kernel32.CloseHandle(process)
