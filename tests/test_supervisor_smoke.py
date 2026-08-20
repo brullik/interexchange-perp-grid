@@ -16,6 +16,33 @@ from interexchange_perp_grid.supervisor_smoke import (
 )
 
 
+async def _wait_for_ready_content(
+    path: Path,
+    process: asyncio.Task[dict[str, object]],
+    *,
+    expected_lines: int | None = None,
+    expected_suffix: str | None = None,
+) -> str:
+    async def wait_until_complete() -> str:
+        while True:
+            if process.done():
+                await process
+                raise RuntimeError("smoke process exited before publishing readiness")
+            if path.is_file():
+                content = path.read_text(encoding="utf-8")
+                lines_complete = (
+                    expected_lines is None or len(content.splitlines()) == expected_lines
+                )
+                suffix_complete = expected_suffix is None or content.strip().endswith(
+                    expected_suffix
+                )
+                if lines_complete and suffix_complete:
+                    return content
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(wait_until_complete(), timeout=6.0)
+
+
 @pytest.mark.asyncio
 async def test_simulated_process_kill_then_restart_recovers_durable_partial(
     tmp_path: Path,
@@ -29,12 +56,8 @@ async def test_simulated_process_kill_then_restart_recovers_durable_partial(
             ready_path=ready,
         )
     )
-    for _ in range(100):
-        if ready.is_file():
-            break
-        await asyncio.sleep(0.01)
-    assert ready.is_file()
-    assert len(ready.read_text(encoding="utf-8").splitlines()) == 10
+    ready_content = await _wait_for_ready_content(ready, killed_process, expected_lines=10)
+    assert len(ready_content.splitlines()) == 10
     journal = LiveOrderJournal(state)
     assert len(await journal.active_actions()) == 10
     killed_process.cancel()
@@ -58,10 +81,7 @@ async def test_second_restart_recovers_only_the_remaining_nine_actions(tmp_path:
     first_process = asyncio.create_task(
         run_supervisor_recovery_smoke(state, hold_after_active=True, ready_path=ready)
     )
-    for _ in range(100):
-        if ready.is_file():
-            break
-        await asyncio.sleep(0.01)
+    await _wait_for_ready_content(ready, first_process, expected_lines=10)
     journal = LiveOrderJournal(state)
     actions = await journal.active_actions()
     assert len(actions) == 10
@@ -88,10 +108,7 @@ async def test_restart_smoke_rejects_nonfinite_durable_stress(tmp_path: Path) ->
     first_process = asyncio.create_task(
         run_supervisor_recovery_smoke(state, hold_after_active=True, ready_path=ready)
     )
-    for _ in range(100):
-        if ready.is_file():
-            break
-        await asyncio.sleep(0.01)
+    await _wait_for_ready_content(ready, first_process, expected_lines=10)
     first_process.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first_process
@@ -140,11 +157,12 @@ async def test_restart_smoke_recovers_every_durable_active_transition(
             transition_state=transition_state,
         )
     )
-    for _ in range(100):
-        if ready.is_file():
-            break
-        await asyncio.sleep(0.01)
-    assert ready.read_text(encoding="utf-8").strip().endswith(f":{transition_state.value}")
+    ready_content = await _wait_for_ready_content(
+        ready,
+        killed_process,
+        expected_suffix=f":{transition_state.value}",
+    )
+    assert ready_content.strip().endswith(f":{transition_state.value}")
     killed_process.cancel()
     with pytest.raises(asyncio.CancelledError):
         await killed_process
@@ -180,11 +198,12 @@ async def test_killed_process_recovers_through_private_transport_and_stable_flat
             action_count=1,
         )
     )
-    for _ in range(100):
-        if ready.is_file():
-            break
-        await asyncio.sleep(0.01)
-    assert ready.read_text(encoding="utf-8").strip().endswith(f":{transition_state.value}")
+    ready_content = await _wait_for_ready_content(
+        ready,
+        killed_process,
+        expected_suffix=f":{transition_state.value}",
+    )
+    assert ready_content.strip().endswith(f":{transition_state.value}")
     killed_process.cancel()
     with pytest.raises(asyncio.CancelledError):
         await killed_process
@@ -221,11 +240,8 @@ async def test_private_priority_restart_recovers_maximum_ten_actions(tmp_path: P
             action_count=10,
         )
     )
-    for _ in range(100):
-        if ready.is_file():
-            break
-        await asyncio.sleep(0.01)
-    assert len(ready.read_text(encoding="utf-8").splitlines()) == 10
+    ready_content = await _wait_for_ready_content(ready, killed_process, expected_lines=10)
+    assert len(ready_content.splitlines()) == 10
     killed_process.cancel()
     with pytest.raises(asyncio.CancelledError):
         await killed_process
