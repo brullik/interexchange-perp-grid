@@ -135,12 +135,15 @@ class PrivateStreamEvent:
     account: AccountSnapshot | None = None
     unknown_active_records: tuple[UnknownActiveRecord, ...] = ()
     account_wide: bool = True
+    exchange_timestamp_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.event_watermark <= 0 or self.source_monotonic_ns < 0:
             raise ValueError("private stream event evidence is invalid")
         if not self.account_wide:
             raise ValueError("private stream event must be account-wide")
+        if self.exchange_timestamp_ms is not None and self.exchange_timestamp_ms <= 0:
+            raise ValueError("private stream exchange timestamp must be positive")
         payloads = bool(self.orders), bool(self.positions), self.account is not None
         if self.kind == PrivateStreamKind.ORDERS and (payloads[1] or payloads[2]):
             raise ValueError("order stream event contains a foreign payload")

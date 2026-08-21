@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** PHASE5_5_CAPABILITY_MATRIX_COMPLETE
-- **Current checkpoint:** Phase 5.5 seven-venue runtime capability matrix and FT-02 Wave 1 isolation passed exact-head CI and independent technical review. Expansion venues remain public/read-only candidates, the immutable Wave 1 and live-canary allowlist remain Binance USD-M/Bybit/OKX, and fresh PREPARED opening capability/control/depth/economics gates fail closed before submit. The next software checkpoint is reproducible FT-03 Germany/Japan latency evidence and region selection
+- **State:** FT03_REGION_EVIDENCE_PIPELINE_READY_OWNER_EVIDENCE_REQUIRED
+- **Current checkpoint:** FT-03 software evidence collection, signed cloud attestation, report reconstruction, and locked Germany/Japan selector are locally complete with independent P0/P1/P2=0 review. Germany remains the fail-closed default. Actual regional qualification is not claimed until two real attested VPS runs provide the required public/private-event measurements
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -39,7 +39,8 @@ This is the only mutable project-status document.
 | Phase 5.3 BingX capability-gated code candidate | COMPLETE | BingX is now a typed venue profile with official `incrDepth` snapshot/update sequence enforcement, persistent desynchronisation until a fresh `action=all`, matching L2 unsubscribe, exact linear-USDT amount/notional metadata, account-wide read-only private parameters, and pinned protected IOC `clientOrderID`/`positionSide=BOTH` mapping. Official BingX WS documents only per-symbol BBO, so the adapter truthfully reports broad BBO unavailable instead of creating an unbounded fallback. Wave 1 remains Binance USD-M/Bybit/OKX and BingX is denied at the live-canary boundary. Exact code head `0678049`; local gate lock64/Ruff99/mypy97/pytest579/doctor shadow-live=false/Bandit0/diff-check passed; exact run `32418726763` passed all five jobs with replay `9424931463`, C4 critical `9424899802`, C4.3 `9424897938`, and security `9424888032`; test-hardening head `54b46f0` passed run `32419627419` 5/5 with replay `9425251748`, C4 critical `9425231202`, C4.3 `9425231328`, and security `9425217060`; independent exact review P0/P1/P2=0. |
 | Phase 5.4 MEXC capability-gated code candidate | COMPLETE | MEXC is a typed public/read-only profile with exact incremental-depth continuity and strict raw symbol/base/quote/settle/contract/price/amount/minimum qualification. Official all-contract tickers do not prove bid/ask and book ticker is per-symbol, so broad BBO is deliberately unavailable rather than using unbounded fan-out. Contract create/cancel are physically denied because the official endpoints remain under maintenance; private capability and live canary fail closed. Code head `fcb0e45` passed independent technical review P0/P1/P2=0. Test-hardening head `0f1221f` passed exact run `32423071724` 5/5 with replay `9426439525` (79 scenarios), C4 critical `9426417474` (30/30, zero production submits), C4.3 `9426419340` (8/8, zero false success/submits), and security `9426408589` (zero vulnerabilities/secret findings). Local gate: lock64, Ruff101, mypy99, pytest585, doctor shadow/live=false, diff-check. |
 | Phase 5.5 seven-venue capability matrix + FT-02 isolation | COMPLETE | One typed matrix reports qualified, quarantined, or disabled state for all seven venue profiles while startup rejects any Wave 1 reclassification. Public scans expose current six-hour-bound reports and isolate one quarantined venue without stopping healthy Wave 1 routes. PREPARED live-canary recovery revalidates current public/private capability, account state, clock, books, funding, economics, journal/reconciliation/risk, protected marketable IOC caps, and final pause/kill immediately before submit; every transport, control-read, and teardown path is owned and bounded. Code head `7506517` passed exact run `32429457353` 5/5 with replay `9428595773` (80 scenarios), C4 critical `9428577449` (30/30), C4.3 `9428574423` (8/8, zero false success/submits), and security `9428569687` (zero vulnerabilities/secret findings); independent exact technical review P0/P1=0. No credentials, expansion submit authority, or real order was added. |
-| C6 venue expansion | IN_PROGRESS | All four expansion adapters plus the seven-venue capability matrix and FT-02 isolation are exact-head verified. FT-03 reproducible region measurements and final operations gates remain pending; Wave 1 and the live-canary allowlist remain unchanged. |
+| FT-03 reproducible Germany/Japan latency evidence | SOFTWARE_READY / OWNER_ACTION | Exact Wave 1 feed/API/private-event samples use exchange timestamps, qualified clock skew and monotonic API RTT; raw NDJSON and reports bind executing code/config/host/attestation/instrument; provider evidence requires a checkout-pinned Ed25519 trust root; final selection rebuilds raw evidence and keeps Germany unless Japan improves weighted p95 by at least 20% with no cell p99 worsening above 50%. The default trust-root sentinel and absent credentials/VPS evidence fail closed. Local locked gate: 629 tests; independent dirty-snapshot review P0/P1/P2=0. |
+| C6 venue expansion | IN_PROGRESS | All four expansion adapters plus the seven-venue capability matrix and FT-02 isolation are exact-head verified. FT-03 software tooling is ready, but real Germany/Japan measurements and final operations gates remain pending; Wave 1 and the live-canary allowlist remain unchanged. |
 
 ## Decisions made during implementation
 
@@ -129,12 +130,20 @@ YYYY-MM-DD — decision — reason — affected modules
 2026-08-16 — Persist public-shadow adaptive parameters per directed route and stable size multiplier with five grid-aligned convergence buckets requiring 30 episodes each — restart-safe robust windows must never substitute aggregate or under-supported convergence evidence for the current entry spread — route calibration, public engine, shadow evaluator, SQLite state
 2026-08-20 — Treat every simulated tranche SQLite write as a bounded ownership transition and retain runtime/risk ownership behind an entry latch when its terminal outcome is unknowable — cancellation, slow native storage, and shutdown may neither create an unowned durable tranche nor block process exit — shadow runtime/trader, execution coordinator, SQLite state
 2026-08-21 — Keep Wave 1 immutable while exposing one current seven-venue capability matrix and repeat every PREPARED opening gate after durable submit intent — expansion evidence must not expand live authority, and stale capability/control/depth/economics must never reach a submit transport — capability matrix, public engine, canary runtime/coordinator
+2026-08-21 — Bind region evidence to the executing checkout, current clock-skew policy, and one checkout-pinned Ed25519 operator key while keeping Germany as the default — self-declared VPS metadata, policy files, timestamps, or trust roots must never qualify a deployment region — region latency pipeline, private event adapter, CLI, runtime policy
 
 ## Active blockers / owner actions
 
 ### Repository visibility
 
 The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action required to make it PRIVATE. No credential or operational evidence may be committed while this remains unresolved.
+
+### FT-03 real regional evidence
+
+- **Exact required action:** provision one Germany VPS and one Japan VPS from the supported provider/region allowlist; create an offline Ed25519 operator key, commit only its raw public-key SHA-256 to `config/RUNTIME_POLICY.yaml`, keep the private key outside Git, provide restricted read-only Wave 1 API credentials to each VPS outside Git, sign each provider metadata document, and run the documented `region-latency-probe`, `region-latency-report`, then `region-latency-select` commands with at least 30 samples per venue/channel.
+- **Why Codex cannot do it:** this requires external VPS access, owner-controlled signing material, exchange account permissions, and real account-wide private events; none are present or authorized for disclosure.
+- **Validation:** both probes produce complete 270-sample raw files, both reports PASS exact reconstruction, and `interexchange-grid region-latency-select ...` prints a hash-bound selection. Japan is selected only at the locked >=20% weighted-p95 improvement and <=50% maximum cell-p99 worsening thresholds.
+- **Fail-closed behavior:** the all-zero trust-root sentinel rejects every supplied key, Germany remains the default, no C5 deployment or live order is authorized, and no region claim is made until the complete signed evidence exists.
 
 ## Last verified command
 
@@ -304,4 +313,22 @@ sent. Exact code head `75065173b87c06f7d58afa2109b32076d5c88855` passed run `324
 30/30; C4.3 `9428574423` reports 8/8 and zero false success/submits; security `9428569687`
 reports zero vulnerabilities and secret findings. Independent exact technical review found P0/P1=0;
 this evidence-only update closes its sole documentation P2. Phase 5.5 is complete.
+```
+
+```text
+2026-08-21 FT-03 region evidence software checkpoint: PASS / OWNER EVIDENCE REQUIRED
+- exact main lock validation: PASS (64 packages)
+- ruff format --check + ruff check: PASS (105 files)
+- mypy --strict: PASS (103 source/test files)
+- pytest: 629 passed
+- interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
+- git diff --check: PASS; independent dirty-snapshot review: P0=0, P1=0, P2=0
+
+The software measures the exact Wave 1 feed/API/private-event matrix on attested Germany and Japan
+hosts, reconstructs every percentile from raw evidence, and applies the locked Germany-default
+migration rule. Monotonic RTT, bounded clock skew, executing-checkout identity, an exact locked-policy
+path, and a pinned Ed25519 public-key fingerprint prevent caller-supplied time, source, policy, and
+cloud-metadata trust. The committed all-zero key fingerprint deliberately blocks real collection until
+the owner installs a real reviewed public trust root. No credentials, real regional evidence,
+production-submit authority, or live order are present, and no deployment-region result is claimed.
 ```

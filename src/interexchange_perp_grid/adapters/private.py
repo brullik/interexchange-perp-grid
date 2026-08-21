@@ -307,6 +307,7 @@ class CcxtPrivateAdapter:
                     source_ns,
                     account=account,
                     unknown_active_records=unknown,
+                    exchange_timestamp_ms=_exchange_timestamp_ms(raw),
                 )
         except (Exception, asyncio.CancelledError):
             self._private_events_pending.discard(watermark)
@@ -1095,3 +1096,47 @@ def _order_status(raw: str, filled: Decimal, amount: Decimal) -> PrivateOrderSta
     if normalized in {"open", "new"}:
         return PrivateOrderStatus.OPEN
     return PrivateOrderStatus.UNKNOWN
+
+
+def _exchange_timestamp_ms(raw: Mapping[str, object]) -> int | None:
+    """Return only a venue-supplied event timestamp; never substitute local time."""
+    candidates: list[object] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, Mapping):
+            candidates.extend(
+                value.get(key)
+                for key in (
+                    "timestamp",
+                    "E",
+                    "T",
+                    "ts",
+                    "uTime",
+                    "updatedTime",
+                    "creationTime",
+                )
+            )
+            for nested in value.values():
+                if isinstance(nested, (Mapping, list, tuple)):
+                    collect(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                collect(nested)
+
+    collect(raw)
+    for candidate in candidates:
+        if isinstance(candidate, bool) or not isinstance(candidate, (int, float, str)):
+            continue
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            if value < 10_000_000_000:
+                value *= 1_000
+            elif value > 10_000_000_000_000_000:
+                value //= 1_000_000
+            elif value > 10_000_000_000_000:
+                value //= 1_000
+            return value
+    return None

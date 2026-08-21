@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import subprocess
+import sys
 from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -39,6 +41,26 @@ from interexchange_perp_grid.qualification import (
     load_runtime_evidence,
     run_qualification,
     write_runtime_evidence,
+)
+from interexchange_perp_grid.region_latency import (
+    MAXIMUM_PROBE_DURATION_SECONDS,
+    WAVE1_VENUES,
+    LatencySample,
+    RegionLatencyPolicy,
+    attestation_sha256,
+    bounded_operation,
+    build_region_latency_report,
+    collect_region_latency_samples,
+    load_latency_samples,
+    load_region_attestation,
+    load_region_latency_policy,
+    load_region_latency_report,
+    local_host_fingerprint,
+    select_deployment_region,
+    validate_region_probe_request,
+    verify_provider_evidence,
+    write_latency_samples,
+    write_region_latency_report,
 )
 from interexchange_perp_grid.release_evidence import REPLAY_TEST_FILES, run_replay_proof
 from interexchange_perp_grid.release_preflight import evaluate_release_preflight
@@ -84,6 +106,28 @@ def _load(config: Path) -> Settings:
     settings = load_settings(config)
     configure_logging(settings.app.log_level)
     return settings
+
+
+def _current_region_evidence_identity(repo_root: Path, config: Path) -> tuple[str, str]:
+    root = repo_root.resolve()
+    package_root = (root / "src/interexchange_perp_grid").resolve()
+    if (
+        not (root / ".git").exists()
+        or not package_root.is_dir()
+        or Path(__file__).resolve().parent != package_root
+    ):
+        raise ValueError("region evidence requires the current repository checkout")
+    source_sha256 = code_hash(root)
+    if source_sha256 == hashlib.sha256(b"").hexdigest():
+        raise ValueError("region evidence source hash cannot be empty")
+    return source_sha256, config_hash(config.resolve())
+
+
+def _load_locked_region_policy(repo_root: Path, runtime_policy: Path) -> RegionLatencyPolicy:
+    expected = (repo_root.resolve() / "config/RUNTIME_POLICY.yaml").resolve()
+    if runtime_policy.resolve() != expected:
+        raise ValueError("region evidence requires the current checkout locked runtime policy")
+    return load_region_latency_policy(expected)
 
 
 def _parse_route(value: str) -> DirectedRouteKey:
@@ -624,6 +668,334 @@ def prune_history(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         settings.shadow.history_retention_days,
     )
     typer.echo(json.dumps({"status": "PASS", "removed": removed}, sort_keys=True))
+
+
+@app.command("region-latency-report")
+def region_latency_report(
+    samples: Annotated[Path, typer.Option("--samples", exists=True, dir_okay=False)],
+    output: Annotated[Path, typer.Option("--output")],
+    minimum_samples: Annotated[int, typer.Option("--minimum-samples")] = 30,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Build one hash-bound p50/p95/p99 Wave 1 region report from NDJSON measurements."""
+    settings = _load(config)
+    source_sha256, config_sha256 = _current_region_evidence_identity(repo_root, config)
+    report = build_region_latency_report(
+        load_latency_samples(samples),
+        expected_source_sha256=source_sha256,
+        expected_config_sha256=config_sha256,
+        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+        minimum_samples_per_cell=minimum_samples,
+    )
+    write_region_latency_report(report, output)
+    typer.echo(json.dumps(asdict(report), default=str, sort_keys=True))
+
+
+@app.command("region-latency-probe-worker", hidden=True)
+def region_latency_probe_worker(
+    region: Annotated[str, typer.Option("--region")],
+    output: Annotated[Path, typer.Option("--output")],
+    attestation: Annotated[
+        Path,
+        typer.Option("--attestation", exists=True, dir_okay=False),
+    ],
+    provider_evidence: Annotated[
+        Path,
+        typer.Option("--provider-evidence", exists=True, dir_okay=False),
+    ],
+    attestation_public_key: Annotated[
+        Path,
+        typer.Option("--attestation-public-key", exists=True, dir_okay=False),
+    ],
+    base: Annotated[str, typer.Option("--base")] = "BTC",
+    samples_per_cell: Annotated[int, typer.Option("--samples-per-cell")] = 30,
+    timeout_seconds: Annotated[float, typer.Option("--timeout-seconds")] = 5,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+    runtime_policy: Annotated[
+        Path,
+        typer.Option("--runtime-policy", exists=True, dir_okay=False),
+    ] = Path("config/RUNTIME_POLICY.yaml"),
+) -> None:
+    """Measure Wave 1 public feed/API and account-wide private-event latency on this VPS."""
+    settings = _load(config)
+    policy = _load_locked_region_policy(repo_root, runtime_policy)
+    source_sha256, config_sha256 = _current_region_evidence_identity(repo_root, config)
+    try:
+        validate_region_probe_request(region, base, samples_per_cell, timeout_seconds)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    normalized_base = base.strip().upper()
+    if not normalized_base:
+        raise typer.BadParameter("base must not be empty")
+    attested = load_region_attestation(attestation, expected_region=region)
+    verify_provider_evidence(
+        attested,
+        provider_evidence,
+        attestation_public_key,
+        policy.attestation_public_key_sha256,
+    )
+    credentials = {venue: PrivateCredentials.from_environment(venue) for venue in WAVE1_VENUES}
+
+    async def probe() -> tuple[LatencySample, ...]:
+        public: dict[Venue, CcxtProAdapter] = {}
+        private: dict[Venue, CcxtPrivateAdapter] = {}
+        try:
+            for venue in WAVE1_VENUES:
+                public[venue] = CcxtProAdapter(venue)
+                private[venue] = CcxtPrivateAdapter(venue, credentials[venue])
+            capabilities = await asyncio.gather(
+                *(
+                    bounded_operation(adapter.probe_public_capabilities, timeout_seconds)
+                    for adapter in public.values()
+                )
+            )
+            if any(
+                report.clock_skew_ms is None
+                or abs(report.clock_skew_ms) > settings.market_data.max_clock_skew_ms
+                for report in capabilities
+            ):
+                raise RuntimeError(
+                    "every Wave 1 venue requires a policy-qualified server clock skew"
+                )
+            discovered = await asyncio.gather(
+                *(
+                    bounded_operation(adapter.discover_instruments, timeout_seconds)
+                    for adapter in public.values()
+                )
+            )
+            instruments = {}
+            for venue, venue_instruments in zip(WAVE1_VENUES, discovered, strict=True):
+                selected = next(
+                    (
+                        instrument
+                        for instrument in venue_instruments
+                        if instrument.base == normalized_base
+                    ),
+                    None,
+                )
+                if selected is None:
+                    raise RuntimeError(
+                        f"{venue.value} has no qualified {normalized_base} instrument"
+                    )
+                instruments[venue] = selected
+            return await collect_region_latency_samples(
+                region=region,
+                host_fingerprint=local_host_fingerprint(),
+                attestation_sha256=attestation_sha256(attested),
+                source_sha256=source_sha256,
+                config_sha256=config_sha256,
+                base=normalized_base,
+                public_adapters=public,
+                private_adapters=private,
+                instruments=instruments,
+                samples_per_cell=samples_per_cell,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            results = await asyncio.gather(
+                *(bounded_operation(adapter.close, timeout_seconds) for adapter in public.values()),
+                *(
+                    bounded_operation(adapter.close, timeout_seconds)
+                    for adapter in private.values()
+                ),
+                return_exceptions=True,
+            )
+            failures = tuple(result for result in results if isinstance(result, BaseException))
+            if failures:
+                raise RuntimeError("region probe adapter shutdown failed")
+
+    loop = asyncio.new_event_loop()
+    shutdown_survivors: tuple[asyncio.Task[object], ...] = ()
+    measured: tuple[LatencySample, ...] | None = None
+    probe_failure: BaseException | None = None
+    try:
+        measured = loop.run_until_complete(probe())
+    except BaseException as error:
+        probe_failure = error
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.sleep(0))
+        shutdown_survivors = tuple(task for task in asyncio.all_tasks(loop) if not task.done())
+        loop.close()
+    if shutdown_survivors:
+        raise RuntimeError(
+            f"region probe shutdown retained {len(shutdown_survivors)} nonterminal task(s)"
+        ) from probe_failure
+    if probe_failure is not None:
+        raise probe_failure
+    if measured is None:
+        raise RuntimeError("region probe returned no measurement set")
+    write_latency_samples(measured, output)
+    typer.echo(json.dumps({"status": "PASS", "samples": len(measured), "output": str(output)}))
+
+
+@app.command("region-latency-probe")
+def region_latency_probe(
+    region: Annotated[str, typer.Option("--region")],
+    output: Annotated[Path, typer.Option("--output")],
+    attestation: Annotated[
+        Path,
+        typer.Option("--attestation", exists=True, dir_okay=False),
+    ],
+    provider_evidence: Annotated[
+        Path,
+        typer.Option("--provider-evidence", exists=True, dir_okay=False),
+    ],
+    attestation_public_key: Annotated[
+        Path,
+        typer.Option("--attestation-public-key", exists=True, dir_okay=False),
+    ],
+    base: Annotated[str, typer.Option("--base")] = "BTC",
+    samples_per_cell: Annotated[int, typer.Option("--samples-per-cell")] = 30,
+    timeout_seconds: Annotated[float, typer.Option("--timeout-seconds")] = 5,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+    runtime_policy: Annotated[
+        Path,
+        typer.Option("--runtime-policy", exists=True, dir_okay=False),
+    ] = Path("config/RUNTIME_POLICY.yaml"),
+) -> None:
+    """Run the real latency probe in a hard-deadline child process."""
+    _load(config)
+    policy = _load_locked_region_policy(repo_root, runtime_policy)
+    _current_region_evidence_identity(repo_root, config)
+    try:
+        validate_region_probe_request(region, base, samples_per_cell, timeout_seconds)
+        attested = load_region_attestation(attestation, expected_region=region)
+        verify_provider_evidence(
+            attested,
+            provider_evidence,
+            attestation_public_key,
+            policy.attestation_public_key_sha256,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    command = (
+        sys.executable,
+        "-m",
+        "interexchange_perp_grid.cli",
+        "region-latency-probe-worker",
+        "--region",
+        region,
+        "--output",
+        str(output.resolve()),
+        "--attestation",
+        str(attestation.resolve()),
+        "--provider-evidence",
+        str(provider_evidence.resolve()),
+        "--attestation-public-key",
+        str(attestation_public_key.resolve()),
+        "--base",
+        base,
+        "--samples-per-cell",
+        str(samples_per_cell),
+        "--timeout-seconds",
+        str(timeout_seconds),
+        "--repo-root",
+        str(repo_root.resolve()),
+        "--config",
+        str(config.resolve()),
+        "--runtime-policy",
+        str(runtime_policy.resolve()),
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repo_root.resolve(),
+            check=False,
+            timeout=MAXIMUM_PROBE_DURATION_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("region latency probe exceeded its one-hour process deadline") from error
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"region latency probe worker failed with exit code {completed.returncode}"
+        )
+
+
+@app.command("region-latency-select")
+def region_latency_select(
+    germany: Annotated[Path, typer.Option("--germany", exists=True, dir_okay=False)],
+    japan: Annotated[Path, typer.Option("--japan", exists=True, dir_okay=False)],
+    germany_samples: Annotated[
+        Path,
+        typer.Option("--germany-samples", exists=True, dir_okay=False),
+    ],
+    japan_samples: Annotated[
+        Path,
+        typer.Option("--japan-samples", exists=True, dir_okay=False),
+    ],
+    germany_attestation: Annotated[
+        Path,
+        typer.Option("--germany-attestation", exists=True, dir_okay=False),
+    ],
+    japan_attestation: Annotated[
+        Path,
+        typer.Option("--japan-attestation", exists=True, dir_okay=False),
+    ],
+    germany_provider_evidence: Annotated[
+        Path,
+        typer.Option("--germany-provider-evidence", exists=True, dir_okay=False),
+    ],
+    japan_provider_evidence: Annotated[
+        Path,
+        typer.Option("--japan-provider-evidence", exists=True, dir_okay=False),
+    ],
+    attestation_public_key: Annotated[
+        Path,
+        typer.Option("--attestation-public-key", exists=True, dir_okay=False),
+    ],
+    runtime_policy: Annotated[
+        Path,
+        typer.Option("--runtime-policy", exists=True, dir_okay=False),
+    ] = Path("config/RUNTIME_POLICY.yaml"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Select Germany/Japan only from comparable reports and the locked latency policy."""
+    settings = _load(config)
+    source_sha256, config_sha256 = _current_region_evidence_identity(repo_root, config)
+    germany_attested = load_region_attestation(
+        germany_attestation,
+        expected_region="Germany",
+        bind_local_host=False,
+    )
+    japan_attested = load_region_attestation(
+        japan_attestation,
+        expected_region="Japan",
+        bind_local_host=False,
+    )
+    policy = _load_locked_region_policy(repo_root, runtime_policy)
+    verify_provider_evidence(
+        germany_attested,
+        germany_provider_evidence,
+        attestation_public_key,
+        policy.attestation_public_key_sha256,
+    )
+    verify_provider_evidence(
+        japan_attested,
+        japan_provider_evidence,
+        attestation_public_key,
+        policy.attestation_public_key_sha256,
+    )
+    selection = select_deployment_region(
+        load_region_latency_report(germany),
+        load_region_latency_report(japan),
+        policy,
+        germany_samples=load_latency_samples(germany_samples),
+        japan_samples=load_latency_samples(japan_samples),
+        germany_attestation=germany_attested,
+        japan_attestation=japan_attested,
+        expected_source_sha256=source_sha256,
+        expected_config_sha256=config_sha256,
+        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+    )
+    typer.echo(json.dumps(asdict(selection), default=str, sort_keys=True))
 
 
 @app.command("private-probe")
