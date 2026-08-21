@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** SOFTWARE_RELEASE_V1_RC_LOCAL_PASS_AWAITING_EXACT_GATE
-- **Current checkpoint:** the remaining software-only operations boundary is locally complete: immutable-digest deployment is idempotent, external secrets require mode 0600, failed health automatically restores backup and the previous exact image, qualification status reports exact 24h progress/blocker counters, and persisted adjacent risk-stage promotion gates new canary entry. Exact-head Linux CI, operations artifact, and independent review are still required before the software RC is published
+- **State:** SOFTWARE_COMPLETE_OWNER_ACTIONS_REQUIRED
+- **Current checkpoint:** software-only implementation and final operations acceptance are complete at code checkpoint `16bf1d2`; exact run `32440216743` passed all five jobs and the downloaded artifacts bind all 42 final-manifest criteria, a real unhealthy-image rollback, 11 private recovery states, zero false success, zero production submits, zero dependency vulnerabilities, and zero secret findings. Remaining work requires external owner-controlled VPS attestation, restricted credentials, 24-hour qualification, and an irreversible live-money canary decision
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -40,8 +40,8 @@ This is the only mutable project-status document.
 | Phase 5.4 MEXC capability-gated code candidate | COMPLETE | MEXC is a typed public/read-only profile with exact incremental-depth continuity and strict raw symbol/base/quote/settle/contract/price/amount/minimum qualification. Official all-contract tickers do not prove bid/ask and book ticker is per-symbol, so broad BBO is deliberately unavailable rather than using unbounded fan-out. Contract create/cancel are physically denied because the official endpoints remain under maintenance; private capability and live canary fail closed. Code head `fcb0e45` passed independent technical review P0/P1/P2=0. Test-hardening head `0f1221f` passed exact run `32423071724` 5/5 with replay `9426439525` (79 scenarios), C4 critical `9426417474` (30/30, zero production submits), C4.3 `9426419340` (8/8, zero false success/submits), and security `9426408589` (zero vulnerabilities/secret findings). Local gate: lock64, Ruff101, mypy99, pytest585, doctor shadow/live=false, diff-check. |
 | Phase 5.5 seven-venue capability matrix + FT-02 isolation | COMPLETE | One typed matrix reports qualified, quarantined, or disabled state for all seven venue profiles while startup rejects any Wave 1 reclassification. Public scans expose current six-hour-bound reports and isolate one quarantined venue without stopping healthy Wave 1 routes. PREPARED live-canary recovery revalidates current public/private capability, account state, clock, books, funding, economics, journal/reconciliation/risk, protected marketable IOC caps, and final pause/kill immediately before submit; every transport, control-read, and teardown path is owned and bounded. Code head `7506517` passed exact run `32429457353` 5/5 with replay `9428595773` (80 scenarios), C4 critical `9428577449` (30/30), C4.3 `9428574423` (8/8, zero false success/submits), and security `9428569687` (zero vulnerabilities/secret findings); independent exact technical review P0/P1=0. No credentials, expansion submit authority, or real order was added. |
 | FT-03 reproducible Germany/Japan latency evidence | SOFTWARE_READY / OWNER_ACTION | Exact Wave 1 feed/API/private-event samples use exchange timestamps, qualified clock skew and monotonic API RTT; raw NDJSON and reports bind executing code/config/host/attestation/instrument; provider evidence requires a checkout-pinned Ed25519 trust root; final selection rebuilds raw evidence and keeps Germany unless Japan improves weighted p95 by at least 20% with no cell p99 worsening above 50%. The default trust-root sentinel and absent credentials/VPS evidence fail closed. Code head `04a4794` passed exact run `32435546614` 5/5 with replay `9430648766` (80 scenarios), C4 critical `9430638548` (30/30, zero submits), C4.3 `9430634489` (8/8, zero false success/submits), and security `9430627269` (zero vulnerabilities/secrets); independent review P0/P1/P2=0. |
-| Operations final proof | LOCAL_PASS / EXACT_GATE_PENDING | Deploy requires an untracked `.env` at mode 0600 and verifies the running exact SHA/digest in shadow; successful identity is atomic and idempotent. Upgrade stops the app for a consistent backup and automatically restores both SQLite state and the previous immutable image after failed health. Qualification progress exposes duration, synchronized-event, funding, replay, unresolved order/exposure, quality, PnL, strategy, and exception blockers. SQLite schema v13 persists adjacent owner-confirmed stages bound to exact qualification/runtime-policy hashes; every promotion after canary additionally requires an immutable matching stable-FLAT stage result and zero active live actions. Active recovery bypasses stage entry gates. The pinned Ubuntu 24.04 Docker job proves clean start, down/up recovery, exact digest deploy twice, a real unhealthy-image rollback with state restoration, the 11-state private restart matrix, and emits raw evidence plus a 42-criterion exact-SHA/JUnit artifact. Local gate: lock64, Ruff111, mypy109, pytest643 (3 platform skips), doctor shadow/live=false, Bandit medium/high0, diff-check. Exact-head CI and independent review remain pending. |
-| C6 venue expansion | IN_PROGRESS | All four expansion adapters plus the seven-venue capability matrix and FT-02 isolation are exact-head verified. FT-03 software tooling is ready, but real Germany/Japan measurements and final operations gates remain pending; Wave 1 and the live-canary allowlist remain unchanged. |
+| Operations final proof | COMPLETE | Code checkpoint `16bf1d2`; deploy requires an untracked `.env` at mode 0600 and verifies the running exact SHA/digest in shadow; successful identity is atomic and idempotent. Upgrade stops the app for a consistent backup and automatically restores both SQLite state and the previous immutable image after failed health. Qualification progress exposes duration, synchronized-event, funding, replay, unresolved order/exposure, quality, PnL, strategy, and exception blockers. SQLite schema v13 persists adjacent owner-confirmed stages bound to exact qualification/runtime-policy hashes; every promotion after canary additionally requires an immutable matching stable-FLAT stage result and zero active live actions. Exact run `32440216743` passed all five jobs. Downloaded operations artifact `9432249857` proves pinned Ubuntu 24.04, exact digest deploy twice, restart count 4, real unhealthy-image rollback with state restoration, all 11 private recovery states, 42/42 manifest criteria through 60 JUnit tests, and zero production transports. Replay `9432176964` is 80/80; C4 critical `9432160656` is 30/30 with zero submits; C4.3 `9432156081` is 8/8 with zero false success/submits; security `9432146473` reports zero vulnerabilities/secrets. Local gate: lock64, Ruff111, mypy109, pytest643 (3 platform skips), doctor shadow/live=false, Bandit medium/high0, diff-check. |
+| C6 venue expansion | SOFTWARE_COMPLETE / OWNER_EVIDENCE | All four expansion adapters plus the seven-venue capability matrix, FT-02 isolation, FT-03 evidence tooling, and operations gates are exact-head verified. Real Germany/Japan measurements, account capability evidence, and a successful owner-operated canary remain external prerequisites; Wave 1 and the live-canary allowlist remain unchanged. |
 
 ## Decisions made during implementation
 
@@ -341,7 +341,7 @@ production-submit authority, or live order are present, and no deployment-region
 ```
 
 ```text
-2026-08-21 operations final-proof local checkpoint: PASS / EXACT GATE PENDING
+2026-08-21 operations final-proof code checkpoint `16bf1d2`: PASS / SOFTWARE COMPLETE
 - exact main lock validation: PASS (64 packages)
 - Ruff format/check: PASS (111 files)
 - strict mypy: PASS (109 source/test files)
@@ -349,9 +349,13 @@ production-submit authority, or live order are present, and no deployment-region
 - doctor: PASS; mode=shadow; live_orders_allowed=false
 - Bandit medium/high: 0; git diff --check: PASS
 
-The delta closes OPS-03/04/07/09 in runtime, not only documentation. CI additionally exercises one
-real local registry digest twice, Compose down/up state recovery, real unhealthy-image rollback with
-SQLite restoration, the full private transition matrix, and publishes raw evidence plus one exact-SHA
-42-criterion JSON/JUnit mapping. No secret, production credential,
-production submit authority, live stage promotion, real VPS result, or real order is present.
+The delta closes OPS-03/04/07/09 in runtime, not only documentation. Exact run `32440216743`
+passed all five jobs. Operations artifact `9432249857` proves one pinned Ubuntu 24.04 local registry
+digest twice, Compose down/up state recovery, real unhealthy-image rollback with SQLite restoration,
+the full 11-state private transition matrix, zero production transports, and all 42 manifest criteria
+through 60 executed JUnit tests. Replay `9432176964` is 80/80; C4 critical `9432160656` is 30/30
+with zero production submits; C4.3 `9432156081` is 8/8 with zero false success/submits; security
+`9432146473` reports zero vulnerabilities and secret findings. No secret, production credential,
+live stage promotion, real VPS result, live-money authorization, or real order is present. All further
+work requires the explicit external owner actions recorded above; the product remains fail closed.
 ```
