@@ -200,6 +200,7 @@ class PublicMarketEngine:
         self._bbo_watchers: dict[Venue, asyncio.Task[None]] = {}
         self._bbo_watcher_symbols: dict[Venue, tuple[str, ...]] = {}
         self._bbo_subscription_started: set[Venue] = set()
+        self._bbo_qualified_venues: set[Venue] = set()
         self._retiring_bbo_watchers: dict[Venue, asyncio.Task[None]] = {}
         self._retiring_bbo_transports: dict[Venue, asyncio.Task[tuple[BboQuote, ...]]] = {}
         self._retiring_bbo_unsubscribes: dict[Venue, asyncio.Task[None]] = {}
@@ -277,6 +278,14 @@ class PublicMarketEngine:
         self._last_candidate_l2_prefilter: tuple[BboPrefilterObservation, ...] = ()
         self._broad_bbo_admitted = True
         self._bbo_watch_timeout_seconds = settings.market_data.max_bbo_age_ms / 1000
+        # A first public WebSocket subscription includes DNS/TLS/authless channel
+        # setup and can legitimately take longer than the quote freshness bound.
+        # Keep that startup allowance bounded; after the first accepted quote the
+        # strict market-data age is again the transport progress deadline.
+        self._bbo_initial_progress_timeout_seconds = max(
+            0.25,
+            min(10.0, self._bbo_watch_timeout_seconds * 6),
+        )
         self._candidate_l2_watch_timeout_seconds = settings.market_data.max_l2_age_ms / 1000
         self._candidate_l2_unsubscribe_timeout_seconds = max(
             1.0,
@@ -574,6 +583,7 @@ class PublicMarketEngine:
                     )
             else:
                 self._bbo_subscription_started.discard(venue)
+                self._bbo_qualified_venues.discard(venue)
 
     def _defer_retired_venue_reconnect(self, venue: Venue, reason: str) -> None:
         attempt = max(1, self._reconnect_attempts.get(venue, 1))
@@ -722,6 +732,7 @@ class PublicMarketEngine:
         self._cleanup_retired_route_calibration_funding_tasks()
         self._cleanup_retired_route_calibration_funding_tasks()
         self._bbo_subscription_started.discard(venue)
+        self._bbo_qualified_venues.discard(venue)
         self._candidate_l2_subscription_started = {
             key for key in self._candidate_l2_subscription_started if key[0] != venue
         }
@@ -868,7 +879,12 @@ class PublicMarketEngine:
             name=f"broad-bbo-transport-{venue.value}",
         )
         try:
-            done, _ = await asyncio.wait((transport,), timeout=self._bbo_watch_timeout_seconds)
+            progress_timeout = (
+                self._bbo_watch_timeout_seconds
+                if venue in self._bbo_qualified_venues
+                else self._bbo_initial_progress_timeout_seconds
+            )
+            done, _ = await asyncio.wait((transport,), timeout=progress_timeout)
             if not done:
                 self._retire_bbo_transport(venue, transport)
                 raise TimeoutError("batch BBO stream made no progress before staleness deadline")
@@ -888,7 +904,7 @@ class PublicMarketEngine:
 
     async def _run_bbo_watcher(self, venue: Venue) -> None:
         loop = asyncio.get_running_loop()
-        qualified_deadline = loop.time() + self._bbo_watch_timeout_seconds
+        qualified_deadline = loop.time() + self._bbo_initial_progress_timeout_seconds
         try:
             while not self._closed and venue not in self._quarantined:
                 symbols = self._symbols_for_venue(venue)
@@ -918,6 +934,7 @@ class PublicMarketEngine:
                         )
                     await asyncio.sleep(min(0.01, remaining))
                     continue
+                self._bbo_qualified_venues.add(venue)
                 qualified_deadline = loop.time() + self._bbo_watch_timeout_seconds
                 self._reconnect_attempts.pop(venue, None)
                 self._reconnect_after_ns.pop(venue, None)

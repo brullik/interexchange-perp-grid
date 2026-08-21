@@ -442,6 +442,13 @@ class DelayedBroadFakeAdapter(BroadFakeAdapter):
         return await super().watch_bbo(symbols)
 
 
+class SlowFirstBroadFakeAdapter(BroadFakeAdapter):
+    async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
+        if self.bbo_calls == 0:
+            await asyncio.sleep(0.05)
+        return await super().watch_bbo(symbols)
+
+
 class OneLateBatchBroadFakeAdapter(BroadFakeAdapter):
     def __init__(self, venue: Venue, received_ns: int) -> None:
         super().__init__(venue, received_ns)
@@ -800,6 +807,29 @@ async def test_broad_bbo_scans_100_common_instruments_and_isolates_one_venue(
     assert adapters[Venue.OKX].bbo_calls == 1
     assert all(adapter.bbo_calls >= 1 for adapter in adapters.values())
     assert all(adapter.bbo_subscription_changes == 1 for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_first_bbo_progress_has_bounded_handshake_allowance(tmp_path: Path) -> None:
+    clock = 1_000_000_000
+    adapters = {venue: SlowFirstBroadFakeAdapter(venue, clock) for venue in WAVE1_VENUES}
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    settings = settings.model_copy(
+        update={"market_data": settings.market_data.model_copy(update={"max_bbo_age_ms": 10})}
+    )
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+    )
+
+    result = await engine.scan_broad_bbo(timeout_seconds=1)
+    await engine.close()
+
+    assert result.quarantined == ()
+    assert result.cache.entries == result.cache.known_keys == 300
+    assert engine._bbo_qualified_venues == set(WAVE1_VENUES)
 
 
 @pytest.mark.asyncio

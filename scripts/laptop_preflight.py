@@ -27,7 +27,7 @@ def _command(command: list[str]) -> None:
     subprocess.run(command, cwd=ROOT, check=True)
 
 
-def _run_static_gate() -> None:
+def _run_static_gate(output_dir: Path) -> None:
     python = sys.executable
     _command([python, "-m", "pip", "check"])
     _command(
@@ -43,7 +43,9 @@ def _run_static_gate() -> None:
     _command([python, "-m", "ruff", "format", "--check", "src", "tests", "scripts"])
     _command([python, "-m", "ruff", "check", "src", "tests", "scripts"])
     _command([python, "-m", "mypy"])
-    _command([python, "-m", "pytest"])
+    pytest_tmp = output_dir / "pytest"
+    pytest_tmp.mkdir(parents=True, exist_ok=False)
+    _command([python, "-m", "pytest", "--basetemp", str(pytest_tmp)])
     _command(
         [
             python,
@@ -212,7 +214,7 @@ def main() -> int:
     }
     try:
         if not args.skip_static:
-            _run_static_gate()
+            _run_static_gate(output_dir)
         report["runtime"] = asyncio.run(
             _run_runtime_gate(
                 args.config.resolve(),
