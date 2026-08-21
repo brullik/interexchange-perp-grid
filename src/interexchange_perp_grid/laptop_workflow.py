@@ -15,7 +15,7 @@ from interexchange_perp_grid.live_journal import (
     is_completed_normal_paired_cycle,
 )
 from interexchange_perp_grid.qualification import QualificationEvidence
-from interexchange_perp_grid.service import BootstrapService
+from interexchange_perp_grid.service import BootstrapService, BoundedServiceReceipt
 from interexchange_perp_grid.state import (
     QualificationEpoch,
     QualificationEpochStatus,
@@ -111,6 +111,7 @@ async def build_laptop_pilot_report(
     started_at: datetime,
     ended_at: datetime,
     runtime_artifact_digest: str,
+    bounded_service: BoundedServiceReceipt,
 ) -> LaptopPilotReport:
     if (
         started_at.tzinfo is None
@@ -132,11 +133,23 @@ async def build_laptop_pilot_report(
         blockers.append("EXACTLY_ONE_COMPLETED_PAIRED_CANARY_REQUIRED")
     post_trade_seconds = 0
     if normal:
-        post_trade_seconds = max(0, int((ended_at - normal[0].updated_at).total_seconds()))
+        post_trade_seconds = max(
+            0,
+            int((bounded_service.ended_at - normal[0].updated_at).total_seconds()),
+        )
     if post_trade_seconds < 28_800:
         blockers.append("EIGHT_HOUR_POST_TRADE_OBSERVATION_REQUIRED")
     if qualification.container_image_digest != runtime_artifact_digest:
         blockers.append("RUNTIME_ARTIFACT_IDENTITY_MISMATCH")
+    if (
+        Path(bounded_service.state_path).resolve() != Path(settings.storage.sqlite_path).resolve()
+        or bounded_service.started_at > started_at
+        or bounded_service.ended_at > ended_at
+        or (ended_at - bounded_service.ended_at).total_seconds() > 300
+        or bounded_service.requested_seconds < 28_800
+        or bounded_service.observed_monotonic_seconds < bounded_service.requested_seconds
+    ):
+        blockers.append("BOUNDED_SERVICE_RECEIPT_MISMATCH")
     health = await read_service_health(
         Path(settings.storage.sqlite_path),
         settings.app.health_max_age_seconds,

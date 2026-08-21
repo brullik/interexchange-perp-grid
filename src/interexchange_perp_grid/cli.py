@@ -95,7 +95,12 @@ from interexchange_perp_grid.risk_stages import (
     verify_risk_stage_completion_evidence,
 )
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
-from interexchange_perp_grid.service import run_for_duration, run_until_signal
+from interexchange_perp_grid.service import (
+    load_bounded_service_receipt,
+    run_for_duration,
+    run_until_signal,
+    write_bounded_service_receipt,
+)
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import (
     QualificationEpoch,
@@ -412,6 +417,7 @@ def run_service_for(
         int,
         typer.Option("--duration-seconds", min=1, max=86_400),
     ],
+    receipt: Annotated[Path | None, typer.Option("--receipt")] = None,
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
     """Run shadow/recovery service for one exact bounded observation interval."""
@@ -420,7 +426,10 @@ def run_service_for(
     if settings.app.mode == "live" or decision.allowed:
         typer.echo("bounded service refuses live mode without runtime gates", err=True)
         raise typer.Exit(code=2)
-    asyncio.run(run_for_duration(settings, duration_seconds))
+    result = asyncio.run(run_for_duration(settings, duration_seconds))
+    if receipt is not None:
+        write_bounded_service_receipt(receipt.resolve(), result)
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
 
 
 @app.command("laptop-qualification-run")
@@ -461,6 +470,10 @@ def laptop_pilot_report(
         Path,
         typer.Option("--qualification", exists=True, dir_okay=False, readable=True),
     ] = Path("state/qualification.json"),
+    service_receipt: Annotated[
+        Path,
+        typer.Option("--service-receipt", exists=True, dir_okay=False, readable=True),
+    ] = Path("state/laptop-service-receipt.json"),
     output: Annotated[Path, typer.Option("--output")] = Path("state/laptop-pilot-report.json"),
     repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
     config: ConfigPath = Path("config/defaults.yaml"),
@@ -468,6 +481,7 @@ def laptop_pilot_report(
     """Prove one real paired canary followed by eight native service hours."""
     settings = _load(config)
     evidence = load_qualification(qualification.resolve())
+    bounded_service = load_bounded_service_receipt(service_receipt.resolve())
     runtime_digest = resolve_runtime_artifact_digest(repo_root.resolve(), config.resolve())
     report = asyncio.run(
         build_laptop_pilot_report(
@@ -476,6 +490,7 @@ def laptop_pilot_report(
             started_at,
             ended_at,
             runtime_digest,
+            bounded_service,
         )
     )
     write_laptop_pilot_report(output.resolve(), report)

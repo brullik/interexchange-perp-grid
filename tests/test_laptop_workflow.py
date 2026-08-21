@@ -17,6 +17,7 @@ from interexchange_perp_grid.laptop_workflow import (
     run_until_qualification_finalized,
 )
 from interexchange_perp_grid.qualification import QualificationEvidence
+from interexchange_perp_grid.service import BoundedServiceReceipt
 from interexchange_perp_grid.state import QualificationEpoch, QualificationEpochStatus
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
@@ -120,6 +121,16 @@ async def test_pilot_report_requires_real_paired_cycle_and_eight_hours(
         QualificationEvidence,
         SimpleNamespace(qualification_hash="q" * 64, container_image_digest=DIGEST),
     )
+    receipt = BoundedServiceReceipt(
+        1,
+        "PASS",
+        started_at - timedelta(seconds=1),
+        ended_at,
+        28_800,
+        28_800,
+        str(Path(settings.storage.sqlite_path).resolve()),
+        2,
+    )
 
     report = await build_laptop_pilot_report(
         settings,
@@ -127,6 +138,7 @@ async def test_pilot_report_requires_real_paired_cycle_and_eight_hours(
         started_at,
         ended_at,
         DIGEST,
+        receipt,
     )
 
     assert report.status == "PASS"
@@ -170,13 +182,25 @@ async def test_pilot_report_fails_when_post_trade_interval_is_short(
         QualificationEvidence,
         SimpleNamespace(qualification_hash="q" * 64, container_image_digest=DIGEST),
     )
+    ended_at = started_at + timedelta(hours=8)
+    receipt = BoundedServiceReceipt(
+        1,
+        "PASS",
+        started_at - timedelta(seconds=1),
+        ended_at,
+        28_800,
+        28_800,
+        str(Path(settings.storage.sqlite_path).resolve()),
+        1,
+    )
 
     report = await build_laptop_pilot_report(
         settings,
         qualification,
         started_at,
-        started_at + timedelta(hours=8),
+        ended_at,
         DIGEST,
+        receipt,
     )
 
     assert report.status == "FAIL"

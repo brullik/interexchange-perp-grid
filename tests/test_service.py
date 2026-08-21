@@ -152,12 +152,19 @@ async def test_bounded_service_runs_full_interval_and_stops_cleanly(
         await stop_event.wait()
         stopped.set()
 
-    monkeypatch.setattr(BootstrapService, "run", fake_run)
+    async def fake_health(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return type("Health", (), {"status": "stopped", "starts": 1})()
 
-    await run_for_duration(settings, 0.02)
+    monkeypatch.setattr(BootstrapService, "run", fake_run)
+    monkeypatch.setattr(service_module, "read_service_health", fake_health)
+
+    receipt = await run_for_duration(settings, 0.02)
 
     assert started.is_set()
     assert stopped.is_set()
+    assert receipt.status == "PASS"
+    assert receipt.observed_monotonic_seconds >= 0.02
 
 
 @pytest.mark.asyncio

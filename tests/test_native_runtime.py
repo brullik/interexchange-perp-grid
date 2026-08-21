@@ -136,6 +136,8 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert '$env:IPEG_LIVE_ENABLED = "true"' in pilot
     assert '$env:IPEG_LIVE_ENABLED = "false"' in pilot
     assert '"--duration-seconds", "33000"' in pilot
+    assert '"--receipt", $serviceReceipt' in pilot
+    assert "--service-receipt $serviceReceipt" in pilot
     assert "laptop-pilot-report" in pilot
     assert "SetThreadExecutionState" in pilot
     assert "LIVE_CANARY_CONSENT" not in loader

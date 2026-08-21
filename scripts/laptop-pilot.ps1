@@ -95,9 +95,11 @@ try {
 
     $serviceStdout = Join-Path $outputDirectory "service.stdout.log"
     $serviceStderr = Join-Path $outputDirectory "service.stderr.log"
+    $serviceReceipt = Join-Path $outputDirectory "service-receipt.json"
     $serviceArguments = @(
         "-m", "interexchange_perp_grid.cli", "run-for",
         "--duration-seconds", "33000",
+        "--receipt", $serviceReceipt,
         "--config", "$root/config/defaults.yaml"
     )
     $env:IPEG_MODE = "shadow"
@@ -167,6 +169,7 @@ try {
         --started-at $startedAt.ToString("o") `
         --ended-at $endedAt.ToString("o") `
         --qualification $qualification `
+        --service-receipt $serviceReceipt `
         --output $reportPath `
         --repo-root $root `
         --config "$root/config/defaults.yaml"

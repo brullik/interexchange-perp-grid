@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import signal
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from interexchange_perp_grid.autonomous_orchestrator import AutonomousOrchestrator
@@ -26,6 +30,7 @@ from interexchange_perp_grid.priority_scheduler import PriorityWorkScheduler
 from interexchange_perp_grid.shadow import ContinuousShadowEvaluator, ShadowRuntime
 from interexchange_perp_grid.state import (
     initialise_state,
+    read_service_health,
     record_service_heartbeat,
     record_service_started,
     record_service_stopped,
@@ -36,6 +41,61 @@ from interexchange_perp_grid.telegram_control import run_telegram_bot
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 _ES_AWAYMODE_REQUIRED = 0x00000040
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedServiceReceipt:
+    schema_version: int
+    status: str
+    started_at: datetime
+    ended_at: datetime
+    requested_seconds: float
+    observed_monotonic_seconds: float
+    state_path: str
+    service_starts: int
+
+    def __post_init__(self) -> None:
+        if (
+            self.schema_version != 1
+            or self.status != "PASS"
+            or self.started_at.tzinfo is None
+            or self.ended_at.tzinfo is None
+            or self.ended_at < self.started_at
+            or self.requested_seconds <= 0
+            or self.observed_monotonic_seconds < self.requested_seconds
+            or self.service_starts < 1
+            or not self.state_path
+        ):
+            raise ValueError("bounded service receipt is invalid")
+
+
+def write_bounded_service_receipt(path: Path, receipt: BoundedServiceReceipt) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(asdict(receipt), default=str, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_bounded_service_receipt(path: Path) -> BoundedServiceReceipt:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("bounded service receipt must be an object")
+    return BoundedServiceReceipt(
+        schema_version=int(payload["schema_version"]),
+        status=str(payload["status"]),
+        started_at=datetime.fromisoformat(str(payload["started_at"])),
+        ended_at=datetime.fromisoformat(str(payload["ended_at"])),
+        requested_seconds=float(payload["requested_seconds"]),
+        observed_monotonic_seconds=float(payload["observed_monotonic_seconds"]),
+        state_path=str(payload["state_path"]),
+        service_starts=int(payload["service_starts"]),
+    )
 
 
 @contextmanager
@@ -190,10 +250,13 @@ async def run_until_signal(settings: Settings) -> None:
             loop.remove_signal_handler(handled_signal)
 
 
-async def run_for_duration(settings: Settings, duration_seconds: float) -> None:
+async def run_for_duration(settings: Settings, duration_seconds: float) -> BoundedServiceReceipt:
     if not 0 < duration_seconds <= 86_400:
         raise ValueError("service duration must be in (0, 86400]")
     with _prevent_windows_sleep():
+        started_at = datetime.now(UTC)
+        started_monotonic = time.monotonic()
+        deadline_monotonic = started_monotonic + duration_seconds
         stop_event = asyncio.Event()
         service = asyncio.create_task(
             BootstrapService(settings).run(stop_event),
@@ -203,9 +266,30 @@ async def run_for_duration(settings: Settings, duration_seconds: float) -> None:
             try:
                 await asyncio.wait_for(asyncio.shield(service), timeout=duration_seconds)
             except TimeoutError:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
                 stop_event.set()
                 await service
-                return
+                ended_at = datetime.now(UTC)
+                observed_seconds = time.monotonic() - started_monotonic
+                health = await read_service_health(
+                    Path(settings.storage.sqlite_path),
+                    settings.app.health_max_age_seconds,
+                    ended_at,
+                )
+                if health.status != "stopped":
+                    raise RuntimeError("bounded service did not persist a stopped state") from None
+                return BoundedServiceReceipt(
+                    schema_version=1,
+                    status="PASS",
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    requested_seconds=duration_seconds,
+                    observed_monotonic_seconds=observed_seconds,
+                    state_path=str(Path(settings.storage.sqlite_path).resolve()),
+                    service_starts=health.starts,
+                )
             raise RuntimeError("service stopped before the requested duration")
         finally:
             stop_event.set()
