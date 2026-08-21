@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** SOFTWARE_COMPLETE_OWNER_ACTIONS_REQUIRED
-- **Current checkpoint:** software-only implementation and final operations acceptance are complete at code checkpoint `16bf1d2`; exact run `32440216743` passed all five jobs and the downloaded artifacts bind all 42 final-manifest criteria, a real unhealthy-image rollback, 11 private recovery states, zero false success, zero production submits, zero dependency vulnerabilities, and zero secret findings. Remaining work requires external owner-controlled VPS attestation, restricted credentials, 24-hour qualification, and an irreversible live-money canary decision
+- **State:** SOFTWARE_RC_AUTONOMOUS_RUNTIME_AWAITING_EXACT_GATE
+- **Current checkpoint:** the previous operations proof exposed a master-goal gap: it did not install the required `ipegctl`/systemd control plane or a persistent qualification orchestrator. The local remediation adds one-command Ubuntu 24.04 bootstrap, external mode-0600 onboarding, exact image-label binding, and a subprocess-owned `AutonomousOrchestrator`; local lock/Ruff/mypy/649-test/doctor gates pass. Commit, exact Ubuntu proof, final review, protected-main merge, and v1 RC publication remain required before `SOFTWARE_COMPLETE`
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -358,4 +358,25 @@ with zero production submits; C4.3 `9432156081` is 8/8 with zero false success/s
 `9432146473` reports zero vulnerabilities and secret findings. No secret, production credential,
 live stage promotion, real VPS result, live-money authorization, or real order is present. All further
 work requires the explicit external owner actions recorded above; the product remains fail closed.
+```
+
+```text
+2026-08-21 autonomous runtime remediation: LOCAL PASS / EXACT GATE REQUIRED
+- exact lock validation: PASS (64 packages)
+- Ruff format/check: PASS (113 files)
+- strict mypy: PASS (111 source/test files)
+- pytest: 649 passed, 6 Bash-only tests skipped on Windows and required on Ubuntu CI
+- doctor: PASS; mode=shadow; live_orders_allowed=false
+- git diff --check: PASS
+
+This delta installs `ipegctl`, an idempotent Ubuntu 24.04 bootstrap and a hardened systemd unit;
+deployment uses `/etc/ipeg/ipeg.env` mode 0600 and rejects an immutable digest whose OCI revision
+label differs from the requested full release SHA. The service-owned `AutonomousOrchestrator`
+idempotently starts/resumes the exact route/release/source/config/image qualification epoch, reports
+blockers, finalizes only the observation collection, and never authorizes canary/live. Parquet progress
+runs in a bounded child process that is terminated on cancellation, so shutdown cannot leave an
+unowned qualification scan. Local onboarding remains interactive and writes credentials only outside
+Git; `canary-arm` fails until a separate `LIVE_CANARY_CONSENT`. The exact Ubuntu deployment/rollback,
+operations artifact, adversarial review, Ready/squash merge, protected main, and v1 RC image/release
+must still pass on the new head.
 ```

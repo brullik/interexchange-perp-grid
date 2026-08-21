@@ -2,7 +2,7 @@
 set -euo pipefail
 
 deployment_state="${IPEG_DEPLOYMENT_STATE_PATH:-.ipeg-deployment-state}"
-secrets_file=".env"
+secrets_file="${IPEG_ENV_FILE:-.env}"
 
 if [[ $# -ne 2 ]]; then
   echo "usage: shadow-deploy.sh IMAGE@sha256:DIGEST FULL_RELEASE_SHA" >&2
@@ -26,18 +26,26 @@ if [[ "$(stat -c '%a' "$secrets_file")" != "600" ]]; then
   echo "$secrets_file must have mode 0600" >&2
   exit 3
 fi
-if [[ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]]; then
-  echo "deployment requires a Git checkout to prove secrets are untracked" >&2
+if [[ "$(git rev-parse --is-inside-work-tree 2>/dev/null || true)" == "true" ]]; then
+  if git ls-files --error-unmatch -- "$secrets_file" >/dev/null 2>&1; then
+    echo "$secrets_file must not be tracked by Git" >&2
+    exit 3
+  fi
+elif [[ "$secrets_file" != /* ]]; then
+  echo "deployment outside a Git checkout requires an absolute external secrets path" >&2
   exit 3
 fi
-if git ls-files --error-unmatch -- "$secrets_file" >/dev/null 2>&1; then
-  echo "$secrets_file must not be tracked by Git" >&2
-  exit 3
-fi
+export IPEG_ENV_FILE="$secrets_file"
 export IPEG_IMAGE_REF="$image_ref"
 export IPEG_RELEASE_SHA="$release_sha"
 export IPEG_CONTAINER_IMAGE_DIGEST="${image_ref##*@}"
 docker compose pull app
+image_revision="$(docker image inspect "$image_ref" \
+  --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+if [[ "$image_revision" != "$release_sha" ]]; then
+  echo "container image revision label does not match the requested release SHA" >&2
+  exit 4
+fi
 docker compose up --detach --no-build --wait --wait-timeout 180 app
 docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml
 docker compose exec -T app interexchange-grid deployment-identity \

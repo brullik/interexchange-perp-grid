@@ -236,7 +236,7 @@ jobs:
           curl --fail --silent http://127.0.0.1:5000/v2/ >/dev/null
           release_sha="$(git rev-parse HEAD)"
           local_tag="localhost:5000/interexchange-perp-grid:$release_sha"
-          docker build --tag "$local_tag" .
+          docker build --label "org.opencontainers.image.revision=$release_sha" --tag "$local_tag" .
           docker push "$local_tag"
           image_ref="$(docker image inspect "$local_tag" --format '{{index .RepoDigests 0}}')"
           [[ "$image_ref" =~ @sha256:[0-9a-f]{64}$ ]]
@@ -313,7 +313,7 @@ jobs:
           docker volume rm "$SMOKE_VOLUME"
       - name: Validate deployment scripts
         run: |
-          bash -n scripts/release-build.sh scripts/shadow-deploy.sh scripts/shadow-upgrade.sh scripts/shadow-rollback.sh
+          bash -n scripts/release-build.sh scripts/shadow-deploy.sh scripts/shadow-upgrade.sh scripts/shadow-rollback.sh scripts/bootstrap-ubuntu.sh scripts/ipegctl
           mapfile -t nodeids < <(python -c 'import json; p=json.load(open("config/ops-scenario-nodeids.json")); print("\n".join(sorted({v for xs in p.values() for v in xs if v.startswith("tests/")})))')
           pytest -q "${nodeids[@]}" --junitxml=state/ops-proof.junit.xml
           interexchange-grid ops-proof \

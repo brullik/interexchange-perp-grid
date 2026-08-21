@@ -17,6 +17,7 @@ import typer
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.autonomous_orchestrator import load_autonomous_runtime_status
 from interexchange_perp_grid.c4_3_proof import run_c4_3_proof
 from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
@@ -291,6 +292,19 @@ def deployment_identity(
 def metrics() -> None:
     """Print the current Prometheus metric exposition."""
     typer.echo(render_metrics(), nl=False)
+
+
+@app.command("autonomous-status")
+def autonomous_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+    """Print the installed orchestrator's fail-closed runtime state."""
+    settings = _load(config)
+    path = Path(settings.storage.sqlite_path).parent / "autonomous-orchestrator.json"
+    try:
+        payload = load_autonomous_runtime_status(path)
+    except (FileNotFoundError, ValueError) as error:
+        typer.echo(json.dumps({"status": "FAIL", "reason": str(error)}, sort_keys=True))
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(payload, default=str, sort_keys=True))
 
 
 def _scan_payload(result: ScanResult) -> dict[str, object]:

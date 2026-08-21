@@ -1,0 +1,25 @@
+[Unit]
+Description=Interexchange Perpetual Grid autonomous shadow service
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=IPEG_ROOT=/opt/ipeg
+Environment=IPEG_ENV_FILE=/etc/ipeg/ipeg.env
+Environment=IPEG_DEPLOYMENT_STATE_PATH=/var/lib/ipeg/deployment.env
+ExecStart=/usr/local/sbin/ipegctl service-run
+ExecStop=/usr/local/sbin/ipegctl service-stop
+Restart=always
+RestartSec=5
+TimeoutStartSec=240
+TimeoutStopSec=45
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/ipeg /var/log/ipeg /opt/ipeg
+
+[Install]
+WantedBy=multi-user.target

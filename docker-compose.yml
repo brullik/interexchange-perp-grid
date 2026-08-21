@@ -4,7 +4,7 @@ services:
     build: .
     restart: unless-stopped
     env_file:
-      - .env
+      - ${IPEG_ENV_FILE:-.env}
     environment:
       IPEG_CONFIG_PATH: /app/config/defaults.yaml
       IPEG_STATE_PATH: /app/state/ipeg.sqlite3

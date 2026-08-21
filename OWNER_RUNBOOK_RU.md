@@ -4,6 +4,28 @@
 
 Software-only контур готовится как `SOFTWARE_RELEASE_V1_RC`; это не live-разрешение. Реальные ордера запрещены до завершения внешних owner actions, точной 24-часовой qualification, независимых live gates и отдельного решения владельца о минимальном canary. Не добавляйте production credentials и не включайте live для software-проверок: CI обязан завершаться с `production_submit_calls=0`.
 
+## 0. One-command Ubuntu 24.04 bootstrap и автономный runtime
+
+На чистом Ubuntu 24.04 из exact release checkout выполните:
+
+```bash
+sudo bash scripts/bootstrap-ubuntu.sh
+sudo ipegctl owner-onboard
+sudo ipegctl deploy --image ghcr.io/brullik/interexchange-perp-grid@sha256:<digest> \
+  --release-sha <full-main-sha>
+sudo ipegctl doctor
+sudo ipegctl status
+```
+
+`owner-onboard` работает только в локальном TTY, записывает Telegram/Wave1 credentials в
+`/etc/ipeg/ipeg.env` mode `0600` и принудительно оставляет `IPEG_MODE=shadow` и
+`IPEG_LIVE_ENABLED=false`. Не вставляйте значения из wizard в GitHub, чат или artifacts.
+Systemd unit `ipeg.service` держит контейнер и встроенный `AutonomousOrchestrator` запущенными
+после выхода Codex: он idempotently начинает/возобновляет exact immutable qualification epoch,
+публикует blockers через `ipegctl status`, финализирует только collection epoch и никогда не
+включает canary/live. `ipegctl canary-arm` остаётся fail-closed до отдельного
+`LIVE_CANARY_CONSENT`.
+
 Fail-closed действует при stale/несинхронизированных данных, sequence gap, неполном raw private snapshot, неизвестном состоянии ордера, недоступном risk engine, несовпадении journal/exchange, нестабильном FLAT или неопределённой возможности emergency venue. Один процесс `app` непрерывно владеет единственным Telegram poller и `LiveSafetySupervisor`; ручной перезапуск или повторный `canary-run` не является способом recovery.
 
 ## 1. Точная сборка и локальная проверка

@@ -6,6 +6,7 @@ import signal
 from dataclasses import dataclass
 from pathlib import Path
 
+from interexchange_perp_grid.autonomous_orchestrator import AutonomousOrchestrator
 from interexchange_perp_grid.canary_runtime import (
     OnDemandLiveControlPlane,
     recover_active_actions,
@@ -87,6 +88,13 @@ class BootstrapService:
         background_tasks.append(
             asyncio.create_task(supervisor.run(stop_event), name="live-safety-supervisor")
         )
+        if self.settings.app.mode == "shadow":
+            background_tasks.append(
+                asyncio.create_task(
+                    AutonomousOrchestrator(self.settings).run(stop_event),
+                    name="autonomous-orchestrator",
+                )
+            )
         if self.run_shadow and self.settings.app.mode == "shadow":
             runtime = ShadowRuntime(self.settings)
             await runtime.start()

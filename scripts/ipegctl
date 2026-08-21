@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="${IPEG_ROOT:-/opt/ipeg}"
+env_file="${IPEG_ENV_FILE:-/etc/ipeg/ipeg.env}"
+deployment_state="${IPEG_DEPLOYMENT_STATE_PATH:-/var/lib/ipeg/deployment.env}"
+compose=(docker compose --project-directory "$root" --file "$root/docker-compose.yml")
+
+usage() {
+  cat >&2 <<'EOF'
+usage: ipegctl COMMAND [arguments]
+commands: bootstrap deploy doctor status start-shadow qualification-start
+          qualification-status qualification-finalize owner-onboard canary-arm
+          canary-status emergency-flatten update rollback backup logs
+EOF
+  exit 2
+}
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "this command requires root" >&2
+    exit 3
+  fi
+}
+
+load_deployment() {
+  [[ -r "$deployment_state" ]] || { echo "deployment identity is unavailable" >&2; exit 4; }
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      image_ref) IPEG_IMAGE_REF="$value" ;;
+      release_sha) IPEG_RELEASE_SHA="$value" ;;
+    esac
+  done <"$deployment_state"
+  [[ "${IPEG_IMAGE_REF:-}" =~ @sha256:[0-9a-f]{64}$ ]] || exit 4
+  [[ "${IPEG_RELEASE_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || exit 4
+  IPEG_CONTAINER_IMAGE_DIGEST="${IPEG_IMAGE_REF##*@}"
+  export IPEG_IMAGE_REF IPEG_RELEASE_SHA IPEG_CONTAINER_IMAGE_DIGEST IPEG_ENV_FILE
+}
+
+compose_exec() {
+  load_deployment
+  "${compose[@]}" exec -T app interexchange-grid "$@"
+}
+
+parse_image_args() {
+  IMAGE_REF=""
+  RELEASE_SHA=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image) IMAGE_REF="${2:-}"; shift 2 ;;
+      --release-sha) RELEASE_SHA="${2:-}"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [[ "$IMAGE_REF" =~ @sha256:[0-9a-f]{64}$ ]] || usage
+  [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || usage
+}
+
+command="${1:-}"
+[[ -n "$command" ]] || usage
+shift || true
+case "$command" in
+  bootstrap)
+    require_root
+    exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bootstrap-ubuntu.sh" "$@"
+    ;;
+  owner-onboard)
+    require_root
+    [[ -t 0 ]] || { echo "owner-onboard requires an interactive terminal" >&2; exit 3; }
+    umask 077
+    read -r -p "Qualification route (BASE:long>short): " qualification_route
+    [[ "$qualification_route" =~ ^[A-Z0-9]+:[a-z0-9]+\>[a-z0-9]+$ ]] || exit 3
+    read -r -p "Telegram owner chat ID: " telegram_owner_chat_id
+    [[ "$telegram_owner_chat_id" =~ ^-?[0-9]+$ ]] || exit 3
+    read -r -s -p "Telegram bot token: " telegram_token; printf '\n' >&2
+    [[ -n "$telegram_token" ]] || exit 3
+    temporary="${env_file}.tmp.$$"
+    trap 'rm -f -- "$temporary"' EXIT
+    {
+      printf 'IPEG_MODE=shadow\nIPEG_LIVE_ENABLED=false\n'
+      printf 'IPEG_QUALIFICATION_ROUTE=%s\n' "$qualification_route"
+      printf 'IPEG_TELEGRAM_ENABLED=true\nIPEG_TELEGRAM_OWNER_CHAT_ID=%s\n' "$telegram_owner_chat_id"
+      printf 'IPEG_TELEGRAM_BOT_TOKEN=%s\n' "$telegram_token"
+      for venue in BINANCEUSDM BYBIT OKX; do
+        read -r -s -p "$venue API key: " api_key; printf '\n' >&2
+        read -r -s -p "$venue API secret: " api_secret; printf '\n' >&2
+        [[ -n "$api_key" && -n "$api_secret" ]] || exit 3
+        printf 'IPEG_%s_API_KEY=%s\nIPEG_%s_API_SECRET=%s\n' \
+          "$venue" "$api_key" "$venue" "$api_secret"
+        read -r -s -p "$venue API password/passphrase (empty when unused): " api_password
+        printf '\n' >&2
+        if [[ "$venue" == "OKX" && -z "$api_password" ]]; then
+          echo "OKX API passphrase is required" >&2
+          exit 3
+        fi
+        printf 'IPEG_%s_API_PASSWORD=%s\n' "$venue" "$api_password"
+      done
+    } >"$temporary"
+    chmod 0600 "$temporary"
+    mv -f "$temporary" "$env_file"
+    trap - EXIT
+    echo "owner onboarding stored outside Git; live remains disabled"
+    ;;
+  deploy)
+    require_root
+    parse_image_args "$@"
+    export IPEG_ENV_FILE IPEG_DEPLOYMENT_STATE_PATH="$deployment_state"
+    cd "$root"
+    bash "$root/scripts/shadow-deploy.sh" "$IMAGE_REF" "$RELEASE_SHA"
+    systemctl restart ipeg.service
+    ;;
+  update)
+    require_root
+    parse_image_args "$@"
+    export IPEG_ENV_FILE IPEG_DEPLOYMENT_STATE_PATH="$deployment_state"
+    cd "$root"
+    bash "$root/scripts/shadow-upgrade.sh" "$IMAGE_REF" "$RELEASE_SHA"
+    systemctl restart ipeg.service
+    ;;
+  rollback)
+    require_root
+    parse_image_args "$@"
+    export IPEG_ENV_FILE IPEG_DEPLOYMENT_STATE_PATH="$deployment_state"
+    cd "$root"
+    bash "$root/scripts/shadow-rollback.sh" "$IMAGE_REF" "$RELEASE_SHA"
+    systemctl restart ipeg.service
+    ;;
+  doctor)
+    compose_exec health --config /app/config/defaults.yaml
+    compose_exec deployment-identity \
+      --expected-release-sha "$IPEG_RELEASE_SHA" \
+      --expected-image-digest "$IPEG_CONTAINER_IMAGE_DIGEST" \
+      --config /app/config/defaults.yaml
+    for venue in binanceusdm bybit okx; do
+      compose_exec private-probe --venue "$venue"
+    done
+    ;;
+  status)
+    compose_exec health --config /app/config/defaults.yaml
+    compose_exec autonomous-status --config /app/config/defaults.yaml
+    ;;
+  start-shadow)
+    require_root
+    systemctl enable --now ipeg.service
+    ;;
+  qualification-start)
+    compose_exec qualification-epoch-start "$@" --config /app/config/defaults.yaml
+    ;;
+  qualification-status)
+    compose_exec qualification-epoch-status "$@" --config /app/config/defaults.yaml
+    ;;
+  qualification-finalize)
+    compose_exec qualification-epoch-finalize "$@" --config /app/config/defaults.yaml
+    ;;
+  canary-arm)
+    echo "canary-arm requires a separate short-lived LIVE_CANARY_CONSENT" >&2
+    exit 5
+    ;;
+  canary-status)
+    compose_exec risk-stage-status --config /app/config/defaults.yaml
+    compose_exec qualification-epoch-status "$@" --config /app/config/defaults.yaml
+    ;;
+  emergency-flatten)
+    compose_exec emergency-flatten "$@" --config /app/config/defaults.yaml
+    ;;
+  backup)
+    compose_exec backup-state "$@" --config /app/config/defaults.yaml
+    ;;
+  logs)
+    load_deployment
+    exec "${compose[@]}" logs --tail 500 --follow app
+    ;;
+  service-run)
+    require_root
+    load_deployment
+    cd "$root"
+    exec "${compose[@]}" up --no-build app
+    ;;
+  service-stop)
+    require_root
+    load_deployment
+    cd "$root"
+    exec "${compose[@]}" stop --timeout 30 app
+    ;;
+  *) usage ;;
+esac

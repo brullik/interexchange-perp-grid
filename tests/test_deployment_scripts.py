@@ -11,6 +11,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = REPO_ROOT / "scripts" / "shadow-deploy.sh"
 UPGRADE = REPO_ROOT / "scripts" / "shadow-upgrade.sh"
+BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap-ubuntu.sh"
+IPEGCTL = REPO_ROOT / "scripts" / "ipegctl"
 OLD_IMAGE = f"ghcr.io/example/app@sha256:{'1' * 64}"
 NEW_IMAGE = f"ghcr.io/example/app@sha256:{'2' * 64}"
 OLD_SHA = "a" * 40
@@ -42,6 +44,10 @@ set -euo pipefail
 printf '%s|%s\\n' "${IPEG_RELEASE_SHA:-none}" "$*" >>"$FAKE_DOCKER_LOG"
 if [[ "$*" == "compose ps --status running --services" ]]; then
   [[ "${FAKE_APP_RUNNING:-0}" == 1 ]] && printf 'app\\n'
+  exit 0
+fi
+if [[ "$*" == image\\ inspect*org.opencontainers.image.revision* ]]; then
+  printf '%s\\n' "${FAKE_IMAGE_REVISION:-${IPEG_RELEASE_SHA:-}}"
   exit 0
 fi
 if [[ "$*" == *"interexchange-grid health"* ]] \
@@ -125,6 +131,20 @@ def test_deploy_is_idempotent_and_persists_only_healthy_exact_identity(tmp_path:
     assert log.count("interexchange-grid deployment-identity") == 2
 
 
+def test_deploy_rejects_digest_whose_revision_label_does_not_match_sha(
+    tmp_path: Path,
+) -> None:
+    environment, state_path, docker_log = _fake_environment(tmp_path)
+    environment["FAKE_IMAGE_REVISION"] = OLD_SHA
+
+    result = _run(DEPLOY, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+
+    assert result.returncode == 4
+    assert "revision label" in result.stderr
+    assert not state_path.exists()
+    assert "compose up" not in docker_log.read_text(encoding="utf-8")
+
+
 def test_failed_upgrade_restores_backup_and_previous_digest(tmp_path: Path) -> None:
     environment, state_path, docker_log = _fake_environment(tmp_path)
     state_path.write_text(
@@ -147,3 +167,62 @@ def test_failed_upgrade_restores_backup_and_previous_digest(tmp_path: Path) -> N
     assert "restore-state" in log
     assert f"{NEW_SHA}|compose up" in log
     assert f"{OLD_SHA}|compose up" in log
+
+
+def test_bootstrap_stages_exact_ubuntu_systemd_control_plane(tmp_path: Path) -> None:
+    os_release = tmp_path / "os-release"
+    os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8")
+    destination = tmp_path / "root"
+    environment = {
+        **os.environ,
+        "DESTDIR": str(destination),
+        "IPEG_OS_RELEASE_PATH": str(os_release),
+        "IPEG_SKIP_PACKAGE_INSTALL": "true",
+    }
+
+    result = _run(BOOTSTRAP, cwd=REPO_ROOT, environment=environment)
+
+    assert result.returncode == 0, result.stderr
+    assert (destination / "usr/local/sbin/ipegctl").is_file()
+    assert (destination / "etc/systemd/system/ipeg.service").is_file()
+    assert (destination / "opt/ipeg/docker-compose.yml").is_file()
+    unit = (destination / "etc/systemd/system/ipeg.service").read_text(encoding="utf-8")
+    assert "Restart=always" in unit
+    assert "IPEG_ENV_FILE=/etc/ipeg/ipeg.env" in unit
+
+
+def test_ipegctl_exposes_locked_commands_and_refuses_canary_without_consent(
+    tmp_path: Path,
+) -> None:
+    syntax = subprocess.run(
+        [_bash(), "-n", str(IPEGCTL)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    result = _run(IPEGCTL, "canary-arm", cwd=tmp_path, environment=dict(os.environ))
+
+    assert result.returncode == 5
+    assert "LIVE_CANARY_CONSENT" in result.stderr
+    text = IPEGCTL.read_text(encoding="utf-8")
+    for command in (
+        "bootstrap",
+        "deploy",
+        "doctor",
+        "status",
+        "start-shadow",
+        "qualification-start",
+        "qualification-status",
+        "qualification-finalize",
+        "owner-onboard",
+        "canary-arm",
+        "canary-status",
+        "emergency-flatten",
+        "update",
+        "rollback",
+        "backup",
+        "logs",
+    ):
+        assert command in text
