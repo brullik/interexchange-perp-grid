@@ -1131,7 +1131,10 @@ class ContinuousShadowEvaluator:
     ) -> None:
         self.settings = settings
         self.runtime = runtime or ShadowRuntime(settings)
-        self._engine = engine or PublicMarketEngine(settings)
+        self._engine = engine or PublicMarketEngine(
+            settings,
+            public_venues=tuple(Venue(value) for value in settings.venues.public_runtime),
+        )
         self._trader = trader or ShadowTrader(settings, self.runtime)
         self._route_calibrator = route_calibrator or PersistentRouteCalibrator(
             Path(settings.storage.sqlite_path),

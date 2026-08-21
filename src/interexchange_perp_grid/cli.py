@@ -338,7 +338,10 @@ async def _run_public_scan(
     quantity: Decimal,
     timeout_seconds: int,
 ) -> ScanResult:
-    engine = PublicMarketEngine(settings)
+    engine = PublicMarketEngine(
+        settings,
+        public_venues=tuple(Venue(value) for value in settings.venues.public_runtime),
+    )
     try:
         return await engine.scan_once(base, quantity, timeout_seconds)
     finally:
@@ -352,7 +355,7 @@ def public_scan(
     quantity: Annotated[str, typer.Option("--quantity")] = "0.01",
     timeout_seconds: Annotated[int, typer.Option("--timeout", min=1, max=120)] = 30,
 ) -> None:
-    """Print one live Wave 1 public-data route snapshot."""
+    """Print one capability-gated public-data route snapshot across configured waves."""
     settings = _load(config)
     try:
         parsed_quantity = Decimal(quantity)

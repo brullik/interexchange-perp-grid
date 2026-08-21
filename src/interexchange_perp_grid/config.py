@@ -43,6 +43,11 @@ class VenuesConfig(StrictModel):
     wave3: tuple[str, ...]
     quarantine_on_unknown_capability: bool = True
 
+    @property
+    def public_runtime(self) -> tuple[str, ...]:
+        """Return every configured public venue without expanding live authority."""
+        return self.wave1_public + self.wave2 + self.wave3
+
     @model_validator(mode="after")
     def unique_venues(self) -> VenuesConfig:
         all_venues = (

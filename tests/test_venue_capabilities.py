@@ -58,7 +58,7 @@ def _reports() -> tuple[dict[Venue, CapabilityReport], dict[Venue, PrivateCapabi
     return public, private
 
 
-def test_default_matrix_covers_all_seven_without_enabling_expansion() -> None:
+def test_default_matrix_enables_qualified_expansion_public_without_live_authority() -> None:
     settings = load_settings(Path("config/defaults.yaml"))
     public, private = _reports()
 
@@ -77,11 +77,18 @@ def test_default_matrix_covers_all_seven_without_enabling_expansion() -> None:
         assert row.public_runtime == CapabilityState.QUALIFIED
         assert row.live_capability == CapabilityState.QUALIFIED
         assert row.execution_authorized is False
-    for venue in (Venue.BITGET, Venue.KUCOIN_FUTURES, Venue.BINGX, Venue.MEXC):
+    for venue in (Venue.BITGET, Venue.KUCOIN_FUTURES):
         row = matrix.for_venue(venue)
-        assert row.public_runtime == CapabilityState.DISABLED
+        assert row.public_runtime == CapabilityState.QUALIFIED
         assert row.live_capability == CapabilityState.DISABLED
-        assert CapabilityReason.PUBLIC_RUNTIME_DISABLED in row.reasons
+        assert CapabilityReason.PUBLIC_RUNTIME_DISABLED not in row.reasons
+        assert CapabilityReason.LIVE_ALLOWLIST_DISABLED in row.reasons
+    for venue in (Venue.BINGX, Venue.MEXC):
+        row = matrix.for_venue(venue)
+        assert row.public_runtime == CapabilityState.QUARANTINED
+        assert row.live_capability == CapabilityState.DISABLED
+        assert CapabilityReason.PUBLIC_RUNTIME_DISABLED not in row.reasons
+        assert CapabilityReason.PUBLIC_CAPABILITY_MISSING in row.reasons
         assert CapabilityReason.LIVE_ALLOWLIST_DISABLED in row.reasons
     assert matrix.for_venue(Venue.BINGX).public_contract == CapabilityState.QUARANTINED
     mexc = matrix.for_venue(Venue.MEXC)
@@ -294,6 +301,6 @@ def test_yaml_reclassification_cannot_enable_expansion_live() -> None:
     mexc = matrix.for_venue(Venue.MEXC)
     assert mexc.public_contract == CapabilityState.QUALIFIED
     assert mexc.private_contract == CapabilityState.QUALIFIED
-    assert mexc.public_runtime == CapabilityState.DISABLED
+    assert mexc.public_runtime == CapabilityState.QUALIFIED
     assert mexc.live_capability == CapabilityState.DISABLED
     assert mexc.execution_authorized is False

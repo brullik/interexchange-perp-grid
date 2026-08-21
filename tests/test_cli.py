@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import re
+from decimal import Decimal
+from pathlib import Path
+from typing import cast
 
+import pytest
 from typer.testing import CliRunner
 
-from interexchange_perp_grid.cli import app
+import interexchange_perp_grid.cli as cli_module
+from interexchange_perp_grid.cli import _run_public_scan, app
+from interexchange_perp_grid.config import load_settings
+from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.public_engine import ScanResult
 
 runner = CliRunner()
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CONFIG = Path("config/defaults.yaml")
 
 
 def test_cli_and_public_scan_help_render() -> None:
@@ -21,6 +31,42 @@ def test_public_scan_rejects_non_decimal_quantity_before_network() -> None:
     result = runner.invoke(app, ["public-scan", "--quantity", "not-a-number"])
     assert result.exit_code == 2
     assert "quantity must be a decimal number" in result.output
+
+
+def test_public_scan_wires_every_configured_public_venue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    sentinel = cast(ScanResult, object())
+
+    class CapturingPublicEngine:
+        def __init__(self, settings: object, **kwargs: object) -> None:
+            del settings
+            captured.update(kwargs)
+
+        async def scan_once(
+            self,
+            base: str,
+            quantity: Decimal,
+            timeout_seconds: int,
+        ) -> ScanResult:
+            del base, quantity, timeout_seconds
+            return sentinel
+
+        async def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setattr(cli_module, "PublicMarketEngine", CapturingPublicEngine)
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+
+    result = asyncio.run(_run_public_scan(settings, "BTC", Decimal("0.01"), 1))
+
+    assert result is sentinel
+    assert captured["public_venues"] == tuple(
+        Venue(value) for value in settings.venues.public_runtime
+    )
+    assert captured["closed"] is True
 
 
 def test_canary_run_requires_explicit_live_money_phrase_before_network() -> None:

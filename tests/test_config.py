@@ -24,6 +24,15 @@ def test_defaults_are_safe_and_match_owner_limits() -> None:
     assert settings.risk.local_free_margin_floor_ratio >= Decimal("0.20")
     assert settings.risk.initial_effective_leverage_cap <= Decimal("3")
     assert settings.risk.max_hold_seconds <= 86400
+    assert settings.venues.public_runtime == (
+        "binanceusdm",
+        "bybit",
+        "okx",
+        "bitget",
+        "kucoinfutures",
+        "mexc",
+        "bingx",
+    )
 
 
 def test_runtime_universe_policy_is_typed_and_locked() -> None:
