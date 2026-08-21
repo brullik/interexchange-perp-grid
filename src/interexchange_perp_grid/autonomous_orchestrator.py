@@ -31,6 +31,7 @@ from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _RELEASE_SHA = re.compile(r"^[0-9a-f]{40}$")
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_LOCKED_QUALIFICATION_ROUTE = "BTC:bybit>okx"
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +213,22 @@ class AutonomousOrchestrator:
                     "Deploy one exact immutable image digest before qualification.",
                 )
             )
+        if os.environ.get("IPEG_OWNER_ONBOARDING_CONFIRMED", "").strip().lower() != "true":
+            return await self._publish(
+                AutonomousRuntimeStatus(
+                    1,
+                    now,
+                    "WAITING_OWNER_ONBOARDING",
+                    release_sha,
+                    image_digest,
+                    raw_route or None,
+                    None,
+                    None,
+                    Decimal(0),
+                    ("OWNER_ONBOARDING_CONFIRMATION_REQUIRED",),
+                    "Complete local owner onboarding; live remains disabled.",
+                )
+            )
         if not raw_route:
             return await self._publish(
                 AutonomousRuntimeStatus(
@@ -226,6 +243,22 @@ class AutonomousOrchestrator:
                     Decimal(0),
                     ("QUALIFICATION_ROUTE_REQUIRED",),
                     "Complete local owner onboarding; live remains disabled.",
+                )
+            )
+        if raw_route != _LOCKED_QUALIFICATION_ROUTE:
+            return await self._publish(
+                AutonomousRuntimeStatus(
+                    1,
+                    now,
+                    "WAITING_OWNER_ONBOARDING",
+                    release_sha,
+                    image_digest,
+                    raw_route,
+                    None,
+                    None,
+                    Decimal(0),
+                    ("QUALIFICATION_ROUTE_LOCK_MISMATCH",),
+                    "Restore the locked onboarding route; live remains disabled.",
                 )
             )
         route = _parse_route(raw_route)

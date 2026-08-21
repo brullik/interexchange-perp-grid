@@ -73,8 +73,19 @@ case "$command" in
     require_root
     [[ -t 0 ]] || { echo "owner-onboard requires an interactive terminal" >&2; exit 3; }
     umask 077
-    read -r -p "Qualification route (BASE:long>short): " qualification_route
-    [[ "$qualification_route" =~ ^[A-Z0-9]+:[a-z0-9]+\>[a-z0-9]+$ ]] || exit 3
+    qualification_route="BTC:bybit>okx"
+    confirm_fact() {
+      local prompt="$1" confirmation
+      read -r -p "$prompt Type CONFIRM: " confirmation
+      if [[ "$confirmation" != "CONFIRM" ]]; then
+        echo "owner onboarding confirmation was not provided; nothing was installed" >&2
+        exit 3
+      fi
+    }
+    confirm_fact "Confirm Binance USD-M, Bybit, and OKX use dedicated subaccounts."
+    confirm_fact "Confirm every API key has withdrawal, transfer, wallet, address-book, and API-management permissions disabled."
+    confirm_fact "Confirm every API key is restricted to this VPS IP allowlist."
+    confirm_fact "Confirm the three dedicated subaccounts are funded for shadow qualification."
     read -r -p "Telegram owner chat ID: " telegram_owner_chat_id
     [[ "$telegram_owner_chat_id" =~ ^-?[0-9]+$ ]] || exit 3
     read -r -s -p "Telegram bot token: " telegram_token; printf '\n' >&2
@@ -83,6 +94,7 @@ case "$command" in
     trap 'rm -f -- "$temporary"' EXIT
     {
       printf 'IPEG_MODE=shadow\nIPEG_LIVE_ENABLED=false\n'
+      printf 'IPEG_OWNER_ONBOARDING_CONFIRMED=true\n'
       printf 'IPEG_QUALIFICATION_ROUTE=%s\n' "$qualification_route"
       printf 'IPEG_TELEGRAM_ENABLED=true\nIPEG_TELEGRAM_OWNER_CHAT_ID=%s\n' "$telegram_owner_chat_id"
       printf 'IPEG_TELEGRAM_BOT_TOKEN=%s\n' "$telegram_token"
