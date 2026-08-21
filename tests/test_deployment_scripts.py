@@ -184,6 +184,7 @@ def test_bootstrap_stages_exact_ubuntu_systemd_control_plane(tmp_path: Path) -> 
 
     assert result.returncode == 0, result.stderr
     assert (destination / "usr/local/sbin/ipegctl").is_file()
+    assert (destination / "usr/local/sbin/ipeg-bootstrap").is_file()
     assert (destination / "etc/systemd/system/ipeg.service").is_file()
     assert (destination / "opt/ipeg/docker-compose.yml").is_file()
     unit = (destination / "etc/systemd/system/ipeg.service").read_text(encoding="utf-8")

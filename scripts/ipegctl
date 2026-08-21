@@ -63,7 +63,11 @@ shift || true
 case "$command" in
   bootstrap)
     require_root
-    exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bootstrap-ubuntu.sh" "$@"
+    bootstrap_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bootstrap-ubuntu.sh"
+    if [[ ! -x "$bootstrap_script" ]]; then
+      bootstrap_script="/usr/local/sbin/ipeg-bootstrap"
+    fi
+    exec "$bootstrap_script" "$@"
     ;;
   owner-onboard)
     require_root

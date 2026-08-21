@@ -39,6 +39,8 @@ install -m 0755 "$source_root/scripts/shadow-deploy.sh" "$(prefix /opt/ipeg/scri
 install -m 0755 "$source_root/scripts/shadow-upgrade.sh" "$(prefix /opt/ipeg/scripts/)"
 install -m 0755 "$source_root/scripts/shadow-rollback.sh" "$(prefix /opt/ipeg/scripts/)"
 install -m 0755 "$source_root/scripts/ipegctl" "$(prefix /usr/local/sbin/ipegctl)"
+install -m 0755 "$source_root/scripts/bootstrap-ubuntu.sh" \
+  "$(prefix /usr/local/sbin/ipeg-bootstrap)"
 install -m 0644 "$source_root/deploy/ipeg.service" "$(prefix /etc/systemd/system/ipeg.service)"
 
 if [[ -z "$destdir" ]]; then

@@ -9,7 +9,7 @@ Software-only контур готовится как `SOFTWARE_RELEASE_V1_RC`; �
 На чистом Ubuntu 24.04 из exact release checkout выполните:
 
 ```bash
-sudo bash scripts/bootstrap-ubuntu.sh
+sudo scripts/ipegctl bootstrap
 sudo ipegctl owner-onboard
 sudo ipegctl deploy --image ghcr.io/brullik/interexchange-perp-grid@sha256:<digest> \
   --release-sha <full-main-sha>
