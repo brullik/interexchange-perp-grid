@@ -24,11 +24,29 @@ if [[ -f "$deployment_state" ]]; then
 fi
 backup_name="pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ).sqlite3"
 backup_created=false
+upgrade_gate_armed=false
+release_upgrade_gate() {
+  if ! docker compose exec -T app interexchange-grid deployment-upgrade-gate \
+    --config /app/config/defaults.yaml --action release; then
+    echo "deployment is healthy but the upgrade entry freeze could not be released" >&2
+    return 1
+  fi
+  upgrade_gate_armed=false
+}
 if docker compose ps --status running --services | grep -qx app; then
+  if ! docker compose exec -T app interexchange-grid deployment-upgrade-gate \
+    --config /app/config/defaults.yaml --action arm; then
+    echo "upgrade aborted before shutdown; entry remains frozen for risk reduction" >&2
+    exit 6
+  fi
+  upgrade_gate_armed=true
   docker compose stop app
   if ! docker compose run --rm --no-deps app interexchange-grid backup-state \
     --config /app/config/defaults.yaml --target "/app/state/backups/${backup_name}"; then
-    docker compose start app
+    docker compose up --detach --no-build --wait --wait-timeout 180 app
+    if ! release_upgrade_gate; then
+      exit 7
+    fi
     echo "upgrade aborted because the quiesced state backup failed" >&2
     exit 4
   fi
@@ -56,8 +74,14 @@ else
     echo "automatic rollback failed; deployment remains fail-closed" >&2
     exit 5
   fi
+  if [[ "$upgrade_gate_armed" == true ]] && ! release_upgrade_gate; then
+    exit 7
+  fi
   echo "automatic rollback completed" >&2
   exit "$upgrade_status"
+fi
+if [[ "$upgrade_gate_armed" == true ]] && ! release_upgrade_gate; then
+  exit 7
 fi
 if [[ "$backup_created" == true ]]; then
   echo "state_backup=/app/state/backups/${backup_name}"

@@ -24,6 +24,7 @@ from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergenc
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.live_journal import (
+    DeploymentUpgradeGate,
     LiveOrderJournal,
     completed_normal_actions_sha256,
     is_completed_normal_paired_cycle,
@@ -495,6 +496,35 @@ def qualification_epoch_finalize(
         return await finalize_qualification_epoch(state_path, epoch_id)
 
     typer.echo(json.dumps(asdict(asyncio.run(finalize())), default=str, sort_keys=True))
+
+
+@app.command("deployment-upgrade-gate")
+def deployment_upgrade_gate(
+    action: Annotated[str, typer.Option("--action")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Atomically freeze new live entry before deployment or release it after recovery."""
+    if action not in {"arm", "release"}:
+        raise typer.BadParameter("action must be arm or release")
+    settings = _load(config)
+
+    async def update_gate() -> tuple[DeploymentUpgradeGate, bool]:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        result = (
+            await journal.arm_deployment_upgrade()
+            if action == "arm"
+            else await journal.release_deployment_upgrade()
+        )
+        return result, action == "arm" and result.active_action_count > 0
+
+    result, blocked = asyncio.run(update_gate())
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+    if blocked:
+        typer.echo("deployment upgrade requires zero active live actions", err=True)
+        raise typer.Exit(6)
 
 
 @app.command("risk-stage-status")

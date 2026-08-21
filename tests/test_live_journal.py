@@ -134,6 +134,91 @@ async def _prepare(
 
 
 @pytest.mark.asyncio
+async def test_deployment_upgrade_gate_is_atomic_durable_and_blocks_only_new_entry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+
+    armed = await journal.arm_deployment_upgrade()
+    assert armed.entry_frozen
+    assert armed.active_action_count == 0
+    with pytest.raises(RuntimeError, match="deployment upgrade freeze"):
+        await _prepare(journal)
+    emergency_request = replace(
+        _request(Venue.BINANCE_USDM, "emergency-close", Side.SELL),
+        order_type="market",
+        price=None,
+        time_in_force=None,
+    )
+    with pytest.raises(RuntimeError, match="deployment upgrade freeze"):
+        await journal.prepare_emergency(
+            "emergency-1",
+            _ROUTE,
+            "emergency",
+            (emergency_request,),
+            {emergency_request.client_order_id: Decimal("0.001")},
+            {},
+            _QUALIFICATION,
+        )
+
+    restarted = LiveOrderJournal(path)
+    await restarted.initialise()
+    with pytest.raises(RuntimeError, match="deployment upgrade freeze"):
+        await _prepare(restarted)
+    released = await restarted.release_deployment_upgrade()
+    assert not released.entry_frozen
+    assert (await _prepare(restarted)).state == LiveActionState.PREPARED
+
+
+@pytest.mark.asyncio
+async def test_upgrade_gate_retains_freeze_until_all_live_actions_are_flat(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    action = await _prepare(journal)
+
+    armed = await journal.arm_deployment_upgrade()
+    assert armed.entry_frozen
+    assert armed.active_action_count == 1
+    with pytest.raises(RuntimeError, match="zero active live actions"):
+        await journal.release_deployment_upgrade()
+    with pytest.raises(RuntimeError, match="deployment upgrade freeze"):
+        await _prepare(
+            journal,
+            "pair-2",
+            "pair-2-long",
+            "pair-2-short",
+            tranche_id="tranche-2",
+        )
+
+    await journal.transition(action.pair_action_id, LiveActionState.QUARANTINED, {})
+    await journal.transition(action.pair_action_id, LiveActionState.FLAT, {})
+    assert not (await journal.release_deployment_upgrade()).entry_frozen
+
+
+@pytest.mark.asyncio
+async def test_upgrade_gate_and_new_entry_have_no_unowned_race(tmp_path: Path) -> None:
+    for index in range(20):
+        journal = LiveOrderJournal(tmp_path / f"race-{index}.sqlite3")
+        await journal.initialise()
+        gate_result, prepare_result = await asyncio.gather(
+            journal.arm_deployment_upgrade(),
+            _prepare(journal),
+            return_exceptions=True,
+        )
+        assert not isinstance(gate_result, BaseException)
+        if isinstance(prepare_result, LiveJournalAction):
+            assert gate_result.active_action_count == 1
+            await journal.transition(prepare_result.pair_action_id, LiveActionState.QUARANTINED)
+            await journal.transition(prepare_result.pair_action_id, LiveActionState.FLAT)
+        else:
+            assert isinstance(prepare_result, RuntimeError)
+            assert gate_result.active_action_count == 0
+        assert not (await journal.release_deployment_upgrade()).entry_frozen
+
+
+@pytest.mark.asyncio
 async def test_prepare_is_atomic_durable_and_allows_distinct_tranche_after_restart(
     tmp_path: Path,
 ) -> None:

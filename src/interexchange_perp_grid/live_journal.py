@@ -220,6 +220,13 @@ class FlatBarrierBatchCommitResult:
     event_watermark: int
 
 
+@dataclass(frozen=True, slots=True)
+class DeploymentUpgradeGate:
+    entry_frozen: bool
+    active_action_count: int
+    updated_at: datetime
+
+
 def request_payload_hash(request: VenueOrderRequest) -> str:
     encoded = json.dumps(asdict(request), default=str, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -329,11 +336,22 @@ class LiveOrderJournal:
                     risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0
                         CHECK (risk_stage_completion_frozen IN (0, 1))
                 );
+                CREATE TABLE IF NOT EXISTS live_deployment_controls (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    upgrade_entry_frozen INTEGER NOT NULL DEFAULT 0
+                        CHECK (upgrade_entry_frozen IN (0, 1)),
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             database.execute(
                 "INSERT OR IGNORE INTO live_entry_controls("
                 "singleton, risk_stage_completion_frozen) VALUES (1, 0)"
+            )
+            database.execute(
+                "INSERT OR IGNORE INTO live_deployment_controls("
+                "singleton, upgrade_entry_frozen, updated_at) VALUES (1, 0, ?)",
+                (datetime.now(UTC).isoformat(),),
             )
             columns = {
                 str(row[1]) for row in database.execute("PRAGMA table_info(live_order_legs)")
@@ -422,6 +440,55 @@ class LiveOrderJournal:
                 database.rollback()
                 raise
 
+    async def arm_deployment_upgrade(self, now: datetime | None = None) -> DeploymentUpgradeGate:
+        return await asyncio.to_thread(
+            self._set_deployment_upgrade_gate_sync,
+            True,
+            now or datetime.now(UTC),
+        )
+
+    async def release_deployment_upgrade(
+        self, now: datetime | None = None
+    ) -> DeploymentUpgradeGate:
+        return await asyncio.to_thread(
+            self._set_deployment_upgrade_gate_sync,
+            False,
+            now or datetime.now(UTC),
+        )
+
+    def _set_deployment_upgrade_gate_sync(
+        self,
+        frozen: bool,
+        now: datetime,
+    ) -> DeploymentUpgradeGate:
+        observed = now.isoformat()
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            active_action_count = int(
+                database.execute(
+                    "SELECT COUNT(*) FROM live_pair_actions WHERE state <> ?",
+                    (LiveActionState.FLAT.value,),
+                ).fetchone()[0]
+            )
+            if not frozen and active_action_count:
+                database.rollback()
+                raise RuntimeError("deployment upgrade release requires zero active live actions")
+            database.execute(
+                "UPDATE live_deployment_controls "
+                "SET upgrade_entry_frozen = ?, updated_at = ? WHERE singleton = 1",
+                (int(frozen), observed),
+            )
+            database.commit()
+        return DeploymentUpgradeGate(frozen, active_action_count, now)
+
+    @staticmethod
+    def _require_deployment_entry_open(database: sqlite3.Connection) -> None:
+        deployment_freeze = database.execute(
+            "SELECT upgrade_entry_frozen FROM live_deployment_controls WHERE singleton = 1"
+        ).fetchone()
+        if deployment_freeze is None or bool(deployment_freeze["upgrade_entry_frozen"]):
+            raise RuntimeError("deployment upgrade freeze blocks new live action")
+
     async def prepare(
         self,
         pair_action_id: str,
@@ -483,6 +550,11 @@ class LiveOrderJournal:
             if stage_freeze is not None and bool(stage_freeze["risk_stage_completion_frozen"]):
                 database.rollback()
                 raise RuntimeError("risk-stage completion freeze blocks new live entry")
+            try:
+                self._require_deployment_entry_open(database)
+            except RuntimeError:
+                database.rollback()
+                raise
             self._validate_new_tranche_in_transaction(
                 database,
                 route,
@@ -655,6 +727,11 @@ class LiveOrderJournal:
             raise ValueError("qualification hash must be a SHA-256 hex digest")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_deployment_entry_open(database)
+            except RuntimeError:
+                database.rollback()
+                raise
             active = database.execute(
                 "SELECT pair_action_id FROM live_pair_actions WHERE state <> ? LIMIT 1",
                 (LiveActionState.FLAT.value,),
@@ -1048,6 +1125,7 @@ class LiveOrderJournal:
         if state not in _TRANSITIONS[previous]:
             raise ValueError(f"invalid live action transition {previous.value}->{state.value}")
         if previous == LiveActionState.FLAT and state != LiveActionState.FLAT:
+            self._require_deployment_entry_open(database)
             route = DirectedRouteKey(
                 str(row["route_base"]),
                 Venue(str(row["long_venue"])),
