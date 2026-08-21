@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -159,6 +159,8 @@ class LiveCanaryCoordinator:
         *,
         terminal_timeout_seconds: Decimal = Decimal("2"),
         flat_barrier_policy: FlatBarrierPolicy | None = None,
+        opening_gate: Callable[[CanaryExecutionPlan], Awaitable[bool]] | None = None,
+        final_opening_gate: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self._journal = journal
         self._adapters = dict(adapters)
@@ -178,23 +180,17 @@ class LiveCanaryCoordinator:
         self._emergency_venue = emergency_venue
         self._terminal_timeout_seconds = terminal_timeout_seconds
         self._flat_barrier_policy = flat_barrier_policy or FlatBarrierPolicy()
+        self._opening_gate = opening_gate
+        self._final_opening_gate = final_opening_gate
         self._orders_sent = 0
         self._sequence = 0
 
     async def prepare(self, plan: CanaryExecutionPlan) -> LiveJournalAction:
         """Persist an exact pair intent without performing any network submission."""
         await self._journal.initialise()
-        active = await self._journal.active()
-        if active is not None:
-            if active.pair_action_id != plan.pair_action_id:
-                raise RuntimeError(
-                    "unreconciled live action blocks entry: "
-                    f"{active.pair_action_id}:{active.state.value}"
-                )
-            return active
-        completed = await self._journal.load(plan.pair_action_id)
-        if completed is not None:
-            return completed
+        existing = await self._journal.load(plan.pair_action_id)
+        if existing is not None:
+            return existing
         return await self._journal.prepare(
             plan.pair_action_id,
             plan.route,
@@ -215,20 +211,24 @@ class LiveCanaryCoordinator:
 
     async def run(self, plan: CanaryExecutionPlan) -> CanaryCycleResult:
         await self._journal.initialise()
-        active = await self._journal.active()
-        completed = await self._journal.load(plan.pair_action_id)
-        if active is None and completed is not None and completed.state == LiveActionState.FLAT:
-            barrier = await self._verify_stable_flat(completed)
+        action = await self._journal.load(plan.pair_action_id)
+        if action is not None and action.state == LiveActionState.FLAT:
+            barrier = await self._verify_stable_flat(action)
             report = barrier.report
-            if barrier.verified:
-                completed, barrier = await self._to_flat(
-                    completed,
+            stable_flat_verified = barrier.verified
+            if stable_flat_verified:
+                action, barrier = await self._to_flat(
+                    action,
                     "REVERIFIED_COMPLETED_FLAT",
                     barrier,
                 )
-            if not barrier.verified and completed.state != LiveActionState.QUARANTINED:
-                completed = await self._quarantine(
-                    completed,
+            if (
+                not barrier.verified
+                and action.state != LiveActionState.QUARANTINED
+                and (not stable_flat_verified or action.state != LiveActionState.FLAT)
+            ):
+                action = await self._quarantine(
+                    action,
                     report,
                     flat_barrier_failure_reason(barrier).value,
                 )
@@ -238,9 +238,9 @@ class LiveCanaryCoordinator:
                 0,
                 False,
                 report.residual_delta,
-                completed.recovery_action,
+                action.recovery_action,
                 None,
-                completed.state,
+                action.state,
                 report,
                 None if barrier.verified else "Previously flat action no longer verifies flat.",
                 barrier.verified,
@@ -248,21 +248,66 @@ class LiveCanaryCoordinator:
                 barrier.consecutive_snapshots,
                 barrier.event_watermark,
             )
-        if active is not None and active.pair_action_id != plan.pair_action_id:
-            return self._failed(
-                active,
-                ReasonCode.RECONCILIATION_INCOMPLETE,
-                recovery_action="BLOCKED_BY_ACTIVE_ACTION",
-            )
-        if active is None:
+        if action is None:
             action = await self.prepare(plan)
-        else:
-            action = active
         if action.state == LiveActionState.PREPARED:
+            opening_allowed = True
+            if self._opening_gate is not None:
+                try:
+                    opening_allowed = await self._opening_gate(plan)
+                except Exception:
+                    opening_allowed = False
+            if not opening_allowed:
+                states = await collect_private_states(
+                    self._adapters,
+                    self._account_instruments,
+                    reconciliation_trigger="PRE_SUBMIT_GATE_DENIED",
+                )
+                report = reconcile_private_states(
+                    action,
+                    states,
+                    await self._journal.known_client_order_ids(),
+                    set(self._adapters),
+                )
+                action = await self._quarantine(action, report, "OPENING_GATE_DENIED")
+                return self._failed(
+                    action,
+                    ReasonCode.VENUE_QUARANTINED,
+                    recovery_action="OPENING_GATE_DENIED",
+                    reconciliation=report,
+                )
             await self._journal.mark_submit_attempted(
                 action.pair_action_id,
                 (plan.long_request.client_order_id, plan.short_request.client_order_id),
             )
+            final_opening_allowed = True
+            if self._final_opening_gate is not None:
+                try:
+                    final_opening_allowed = await self._final_opening_gate()
+                except Exception:
+                    final_opening_allowed = False
+            if not final_opening_allowed:
+                current = await self._journal.load(action.pair_action_id)
+                if current is not None:
+                    action = current
+                states = await collect_private_states(
+                    self._adapters,
+                    self._account_instruments,
+                    reconciliation_trigger="FINAL_PRE_SUBMIT_GATE_DENIED",
+                )
+                report = reconcile_private_states(
+                    action,
+                    states,
+                    await self._journal.known_client_order_ids(),
+                    set(self._adapters),
+                )
+                action = await self._quarantine(action, report, "FINAL_OPENING_GATE_DENIED")
+                return self._failed(
+                    action,
+                    ReasonCode.VENUE_QUARANTINED,
+                    recovery_action="FINAL_OPENING_GATE_DENIED",
+                    reconciliation=report,
+                )
             self._orders_sent += 2
             long_order, short_order = await asyncio.gather(
                 self._submit_and_resolve(
@@ -817,7 +862,17 @@ class LiveCanaryCoordinator:
         if commit.committed and observed_after == barrier.event_watermark:
             return commit.action, barrier
         failed_action = commit.action
-        if failed_action.state != LiveActionState.QUARANTINED:
+        preserve_terminal_flat = False
+        if (
+            failed_action.state == LiveActionState.FLAT
+            and not commit.committed
+            and commit.event_watermark == journal_watermark
+        ):
+            preserve_terminal_flat = any(
+                action.pair_action_id != failed_action.pair_action_id
+                for action in await self._journal.active_actions()
+            )
+        if failed_action.state != LiveActionState.QUARANTINED and not preserve_terminal_flat:
             failed_action = await self._quarantine(failed_action, barrier.report, reason)
         return (
             failed_action,

@@ -6,6 +6,8 @@
       "base": "BTC",
       "quote": "USDT",
       "settle": "USDT",
+      "active": true,
+      "created": 1609459200000,
       "contract": true,
       "swap": true,
       "linear": true,
@@ -22,6 +24,7 @@
       "base": "BTC",
       "quote": "USDT",
       "settle": null,
+      "active": true,
       "contract": false,
       "swap": false,
       "linear": false,
@@ -40,6 +43,8 @@
       "base": "BTC",
       "quote": "USDT",
       "settle": "USDT",
+      "active": true,
+      "created": 1609459200000,
       "contract": true,
       "swap": true,
       "linear": true,
@@ -48,7 +53,8 @@
       "contractSize": 1,
       "taker": "0.0006",
       "precision": {"amount": "0.001", "price": "0.1"},
-      "limits": {"amount": {"min": "0.001"}, "cost": {"min": null}}
+      "limits": {"amount": {"min": "0.001"}, "cost": {"min": null}},
+      "info": {"lotSizeFilter": {"minNotionalValue": "5"}}
     },
     {
       "symbol": "BTC/USD:BTC",
@@ -56,6 +62,7 @@
       "base": "BTC",
       "quote": "USD",
       "settle": "BTC",
+      "active": true,
       "contract": true,
       "swap": true,
       "linear": false,
@@ -74,6 +81,8 @@
       "base": "BTC",
       "quote": "USDT",
       "settle": "USDT",
+      "active": true,
+      "created": 1609459200000,
       "contract": true,
       "swap": true,
       "linear": true,
@@ -82,7 +91,8 @@
       "contractSize": "0.01",
       "taker": "0.0005",
       "precision": {"amount": "0.01", "price": "0.1"},
-      "limits": {"amount": {"min": "0.01"}, "cost": {"min": null}}
+      "limits": {"amount": {"min": "0.01"}, "cost": {"min": null}},
+      "info": {"instType": "SWAP", "ctType": "linear", "minSz": "0.01"}
     },
     {
       "symbol": "BTC/USDC:USDC",
@@ -90,6 +100,7 @@
       "base": "BTC",
       "quote": "USDC",
       "settle": "USDC",
+      "active": true,
       "contract": true,
       "swap": true,
       "linear": true,

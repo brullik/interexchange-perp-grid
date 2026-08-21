@@ -27,6 +27,8 @@ data:
 strategy:
   stressed_cost_multiplier: '2.0'
   max_parameter_change_ratio_per_day: '0.20'
+  calibration_size_multipliers: ['1', '2', '5']
+  calibration_funding_refresh_seconds: 60
   max_tranches: 5
   hard_max_hold_seconds: 86400
 risk_stages:
@@ -73,3 +75,6 @@ deployment:
   default_region: Germany
   japan_migration_p95_improvement_ratio: '0.20'
   max_single_venue_p99_worsening_ratio: '0.50'
+  # Fail-closed sentinel. OWNER_ACTION must replace this with the SHA-256 of the
+  # authorized raw Ed25519 public key before collecting FT-03 region evidence.
+  attestation_public_key_sha256: '0000000000000000000000000000000000000000000000000000000000000000'

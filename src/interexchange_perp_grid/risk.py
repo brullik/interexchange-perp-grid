@@ -112,6 +112,38 @@ class RiskBook:
         with self._lock:
             return tuple(self._reservations.values())
 
+    def restore(self, requests: tuple[RiskRequest, ...]) -> None:
+        """Atomically replace the book with a fully validated persisted snapshot."""
+        with self._lock:
+            restored: dict[str, RiskRequest] = {}
+            for request in sorted(requests, key=lambda item: item.reservation_id):
+                existing = tuple(restored.values())
+                route_stress = sum(
+                    (
+                        reservation.projected_stress_usdt
+                        for reservation in existing
+                        if reservation.route_id == request.route_id
+                    ),
+                    request.projected_stress_usdt,
+                )
+                portfolio_stress = sum(
+                    (reservation.projected_stress_usdt for reservation in existing),
+                    request.projected_stress_usdt,
+                )
+                reason = self._rejection_reason(
+                    request,
+                    existing,
+                    route_stress,
+                    portfolio_stress,
+                    reservations=restored,
+                )
+                if reason is not None:
+                    raise ValueError(
+                        f"persisted risk reservation {request.reservation_id} is invalid: {reason}"
+                    )
+                restored[request.reservation_id] = request
+            self._reservations = restored
+
     def set_execution_block(self, *, unmatched_exposure: bool, unknown_order_state: bool) -> None:
         with self._lock:
             self._unmatched_exposure = unmatched_exposure
@@ -157,8 +189,11 @@ class RiskBook:
         existing: tuple[RiskRequest, ...],
         route_stress: Decimal,
         portfolio_stress: Decimal,
+        *,
+        reservations: dict[str, RiskRequest] | None = None,
     ) -> ReasonCode | None:
-        if request.reservation_id in self._reservations:
+        reservation_book = self._reservations if reservations is None else reservations
+        if request.reservation_id in reservation_book:
             return ReasonCode.RESERVATION_EXISTS
         if self._unmatched_exposure or self._unknown_order_state:
             return ReasonCode.UNRESOLVED_EXECUTION_STATE

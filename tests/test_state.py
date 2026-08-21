@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -17,13 +20,46 @@ from interexchange_perp_grid.execution import (
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.state import (
     SCHEMA_VERSION,
+    RuntimeControls,
     initialise_state,
     load_tranches,
     read_private_event_watermark,
+    read_runtime_controls_bounded,
     save_private_event_watermark,
     save_tranche,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
+
+
+@pytest.mark.asyncio
+async def test_bounded_runtime_controls_read_does_not_own_process_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import interexchange_perp_grid.state as state_module
+
+    release = threading.Event()
+    started = threading.Event()
+
+    def resistant_read(path: Path, busy_timeout_ms: int = 30000) -> RuntimeControls:
+        del path, busy_timeout_ms
+        started.set()
+        release.wait(1)
+        return RuntimeControls(False, False, "READY", datetime.now(UTC))
+
+    monkeypatch.setattr(state_module, "_read_runtime_controls_sync", resistant_read)
+    started_at = time.monotonic()
+    with pytest.raises(TimeoutError, match="runtime controls read exceeded its deadline"):
+        await read_runtime_controls_bounded(
+            tmp_path / "state.sqlite3",
+            timeout_seconds=0.05,
+            busy_timeout_ms=10,
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert started.wait(0.1)
+    assert elapsed < 0.2
+    release.set()
 
 
 @pytest.mark.asyncio
@@ -57,6 +93,160 @@ async def test_version_one_state_migrates_without_losing_metadata(tmp_path: Path
         assert database.execute(
             "SELECT value FROM metadata WHERE key = 'owner_value'"
         ).fetchone() == ("preserved",)
+
+
+@pytest.mark.asyncio
+async def test_version_seven_route_calibration_schema_migrates_before_indexes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-v7.sqlite3"
+    with sqlite3.connect(path) as database:
+        database.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        database.execute("INSERT INTO metadata VALUES ('schema_version', '7')")
+        database.execute(
+            """
+            CREATE TABLE route_calibration_observations (
+                observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                route TEXT NOT NULL,
+                size_bucket_base_quantity TEXT NOT NULL,
+                epoch_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+            """
+        )
+        database.execute(
+            """
+            CREATE TABLE route_calibration_parameters (
+                route TEXT NOT NULL,
+                size_bucket_base_quantity TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(route, size_bucket_base_quantity)
+            )
+            """
+        )
+        database.execute(
+            """
+            CREATE TABLE route_calibration_episodes (
+                route TEXT NOT NULL,
+                size_bucket_base_quantity TEXT NOT NULL,
+                epoch_id TEXT NOT NULL,
+                entry_spread_bps TEXT NOT NULL,
+                convergence_target_bps TEXT NOT NULL,
+                peak_spread_bps TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                PRIMARY KEY(route, size_bucket_base_quantity, epoch_id)
+            )
+            """
+        )
+        database.execute(
+            """
+            INSERT INTO route_calibration_observations(
+                route, size_bucket_base_quantity, epoch_id, observed_at, payload_json
+            ) VALUES ('BTC:BYBIT->OKX', '0.001', 'legacy', '2026-01-01T00:00:00Z', '{}')
+            """
+        )
+
+    await initialise_state(path)
+
+    with sqlite3.connect(path) as database:
+        columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_observations)")
+        }
+        assert "size_bucket_multiplier" in columns
+        assert "size_bucket_base_quantity" not in columns
+        assert "reason" in columns
+        parameter_columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_parameters)")
+        }
+        assert "active" in parameter_columns
+        assert "transient_blocked" in parameter_columns
+        assert database.execute(
+            "SELECT count(*) FROM route_calibration_observations_legacy_v7"
+        ).fetchone() == (1,)
+        assert database.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'index' AND name = "
+            "'route_calibration_observations_key_time_v8'"
+        ).fetchone() == ("route_calibration_observations_key_time_v8",)
+
+
+@pytest.mark.asyncio
+async def test_version_ten_open_episode_migrates_fail_closed_to_bucket_schema(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-v10.sqlite3"
+    with sqlite3.connect(path) as database:
+        database.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        database.execute("INSERT INTO metadata VALUES ('schema_version', '10')")
+        database.execute(
+            """
+            CREATE TABLE route_calibration_episodes (
+                route TEXT NOT NULL,
+                size_bucket_multiplier TEXT NOT NULL,
+                epoch_id TEXT NOT NULL,
+                entry_spread_bps TEXT NOT NULL,
+                convergence_target_bps TEXT NOT NULL,
+                peak_spread_bps TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                PRIMARY KEY(route, size_bucket_multiplier, epoch_id)
+            )
+            """
+        )
+        database.execute(
+            """
+            INSERT INTO route_calibration_episodes VALUES (
+                'BTC:bybit>okx', '1', 'legacy', '10', '5', '12',
+                '2026-08-16T00:00:00+00:00'
+            )
+            """
+        )
+
+    await initialise_state(path)
+
+    with sqlite3.connect(path) as database:
+        columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(route_calibration_episodes)")
+        }
+        assert "spread_bucket_index" in columns
+        assert database.execute(
+            "SELECT spread_bucket_index FROM route_calibration_episodes"
+        ).fetchone() == (0,)
+        assert database.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone() == (SCHEMA_VERSION,)
+
+
+@pytest.mark.asyncio
+async def test_version_nine_adds_transient_calibration_gate(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-v9.sqlite3"
+    with sqlite3.connect(path) as database:
+        database.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        database.execute("INSERT INTO metadata VALUES ('schema_version', '9')")
+        database.execute(
+            """
+            CREATE TABLE route_calibration_parameters (
+                route TEXT NOT NULL,
+                size_bucket_multiplier TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                PRIMARY KEY(route, size_bucket_multiplier)
+            )
+            """
+        )
+
+    await initialise_state(path)
+
+    with sqlite3.connect(path) as database:
+        columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_parameters)")
+        }
+        assert "transient_blocked" in columns
 
 
 @pytest.mark.asyncio

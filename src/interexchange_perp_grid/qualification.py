@@ -183,6 +183,51 @@ class VenueBookStatistics:
 
 
 @dataclass(frozen=True, slots=True)
+class VenueQualificationProgress:
+    venue: Venue
+    synchronised_snapshots: int
+    required_synchronised_snapshots: int
+    remaining_synchronised_snapshots: int
+    funding_checkpoints: int
+    required_funding_checkpoints: int
+    remaining_funding_checkpoints: int
+    sequence_gap_count: int
+    stale_snapshot_count: int
+    sequence_unknown_snapshot_count: int
+    unsynchronised_snapshot_count: int
+    clock_skew_snapshot_count: int
+    maximum_inter_snapshot_gap_seconds: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class QualificationProgress:
+    schema_version: int
+    generated_at: datetime
+    epoch_id: str
+    epoch_status: QualificationEpochStatus
+    route: DirectedRouteKey
+    release_sha: str
+    source_sha256: str
+    config_sha256: str
+    container_image_digest: str
+    elapsed_seconds: Decimal
+    required_duration_seconds: int
+    remaining_duration_seconds: Decimal
+    completion_ratio: Decimal
+    accepted_signals: int
+    rejected_signals: int
+    unhandled_exception_count: int
+    replay_completed: bool
+    unresolved_order_count: int
+    unresolved_exposure_count: int
+    simulated_net_pnl_usdt: Decimal
+    venues: tuple[VenueQualificationProgress, ...]
+    blockers: tuple[str, ...]
+    ready_to_finalize: bool
+    qualification_ready: bool
+
+
+@dataclass(frozen=True, slots=True)
 class QualificationEvidence:
     schema_version: int
     generated_at: datetime
@@ -622,6 +667,167 @@ def _route_observation_period(statistics: tuple[VenueBookStatistics, ...]) -> De
     first = max(item.first_observed_at for item in statistics if item.first_observed_at)
     last = min(item.last_observed_at for item in statistics if item.last_observed_at)
     return max(Decimal(0), Decimal(str((last - first).total_seconds())))
+
+
+async def build_qualification_progress(
+    state_path: Path,
+    data_root: Path,
+    epoch_id: str | None,
+    policy: QualificationPolicy,
+    now: datetime | None = None,
+) -> QualificationProgress:
+    """Report exact persisted 24h progress without treating elapsed time as qualification."""
+    from interexchange_perp_grid.state import (
+        load_tranches,
+        read_qualification_epoch,
+        read_qualification_statistics,
+    )
+
+    epoch = await read_qualification_epoch(state_path, epoch_id)
+    if epoch is None:
+        raise KeyError(epoch_id or "current")
+    observed_at = now or datetime.now(UTC)
+    effective_end = min(observed_at, epoch.ended_at or observed_at)
+    elapsed = max(Decimal(0), Decimal(str((effective_end - epoch.started_at).total_seconds())))
+    statistics = tuple(
+        _venue_book_statistics(
+            data_root,
+            venue,
+            epoch.route.base,
+            policy,
+            epoch.started_at,
+            effective_end,
+        )
+        for venue in (epoch.route.long_venue, epoch.route.short_venue)
+    )
+    stored = await read_qualification_statistics(state_path, epoch.epoch_id)
+    tranches = await load_tranches(state_path)
+    route_tranches = tuple(tranche for tranche in tranches if tranche.route == epoch.route)
+    unresolved_orders = sum(
+        tranche.state == PairActionState.UNKNOWN_ORDER for tranche in route_tranches
+    )
+    unresolved_exposure = sum(
+        tranche.state not in {PairActionState.CLOSED, PairActionState.CREATED}
+        or tranche.residual_quantity != 0
+        for tranche in route_tranches
+    )
+    checkpoint_counts = {
+        venue: len(
+            {
+                (next_funding_timestamp_ms, interval)
+                for (
+                    observed_venue,
+                    _,
+                    _,
+                    next_funding_timestamp_ms,
+                    interval,
+                ) in stored.funding_rows
+                if observed_venue == venue
+            }
+        )
+        for venue in (epoch.route.long_venue, epoch.route.short_venue)
+    }
+    venue_progress = tuple(
+        VenueQualificationProgress(
+            venue=item.venue,
+            synchronised_snapshots=item.synchronised_snapshots,
+            required_synchronised_snapshots=(policy.minimum_synchronised_snapshots_per_venue),
+            remaining_synchronised_snapshots=max(
+                0,
+                policy.minimum_synchronised_snapshots_per_venue - item.synchronised_snapshots,
+            ),
+            funding_checkpoints=checkpoint_counts[item.venue],
+            required_funding_checkpoints=policy.minimum_funding_checkpoints_per_venue,
+            remaining_funding_checkpoints=max(
+                0,
+                policy.minimum_funding_checkpoints_per_venue - checkpoint_counts[item.venue],
+            ),
+            sequence_gap_count=item.sequence_gap_count,
+            stale_snapshot_count=item.stale_snapshot_count,
+            sequence_unknown_snapshot_count=item.sequence_unknown_snapshot_count,
+            unsynchronised_snapshot_count=item.unsynchronised_snapshot_count,
+            clock_skew_snapshot_count=item.clock_skew_snapshot_count,
+            maximum_inter_snapshot_gap_seconds=item.maximum_inter_snapshot_gap_seconds,
+        )
+        for item in statistics
+    )
+    blockers: list[str] = []
+    if epoch.status != QualificationEpochStatus.RUNNING:
+        blockers.append(f"EPOCH_{epoch.status.value}")
+    if elapsed < policy.minimum_duration_seconds:
+        blockers.append("OBSERVATION_PERIOD_INSUFFICIENT")
+    for item in venue_progress:
+        prefix = item.venue.value.upper()
+        if item.remaining_synchronised_snapshots:
+            blockers.append(f"{prefix}_SYNCHRONISED_SNAPSHOTS_INSUFFICIENT")
+        if item.remaining_funding_checkpoints:
+            blockers.append(f"{prefix}_FUNDING_CHECKPOINTS_INSUFFICIENT")
+        if item.maximum_inter_snapshot_gap_seconds > policy.maximum_inter_snapshot_gap_seconds:
+            blockers.append(f"{prefix}_CONTINUITY_GAP_EXCEEDED")
+        if item.sequence_gap_count > policy.maximum_sequence_gaps:
+            blockers.append(f"{prefix}_SEQUENCE_GAPS_EXCEEDED")
+        if item.stale_snapshot_count > policy.maximum_stale_snapshots:
+            blockers.append(f"{prefix}_STALE_SNAPSHOTS_EXCEEDED")
+        if item.sequence_unknown_snapshot_count > policy.maximum_sequence_unknown_snapshots:
+            blockers.append(f"{prefix}_BOOK_SEQUENCE_UNKNOWN")
+        if item.unsynchronised_snapshot_count:
+            blockers.append(f"{prefix}_UNSYNCHRONISED_SNAPSHOTS")
+        if item.clock_skew_snapshot_count > policy.maximum_clock_skew_snapshots:
+            blockers.append(f"{prefix}_CLOCK_SKEW_EXCEEDED")
+    if stored.accepted_signals + stored.rejected_signals == 0:
+        blockers.append("SIGNAL_STATISTICS_MISSING")
+    simulated_pnl = Decimal(stored.latest_simulated_net_pnl_usdt)
+    if simulated_pnl <= 0:
+        blockers.append("SIMULATED_NET_PNL_NOT_POSITIVE")
+    if stored.strategy is None:
+        blockers.append("STRATEGY_PARAMETERS_MISSING")
+    if stored.unhandled_exception_count:
+        blockers.append("UNHANDLED_EXCEPTIONS")
+    collection_blockers = tuple(blockers)
+    # Replay evidence is bound only by the immutable final qualification artifact.  A
+    # running epoch must never imply that replay has already passed.
+    blockers.append("REPLAY_NOT_COMPLETED")
+    if unresolved_orders:
+        blockers.append("UNRESOLVED_ORDER_STATE")
+    if unresolved_exposure:
+        blockers.append("UNRESOLVED_EXPOSURE")
+    remaining_duration = max(Decimal(0), Decimal(policy.minimum_duration_seconds) - elapsed)
+    duration_ratio = min(Decimal(1), elapsed / Decimal(policy.minimum_duration_seconds))
+    venue_ratios = tuple(
+        min(
+            Decimal(1),
+            Decimal(item.synchronised_snapshots) / Decimal(item.required_synchronised_snapshots),
+            Decimal(item.funding_checkpoints) / Decimal(item.required_funding_checkpoints),
+        )
+        for item in venue_progress
+    )
+    completion_ratio = min(duration_ratio, *venue_ratios)
+    return QualificationProgress(
+        schema_version=1,
+        generated_at=observed_at,
+        epoch_id=epoch.epoch_id,
+        epoch_status=epoch.status,
+        route=epoch.route,
+        release_sha=epoch.release_sha,
+        source_sha256=epoch.source_sha256,
+        config_sha256=epoch.config_sha256,
+        container_image_digest=epoch.container_image_digest,
+        elapsed_seconds=elapsed,
+        required_duration_seconds=policy.minimum_duration_seconds,
+        remaining_duration_seconds=remaining_duration,
+        completion_ratio=completion_ratio,
+        accepted_signals=stored.accepted_signals,
+        rejected_signals=stored.rejected_signals,
+        unhandled_exception_count=stored.unhandled_exception_count,
+        replay_completed=False,
+        unresolved_order_count=unresolved_orders,
+        unresolved_exposure_count=unresolved_exposure,
+        simulated_net_pnl_usdt=simulated_pnl,
+        venues=venue_progress,
+        blockers=tuple(blockers),
+        ready_to_finalize=not collection_blockers,
+        qualification_ready=not blockers,
+    )
 
 
 def _qualification_blockers(

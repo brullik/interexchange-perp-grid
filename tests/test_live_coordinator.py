@@ -235,6 +235,56 @@ async def _run(
 
 
 @pytest.mark.asyncio
+async def test_prepared_action_rechecks_opening_gate_before_any_submit(tmp_path: Path) -> None:
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    adapters = {
+        Venue.BINANCE_USDM: DeterministicPrivateExchange(
+            Venue.BINANCE_USDM,
+            instruments[Venue.BINANCE_USDM],
+            (_outcome(PrivateOrderStatus.FILLED, "1"),),
+        ),
+        Venue.OKX: DeterministicPrivateExchange(
+            Venue.OKX,
+            instruments[Venue.OKX],
+            (_outcome(PrivateOrderStatus.FILLED, "1"),),
+        ),
+        Venue.BYBIT: DeterministicPrivateExchange(
+            Venue.BYBIT,
+            instruments[Venue.BYBIT],
+            (),
+        ),
+    }
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+
+    async def deny_opening(_: CanaryExecutionPlan) -> bool:
+        return False
+
+    coordinator = LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        StaticProtectionProvider({}),
+        DeterministicCanaryMonitor(CloseReason.TARGET_CONVERGENCE),
+        Venue.BYBIT,
+        opening_gate=deny_opening,
+    )
+    prepared = await coordinator.prepare(_plan())
+    assert prepared.state == LiveActionState.PREPARED
+
+    result = await coordinator.run(_plan())
+
+    assert result.success is False
+    assert result.reason == ReasonCode.VENUE_QUARANTINED
+    assert result.orders_sent == 0
+    assert result.terminal_state == LiveActionState.QUARANTINED
+    assert result.recovery_action == "OPENING_GATE_DENIED"
+    assert sum(adapter.submit_calls for adapter in adapters.values()) == 0
+    action = await journal.load(_plan().pair_action_id)
+    assert action is not None
+    assert action.state == LiveActionState.QUARANTINED
+
+
+@pytest.mark.asyncio
 async def test_full_fill_canary_auto_closes_and_succeeds_only_flat(tmp_path: Path) -> None:
     result, adapters = await _run(
         tmp_path,
@@ -543,6 +593,60 @@ async def test_process_restart_after_durable_transition_resumes_without_duplicat
     assert result.terminal_state == LiveActionState.FLAT
     assert adapters[Venue.BINANCE_USDM].submit_calls == 2
     assert adapters[Venue.OKX].submit_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reverifying_flat_action_never_reactivates_it_for_an_unexpected_action(
+    tmp_path: Path,
+) -> None:
+    result, adapters = await _run(
+        tmp_path,
+        (
+            _outcome(PrivateOrderStatus.FILLED, "1"),
+            _outcome(PrivateOrderStatus.FILLED, "1"),
+        ),
+        (
+            _outcome(PrivateOrderStatus.FILLED, "1"),
+            _outcome(PrivateOrderStatus.FILLED, "1"),
+        ),
+    )
+    assert result.success is True and result.terminal_state == LiveActionState.FLAT
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await journal.prepare(
+        "eth-pending",
+        DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
+        "eth-tranche",
+        _request(Venue.BINANCE_USDM, "eth-long", Side.BUY),
+        _request(Venue.OKX, "eth-short", Side.SELL),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {"projected_stress_usdt": "0.8"},
+        "b" * 64,
+    )
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    coordinator = LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        StaticProtectionProvider(
+            {
+                (venue, side): Decimal("101") if side == Side.BUY else Decimal("99")
+                for venue in Venue
+                for side in Side
+            }
+        ),
+        DeterministicCanaryMonitor(CloseReason.TARGET_CONVERGENCE),
+        Venue.BYBIT,
+    )
+
+    replay = await coordinator.run(_plan())
+
+    assert replay.success is False
+    completed = await journal.load("cycle-1")
+    unexpected = await journal.load("eth-pending")
+    assert completed is not None and completed.state == LiveActionState.FLAT
+    assert unexpected is not None and unexpected.state == LiveActionState.QUARANTINED
 
 
 @pytest.mark.asyncio

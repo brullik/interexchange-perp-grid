@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import cast
 
 from interexchange_perp_grid.domain import (
     BookLevel,
@@ -38,7 +39,7 @@ def _instrument(venue: Venue) -> Instrument:
         amount_step_contracts=Decimal("1"),
         price_tick=Decimal("0.1"),
         minimum_amount_contracts=Decimal("1"),
-        minimum_notional=None,
+        minimum_notional=Decimal("0.01"),
         taker_fee_rate=Decimal("0.0005"),
         fee_source="public",
     )
@@ -279,6 +280,22 @@ def test_third_venue_blocks_when_any_quantized_residual_is_not_executable() -> N
     assert assessment.reason == ReasonCode.RESIDUAL_NOT_EXECUTABLE
     assert assessment.checks["all_residual_steps"] is False
     assert _decision(emergency=assessment).accepted is False
+
+
+def test_third_venue_blocks_malformed_notional_runtime_types() -> None:
+    malformed = (
+        replace(_instrument(Venue.BYBIT), minimum_notional=cast(Decimal, 5.0)),
+        replace(
+            _instrument(Venue.BYBIT),
+            minimum_notional=None,
+            no_fixed_minimum_notional=cast(bool, "yes"),
+        ),
+    )
+
+    for instrument in malformed:
+        assessment = _emergency_assessment(instrument=instrument)
+        assert assessment.passed is False
+        assert assessment.reason == ReasonCode.RESIDUAL_NOT_EXECUTABLE
 
 
 def test_third_venue_blocks_when_either_side_depth_cannot_cover_maximum_residual() -> None:

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from interexchange_perp_grid.client_ids import is_bot_client_order_id
 from interexchange_perp_grid.domain import Instrument, Venue
@@ -30,6 +30,10 @@ from interexchange_perp_grid.risk import (
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
+MAX_PRIVATE_RECONCILIATION_SYMBOLS_PER_VENUE = 10
+_PrivateRequestKey = tuple[Venue, str, str]
+_PRIVATE_REQUEST_TASKS: dict[_PrivateRequestKey, tuple[int, asyncio.Task[object]]] = {}
+
 
 class ReconciliationStatus(StrEnum):
     CONSISTENT = "CONSISTENT"
@@ -51,6 +55,14 @@ class PrivateStateAdapter(Protocol):
     async def fetch_trading_fee(self, instrument: Instrument) -> Decimal | None: ...
 
 
+class ClientOrderLookupAdapter(PrivateStateAdapter, Protocol):
+    async def find_order_by_client_id(
+        self,
+        client_order_id: str,
+        instrument: Instrument,
+    ) -> PrivateOrder | None: ...
+
+
 @runtime_checkable
 class ReconcilingPrivateStateAdapter(Protocol):
     async def reconcile_active_snapshot(self, trigger: str) -> PrivateActiveSnapshot: ...
@@ -64,6 +76,102 @@ class PrivateEventWatermarkAdapter(Protocol):
 def _consume_background_task[T](task: asyncio.Task[T]) -> None:
     with suppress(asyncio.CancelledError, Exception):
         task.exception()
+
+
+def _owned_private_request[T](
+    key: _PrivateRequestKey,
+    adapter: PrivateStateAdapter,
+    factory: Callable[[], Coroutine[Any, Any, T]],
+) -> asyncio.Task[T]:
+    """Return the one process-owned in-flight request for a private endpoint key."""
+    loop = asyncio.get_running_loop()
+    existing = _PRIVATE_REQUEST_TASKS.get(key)
+    if existing is not None:
+        owner, task = existing
+        if task.done():
+            _consume_background_task(task)
+            _PRIVATE_REQUEST_TASKS.pop(key, None)
+        elif owner != id(adapter) or task.get_loop() is not loop:
+            raise RuntimeError(f"prior private request remains active: {key}")
+        else:
+            return cast(asyncio.Task[T], task)
+
+    if key[1] == "recent":
+        outstanding_recent = sum(
+            1
+            for (venue, operation, _), (_, task) in _PRIVATE_REQUEST_TASKS.items()
+            if venue == key[0] and operation == "recent" and not task.done()
+        )
+        if outstanding_recent >= MAX_PRIVATE_RECONCILIATION_SYMBOLS_PER_VENUE:
+            raise RuntimeError(f"private reconciliation request budget exhausted: {key[0].value}")
+
+    created: asyncio.Task[T] = asyncio.create_task(factory())
+    owned = cast(asyncio.Task[object], created)
+    _PRIVATE_REQUEST_TASKS[key] = (id(adapter), owned)
+
+    def release(completed: asyncio.Task[T]) -> None:
+        current = _PRIVATE_REQUEST_TASKS.get(key)
+        if current is not None and current[1] is completed:
+            _PRIVATE_REQUEST_TASKS.pop(key, None)
+        _consume_background_task(completed)
+
+    created.add_done_callback(release)
+    return created
+
+
+async def shutdown_private_requests(
+    adapters: Mapping[Venue, PrivateStateAdapter],
+    *,
+    timeout_seconds: float = 1.0,
+) -> None:
+    """Cancel and boundedly drain every process-owned request for these adapters."""
+    if timeout_seconds <= 0:
+        raise ValueError("private request shutdown timeout must be positive")
+    owner_ids = {id(adapter) for adapter in adapters.values()}
+    tasks = tuple(
+        task
+        for owner, task in _PRIVATE_REQUEST_TASKS.values()
+        if owner in owner_ids and not task.done()
+    )
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    done, pending = await asyncio.wait(
+        tasks,
+        timeout=timeout_seconds,
+        return_when=asyncio.ALL_COMPLETED,
+    )
+    for task in done:
+        _consume_background_task(task)
+    if pending:
+        venues = sorted(
+            {
+                venue.value
+                for (venue, _, _), (owner, task) in _PRIVATE_REQUEST_TASKS.items()
+                if owner in owner_ids and task in pending
+            }
+        )
+        raise RuntimeError("private request shutdown deadline exceeded: " + ",".join(venues))
+
+
+async def find_private_order_by_client_id(
+    adapter: ClientOrderLookupAdapter,
+    venue: Venue,
+    client_order_id: str,
+    instrument: Instrument,
+    *,
+    timeout_seconds: float = 1.0,
+) -> PrivateOrder | None:
+    """Bound and retain ownership of one restart client-ID lookup."""
+    if timeout_seconds <= 0:
+        raise ValueError("private order lookup timeout must be positive")
+    task = _owned_private_request(
+        (venue, "find", client_order_id),
+        adapter,
+        lambda: adapter.find_order_by_client_id(client_order_id, instrument),
+    )
+    return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +398,7 @@ async def collect_private_states(
     *,
     timeout_seconds: float = 2.0,
     reconciliation_trigger: str | None = None,
+    recent_instruments: Mapping[Venue, Sequence[Instrument]] | None = None,
 ) -> dict[Venue, VenuePrivateState]:
     if timeout_seconds <= 0:
         raise ValueError("private state collection timeout must be positive")
@@ -297,34 +406,91 @@ async def collect_private_states(
     async def collect(venue: Venue) -> VenuePrivateState:
         adapter = adapters[venue]
         instrument = instruments[venue]
+
+        async def fetch_active() -> PrivateActiveSnapshot:
+            if reconciliation_trigger is not None and isinstance(
+                adapter, ReconcilingPrivateStateAdapter
+            ):
+                return await adapter.reconcile_active_snapshot(
+                    f"{reconciliation_trigger}:{venue.value}"
+                )
+            return await adapter.fetch_active_snapshot()
+
+        def recent_factory(
+            recent_instrument: Instrument,
+        ) -> Callable[[], Coroutine[Any, Any, tuple[PrivateOrder, ...]]]:
+            async def fetch_recent() -> tuple[PrivateOrder, ...]:
+                return await adapter.fetch_closed_orders(recent_instrument)
+
+            return fetch_recent
+
         try:
-            active_request = (
-                adapter.reconcile_active_snapshot(f"{reconciliation_trigger}:{venue.value}")
-                if reconciliation_trigger is not None
-                and isinstance(adapter, ReconcilingPrivateStateAdapter)
-                else adapter.fetch_active_snapshot()
+            venue_recent_instruments = tuple(
+                {
+                    item.symbol: item
+                    for item in (
+                        recent_instruments.get(venue, (instrument,))
+                        if recent_instruments is not None
+                        else (instrument,)
+                    )
+                }.values()
+            ) or (instrument,)
+            if len(venue_recent_instruments) > MAX_PRIVATE_RECONCILIATION_SYMBOLS_PER_VENUE:
+                raise ValueError("private reconciliation symbol budget exceeded")
+            if any(item.venue != venue for item in venue_recent_instruments):
+                raise ValueError("private reconciliation instrument venue mismatch")
+            account_task = _owned_private_request(
+                (venue, "account", instrument.symbol),
+                adapter,
+                lambda: adapter.fetch_account(instrument),
             )
-            account_task = asyncio.create_task(adapter.fetch_account(instrument))
-            active_task = asyncio.create_task(active_request)
-            recent_orders_task = asyncio.create_task(adapter.fetch_closed_orders(instrument))
-            fee_task = asyncio.create_task(adapter.fetch_trading_fee(instrument))
-            tasks = (account_task, active_task, recent_orders_task, fee_task)
+            active_task = _owned_private_request(
+                (
+                    venue,
+                    "active-reconcile" if reconciliation_trigger is not None else "active",
+                    "account-wide",
+                ),
+                adapter,
+                fetch_active,
+            )
+            recent_orders_tasks = tuple(
+                _owned_private_request(
+                    (venue, "recent", recent_instrument.symbol),
+                    adapter,
+                    recent_factory(recent_instrument),
+                )
+                for recent_instrument in venue_recent_instruments
+            )
+            fee_task = _owned_private_request(
+                (venue, "fee", instrument.symbol),
+                adapter,
+                lambda: adapter.fetch_trading_fee(instrument),
+            )
+            tasks = (account_task, active_task, *recent_orders_tasks, fee_task)
             _, pending = await asyncio.wait(
                 tasks,
                 timeout=timeout_seconds,
                 return_when=asyncio.ALL_COMPLETED,
             )
             if pending:
-                for task in tasks:
-                    if task.done():
-                        _consume_background_task(task)
-                    else:
-                        task.cancel()
-                        task.add_done_callback(_consume_background_task)
                 raise TimeoutError
+            task_errors = tuple(error for task in tasks if (error := task.exception()) is not None)
+            if task_errors:
+                raise task_errors[0]
             account = account_task.result()
             active = active_task.result()
-            recent_orders = recent_orders_task.result()
+            recent_orders_by_key = {
+                (
+                    order.client_order_id,
+                    order.order_id,
+                    order.status,
+                    order.filled_base_quantity,
+                    order.observed_at,
+                ): order
+                for task in recent_orders_tasks
+                for order in task.result()
+            }
+            recent_orders = tuple(recent_orders_by_key.values())
             fee = fee_task.result()
             return VenuePrivateState(
                 venue,
@@ -362,11 +528,18 @@ async def collect_private_states(
 
 
 def reconcile_private_states(
-    action: LiveJournalAction | None,
+    action: LiveJournalAction | Sequence[LiveJournalAction] | None,
     states: dict[Venue, VenuePrivateState],
     known_client_order_ids: set[str],
     required_venues: set[Venue],
 ) -> ReconciliationReport:
+    actions = (
+        ()
+        if action is None
+        else (action,)
+        if isinstance(action, LiveJournalAction)
+        else tuple(action)
+    )
     discrepancies: list[str] = []
     unknown: list[str] = []
     missing = required_venues - set(states)
@@ -407,13 +580,16 @@ def reconcile_private_states(
         recent_by_client.setdefault(order.client_order_id, []).append(order)
 
     expected_positions = {venue: Decimal(0) for venue in required_venues}
-    if action is not None:
-        initial_positions = action.risk_reservation.get("initial_signed_positions", {})
-        if isinstance(initial_positions, dict):
-            for venue, quantity in initial_positions.items():
-                parsed_venue = Venue(str(venue))
-                expected_positions[parsed_venue] = Decimal(str(quantity))
-        for leg in action.legs:
+    if actions:
+        for current_action in actions:
+            initial_positions = current_action.risk_reservation.get("initial_signed_positions", {})
+            if isinstance(initial_positions, dict):
+                for venue, quantity in initial_positions.items():
+                    parsed_venue = Venue(str(venue))
+                    expected_positions[parsed_venue] = expected_positions.get(
+                        parsed_venue, Decimal(0)
+                    ) + Decimal(str(quantity))
+        for leg in (leg for current_action in actions for leg in current_action.legs):
             signed = leg.filled_base_quantity if leg.side == Side.BUY else -leg.filled_base_quantity
             expected_positions[leg.venue] = expected_positions.get(leg.venue, Decimal(0)) + signed
             if not leg.submit_attempted:
@@ -446,12 +622,12 @@ def reconcile_private_states(
         for state in states.values()
     )
     allowed_symbols: dict[Venue, set[str]] = {}
-    if action is not None:
-        for leg in action.legs:
+    if actions:
+        for leg in (leg for current_action in actions for leg in current_action.legs):
             allowed_symbols.setdefault(leg.venue, set()).add(leg.symbol)
     for state in states.values():
         for position in state.positions:
-            if action is None:
+            if not actions:
                 discrepancies.append(f"{position.venue.value}:UNEXPECTED_OPEN_POSITION")
             elif position.symbol not in allowed_symbols.get(position.venue, set()):
                 discrepancies.append(f"{position.venue.value}:NON_ROUTE_POSITION")

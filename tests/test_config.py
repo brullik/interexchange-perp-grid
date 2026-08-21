@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from interexchange_perp_grid.config import Settings, load_settings
@@ -25,6 +26,130 @@ def test_defaults_are_safe_and_match_owner_limits() -> None:
     assert settings.risk.max_hold_seconds <= 86400
 
 
+def test_runtime_universe_policy_is_typed_and_locked() -> None:
+    settings = load_settings(CONFIG)
+    policy = yaml.safe_load(Path("config/RUNTIME_POLICY.yaml").read_text(encoding="utf-8"))
+
+    assert (
+        settings.universe.live_min_listing_age_days
+        == policy["universe"]["live_min_listing_age_days"]
+    )
+    assert (
+        settings.universe.instrument_refresh_seconds
+        == policy["universe"]["instrument_refresh_seconds"]
+    )
+    assert (
+        settings.universe.max_dynamic_l2_candidates
+        == policy["universe"]["max_dynamic_l2_candidates"]
+    )
+    assert settings.universe.decision_debounce_ms == policy["universe"]["decision_debounce_ms"]
+    assert settings.market_data.max_bbo_age_ms == policy["data"]["max_bbo_age_ms"]
+    assert list(settings.strategy.calibration_size_multipliers) == [
+        Decimal(value) for value in policy["strategy"]["calibration_size_multipliers"]
+    ]
+    assert (
+        settings.strategy.calibration_funding_refresh_seconds
+        == policy["strategy"]["calibration_funding_refresh_seconds"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("calibration_size_multipliers", ["1", "3", "5"]),
+        ("calibration_funding_refresh_seconds", 61),
+    ),
+)
+def test_calibration_policy_drift_fails_startup(
+    tmp_path: Path,
+    key: str,
+    value: object,
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw["strategy"][key] = value
+    config = tmp_path / "defaults.yaml"
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    (tmp_path / "RUNTIME_POLICY.yaml").write_text(
+        Path("config/RUNTIME_POLICY.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=f"configuration {key} differs"):
+        load_settings(config)
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "message"),
+    (
+        (
+            "strategy",
+            "grid_parameter_change_limit_ratio",
+            "0.50",
+            "change limit exceeds",
+        ),
+        (
+            "strategy",
+            "stressed_cost_multiplier",
+            "1.0",
+            "stressed cost multiplier is below",
+        ),
+        ("market_data", "max_l2_age_ms", 1001, "max_l2_age_ms differs"),
+        (
+            "live",
+            "flat_barrier_quiet_period_seconds",
+            "1",
+            "flat_barrier_quiet_period_seconds differs",
+        ),
+        ("risk", "max_hold_seconds", 86_399, "risk_hard_max_hold_seconds differs"),
+    ),
+)
+def test_locked_calibration_safety_cannot_be_weakened(
+    tmp_path: Path,
+    section: str,
+    key: str,
+    value: object,
+    message: str,
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw[section][key] = value
+    config = tmp_path / "defaults.yaml"
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    (tmp_path / "RUNTIME_POLICY.yaml").write_text(
+        Path("config/RUNTIME_POLICY.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_settings(config)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("canary_max_routes", 2),
+        ("canary_max_tranches", 2),
+        ("canary_pair_stressed_loss_limit_usdt", "2"),
+        ("canary_effective_leverage_cap", "2"),
+    ),
+)
+def test_canary_runtime_limits_cannot_drift_from_locked_stage(
+    tmp_path: Path,
+    key: str,
+    value: object,
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw["live"][key] = value
+    config = tmp_path / "defaults.yaml"
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    (tmp_path / "RUNTIME_POLICY.yaml").write_text(
+        Path("config/RUNTIME_POLICY.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=f"configuration {key} differs"):
+        load_settings(config)
+
+
 def test_risk_budget_relationship_is_enforced() -> None:
     settings = load_settings(CONFIG)
     raw = settings.model_dump(mode="json")
@@ -33,11 +158,45 @@ def test_risk_budget_relationship_is_enforced() -> None:
         Settings.model_validate(raw)
 
 
+def test_scan_cadence_must_leave_funding_refresh_safety_margin() -> None:
+    settings = load_settings(CONFIG)
+    raw = settings.model_dump(mode="json")
+    raw["shadow"]["scan_interval_seconds"] = 31
+
+    with pytest.raises(ValidationError, match="funding refresh safety margin"):
+        Settings.model_validate(raw)
+
+
 def test_unsupported_product_cannot_be_configured() -> None:
     settings = load_settings(CONFIG)
     raw = settings.model_dump(mode="json")
     raw["products"]["settlement"] = "USDC"
     with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+def test_venue_profiles_are_known_unique_and_canary_is_wave1_only() -> None:
+    settings = load_settings(CONFIG)
+    raw = settings.model_dump(mode="json")
+    raw["venues"]["wave2"] = ["bitget", "unknown"]
+    with pytest.raises(ValidationError, match="unknown venue profiles"):
+        Settings.model_validate(raw)
+
+    raw = settings.model_dump(mode="json")
+    raw["venues"]["wave2"] = ["bitget", "bitget"]
+    with pytest.raises(ValidationError, match="duplicate venue profile"):
+        Settings.model_validate(raw)
+
+    raw = settings.model_dump(mode="json")
+    raw["venues"]["canary_primary"] = ["bitget"]
+    with pytest.raises(ValidationError, match="subset of wave1_public"):
+        Settings.model_validate(raw)
+
+    raw = settings.model_dump(mode="json")
+    raw["venues"]["wave1_public"] = ["mexc", "bybit", "okx"]
+    raw["venues"]["wave3"] = ["binanceusdm", "bingx"]
+    raw["venues"]["canary_primary"] = ["mexc", "bybit"]
+    with pytest.raises(ValidationError, match="wave1_public must remain exactly"):
         Settings.model_validate(raw)
 
 

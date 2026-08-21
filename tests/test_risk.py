@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
@@ -149,3 +151,57 @@ def test_risk_caps_ten_routes_and_fifty_usdt_portfolio_stress() -> None:
         request(10, Decimal("0.01"), route="EXTRA:bybit>okx", base="EXTRA")
     )
     assert portfolio_limit.reason == ReasonCode.PORTFOLIO_STRESS_LIMIT
+
+
+def test_risk_restore_is_atomic_and_preserves_one_route_per_base() -> None:
+    book = RiskBook(limits())
+    original = request(0, Decimal("1"))
+    book.restore((original,))
+    assert book.reservations == (original,)
+
+    conflicting = request(
+        1,
+        Decimal("1"),
+        route="BTC:okx>bybit",
+        base="BTC",
+    )
+    with pytest.raises(ValueError, match="BASE_ROUTE_LIMIT"):
+        book.restore((original, conflicting))
+
+    assert book.reservations == (original,)
+
+
+def test_concurrent_portfolio_reservation_is_atomic_at_full_target() -> None:
+    book = RiskBook(limits())
+    requests = tuple(
+        request(
+            route_index * 5 + tranche_index,
+            Decimal("1"),
+            route=f"B{route_index:02d}:bybit>okx",
+            base=f"B{route_index:02d}",
+        )
+        for route_index in range(10)
+        for tranche_index in range(5)
+    )
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        decisions = tuple(executor.map(book.reserve, requests))
+
+    assert all(decision.accepted for decision in decisions)
+    per_route, portfolio = book.totals()
+    assert len(book.reservations) == 50
+    assert len(per_route) == 10
+    assert set(per_route.values()) == {Decimal("5")}
+    assert portfolio == Decimal("50")
+
+    competing = RiskBook(limits())
+    same_base = (
+        request(100, Decimal("1"), route="BTC:bybit>okx", base="BTC"),
+        request(101, Decimal("1"), route="BTC:okx>bybit", base="BTC"),
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        base_decisions = tuple(executor.map(competing.reserve, same_base))
+    assert sum(decision.accepted for decision in base_decisions) == 1
+    assert {decision.reason for decision in base_decisions} == {
+        ReasonCode.RISK_RESERVED,
+        ReasonCode.BASE_ROUTE_LIMIT,
+    }

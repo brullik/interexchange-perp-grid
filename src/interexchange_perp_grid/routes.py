@@ -6,6 +6,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from itertools import permutations
 
 from interexchange_perp_grid.domain import (
+    NO_FIXED_MINIMUM_NOTIONAL_VENUES,
     BookLevel,
     CommonInstrument,
     FundingSnapshot,
@@ -63,7 +64,7 @@ def match_common_instruments(
             for venue, venue_instruments in by_venue.items()
             if len(venue_instruments) == 1
         }
-        if len(unambiguous) < minimum_venues or len(unambiguous) != len(by_venue):
+        if len(unambiguous) < minimum_venues:
             continue
         common.append(
             CommonInstrument(
@@ -125,19 +126,56 @@ def minimum_common_base_quantity(
     long_price: Decimal,
     short_price: Decimal,
 ) -> Decimal:
+    raw_monetary_values = (
+        long_instrument.contract_size_base,
+        long_instrument.amount_step_contracts,
+        long_instrument.minimum_amount_contracts,
+        short_instrument.contract_size_base,
+        short_instrument.amount_step_contracts,
+        short_instrument.minimum_amount_contracts,
+        long_price,
+        short_price,
+    )
+    if any(
+        not isinstance(value, Decimal) or not value.is_finite() or value <= 0
+        for value in raw_monetary_values
+    ):
+        raise ValueError("minimum quantity raw inputs must be finite positive Decimals")
+
+    monetary_values = (
+        long_instrument.minimum_base_amount,
+        short_instrument.minimum_base_amount,
+        long_instrument.base_amount_step,
+        short_instrument.base_amount_step,
+    )
+    if any(not value.is_finite() or value <= 0 for value in monetary_values):
+        raise ValueError("minimum quantity derived inputs must be finite positive Decimals")
+
+    def minimum_notional_quantity(instrument: Instrument, price: Decimal) -> Decimal:
+        if not isinstance(instrument.no_fixed_minimum_notional, bool):
+            raise ValueError("minimum notional absence flag must be boolean")
+        notional = instrument.minimum_notional
+        if notional is None:
+            if (
+                instrument.venue not in NO_FIXED_MINIMUM_NOTIONAL_VENUES
+                or not instrument.no_fixed_minimum_notional
+            ):
+                raise ValueError("fixed minimum notional is unknown")
+            return Decimal(0)
+        if (
+            not isinstance(notional, Decimal)
+            or instrument.no_fixed_minimum_notional
+            or not notional.is_finite()
+            or notional <= 0
+        ):
+            raise ValueError("minimum notional must be a finite positive Decimal")
+        return notional / price
+
     minimum = max(
         long_instrument.minimum_base_amount,
         short_instrument.minimum_base_amount,
-        (
-            long_instrument.minimum_notional / long_price
-            if long_instrument.minimum_notional is not None
-            else Decimal(0)
-        ),
-        (
-            short_instrument.minimum_notional / short_price
-            if short_instrument.minimum_notional is not None
-            else Decimal(0)
-        ),
+        minimum_notional_quantity(long_instrument, long_price),
+        minimum_notional_quantity(short_instrument, short_price),
     )
     step = _common_decimal_step(
         long_instrument.base_amount_step,
@@ -253,7 +291,20 @@ def evaluate_directed_route(
 
 
 def _meets_notional(instrument: Instrument, price: Decimal, quantity: Decimal) -> bool:
-    return instrument.minimum_notional is None or price * quantity >= instrument.minimum_notional
+    if not isinstance(instrument.no_fixed_minimum_notional, bool):
+        return False
+    if instrument.minimum_notional is None:
+        return (
+            instrument.no_fixed_minimum_notional
+            and instrument.venue in NO_FIXED_MINIMUM_NOTIONAL_VENUES
+        )
+    return (
+        isinstance(instrument.minimum_notional, Decimal)
+        and not instrument.no_fixed_minimum_notional
+        and instrument.minimum_notional.is_finite()
+        and instrument.minimum_notional > 0
+        and price * quantity >= instrument.minimum_notional
+    )
 
 
 def _rejected(

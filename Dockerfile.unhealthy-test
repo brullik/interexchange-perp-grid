@@ -1,0 +1,4 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY tests/fixtures/unhealthy_upgrade.py /app/unhealthy_upgrade.py
+CMD ["python", "/app/unhealthy_upgrade.py"]

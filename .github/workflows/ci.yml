@@ -182,52 +182,161 @@ jobs:
           retention-days: 30
 
   docker-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact application lock
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps --no-build-isolation
+          python scripts/check_lock.py --lock requirements.lock --pyproject pyproject.toml --verify-installed
       - name: Configure safe defaults
-        run: cp .env.example .env
+        run: |
+          cp .env.example .env
+          chmod 0600 .env
+          mkdir -p state/ops-evidence
+          printf '{"runner_image":"ubuntu-24.04"}\n' > state/ops-evidence/platform.json
       - name: Build and wait for health
         run: docker compose up --build --detach --wait --wait-timeout 180
       - name: Verify live service health
-        run: docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml
+        run: |
+          docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml \
+            | tee state/ops-evidence/clean-health.json
       - name: Restart and verify persisted runtime state
         run: |
           docker compose restart app
           docker compose up --detach --wait --wait-timeout 120
           docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml \
             | python -c 'import json, sys; payload = json.load(sys.stdin); assert payload["starts"] >= 2, payload'
+      - name: Prove host restart recovery
+        run: |
+          docker compose down
+          docker compose up --detach --no-build --wait --wait-timeout 120
+          docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml \
+            | tee state/ops-evidence/restart-health.json \
+            | python -c 'import json, sys; payload = json.load(sys.stdin); assert payload["starts"] >= 3, payload'
+      - name: Prove idempotent immutable-digest deployment
+        run: |
+          docker compose down
+          docker run --detach --name "ipeg-registry-${GITHUB_RUN_ID}" --publish 5000:5000 \
+            registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+          for attempt in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:5000/v2/ >/dev/null && break
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:5000/v2/ >/dev/null
+          release_sha="$(git rev-parse HEAD)"
+          local_tag="localhost:5000/interexchange-perp-grid:$release_sha"
+          docker build --label "org.opencontainers.image.revision=$release_sha" --tag "$local_tag" .
+          docker push "$local_tag"
+          image_ref="$(docker image inspect "$local_tag" --format '{{index .RepoDigests 0}}')"
+          [[ "$image_ref" =~ @sha256:[0-9a-f]{64}$ ]]
+          bash scripts/shadow-deploy.sh "$image_ref" "$release_sha"
+          bash scripts/shadow-deploy.sh "$image_ref" "$release_sha"
+          docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml
+          docker compose exec -T app interexchange-grid deployment-identity \
+            --config /app/config/defaults.yaml --expected-release-sha "$release_sha" \
+            --expected-image-digest "${image_ref##*@}" \
+            > state/ops-evidence/deployment-identity.json
+      - name: Prove real unhealthy upgrade restores image and SQLite state
+        run: |
+          release_sha="$(git rev-parse HEAD)"
+          image_ref="$(sed -n 's/^image_ref=//p' .ipeg-deployment-state)"
+          docker compose exec -T app python -c \
+            "import sqlite3; p='/app/state/ipeg.sqlite3'; d=sqlite3.connect(p); d.execute(\"INSERT INTO metadata(key,value) VALUES ('ops_rollback_sentinel','good') ON CONFLICT(key) DO UPDATE SET value='good'\"); d.commit()"
+          bad_tag="localhost:5000/interexchange-perp-grid:unhealthy-${release_sha}"
+          docker build --file Dockerfile.unhealthy-test --build-arg "BASE_IMAGE=${image_ref}" \
+            --tag "$bad_tag" .
+          docker push "$bad_tag"
+          bad_ref="$(docker image inspect "$bad_tag" --format '{{index .RepoDigests 0}}')"
+          set +e
+          bash scripts/shadow-upgrade.sh "$bad_ref" "$release_sha"
+          upgrade_status=$?
+          set -e
+          test "$upgrade_status" -ne 0
+          test "$(sed -n 's/^image_ref=//p' .ipeg-deployment-state)" = "$image_ref"
+          test "$(sed -n 's/^release_sha=//p' .ipeg-deployment-state)" = "$release_sha"
+          docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml
+          sentinel="$(docker compose exec -T app python -c \
+            "import sqlite3; d=sqlite3.connect('/app/state/ipeg.sqlite3'); print(d.execute(\"SELECT value FROM metadata WHERE key='ops_rollback_sentinel'\").fetchone()[0])")"
+          test "$sentinel" = good
+          python - "$upgrade_status" "$release_sha" "$image_ref" <<'PY'
+          import json, pathlib, sys
+          status, release, image = sys.argv[1:]
+          pathlib.Path('state/ops-evidence/rollback.json').write_text(json.dumps({
+              'status': 'PASS',
+              'failed_upgrade_exit_nonzero': int(status) != 0,
+              'state_restored': True,
+              'release_sha': release,
+              'image_ref': image,
+          }), encoding='utf-8')
+          PY
       - name: Kill process and prove automatic supervisor recovery in simulator
         run: |
           IMAGE_ID="$(docker compose images -q app)"
-          SMOKE_NAME="ipeg-c4-recovery-${GITHUB_RUN_ID}"
           SMOKE_VOLUME="ipeg-c4-recovery-${GITHUB_RUN_ID}"
           docker volume create "$SMOKE_VOLUME"
           docker run --rm --user 0:0 --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
             chown ipeg:ipeg /smoke
-          docker run --detach --name "$SMOKE_NAME" --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
-            interexchange-grid supervisor-recovery-smoke \
-            --state /smoke/state.sqlite3 --ready /smoke/ready --hold-after-active
-          for attempt in $(seq 1 60); do
-            docker exec "$SMOKE_NAME" test -f /smoke/ready && break
-            sleep 1
+          for state in PREPARED SUBMITTING ACKNOWLEDGED PARTIAL FILLED REJECTED UNKNOWN RECOVERING HEDGED CLOSING QUARANTINED; do
+            state_slug="$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')"
+            SMOKE_NAME="ipeg-c4-recovery-${GITHUB_RUN_ID}-${state_slug}"
+            state_path="/smoke/${state_slug}.sqlite3"
+            private_state_dir="/smoke/${state_slug}-private"
+            ready_path="/smoke/${state_slug}.ready"
+            docker run --detach --name "$SMOKE_NAME" --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+              interexchange-grid private-transition-recovery-smoke \
+              --state "$state_path" --ready "$ready_path" --hold-after-active \
+              --transition-state "$state" --private-state-dir "$private_state_dir"
+            for attempt in $(seq 1 60); do
+              docker exec "$SMOKE_NAME" test -f "$ready_path" && break
+              sleep 1
+            done
+            docker exec "$SMOKE_NAME" test -f "$ready_path"
+            docker kill "$SMOKE_NAME"
+            docker rm "$SMOKE_NAME"
+            docker run --rm --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+              interexchange-grid private-transition-recovery-smoke --state "$state_path" \
+              --transition-state "$state" --private-state-dir "$private_state_dir" \
+              | tee "state/ops-evidence/private-recovery-${state_slug}.json" \
+              | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["restarted_transition_state"] == sys.argv[1]; assert p["expected_action_count"] == 10; assert p["recovered_action_count"] == 10; assert p["flat_barrier_verified"] is True; assert p["priority_scheduler_restart_proof"] is True; assert p["new_entry_shed_while_p0_active"] is True; assert p["production_exchange_transports_opened"] == 0' "$state"
           done
-          docker exec "$SMOKE_NAME" test -f /smoke/ready
-          docker kill "$SMOKE_NAME"
-          docker rm "$SMOKE_NAME"
-          docker run --rm --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
-            interexchange-grid supervisor-recovery-smoke --state /smoke/state.sqlite3 \
-            | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["production_exchange_transports_opened"] == 0'
           docker volume rm "$SMOKE_VOLUME"
       - name: Validate deployment scripts
-        run: bash -n scripts/release-build.sh scripts/shadow-deploy.sh scripts/shadow-upgrade.sh scripts/shadow-rollback.sh
+        run: |
+          bash -n scripts/release-build.sh scripts/shadow-deploy.sh scripts/shadow-upgrade.sh scripts/shadow-rollback.sh scripts/bootstrap-ubuntu.sh scripts/ipegctl
+          mapfile -t nodeids < <(python -c 'import json; p=json.load(open("config/ops-scenario-nodeids.json")); print("\n".join(sorted({v for xs in p.values() for v in xs if v.startswith("tests/")})))')
+          pytest -q "${nodeids[@]}" --junitxml=state/ops-proof.junit.xml
+          interexchange-grid ops-proof \
+            --repo-root . \
+            --config config/defaults.yaml \
+            --junit state/ops-proof.junit.xml \
+            --evidence-dir state/ops-evidence \
+            --output state/ops-proof.json
+      - name: Upload operations evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: operations-proof-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            state/ops-proof.json
+            state/ops-proof.junit.xml
+            state/ops-evidence/*.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Show logs on failure
         if: failure()
         run: docker compose logs --no-color
       - name: Stop stack
         if: always()
-        run: docker compose down --volumes
+        run: |
+          docker compose down --volumes
+          docker rm --force "ipeg-registry-${GITHUB_RUN_ID}" || true

@@ -128,6 +128,10 @@ class CcxtPrivateAdapter:
             "fetch_closed_orders": self._has("fetchClosedOrders"),
             "fetch_fee": self._has("fetchTradingFee") or self._has("fetchTradingFees"),
         }
+        if self.venue == Venue.MEXC:
+            # MEXC's official contract API still marks place/cancel endpoints as maintenance.
+            values["submit_order"] = False
+            values["cancel_order"] = False
         return PrivateCapabilityReport(
             venue=self.venue,
             checked_at=datetime.now(UTC),
@@ -303,6 +307,7 @@ class CcxtPrivateAdapter:
                     source_ns,
                     account=account,
                     unknown_active_records=unknown,
+                    exchange_timestamp_ms=_exchange_timestamp_ms(raw),
                 )
         except (Exception, asyncio.CancelledError):
             self._private_events_pending.discard(watermark)
@@ -344,8 +349,14 @@ class CcxtPrivateAdapter:
         order_limit, position_limit = _account_wide_snapshot_limits(self.venue)
 
         async def sample() -> tuple[tuple[object, ...], tuple[object, ...]]:
-            order_params = _account_wide_snapshot_params(self.venue)
-            position_params = _account_wide_snapshot_params(self.venue)
+            order_params = _account_wide_snapshot_params(
+                self.venue,
+                PrivateStreamKind.ORDERS,
+            )
+            position_params = _account_wide_snapshot_params(
+                self.venue,
+                PrivateStreamKind.POSITIONS,
+            )
             if position_limit is not None:
                 position_params["limit"] = position_limit
             raw_orders, raw_positions = await asyncio.gather(
@@ -437,6 +448,8 @@ class CcxtPrivateAdapter:
         request: VenueOrderRequest,
         instrument: Instrument,
     ) -> PrivateOrder:
+        if self.venue == Venue.MEXC:
+            raise RuntimeError("MEXC contract order submission is not qualified")
         if self._production_transport:
             _enforce_production_submit_guard()
         raw = await self._exchange.create_order(
@@ -456,6 +469,8 @@ class CcxtPrivateAdapter:
         order_id: str,
         instrument: Instrument,
     ) -> PrivateOrder:
+        if self.venue == Venue.MEXC:
+            raise RuntimeError("MEXC contract order cancellation is not qualified")
         raw = await self._exchange.cancel_order(order_id, instrument.symbol)
         if not isinstance(raw, Mapping):
             raise TypeError("CCXT cancel_order must return a mapping")
@@ -641,12 +656,19 @@ def _normalise_account_position_updates(
         contracts = _decimal(value.get("contracts"))
         side_value = str(value.get("side", "")).lower()
         side = Side.BUY if side_value == "long" else Side.SELL if side_value == "short" else None
-        closes_one_way_position = (
-            contracts == 0
-            and side is None
-            and (venue == Venue.BYBIT or (venue == Venue.BINANCE_USDM and side_value == "both"))
-        )
-        if closes_one_way_position:
+        tombstone_sides: tuple[Side, ...] = ()
+        if contracts == 0 and side is None:
+            if venue == Venue.KUCOIN_FUTURES:
+                position_side = str(_mapping(value.get("info")).get("positionSide", "")).upper()
+                if position_side == "LONG":
+                    tombstone_sides = (Side.BUY,)
+                elif position_side == "SHORT":
+                    tombstone_sides = (Side.SELL,)
+                elif position_side == "BOTH":
+                    tombstone_sides = (Side.BUY, Side.SELL)
+            elif venue == Venue.BYBIT or (venue == Venue.BINANCE_USDM and side_value == "both"):
+                tombstone_sides = (Side.BUY, Side.SELL)
+        if tombstone_sides:
             positions.extend(
                 PositionSnapshot(
                     venue,
@@ -657,7 +679,7 @@ def _normalise_account_position_updates(
                     _decimal(value.get("markPrice")),
                     datetime.now(UTC),
                 )
-                for tombstone_side in (Side.BUY, Side.SELL)
+                for tombstone_side in tombstone_sides
             )
             continue
         if contracts is None or side is None:
@@ -730,7 +752,25 @@ def _require_sequence(raw: object, operation: str) -> tuple[object, ...]:
     return tuple(raw)
 
 
-def _account_wide_snapshot_params(venue: Venue) -> dict[str, object]:
+def _account_wide_snapshot_params(
+    venue: Venue,
+    kind: PrivateStreamKind,
+) -> dict[str, object]:
+    if venue == Venue.BITGET:
+        params: dict[str, object] = {"productType": "USDT-FUTURES"}
+        if kind == PrivateStreamKind.POSITIONS:
+            params["marginCoin"] = "USDT"
+        return params
+    if venue == Venue.KUCOIN_FUTURES:
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"uta": False}
+        return {"type": "swap", "uta": False}
+    if venue == Venue.BINGX:
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"subType": "linear"}
+        return {"type": "swap", "subType": "linear"}
+    if venue == Venue.MEXC:
+        return {"type": "swap"}
     if venue == Venue.BYBIT:
         return {"category": "linear", "settleCoin": "USDT"}
     if venue == Venue.OKX:
@@ -741,6 +781,14 @@ def _account_wide_snapshot_params(venue: Venue) -> dict[str, object]:
 
 
 def _account_wide_snapshot_limits(venue: Venue) -> tuple[int | None, int | None]:
+    if venue == Venue.BITGET:
+        return 100, None
+    if venue == Venue.KUCOIN_FUTURES:
+        return 50, None
+    if venue == Venue.BINGX:
+        return None, None
+    if venue == Venue.MEXC:
+        return None, None
     if venue == Venue.BYBIT:
         return 50, 200
     if venue == Venue.OKX:
@@ -754,6 +802,25 @@ def _account_wide_stream_params(
     venue: Venue,
     kind: PrivateStreamKind,
 ) -> dict[str, object]:
+    if venue == Venue.BITGET:
+        if kind == PrivateStreamKind.ORDERS:
+            return {
+                "type": "swap",
+                "subType": "linear",
+                "productType": "USDT-FUTURES",
+                "uta": False,
+            }
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"instType": "USDT-FUTURES", "uta": False}
+        return {"type": "swap", "instType": "USDT-FUTURES", "uta": False}
+    if venue == Venue.KUCOIN_FUTURES:
+        if kind == PrivateStreamKind.POSITIONS:
+            return {"uta": False}
+        return {"type": "swap", "uta": False}
+    if venue == Venue.BINGX:
+        return {"type": "swap", "subType": "linear"}
+    if venue == Venue.MEXC:
+        return {"type": "swap"}
     if venue == Venue.BYBIT:
         # The configured CCXT transport already selects swap/linear. Unconsumed params are
         # merged into Bybit's subscribe frame, whose schema only permits op/req_id/args.
@@ -1029,3 +1096,47 @@ def _order_status(raw: str, filled: Decimal, amount: Decimal) -> PrivateOrderSta
     if normalized in {"open", "new"}:
         return PrivateOrderStatus.OPEN
     return PrivateOrderStatus.UNKNOWN
+
+
+def _exchange_timestamp_ms(raw: Mapping[str, object]) -> int | None:
+    """Return only a venue-supplied event timestamp; never substitute local time."""
+    candidates: list[object] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, Mapping):
+            candidates.extend(
+                value.get(key)
+                for key in (
+                    "timestamp",
+                    "E",
+                    "T",
+                    "ts",
+                    "uTime",
+                    "updatedTime",
+                    "creationTime",
+                )
+            )
+            for nested in value.values():
+                if isinstance(nested, (Mapping, list, tuple)):
+                    collect(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                collect(nested)
+
+    collect(raw)
+    for candidate in candidates:
+        if isinstance(candidate, bool) or not isinstance(candidate, (int, float, str)):
+            continue
+        try:
+            value = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            if value < 10_000_000_000:
+                value *= 1_000
+            elif value > 10_000_000_000_000_000:
+                value //= 1_000_000
+            elif value > 10_000_000_000_000:
+                value //= 1_000
+            return value
+    return None

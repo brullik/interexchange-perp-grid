@@ -10,7 +10,7 @@ from typing import Protocol
 import pytest
 
 from interexchange_perp_grid.client_ids import venue_client_order_id
-from interexchange_perp_grid.domain import Instrument, Venue
+from interexchange_perp_grid.domain import WAVE1_VENUES, Instrument, Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_control import LiveControlService
 from interexchange_perp_grid.live_coordinator import (
@@ -93,7 +93,9 @@ def _instrument(venue: Venue) -> Instrument:
 
 
 def _adapters() -> dict[Venue, DeterministicPrivateExchange]:
-    return {venue: DeterministicPrivateExchange(venue, _instrument(venue), ()) for venue in Venue}
+    return {
+        venue: DeterministicPrivateExchange(venue, _instrument(venue), ()) for venue in WAVE1_VENUES
+    }
 
 
 class _BarrierPublicResult(Protocol):
@@ -138,7 +140,7 @@ def _watermarked_adapters(
     watermark: int,
 ) -> dict[Venue, _WatermarkedPrivateExchange]:
     adapters: dict[Venue, _WatermarkedPrivateExchange] = {}
-    for venue in Venue:
+    for venue in WAVE1_VENUES:
         adapter = _WatermarkedPrivateExchange(venue, _instrument(venue), ())
         adapter.private_event_watermark = watermark
         adapters[venue] = adapter
@@ -201,7 +203,7 @@ def _service(journal: LiveOrderJournal) -> LiveControlService:
     return LiveControlService(
         journal,
         _adapters(),
-        {venue: _instrument(venue) for venue in Venue},
+        {venue: _instrument(venue) for venue in WAVE1_VENUES},
         _ROUTE,
         "a" * 64,
     )
@@ -435,10 +437,10 @@ async def test_private_watermark_is_preserved_across_atomic_flat_commit(tmp_path
     service = LiveControlService(
         journal,
         adapters,
-        {venue: _instrument(venue) for venue in Venue},
+        {venue: _instrument(venue) for venue in WAVE1_VENUES},
         _ROUTE,
         "a" * 64,
-        flat_barrier_policy=FlatBarrierPolicy(2, 0, 0.001, 0.05),
+        flat_barrier_policy=FlatBarrierPolicy(2, 0, 0.001, 0.5),
     )
 
     result = await service.emergency_flatten()
@@ -470,6 +472,36 @@ async def test_private_event_during_flat_commit_quarantines_action(tmp_path: Pat
     )
 
     assert marked_action is not None
+    assert marked_action.state == LiveActionState.QUARANTINED
+    assert barrier.verified is False
+    assert barrier.failure_reason == ReasonCode.FLAT_BARRIER_EVENT_RACE
+    assert barrier.event_watermark == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinator_private_event_after_flat_commit_quarantines_action(
+    tmp_path: Path,
+) -> None:
+    adapters = _watermarked_adapters(0)
+    raced_adapter = adapters[Venue.BINANCE_USDM]
+    journal = _PrivateWatermarkRaceJournal(tmp_path / "state.sqlite3", raced_adapter)
+    action, _, _ = await _recovering_action(journal, "coordinator-private-race")
+    action = await journal.transition(action.pair_action_id, LiveActionState.FLAT)
+    coordinator = LiveCanaryCoordinator(
+        journal,
+        adapters,
+        {venue: _instrument(venue) for venue in Venue},
+        StaticProtectionProvider({(venue, side): Decimal(100) for venue in Venue for side in Side}),
+        DeterministicCanaryMonitor(CloseReason.TARGET_CONVERGENCE),
+        Venue.BYBIT,
+    )
+
+    marked_action, barrier = await coordinator._to_flat(
+        action,
+        "COORDINATOR_PRIVATE_EVENT_RACE_TEST",
+        FlatBarrierResult(True, _report(), 2, 0, False),
+    )
+
     assert marked_action.state == LiveActionState.QUARANTINED
     assert barrier.verified is False
     assert barrier.failure_reason == ReasonCode.FLAT_BARRIER_EVENT_RACE

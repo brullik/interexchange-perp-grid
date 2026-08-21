@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import cast
+
+import pytest
 
 from interexchange_perp_grid.domain import (
     BookLevel,
@@ -13,7 +16,11 @@ from interexchange_perp_grid.domain import (
 )
 from interexchange_perp_grid.market_data import DataQualityAssessment
 from interexchange_perp_grid.reason_codes import ReasonCode
-from interexchange_perp_grid.routes import evaluate_directed_route, match_common_instruments
+from interexchange_perp_grid.routes import (
+    evaluate_directed_route,
+    match_common_instruments,
+    minimum_common_base_quantity,
+)
 
 
 def instrument(venue: Venue, contract_size: str, amount_step: str, fee: str) -> Instrument:
@@ -28,7 +35,7 @@ def instrument(venue: Venue, contract_size: str, amount_step: str, fee: str) -> 
         amount_step_contracts=Decimal(amount_step),
         price_tick=Decimal("0.1"),
         minimum_amount_contracts=Decimal(amount_step),
-        minimum_notional=None,
+        minimum_notional=Decimal("0.01"),
         taker_fee_rate=Decimal(fee),
         fee_source="fixture",
     )
@@ -144,6 +151,115 @@ def test_unknown_mark_or_index_blocks_route() -> None:
     )
     assert quote.eligible is False
     assert quote.reason == ReasonCode.MARK_INDEX_UNKNOWN
+
+
+def test_unknown_minimum_notional_blocks_route() -> None:
+    bybit = replace(instrument(Venue.BYBIT, "1", "0.001", "0.0006"), minimum_notional=None)
+    okx = instrument(Venue.OKX, "0.01", "0.01", "0.0005")
+    accepted = DataQualityAssessment(True, ReasonCode.QUOTE_READY, 1)
+
+    quote = evaluate_directed_route(
+        bybit,
+        okx,
+        book(Venue.BYBIT, "100", "101"),
+        book(Venue.OKX, "103", "104"),
+        funding(Venue.BYBIT, "0.0001"),
+        funding(Venue.OKX, "0.0002"),
+        accepted,
+        accepted,
+        Decimal("0.001"),
+    )
+
+    assert quote.eligible is False
+    assert quote.reason == ReasonCode.CONTRACT_METADATA_UNKNOWN
+
+
+@pytest.mark.parametrize("no_fixed_venue", [Venue.OKX, Venue.KUCOIN_FUTURES])
+def test_venue_proven_absence_of_fixed_notional_uses_amount_floor(
+    no_fixed_venue: Venue,
+) -> None:
+    bybit = instrument(Venue.BYBIT, "1", "0.001", "0.0006")
+    no_fixed = replace(
+        instrument(no_fixed_venue, "0.01", "0.01", "0.0005"),
+        minimum_notional=None,
+        no_fixed_minimum_notional=True,
+    )
+    accepted = DataQualityAssessment(True, ReasonCode.QUOTE_READY, 1)
+
+    quote = evaluate_directed_route(
+        bybit,
+        no_fixed,
+        book(Venue.BYBIT, "100", "101"),
+        book(no_fixed_venue, "103", "104"),
+        funding(Venue.BYBIT, "0.0001"),
+        funding(no_fixed_venue, "0.0002"),
+        accepted,
+        accepted,
+        Decimal("0.001"),
+    )
+
+    assert quote.eligible is True
+    assert quote.reason == ReasonCode.QUOTE_READY
+
+
+def test_malformed_notional_runtime_types_block_route_without_raising() -> None:
+    bybit = instrument(Venue.BYBIT, "1", "0.001", "0.0006")
+    okx = instrument(Venue.OKX, "0.01", "0.01", "0.0005")
+    accepted = DataQualityAssessment(True, ReasonCode.QUOTE_READY, 1)
+    malformed_pairs = (
+        (replace(bybit, minimum_notional=cast(Decimal, 5.0)), okx),
+        (
+            bybit,
+            replace(
+                okx,
+                minimum_notional=None,
+                no_fixed_minimum_notional=cast(bool, "yes"),
+            ),
+        ),
+    )
+
+    for malformed_long, malformed_short in malformed_pairs:
+        quote = evaluate_directed_route(
+            malformed_long,
+            malformed_short,
+            book(Venue.BYBIT, "100", "101"),
+            book(Venue.OKX, "103", "104"),
+            funding(Venue.BYBIT, "0.0001"),
+            funding(Venue.OKX, "0.0002"),
+            accepted,
+            accepted,
+            Decimal("0.001"),
+        )
+        assert quote.eligible is False
+        assert quote.reason == ReasonCode.CONTRACT_METADATA_UNKNOWN
+
+
+def test_malformed_notional_runtime_types_block_minimum_quantity_sizing() -> None:
+    bybit = instrument(Venue.BYBIT, "1", "0.001", "0.0006")
+    okx = instrument(Venue.OKX, "0.01", "0.01", "0.0005")
+    malformed_pairs = (
+        (replace(bybit, minimum_notional=cast(Decimal, 5.0)), okx),
+        (replace(bybit, contract_size_base=cast(Decimal, 1.0)), okx),
+        (replace(bybit, amount_step_contracts=cast(Decimal, 0.001)), okx),
+        (replace(bybit, minimum_amount_contracts=cast(Decimal, 0.001)), okx),
+        (
+            bybit,
+            replace(
+                okx,
+                minimum_notional=None,
+                no_fixed_minimum_notional=cast(bool, "yes"),
+            ),
+        ),
+    )
+
+    for malformed_long, malformed_short in malformed_pairs:
+        with pytest.raises(ValueError, match=r"minimum (notional|quantity)"):
+            minimum_common_base_quantity(
+                malformed_long,
+                malformed_short,
+                Decimal(100),
+                Decimal(100),
+            )
 
 
 def test_ambiguous_contract_mapping_is_rejected() -> None:

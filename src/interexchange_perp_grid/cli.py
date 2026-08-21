@@ -4,6 +4,10 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
+import re
+import subprocess
+import sys
 from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -13,47 +17,94 @@ import typer
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.autonomous_orchestrator import load_autonomous_runtime_status
 from interexchange_perp_grid.c4_3_proof import run_c4_3_proof
 from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.live_journal import (
+    LiveOrderJournal,
+    completed_normal_actions_sha256,
+    is_completed_normal_paired_cycle,
+)
 from interexchange_perp_grid.maintenance import (
     backup_sqlite,
     prune_market_history,
     restore_sqlite,
 )
 from interexchange_perp_grid.observability import configure_logging, render_metrics
+from interexchange_perp_grid.ops_evidence import build_operations_proof
 from interexchange_perp_grid.private_domain import PrivateCapabilityReport
+from interexchange_perp_grid.private_transition_smoke import (
+    run_private_transition_recovery_smoke,
+)
 from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
 from interexchange_perp_grid.qualification import (
     QualificationPolicy,
+    QualificationProgress,
     QualificationRuntimeEvidence,
+    build_qualification_progress,
     build_runtime_evidence_from_state,
     code_hash,
     config_hash,
     current_code_commit_sha,
+    load_qualification,
     load_runtime_evidence,
+    qualification_is_current,
     run_qualification,
     write_runtime_evidence,
 )
+from interexchange_perp_grid.region_latency import (
+    MAXIMUM_PROBE_DURATION_SECONDS,
+    WAVE1_VENUES,
+    LatencySample,
+    RegionLatencyPolicy,
+    attestation_sha256,
+    bounded_operation,
+    build_region_latency_report,
+    collect_region_latency_samples,
+    load_latency_samples,
+    load_region_attestation,
+    load_region_latency_policy,
+    load_region_latency_report,
+    local_host_fingerprint,
+    select_deployment_region,
+    validate_region_probe_request,
+    verify_provider_evidence,
+    write_latency_samples,
+    write_region_latency_report,
+)
 from interexchange_perp_grid.release_evidence import REPLAY_TEST_FILES, run_replay_proof
 from interexchange_perp_grid.release_preflight import evaluate_release_preflight
+from interexchange_perp_grid.risk_stages import (
+    load_locked_risk_stage_table,
+    verify_risk_stage_completion_evidence,
+)
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.service import run_until_signal
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import (
     QualificationEpoch,
+    RiskStage,
+    RiskStageResult,
+    RiskStageState,
     ServiceHealth,
     finalize_qualification_epoch,
     initialise_state,
+    promote_risk_stage,
     read_qualification_epoch,
+    read_risk_stage,
     read_service_health,
+    record_risk_stage_result,
     start_qualification_epoch,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
 from interexchange_perp_grid.supervisor import SupervisorHealth, read_supervisor_health
-from interexchange_perp_grid.supervisor_smoke import run_supervisor_recovery_smoke
+from interexchange_perp_grid.supervisor_smoke import (
+    RecoverySmokeTransition,
+    run_supervisor_recovery_smoke,
+)
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 ConfigPath = Annotated[
@@ -78,6 +129,51 @@ def _load(config: Path) -> Settings:
     settings = load_settings(config)
     configure_logging(settings.app.log_level)
     return settings
+
+
+def _qualification_policy(settings: Settings) -> QualificationPolicy:
+    return QualificationPolicy(
+        minimum_duration_seconds=settings.shadow.qualification_min_duration_seconds,
+        minimum_synchronised_snapshots_per_venue=(
+            settings.shadow.qualification_min_synchronised_snapshots_per_venue
+        ),
+        minimum_funding_checkpoints_per_venue=(
+            settings.shadow.qualification_min_funding_checkpoints_per_venue
+        ),
+        maximum_inter_snapshot_gap_seconds=(
+            settings.shadow.qualification_max_inter_snapshot_gap_seconds
+        ),
+        maximum_sequence_gaps=settings.shadow.qualification_max_sequence_gaps,
+        maximum_stale_snapshots=settings.shadow.qualification_max_stale_snapshots,
+        maximum_sequence_unknown_snapshots=(
+            settings.shadow.qualification_max_sequence_unknown_snapshots
+        ),
+        maximum_clock_skew_snapshots=settings.shadow.qualification_max_clock_skew_snapshots,
+        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+        maximum_snapshot_age_ms=settings.market_data.max_l2_age_ms,
+    )
+
+
+def _current_region_evidence_identity(repo_root: Path, config: Path) -> tuple[str, str]:
+    root = repo_root.resolve()
+    package_root = (root / "src/interexchange_perp_grid").resolve()
+    if (
+        not (root / ".git").exists()
+        or not package_root.is_dir()
+        or Path(__file__).resolve().parent != package_root
+    ):
+        raise ValueError("region evidence requires the current repository checkout")
+    source_sha256 = code_hash(root)
+    if source_sha256 == hashlib.sha256(b"").hexdigest():
+        raise ValueError("region evidence source hash cannot be empty")
+    return source_sha256, config_hash(config.resolve())
+
+
+def _load_locked_region_policy(repo_root: Path, runtime_policy: Path) -> RegionLatencyPolicy:
+    expected = (repo_root.resolve() / "config/RUNTIME_POLICY.yaml").resolve()
+    if runtime_policy.resolve() != expected:
+        raise ValueError("region evidence requires the current checkout locked runtime policy")
+    return load_region_latency_policy(expected)
 
 
 def _parse_route(value: str) -> DirectedRouteKey:
@@ -162,10 +258,60 @@ def health(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         raise typer.Exit(code=1)
 
 
+@app.command("deployment-identity")
+def deployment_identity(
+    expected_release_sha: Annotated[str, typer.Option("--expected-release-sha")],
+    expected_image_digest: Annotated[str, typer.Option("--expected-image-digest")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Fail unless the running shadow container has the exact deployed identity."""
+    settings = _load(config)
+    release_sha = os.environ.get("IPEG_RELEASE_SHA", "").strip().lower()
+    image_digest = os.environ.get("IPEG_CONTAINER_IMAGE_DIGEST", "").strip().lower()
+    expected_release = expected_release_sha.strip().lower()
+    expected_image = expected_image_digest.strip().lower()
+    passed = (
+        re.fullmatch(r"[0-9a-f]{40}", expected_release) is not None
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_image) is not None
+        and release_sha == expected_release
+        and image_digest == expected_image
+        and settings.app.mode == "shadow"
+        and settings.live.enabled is False
+        and settings.execution.normal_unbounded_market_allowed is False
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "status": "PASS" if passed else "FAIL",
+                "release_sha": release_sha,
+                "image_digest": image_digest,
+                "mode": settings.app.mode,
+                "live_enabled": settings.live.enabled,
+            },
+            sort_keys=True,
+        )
+    )
+    if not passed:
+        raise typer.Exit(code=8)
+
+
 @app.command()
 def metrics() -> None:
     """Print the current Prometheus metric exposition."""
     typer.echo(render_metrics(), nl=False)
+
+
+@app.command("autonomous-status")
+def autonomous_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+    """Print the installed orchestrator's fail-closed runtime state."""
+    settings = _load(config)
+    path = Path(settings.storage.sqlite_path).parent / "autonomous-orchestrator.json"
+    try:
+        payload = load_autonomous_runtime_status(path)
+    except (FileNotFoundError, ValueError) as error:
+        typer.echo(json.dumps({"status": "FAIL", "reason": str(error)}, sort_keys=True))
+        raise typer.Exit(code=1) from error
+    typer.echo(json.dumps(payload, default=str, sort_keys=True))
 
 
 def _scan_payload(result: ScanResult) -> dict[str, object]:
@@ -178,6 +324,11 @@ def _scan_payload(result: ScanResult) -> dict[str, object]:
         "routes": [asdict(quote) for quote in result.quotes],
         "capabilities": [asdict(report) for report in result.capabilities],
         "quarantined": [asdict(record) for record in result.quarantined],
+        "venue_capability_matrix": (
+            asdict(result.venue_capability_matrix)
+            if result.venue_capability_matrix is not None
+            else None
+        ),
     }
 
 
@@ -256,26 +407,7 @@ def qualify(
 ) -> None:
     """Write exact-route, release/image/data-bound qualification evidence."""
     settings = _load(config)
-    policy = QualificationPolicy(
-        minimum_duration_seconds=settings.shadow.qualification_min_duration_seconds,
-        minimum_synchronised_snapshots_per_venue=(
-            settings.shadow.qualification_min_synchronised_snapshots_per_venue
-        ),
-        minimum_funding_checkpoints_per_venue=(
-            settings.shadow.qualification_min_funding_checkpoints_per_venue
-        ),
-        maximum_inter_snapshot_gap_seconds=(
-            settings.shadow.qualification_max_inter_snapshot_gap_seconds
-        ),
-        maximum_sequence_gaps=settings.shadow.qualification_max_sequence_gaps,
-        maximum_stale_snapshots=settings.shadow.qualification_max_stale_snapshots,
-        maximum_sequence_unknown_snapshots=(
-            settings.shadow.qualification_max_sequence_unknown_snapshots
-        ),
-        maximum_clock_skew_snapshots=(settings.shadow.qualification_max_clock_skew_snapshots),
-        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
-        maximum_snapshot_age_ms=settings.market_data.max_l2_age_ms,
-    )
+    policy = _qualification_policy(settings)
     result = run_qualification(
         repo_root.resolve(),
         config.resolve(),
@@ -326,18 +458,24 @@ def qualification_epoch_status(
     epoch_id: Annotated[str | None, typer.Option("--epoch-id")] = None,
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
-    """Print the current or selected immutable qualification epoch as JSON."""
+    """Print exact 24h progress, remaining work, and fail-closed blockers as JSON."""
     settings = _load(config)
 
-    async def status() -> QualificationEpoch | None:
+    async def status() -> QualificationProgress:
         state_path = Path(settings.storage.sqlite_path)
         await initialise_state(state_path)
-        return await read_qualification_epoch(state_path, epoch_id)
+        return await build_qualification_progress(
+            state_path,
+            Path(settings.storage.parquet_dir),
+            epoch_id,
+            _qualification_policy(settings),
+        )
 
-    epoch = asyncio.run(status())
-    if epoch is None:
-        raise typer.Exit(code=4)
-    typer.echo(json.dumps(asdict(epoch), default=str, sort_keys=True))
+    try:
+        progress = asyncio.run(status())
+    except KeyError:
+        raise typer.Exit(code=4) from None
+    typer.echo(json.dumps(asdict(progress), default=str, sort_keys=True))
 
 
 @app.command("qualification-epoch-finalize")
@@ -354,6 +492,207 @@ def qualification_epoch_finalize(
         return await finalize_qualification_epoch(state_path, epoch_id)
 
     typer.echo(json.dumps(asdict(asyncio.run(finalize())), default=str, sort_keys=True))
+
+
+@app.command("risk-stage-status")
+def risk_stage_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+    """Print the persisted stage and exact locked limits without authorizing promotion."""
+    settings = _load(config)
+    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+
+    async def status() -> RiskStageState:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        return await read_risk_stage(state_path)
+
+    typer.echo(
+        json.dumps(
+            {"state": asdict(asyncio.run(status())), "locked_table": asdict(table)},
+            default=str,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("risk-stage-promote")
+def risk_stage_promote(
+    expected_current: Annotated[RiskStage, typer.Option("--expected-current")],
+    target: Annotated[RiskStage, typer.Option("--target")],
+    actor: Annotated[str, typer.Option("--actor")],
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    qualification: Annotated[
+        Path,
+        typer.Option("--qualification", exists=True, dir_okay=False, readable=True),
+    ],
+    container_image_digest: Annotated[
+        str,
+        typer.Option("--container-image-digest", envvar="IPEG_CONTAINER_IMAGE_DIGEST"),
+    ],
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Persist one adjacent owner-confirmed promotion after exact qualification validation."""
+    settings = _load(config)
+    evidence = load_qualification(qualification.resolve())
+    current, reason = qualification_is_current(
+        evidence,
+        repo_root.resolve(),
+        config.resolve(),
+        Path(settings.storage.parquet_dir).resolve(),
+        settings.live.qualification_max_age_seconds,
+        current_container_image_digest=container_image_digest.lower(),
+    )
+    if not current:
+        raise typer.BadParameter(f"qualification is not current: {reason.value}")
+    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+
+    async def promote() -> RiskStageState:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        if await journal.active_actions():
+            raise RuntimeError("risk stage promotion requires zero active live actions")
+        return await promote_risk_stage(
+            state_path,
+            expected_current,
+            target,
+            evidence.qualification_hash,
+            table.runtime_policy_sha256,
+            actor,
+            confirmation,
+        )
+
+    result = asyncio.run(promote())
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+
+
+@app.command("risk-stage-complete")
+def risk_stage_complete(
+    stage: Annotated[RiskStage, typer.Option("--stage")],
+    actor: Annotated[str, typer.Option("--actor")],
+    evidence: Annotated[
+        Path,
+        typer.Option("--evidence", exists=True, dir_okay=False, readable=True),
+    ],
+    qualification: Annotated[
+        Path,
+        typer.Option("--qualification", exists=True, dir_okay=False, readable=True),
+    ],
+    attestation_public_key: Annotated[
+        Path,
+        typer.Option("--attestation-public-key", exists=True, dir_okay=False, readable=True),
+    ],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Bind one signed, account-wide completed stage before any next promotion."""
+    settings = _load(config)
+    policy_path = config.resolve().parent / "RUNTIME_POLICY.yaml"
+    table = load_locked_risk_stage_table(policy_path)
+    limits = next((item for item in table.stages if item.stage == stage), None)
+    if limits is None:
+        raise typer.BadParameter("shadow cannot produce a live risk-stage result")
+    attestation_policy = load_region_latency_policy(policy_path)
+    try:
+        attested = verify_risk_stage_completion_evidence(
+            evidence.resolve(),
+            attestation_public_key.resolve(),
+            attestation_policy.attestation_public_key_sha256,
+            limits,
+            required_consecutive_snapshots=table.flat_barrier_snapshots,
+            required_quiet_period_seconds=table.flat_barrier_quiet_seconds,
+            hard_maximum_holding_seconds=table.hard_maximum_holding_seconds,
+        )
+    except (ValueError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(str(error)) from error
+    qualification_evidence = load_qualification(qualification.resolve())
+
+    async def complete() -> RiskStageResult:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        current = await read_risk_stage(state_path)
+        if current.stage != stage or current.qualification_hash is None:
+            raise RuntimeError("stage evidence does not match the current risk stage")
+        if (
+            attested.qualification_hash != current.qualification_hash
+            or attested.qualification_hash != qualification_evidence.qualification_hash
+            or attested.runtime_policy_sha256 != table.runtime_policy_sha256
+            or attested.release_sha != qualification_evidence.code_commit_sha
+            or attested.source_sha256 != qualification_evidence.code_sha256
+            or attested.config_sha256 != qualification_evidence.config_sha256
+            or attested.container_image_digest != qualification_evidence.container_image_digest
+            or current.promoted_at is None
+            or attested.stage_started_at != current.promoted_at
+        ):
+            raise RuntimeError("stage evidence identity does not match current runtime state")
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        if await journal.active_actions():
+            raise RuntimeError("risk stage completion requires zero active live actions")
+        all_completed = tuple(
+            sorted(
+                await journal.completed_actions_since(
+                    current.promoted_at,
+                    current.qualification_hash,
+                ),
+                key=lambda action: action.pair_action_id,
+            )
+        )
+        completed = tuple(
+            action for action in all_completed if is_completed_normal_paired_cycle(action)
+        )
+        completed_ids = tuple(action.pair_action_id for action in completed)
+        completed_sha256 = completed_normal_actions_sha256(all_completed)
+        all_completed_ids = tuple(action.pair_action_id for action in all_completed)
+        journal_pair_actions_sha256 = hashlib.sha256(
+            json.dumps(all_completed_ids, separators=(",", ":")).encode()
+        ).hexdigest()
+        if (
+            completed_ids != attested.completed_pair_action_ids
+            or completed_sha256 != attested.completed_pair_actions_sha256
+        ):
+            raise RuntimeError("stage evidence does not match durable completed paired cycles")
+        return await record_risk_stage_result(
+            state_path,
+            stage,
+            current.qualification_hash,
+            table.runtime_policy_sha256,
+            attested.evidence_sha256,
+            True,
+            actor,
+            await journal.event_watermark(),
+            completed_sha256,
+            journal_pair_actions_sha256,
+            all_completed_ids,
+        )
+
+    result = asyncio.run(complete())
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+
+
+@app.command("ops-proof")
+def ops_proof(
+    junit: Annotated[
+        Path,
+        typer.Option("--junit", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output")] = Path("state/ops-proof.json"),
+    evidence_dir: Annotated[Path, typer.Option("--evidence-dir")] = Path("state/ops-evidence"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Validate raw Docker evidence and bind all final criteria to one exact SHA."""
+    result = build_operations_proof(
+        repo_root.resolve(),
+        config.resolve(),
+        config.resolve().parent / "RUNTIME_POLICY.yaml",
+        config.resolve().parent / "FINAL_ACCEPTANCE_MANIFEST.json",
+        config.resolve().parent / "ops-scenario-nodeids.json",
+        junit.resolve(),
+        evidence_dir.resolve(),
+        output.resolve(),
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
 
 
 @app.command("qualification-runtime")
@@ -516,6 +855,11 @@ def supervisor_recovery_smoke(
     state: Annotated[Path, typer.Option("--state")],
     hold_after_active: Annotated[bool, typer.Option("--hold-after-active")] = False,
     ready: Annotated[Path | None, typer.Option("--ready")] = None,
+    action_count: Annotated[int, typer.Option("--action-count", min=1, max=10)] = 10,
+    transition_state: Annotated[
+        RecoverySmokeTransition,
+        typer.Option("--transition-state", case_sensitive=False),
+    ] = RecoverySmokeTransition.PARTIAL,
 ) -> None:
     """Run deterministic Docker process-kill/restart recovery proof without exchange I/O."""
     result = asyncio.run(
@@ -523,6 +867,34 @@ def supervisor_recovery_smoke(
             state.resolve(),
             hold_after_active=hold_after_active,
             ready_path=ready.resolve() if ready is not None else None,
+            action_count=action_count,
+            transition_state=transition_state,
+        )
+    )
+    typer.echo(json.dumps(result, default=str, sort_keys=True))
+
+
+@app.command("private-transition-recovery-smoke")
+def private_transition_recovery_smoke(
+    state: Annotated[Path, typer.Option("--state")],
+    private_state_dir: Annotated[Path, typer.Option("--private-state-dir")],
+    transition_state: Annotated[
+        RecoverySmokeTransition,
+        typer.Option("--transition-state", case_sensitive=False),
+    ],
+    hold_after_active: Annotated[bool, typer.Option("--hold-after-active")] = False,
+    ready: Annotated[Path | None, typer.Option("--ready")] = None,
+    action_count: Annotated[int, typer.Option("--action-count", min=1, max=10)] = 10,
+) -> None:
+    """Prove killed-process recovery through production private reconciliation."""
+    result = asyncio.run(
+        run_private_transition_recovery_smoke(
+            state.resolve(),
+            private_state_dir.resolve(),
+            hold_after_active=hold_after_active,
+            transition_state=transition_state,
+            ready_path=ready.resolve() if ready is not None else None,
+            action_count=action_count,
         )
     )
     typer.echo(json.dumps(result, default=str, sort_keys=True))
@@ -582,11 +954,339 @@ def prune_history(config: ConfigPath = Path("config/defaults.yaml")) -> None:
     typer.echo(json.dumps({"status": "PASS", "removed": removed}, sort_keys=True))
 
 
+@app.command("region-latency-report")
+def region_latency_report(
+    samples: Annotated[Path, typer.Option("--samples", exists=True, dir_okay=False)],
+    output: Annotated[Path, typer.Option("--output")],
+    minimum_samples: Annotated[int, typer.Option("--minimum-samples")] = 30,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Build one hash-bound p50/p95/p99 Wave 1 region report from NDJSON measurements."""
+    settings = _load(config)
+    source_sha256, config_sha256 = _current_region_evidence_identity(repo_root, config)
+    report = build_region_latency_report(
+        load_latency_samples(samples),
+        expected_source_sha256=source_sha256,
+        expected_config_sha256=config_sha256,
+        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+        minimum_samples_per_cell=minimum_samples,
+    )
+    write_region_latency_report(report, output)
+    typer.echo(json.dumps(asdict(report), default=str, sort_keys=True))
+
+
+@app.command("region-latency-probe-worker", hidden=True)
+def region_latency_probe_worker(
+    region: Annotated[str, typer.Option("--region")],
+    output: Annotated[Path, typer.Option("--output")],
+    attestation: Annotated[
+        Path,
+        typer.Option("--attestation", exists=True, dir_okay=False),
+    ],
+    provider_evidence: Annotated[
+        Path,
+        typer.Option("--provider-evidence", exists=True, dir_okay=False),
+    ],
+    attestation_public_key: Annotated[
+        Path,
+        typer.Option("--attestation-public-key", exists=True, dir_okay=False),
+    ],
+    base: Annotated[str, typer.Option("--base")] = "BTC",
+    samples_per_cell: Annotated[int, typer.Option("--samples-per-cell")] = 30,
+    timeout_seconds: Annotated[float, typer.Option("--timeout-seconds")] = 5,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+    runtime_policy: Annotated[
+        Path,
+        typer.Option("--runtime-policy", exists=True, dir_okay=False),
+    ] = Path("config/RUNTIME_POLICY.yaml"),
+) -> None:
+    """Measure Wave 1 public feed/API and account-wide private-event latency on this VPS."""
+    settings = _load(config)
+    policy = _load_locked_region_policy(repo_root, runtime_policy)
+    source_sha256, config_sha256 = _current_region_evidence_identity(repo_root, config)
+    try:
+        validate_region_probe_request(region, base, samples_per_cell, timeout_seconds)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    normalized_base = base.strip().upper()
+    if not normalized_base:
+        raise typer.BadParameter("base must not be empty")
+    attested = load_region_attestation(attestation, expected_region=region)
+    verify_provider_evidence(
+        attested,
+        provider_evidence,
+        attestation_public_key,
+        policy.attestation_public_key_sha256,
+    )
+    credentials = {venue: PrivateCredentials.from_environment(venue) for venue in WAVE1_VENUES}
+
+    async def probe() -> tuple[LatencySample, ...]:
+        public: dict[Venue, CcxtProAdapter] = {}
+        private: dict[Venue, CcxtPrivateAdapter] = {}
+        try:
+            for venue in WAVE1_VENUES:
+                public[venue] = CcxtProAdapter(venue)
+                private[venue] = CcxtPrivateAdapter(venue, credentials[venue])
+            capabilities = await asyncio.gather(
+                *(
+                    bounded_operation(adapter.probe_public_capabilities, timeout_seconds)
+                    for adapter in public.values()
+                )
+            )
+            if any(
+                report.clock_skew_ms is None
+                or abs(report.clock_skew_ms) > settings.market_data.max_clock_skew_ms
+                for report in capabilities
+            ):
+                raise RuntimeError(
+                    "every Wave 1 venue requires a policy-qualified server clock skew"
+                )
+            discovered = await asyncio.gather(
+                *(
+                    bounded_operation(adapter.discover_instruments, timeout_seconds)
+                    for adapter in public.values()
+                )
+            )
+            instruments = {}
+            for venue, venue_instruments in zip(WAVE1_VENUES, discovered, strict=True):
+                selected = next(
+                    (
+                        instrument
+                        for instrument in venue_instruments
+                        if instrument.base == normalized_base
+                    ),
+                    None,
+                )
+                if selected is None:
+                    raise RuntimeError(
+                        f"{venue.value} has no qualified {normalized_base} instrument"
+                    )
+                instruments[venue] = selected
+            return await collect_region_latency_samples(
+                region=region,
+                host_fingerprint=local_host_fingerprint(),
+                attestation_sha256=attestation_sha256(attested),
+                source_sha256=source_sha256,
+                config_sha256=config_sha256,
+                base=normalized_base,
+                public_adapters=public,
+                private_adapters=private,
+                instruments=instruments,
+                samples_per_cell=samples_per_cell,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            results = await asyncio.gather(
+                *(bounded_operation(adapter.close, timeout_seconds) for adapter in public.values()),
+                *(
+                    bounded_operation(adapter.close, timeout_seconds)
+                    for adapter in private.values()
+                ),
+                return_exceptions=True,
+            )
+            failures = tuple(result for result in results if isinstance(result, BaseException))
+            if failures:
+                raise RuntimeError("region probe adapter shutdown failed")
+
+    loop = asyncio.new_event_loop()
+    shutdown_survivors: tuple[asyncio.Task[object], ...] = ()
+    measured: tuple[LatencySample, ...] | None = None
+    probe_failure: BaseException | None = None
+    try:
+        measured = loop.run_until_complete(probe())
+    except BaseException as error:
+        probe_failure = error
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.sleep(0))
+        shutdown_survivors = tuple(task for task in asyncio.all_tasks(loop) if not task.done())
+        loop.close()
+    if shutdown_survivors:
+        raise RuntimeError(
+            f"region probe shutdown retained {len(shutdown_survivors)} nonterminal task(s)"
+        ) from probe_failure
+    if probe_failure is not None:
+        raise probe_failure
+    if measured is None:
+        raise RuntimeError("region probe returned no measurement set")
+    write_latency_samples(measured, output)
+    typer.echo(json.dumps({"status": "PASS", "samples": len(measured), "output": str(output)}))
+
+
+@app.command("region-latency-probe")
+def region_latency_probe(
+    region: Annotated[str, typer.Option("--region")],
+    output: Annotated[Path, typer.Option("--output")],
+    attestation: Annotated[
+        Path,
+        typer.Option("--attestation", exists=True, dir_okay=False),
+    ],
+    provider_evidence: Annotated[
+        Path,
+        typer.Option("--provider-evidence", exists=True, dir_okay=False),
+    ],
+    attestation_public_key: Annotated[
+        Path,
+        typer.Option("--attestation-public-key", exists=True, dir_okay=False),
+    ],
+    base: Annotated[str, typer.Option("--base")] = "BTC",
+    samples_per_cell: Annotated[int, typer.Option("--samples-per-cell")] = 30,
+    timeout_seconds: Annotated[float, typer.Option("--timeout-seconds")] = 5,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+    runtime_policy: Annotated[
+        Path,
+        typer.Option("--runtime-policy", exists=True, dir_okay=False),
+    ] = Path("config/RUNTIME_POLICY.yaml"),
+) -> None:
+    """Run the real latency probe in a hard-deadline child process."""
+    _load(config)
+    policy = _load_locked_region_policy(repo_root, runtime_policy)
+    _current_region_evidence_identity(repo_root, config)
+    try:
+        validate_region_probe_request(region, base, samples_per_cell, timeout_seconds)
+        attested = load_region_attestation(attestation, expected_region=region)
+        verify_provider_evidence(
+            attested,
+            provider_evidence,
+            attestation_public_key,
+            policy.attestation_public_key_sha256,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    command = (
+        sys.executable,
+        "-m",
+        "interexchange_perp_grid.cli",
+        "region-latency-probe-worker",
+        "--region",
+        region,
+        "--output",
+        str(output.resolve()),
+        "--attestation",
+        str(attestation.resolve()),
+        "--provider-evidence",
+        str(provider_evidence.resolve()),
+        "--attestation-public-key",
+        str(attestation_public_key.resolve()),
+        "--base",
+        base,
+        "--samples-per-cell",
+        str(samples_per_cell),
+        "--timeout-seconds",
+        str(timeout_seconds),
+        "--repo-root",
+        str(repo_root.resolve()),
+        "--config",
+        str(config.resolve()),
+        "--runtime-policy",
+        str(runtime_policy.resolve()),
+    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repo_root.resolve(),
+            check=False,
+            timeout=MAXIMUM_PROBE_DURATION_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("region latency probe exceeded its one-hour process deadline") from error
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"region latency probe worker failed with exit code {completed.returncode}"
+        )
+
+
+@app.command("region-latency-select")
+def region_latency_select(
+    germany: Annotated[Path, typer.Option("--germany", exists=True, dir_okay=False)],
+    japan: Annotated[Path, typer.Option("--japan", exists=True, dir_okay=False)],
+    germany_samples: Annotated[
+        Path,
+        typer.Option("--germany-samples", exists=True, dir_okay=False),
+    ],
+    japan_samples: Annotated[
+        Path,
+        typer.Option("--japan-samples", exists=True, dir_okay=False),
+    ],
+    germany_attestation: Annotated[
+        Path,
+        typer.Option("--germany-attestation", exists=True, dir_okay=False),
+    ],
+    japan_attestation: Annotated[
+        Path,
+        typer.Option("--japan-attestation", exists=True, dir_okay=False),
+    ],
+    germany_provider_evidence: Annotated[
+        Path,
+        typer.Option("--germany-provider-evidence", exists=True, dir_okay=False),
+    ],
+    japan_provider_evidence: Annotated[
+        Path,
+        typer.Option("--japan-provider-evidence", exists=True, dir_okay=False),
+    ],
+    attestation_public_key: Annotated[
+        Path,
+        typer.Option("--attestation-public-key", exists=True, dir_okay=False),
+    ],
+    runtime_policy: Annotated[
+        Path,
+        typer.Option("--runtime-policy", exists=True, dir_okay=False),
+    ] = Path("config/RUNTIME_POLICY.yaml"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Select Germany/Japan only from comparable reports and the locked latency policy."""
+    settings = _load(config)
+    source_sha256, config_sha256 = _current_region_evidence_identity(repo_root, config)
+    germany_attested = load_region_attestation(
+        germany_attestation,
+        expected_region="Germany",
+        bind_local_host=False,
+    )
+    japan_attested = load_region_attestation(
+        japan_attestation,
+        expected_region="Japan",
+        bind_local_host=False,
+    )
+    policy = _load_locked_region_policy(repo_root, runtime_policy)
+    verify_provider_evidence(
+        germany_attested,
+        germany_provider_evidence,
+        attestation_public_key,
+        policy.attestation_public_key_sha256,
+    )
+    verify_provider_evidence(
+        japan_attested,
+        japan_provider_evidence,
+        attestation_public_key,
+        policy.attestation_public_key_sha256,
+    )
+    selection = select_deployment_region(
+        load_region_latency_report(germany),
+        load_region_latency_report(japan),
+        policy,
+        germany_samples=load_latency_samples(germany_samples),
+        japan_samples=load_latency_samples(japan_samples),
+        germany_attestation=germany_attested,
+        japan_attestation=japan_attested,
+        expected_source_sha256=source_sha256,
+        expected_config_sha256=config_sha256,
+        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+    )
+    typer.echo(json.dumps(asdict(selection), default=str, sort_keys=True))
+
+
 @app.command("private-probe")
 def private_probe(
     venue: Annotated[str, typer.Option("--venue")],
 ) -> None:
-    """Read-only probe of one Wave 1 venue's CCXT Pro private capabilities."""
+    """Read-only probe of one venue transport's declared private capabilities."""
     selected = Venue(venue)
 
     async def probe() -> PrivateCapabilityReport:

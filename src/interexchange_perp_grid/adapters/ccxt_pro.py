@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -10,7 +9,11 @@ from typing import Any
 import ccxt.pro as ccxtpro  # type: ignore[import-untyped]
 
 from interexchange_perp_grid.adapters.base import ExchangeAdapter
+from interexchange_perp_grid.adapters.bingx_swap import SequenceQualifiedBingxExchange
+from interexchange_perp_grid.adapters.bitget_classic import ClassicBitgetExchange
 from interexchange_perp_grid.adapters.bybit_v5 import SequenceQualifiedBybitExchange
+from interexchange_perp_grid.adapters.kucoin_classic import ClassicKucoinFuturesExchange
+from interexchange_perp_grid.adapters.mexc_swap import SequenceQualifiedMexcExchange
 from interexchange_perp_grid.domain import (
     BboQuote,
     BookLevel,
@@ -40,9 +43,31 @@ def _supported(value: object) -> bool:
     return value is True or value == "emulated"
 
 
+def _listing_datetime(market: Mapping[str, Any]) -> datetime | None:
+    info = _mapping(market.get("info"))
+    candidates = (
+        market.get("created"),
+        market.get("listingTimestamp"),
+        info.get("onboardDate"),
+        info.get("launchTime"),
+        info.get("listTime"),
+    )
+    for candidate in candidates:
+        timestamp = _decimal(candidate)
+        if timestamp is None or timestamp <= 0:
+            continue
+        milliseconds = timestamp * 1000 if timestamp < Decimal("100000000000") else timestamp
+        try:
+            return datetime.fromtimestamp(float(milliseconds / 1000), tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            continue
+    return None
+
+
 def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | None:
     if not (
-        market.get("contract") is True
+        market.get("active") is True
+        and market.get("contract") is True
         and market.get("swap") is True
         and market.get("linear") is True
         and market.get("inverse") is False
@@ -54,11 +79,14 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
     contract_size = _decimal(market.get("contractSize"))
     precision = _mapping(market.get("precision"))
     limits = _mapping(market.get("limits"))
+    info = _mapping(market.get("info"))
     amount_limits = _mapping(limits.get("amount"))
     cost_limits = _mapping(limits.get("cost"))
     amount_step = _decimal(precision.get("amount"))
     price_tick = _decimal(precision.get("price"))
     minimum_amount = _decimal(amount_limits.get("min"))
+    if venue == Venue.MEXC and info.get("apiAllowed") is not True:
+        return None
     if contract_size is None or contract_size <= 0:
         return None
     if amount_step is None or amount_step <= 0:
@@ -76,8 +104,46 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
         return None
     if not isinstance(exchange_symbol, str) or not exchange_symbol:
         return None
+    if venue == Venue.MEXC and not (
+        info.get("apiAllowed") is True
+        and str(info.get("state")) == "0"
+        and info.get("symbol") == exchange_symbol
+        and info.get("baseCoin") == base
+        and info.get("quoteCoin") == "USDT"
+        and info.get("settleCoin") == "USDT"
+        and _decimal(info.get("contractSize")) == contract_size
+        and _decimal(info.get("priceUnit")) == price_tick
+        and _decimal(info.get("volUnit")) == amount_step
+        and _decimal(info.get("minVol")) == minimum_amount
+    ):
+        return None
     taker_fee = _decimal(market.get("taker"))
     minimum_notional = _decimal(cost_limits.get("min"))
+    if minimum_notional is None and venue == Venue.BYBIT:
+        minimum_notional = _decimal(_mapping(info.get("lotSizeFilter")).get("minNotionalValue"))
+    no_fixed_minimum_notional = minimum_notional is None and (
+        (
+            venue == Venue.OKX
+            and info.get("instType") == "SWAP"
+            and info.get("ctType") == "linear"
+            and _decimal(info.get("minSz")) == minimum_amount
+        )
+        or (
+            venue == Venue.KUCOIN_FUTURES
+            and info.get("status") == "Open"
+            and info.get("settleCurrency") == "USDT"
+            and _decimal(info.get("lotSize")) == minimum_amount
+            and _decimal(info.get("multiplier")) == contract_size
+        )
+        or (
+            venue == Venue.MEXC
+            and info.get("apiAllowed") is True
+            and str(info.get("state")) == "0"
+            and _decimal(info.get("contractSize")) == contract_size
+            and _decimal(info.get("volUnit")) == amount_step
+            and _decimal(info.get("minVol")) == minimum_amount
+        )
+    )
     return Instrument(
         venue=venue,
         symbol=symbol,
@@ -92,6 +158,9 @@ def normalize_market(venue: Venue, market: Mapping[str, Any]) -> Instrument | No
         minimum_notional=minimum_notional,
         taker_fee_rate=taker_fee,
         fee_source="ccxt_market_metadata" if taker_fee is not None else None,
+        active=True,
+        listed_at=_listing_datetime(market),
+        no_fixed_minimum_notional=no_fixed_minimum_notional,
     )
 
 
@@ -101,6 +170,7 @@ class CcxtProAdapter(ExchangeAdapter):
         self._exchange: Any = exchange if exchange is not None else self._build_exchange(venue)
         self._clock_skew_ms: int | None = None
         self._instruments: dict[str, Instrument] = {}
+        self._bbo_subscription_kind: str | None = None
 
     @staticmethod
     def _build_exchange(venue: Venue) -> Any:
@@ -117,6 +187,14 @@ class CcxtProAdapter(ExchangeAdapter):
             return ccxtpro.binance(configuration)
         if venue == Venue.BYBIT:
             return SequenceQualifiedBybitExchange(configuration)
+        if venue == Venue.BITGET:
+            return ClassicBitgetExchange(configuration)
+        if venue == Venue.KUCOIN_FUTURES:
+            return ClassicKucoinFuturesExchange(configuration)
+        if venue == Venue.BINGX:
+            return SequenceQualifiedBingxExchange(configuration)
+        if venue == Venue.MEXC:
+            return SequenceQualifiedMexcExchange(configuration)
         exchange_class = getattr(ccxtpro, venue.value)
         return exchange_class(configuration)
 
@@ -124,11 +202,42 @@ class CcxtProAdapter(ExchangeAdapter):
         capabilities = _mapping(self._exchange.has)
         return _supported(capabilities.get(capability))
 
+    def _has_concrete_method(self, method_name: str) -> bool:
+        method = getattr(self._exchange, method_name, None)
+        if not callable(method):
+            return False
+        for owner in type(self._exchange).__mro__:
+            if method_name not in owner.__dict__:
+                continue
+            return owner.__module__ != "ccxt.async_support.base.exchange"
+        return False
+
+    def _bbo_stream_kind(self) -> str | None:
+        capabilities = _mapping(self._exchange.has)
+        pairs: tuple[tuple[str, str, str, str], ...] = (
+            ("bids_asks", "watchBidsAsks", "unWatchBidsAsks", "un_watch_bids_asks"),
+            ("tickers", "watchTickers", "unWatchTickers", "un_watch_tickers"),
+        )
+        if self.venue == Venue.MEXC:
+            return None
+        if self.venue == Venue.BITGET:
+            pairs = (pairs[1],)
+        for kind, watch_capability, unwatch_capability, unwatch_method in pairs:
+            declared_unwatch = capabilities.get(unwatch_capability)
+            if (
+                self._has(watch_capability)
+                and declared_unwatch is not False
+                and self._has_concrete_method(unwatch_method)
+            ):
+                return kind
+        return None
+
+    def _bbo_ticker_params(self) -> dict[str, str]:
+        return {"name": "ticker"} if self.venue == Venue.BINANCE_USDM else {}
+
     async def probe_public_capabilities(self) -> CapabilityReport:
         await self._exchange.load_markets()
-        bbo_stream = any(
-            self._has(capability) for capability in ("watchBidsAsks", "watchTickers", "watchTicker")
-        )
+        bbo_stream = self._bbo_stream_kind() is not None
         l2_stream = self._has("watchOrderBook")
         funding = self._has("fetchFundingRate") or self._has("fetchFundingRates")
         mark_index = self._has("fetchMarkPrice") or self._has("fetchTicker")
@@ -207,7 +316,9 @@ class CcxtProAdapter(ExchangeAdapter):
     async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
         if not symbols:
             return ()
-        if self._has("watchBidsAsks"):
+        stream_kind = self._bbo_stream_kind()
+        if stream_kind == "bids_asks":
+            self._bbo_subscription_kind = stream_kind
             raw_result = await self._exchange.watch_bids_asks(list(symbols))
             if not isinstance(raw_result, Mapping):
                 raise TypeError("CCXT watch_bids_asks must return a mapping")
@@ -216,8 +327,12 @@ class CcxtProAdapter(ExchangeAdapter):
                 for raw in raw_result.values()
                 if isinstance(raw, Mapping) and raw.get("symbol") in symbols
             )
-        if self._has("watchTickers"):
-            raw_result = await self._exchange.watch_tickers(list(symbols))
+        if stream_kind == "tickers":
+            self._bbo_subscription_kind = stream_kind
+            raw_result = await self._exchange.watch_tickers(
+                list(symbols),
+                self._bbo_ticker_params(),
+            )
             if not isinstance(raw_result, Mapping):
                 raise TypeError("CCXT watch_tickers must return a mapping")
             return tuple(
@@ -225,10 +340,19 @@ class CcxtProAdapter(ExchangeAdapter):
                 for raw in raw_result.values()
                 if isinstance(raw, Mapping) and raw.get("symbol") in symbols
             )
-        raw_tickers = await asyncio.gather(
-            *(self._exchange.watch_ticker(symbol) for symbol in symbols)
-        )
-        return tuple(self._normalise_bbo(raw) for raw in raw_tickers if isinstance(raw, Mapping))
+        raise RuntimeError("batch BBO stream capability is required")
+
+    async def unwatch_bbo(self, symbols: tuple[str, ...]) -> None:
+        if self._bbo_subscription_kind == "bids_asks":
+            await self._exchange.un_watch_bids_asks(list(symbols))
+        elif self._bbo_subscription_kind == "tickers":
+            await self._exchange.un_watch_tickers(
+                list(symbols),
+                self._bbo_ticker_params(),
+            )
+        else:
+            raise RuntimeError("broad BBO subscription kind is unknown")
+        self._bbo_subscription_kind = None
 
     async def watch_order_book(self, instrument: Instrument, limit: int = 50) -> OrderBookSnapshot:
         if self.venue == Venue.OKX:
@@ -237,6 +361,10 @@ class CcxtProAdapter(ExchangeAdapter):
                 None,
                 {"depth": "books"},
             )
+        elif self.venue == Venue.BITGET:
+            raw = await self._exchange.watch_order_book(instrument.symbol, 15)
+        elif self.venue == Venue.KUCOIN_FUTURES:
+            raw = await self._exchange.watch_order_book(instrument.symbol, 50)
         else:
             raw = await self._exchange.watch_order_book(instrument.symbol, limit)
         if not isinstance(raw, Mapping):
@@ -263,6 +391,30 @@ class CcxtProAdapter(ExchangeAdapter):
             sequence_reset=raw.get("ipegSequenceReset") is True,
             sequence_contiguous=raw.get("ipegSequenceContiguous") is not False,
         )
+
+    async def unwatch_order_book(self, instrument: Instrument, limit: int = 50) -> None:
+        if self.venue == Venue.OKX:
+            await self._exchange.un_watch_order_book(
+                instrument.symbol,
+                {"depth": "books"},
+            )
+        elif self.venue == Venue.BYBIT:
+            await self._exchange.un_watch_order_book(
+                instrument.symbol,
+                {"limit": limit},
+            )
+        elif self.venue == Venue.BITGET:
+            await self._exchange.un_watch_order_book(
+                instrument.symbol,
+                {"limit": 15},
+            )
+        elif self.venue == Venue.KUCOIN_FUTURES:
+            await self._exchange.un_watch_order_book(
+                instrument.symbol,
+                {"limit": 50},
+            )
+        else:
+            await self._exchange.un_watch_order_book(instrument.symbol, {})
 
     @staticmethod
     def _normalise_levels(raw_levels: object, instrument: Instrument) -> tuple[BookLevel, ...]:

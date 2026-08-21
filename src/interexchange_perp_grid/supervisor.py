@@ -13,6 +13,7 @@ from interexchange_perp_grid.live_journal import (
     LiveJournalAction,
     LiveOrderJournal,
 )
+from interexchange_perp_grid.priority_scheduler import PriorityWorkScheduler, WorkPriority
 
 
 class SupervisorMode(StrEnum):
@@ -27,6 +28,7 @@ class SupervisorHealth:
     mode: SupervisorMode
     active_pair_action_id: str | None
     action_state: LiveActionState | None
+    active_action_count: int
     outcome: str
     recovery_required: bool
     failure: str | None
@@ -58,12 +60,18 @@ def _read_supervisor_health_sync(path: Path) -> SupervisorHealth | None:
 
 def _health_from_row(row: sqlite3.Row) -> SupervisorHealth:
     state = str(row["action_state"]) if row["action_state"] is not None else None
+    columns = tuple(row.keys())
     return SupervisorHealth(
         mode=SupervisorMode(str(row["mode"])),
         active_pair_action_id=(
             str(row["active_pair_action_id"]) if row["active_pair_action_id"] is not None else None
         ),
         action_state=LiveActionState(state) if state is not None else None,
+        active_action_count=(
+            int(row["active_action_count"])
+            if "active_action_count" in columns
+            else int(row["active_pair_action_id"] is not None)
+        ),
         outcome=str(row["outcome"]),
         recovery_required=bool(row["recovery_required"]),
         failure=str(row["failure"]) if row["failure"] is not None else None,
@@ -72,7 +80,7 @@ def _health_from_row(row: sqlite3.Row) -> SupervisorHealth:
 
 
 class LiveSafetySupervisor:
-    """Single long-running owner of every durable live action and restart recovery."""
+    """Single long-running owner of all durable live actions and restart recovery."""
 
     def __init__(
         self,
@@ -80,14 +88,21 @@ class LiveSafetySupervisor:
         recovery_runner: RecoveryRunner,
         *,
         poll_interval_seconds: float = 1.0,
+        recovery_timeout_seconds: float = 5.0,
+        priority_scheduler: PriorityWorkScheduler | None = None,
     ) -> None:
         if poll_interval_seconds <= 0:
             raise ValueError("supervisor poll interval must be positive")
+        if recovery_timeout_seconds <= 0:
+            raise ValueError("supervisor recovery timeout must be positive")
         self._journal = journal
         self._recovery_runner = recovery_runner
         self._poll_interval_seconds = poll_interval_seconds
+        self._recovery_timeout_seconds = recovery_timeout_seconds
+        self._priority_scheduler = priority_scheduler
         self._recovery_lock = asyncio.Lock()
         self._initialise_lock = asyncio.Lock()
+        self._recovery_tasks: dict[str, asyncio.Task[object]] = {}
         self._initialised = False
 
     async def initialise(self) -> None:
@@ -99,58 +114,111 @@ class LiveSafetySupervisor:
             self._initialised = True
 
     async def reconcile_once(self) -> SupervisorHealth:
-        """Recover one active action without qualification or owner-entry gates."""
+        """Recover every active action without qualification or owner-entry gates."""
         async with self._recovery_lock:
             await self.initialise()
-            active = await self._journal.active()
-            if active is None:
+            active = await self._journal.active_actions()
+            active_ids = {action.pair_action_id for action in active}
+            for pair_action_id, task in tuple(self._recovery_tasks.items()):
+                if task.done() and pair_action_id not in active_ids:
+                    self._consume_recovery_task(task)
+                    self._recovery_tasks.pop(pair_action_id, None)
+            if not active:
+                if self._recovery_tasks:
+                    return await self._record(
+                        SupervisorMode.BLOCKED,
+                        None,
+                        LiveActionState.FLAT,
+                        0,
+                        "RECOVERY_TASKS_REMAIN_ACTIVE",
+                        True,
+                        "TimeoutError",
+                    )
                 return await self._record(
                     SupervisorMode.IDLE,
                     None,
                     None,
+                    0,
                     "FLAT_NO_ACTIVE_ACTION",
                     False,
                     None,
                 )
+            representative = active[0]
             await self._record(
                 SupervisorMode.RECOVERY_ONLY,
-                active.pair_action_id,
-                active.state,
-                "RECOVERY_STARTED",
+                representative.pair_action_id,
+                representative.state if len(active) == 1 else None,
+                len(active),
+                f"RECOVERY_STARTED:{len(active)}",
                 True,
                 None,
             )
-            try:
-                await self._recovery_runner(active)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                current = await self._journal.active()
-                return await self._record(
-                    SupervisorMode.BLOCKED,
-                    current.pair_action_id if current is not None else active.pair_action_id,
-                    current.state if current is not None else active.state,
-                    "RECOVERY_FAILED_CLOSED",
-                    True,
-                    type(error).__name__,
-                )
-            current = await self._journal.active()
-            if current is None:
+            tasks: dict[str, asyncio.Task[object]] = {}
+            account_wide_recovery = len(active) > 1
+            for action in active:
+                recovery_task = self._recovery_tasks.get(action.pair_action_id)
+                if recovery_task is None:
+                    recovery_task = asyncio.create_task(
+                        self._run_recovery(
+                            action,
+                            (
+                                WorkPriority.EMERGENCY_FLATTEN
+                                if account_wide_recovery
+                                else _recovery_priority(action)
+                            ),
+                            (
+                                "live-recovery:account"
+                                if account_wide_recovery
+                                else f"live-recovery:{action.pair_action_id}"
+                            ),
+                        ),
+                        name=f"live-recovery-{action.pair_action_id}",
+                    )
+                    self._recovery_tasks[action.pair_action_id] = recovery_task
+                tasks[action.pair_action_id] = recovery_task
+            _done, pending = await asyncio.wait(
+                tasks.values(),
+                timeout=self._recovery_timeout_seconds,
+            )
+            failures_list: list[str] = []
+            for pair_action_id, task in tasks.items():
+                if task in pending:
+                    failures_list.append(f"{pair_action_id}:TimeoutError")
+                    continue
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    failures_list.append(f"{pair_action_id}:CancelledError")
+                except Exception as error:
+                    failures_list.append(f"{pair_action_id}:{type(error).__name__}")
+                finally:
+                    if self._recovery_tasks.get(pair_action_id) is task:
+                        self._recovery_tasks.pop(pair_action_id, None)
+            failures = tuple(failures_list)
+            current = await self._journal.active_actions()
+            if not current:
                 return await self._record(
                     SupervisorMode.IDLE,
                     None,
                     LiveActionState.FLAT,
+                    0,
                     "RECOVERY_EXCHANGE_VERIFIED_FLAT",
                     False,
                     None,
                 )
+            representative = current[0]
             return await self._record(
                 SupervisorMode.BLOCKED,
-                current.pair_action_id,
-                current.state,
-                "RECOVERY_REMAINS_ACTIVE",
+                representative.pair_action_id,
+                representative.state if len(current) == 1 else None,
+                len(current),
+                (
+                    f"RECOVERY_FAILED_CLOSED:{len(current)}"
+                    if failures
+                    else f"RECOVERY_REMAINS_ACTIVE:{len(current)}"
+                ),
                 True,
-                None,
+                "|".join(failures) if failures else None,
             )
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -166,15 +234,37 @@ class LiveSafetySupervisor:
                 except TimeoutError:
                     continue
         finally:
-            active = await self._journal.active()
+            recovery_tasks = tuple(self._recovery_tasks.values())
+            for task in recovery_tasks:
+                task.cancel()
+            if recovery_tasks:
+                done, pending = await asyncio.wait(
+                    recovery_tasks,
+                    timeout=self._recovery_timeout_seconds,
+                )
+                for task in done:
+                    self._consume_recovery_task(task)
+            else:
+                pending = set()
+            active = await self._journal.active_actions()
+            representative = active[0] if active else None
             await self._record(
                 SupervisorMode.STOPPED,
-                active.pair_action_id if active is not None else None,
-                active.state if active is not None else LiveActionState.FLAT,
+                representative.pair_action_id if representative is not None else None,
+                (
+                    representative.state
+                    if representative is not None and len(active) == 1
+                    else LiveActionState.FLAT
+                    if not active
+                    else None
+                ),
+                len(active),
                 "SUPERVISOR_STOPPED",
-                active is not None,
-                None,
+                bool(active),
+                "RecoveryShutdownTimeout" if pending else None,
             )
+            if pending:
+                raise RuntimeError("supervisor shutdown failed: recovery tasks remain active")
 
     async def health(self) -> SupervisorHealth:
         await self.initialise()
@@ -195,6 +285,7 @@ class LiveSafetySupervisor:
                     mode TEXT NOT NULL,
                     active_pair_action_id TEXT,
                     action_state TEXT,
+                    active_action_count INTEGER NOT NULL DEFAULT 0,
                     outcome TEXT NOT NULL,
                     recovery_required INTEGER NOT NULL CHECK (recovery_required IN (0, 1)),
                     failure TEXT,
@@ -212,12 +303,21 @@ class LiveSafetySupervisor:
                 """,
                 (SupervisorMode.IDLE.value, now),
             )
+            columns = {
+                str(row[1]) for row in database.execute("PRAGMA table_info(live_safety_supervisor)")
+            }
+            if "active_action_count" not in columns:
+                database.execute(
+                    "ALTER TABLE live_safety_supervisor "
+                    "ADD COLUMN active_action_count INTEGER NOT NULL DEFAULT 0"
+                )
 
     async def _record(
         self,
         mode: SupervisorMode,
         pair_action_id: str | None,
         action_state: LiveActionState | None,
+        active_action_count: int,
         outcome: str,
         recovery_required: bool,
         failure: str | None,
@@ -226,6 +326,7 @@ class LiveSafetySupervisor:
             mode,
             pair_action_id,
             action_state,
+            active_action_count,
             outcome,
             recovery_required,
             failure,
@@ -239,7 +340,8 @@ class LiveSafetySupervisor:
             database.execute(
                 """
                 UPDATE live_safety_supervisor
-                SET mode = ?, active_pair_action_id = ?, action_state = ?, outcome = ?,
+                SET mode = ?, active_pair_action_id = ?, action_state = ?,
+                    active_action_count = ?, outcome = ?,
                     recovery_required = ?, failure = ?, heartbeat_at = ?
                 WHERE singleton = 1
                 """,
@@ -247,6 +349,7 @@ class LiveSafetySupervisor:
                     health.mode.value,
                     health.active_pair_action_id,
                     health.action_state.value if health.action_state is not None else None,
+                    health.active_action_count,
                     health.outcome,
                     int(health.recovery_required),
                     health.failure,
@@ -262,3 +365,58 @@ class LiveSafetySupervisor:
         if row is None:
             raise RuntimeError("supervisor health is not initialised")
         return _health_from_row(row)
+
+    async def _run_recovery(
+        self,
+        action: LiveJournalAction,
+        priority: WorkPriority,
+        work_key: str,
+    ) -> object:
+        if self._priority_scheduler is None:
+            return await self._recovery_runner(action)
+        return await self._priority_scheduler.run(
+            priority,
+            work_key,
+            lambda: self._recovery_runner(action),
+        )
+
+    @staticmethod
+    def _consume_recovery_task(task: asyncio.Task[object]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            return
+
+
+def _recovery_priority(action: LiveJournalAction) -> WorkPriority:
+    emergency_actions = {
+        "EMERGENCY_FLATTEN",
+        "KILL_CANCEL_FLATTEN",
+        "CLOSE_ALL_LIVE",
+    }
+    risk_action = action.risk_reservation.get("action")
+    if action.recovery_action in emergency_actions or (
+        isinstance(risk_action, str) and risk_action in emergency_actions
+    ):
+        return WorkPriority.EMERGENCY_FLATTEN
+    if (
+        action.state == LiveActionState.PREPARED
+        and action.risk_reservation.get("supervisor_intent") == "LIVE_CANARY"
+        and action.risk_reservation.get("supervisor_queued") is True
+    ):
+        return WorkPriority.NEW_ENTRY
+    if action.state in {
+        LiveActionState.SUBMITTING,
+        LiveActionState.ACKNOWLEDGED,
+        LiveActionState.PARTIAL,
+        LiveActionState.FILLED,
+        LiveActionState.REJECTED,
+        LiveActionState.UNKNOWN,
+        LiveActionState.RECOVERING,
+    }:
+        return WorkPriority.UNMATCHED_HEDGE
+    if action.state in {LiveActionState.HEDGED, LiveActionState.CLOSING}:
+        return WorkPriority.NORMAL_CLOSE
+    return WorkPriority.PRIVATE_RECONCILE

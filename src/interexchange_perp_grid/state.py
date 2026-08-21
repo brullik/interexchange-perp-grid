@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import re
 import sqlite3
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -19,10 +25,13 @@ from interexchange_perp_grid.execution import (
     Side,
     Tranche,
 )
+from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.reason_codes import ReasonCode
+from interexchange_perp_grid.risk import RiskRequest, VenueProjection
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "14"
+STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS = 1.0
 SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS metadata (
@@ -56,6 +65,14 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS shadow_risk_reservations (
+        tranche_id TEXT PRIMARY KEY REFERENCES simulated_tranches(tranche_id) ON DELETE CASCADE,
+        reservation_id TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS command_audit (
         audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
         actor TEXT NOT NULL,
@@ -78,6 +95,38 @@ SCHEMA_STATEMENTS = (
         confirmed_until TEXT NOT NULL,
         confirmed_by TEXT NOT NULL,
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS risk_stage_runtime (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        stage TEXT NOT NULL,
+        qualification_hash TEXT,
+        runtime_policy_sha256 TEXT,
+        promoted_by TEXT NOT NULL,
+        promoted_at TEXT NOT NULL,
+        completion_frozen INTEGER NOT NULL DEFAULT 0 CHECK (completion_frozen IN (0, 1))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS risk_stage_results (
+        stage TEXT PRIMARY KEY,
+        qualification_hash TEXT NOT NULL,
+        runtime_policy_sha256 TEXT NOT NULL,
+        evidence_sha256 TEXT NOT NULL,
+        stable_flat_verified INTEGER NOT NULL CHECK (stable_flat_verified IN (0, 1)),
+        completed_by TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        journal_event_watermark INTEGER NOT NULL DEFAULT -1,
+        completed_actions_sha256 TEXT NOT NULL DEFAULT '',
+        journal_pair_actions_sha256 TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS live_entry_controls (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0
+            CHECK (risk_stage_completion_frozen IN (0, 1))
     )
     """,
     """
@@ -156,6 +205,81 @@ SCHEMA_STATEMENTS = (
         updated_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_observations (
+        observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        route TEXT NOT NULL,
+        size_bucket_multiplier TEXT NOT NULL,
+        epoch_id TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        UNIQUE(route, size_bucket_multiplier, epoch_id, observed_at)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_parameters (
+        route TEXT NOT NULL,
+        size_bucket_multiplier TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+        transient_blocked INTEGER NOT NULL DEFAULT 0 CHECK (transient_blocked IN (0, 1)),
+        PRIMARY KEY(route, size_bucket_multiplier)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_episodes (
+        route TEXT NOT NULL,
+        size_bucket_multiplier TEXT NOT NULL,
+        epoch_id TEXT NOT NULL,
+        spread_bucket_index INTEGER NOT NULL CHECK (spread_bucket_index BETWEEN 0 AND 4),
+        entry_spread_bps TEXT NOT NULL,
+        convergence_target_bps TEXT NOT NULL,
+        peak_spread_bps TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        PRIMARY KEY(route, size_bucket_multiplier, epoch_id, spread_bucket_index)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_segments (
+        route TEXT NOT NULL,
+        size_bucket_multiplier TEXT NOT NULL,
+        epoch_id TEXT NOT NULL,
+        ready_sample_count INTEGER NOT NULL CHECK (ready_sample_count >= 0),
+        segment_started_at TEXT,
+        last_observed_at TEXT NOT NULL,
+        last_reason TEXT NOT NULL,
+        PRIMARY KEY(route, size_bucket_multiplier, epoch_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration_runtime (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        epoch_id TEXT NOT NULL,
+        policy_fingerprint TEXT NOT NULL,
+        last_observed_at TEXT
+    )
+    """,
+)
+
+_SCHEMA_INDEX_STATEMENTS = (
+    """
+    CREATE INDEX IF NOT EXISTS route_calibration_observations_key_time_v8
+    ON route_calibration_observations(
+        route, size_bucket_multiplier, epoch_id, observed_at
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS route_calibration_observations_key_observed_v9
+    ON route_calibration_observations(
+        route, size_bucket_multiplier, observed_at
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS route_calibration_observations_observed_v9
+    ON route_calibration_observations(observed_at)
+    """,
 )
 
 _EPOCH_OBSERVATION_TABLES = (
@@ -171,6 +295,49 @@ class QualificationEpochStatus(StrEnum):
     RUNNING = "RUNNING"
     FINALIZED = "FINALIZED"
     CLOSED = "CLOSED"
+
+
+class RiskStage(StrEnum):
+    SHADOW = "shadow"
+    CANARY = "canary"
+    PILOT_A = "pilot_a"
+    PILOT_B = "pilot_b"
+    WAVE1_PROD = "wave1_prod"
+    FULL = "full"
+
+
+RISK_STAGE_ORDER = (
+    RiskStage.SHADOW,
+    RiskStage.CANARY,
+    RiskStage.PILOT_A,
+    RiskStage.PILOT_B,
+    RiskStage.WAVE1_PROD,
+    RiskStage.FULL,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RiskStageState:
+    stage: RiskStage
+    qualification_hash: str | None
+    runtime_policy_sha256: str | None
+    promoted_by: str
+    promoted_at: datetime
+    completion_frozen: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RiskStageResult:
+    stage: RiskStage
+    qualification_hash: str
+    runtime_policy_sha256: str
+    evidence_sha256: str
+    stable_flat_verified: bool
+    completed_by: str
+    completed_at: datetime
+    journal_event_watermark: int
+    completed_actions_sha256: str
+    journal_pair_actions_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,9 +380,127 @@ class CommandAudit:
     created_at: datetime
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    database = sqlite3.connect(path, timeout=30)
-    database.execute("PRAGMA busy_timeout=30000")
+class StateTransitionDeadlineError(RuntimeError):
+    """A daemon SQLite transition did not reach a knowable terminal state."""
+
+
+_STATE_WORKERS_LOCK = threading.Lock()
+_STATE_WORKERS: dict[Path, set[_DaemonStateWorker]] = {}
+_STATE_RECOVERY_LEASES: set[Path] = set()
+
+
+def _persistence_indeterminate_marker(path: Path) -> Path:
+    return path.with_name(f"{path.name}.indeterminate")
+
+
+def persistence_indeterminate_marker_exists(path: Path) -> bool:
+    return _persistence_indeterminate_marker(path).is_file()
+
+
+def mark_persistence_indeterminate(path: Path) -> None:
+    """Durably latch an unknown SQLite outcome without competing for its writer lock."""
+    marker = _persistence_indeterminate_marker(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary = marker.with_name(f"{marker.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write("INDETERMINATE\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def clear_persistence_indeterminate(path: Path) -> None:
+    _persistence_indeterminate_marker(path).unlink(missing_ok=True)
+
+
+class _DaemonStateWorker:
+    def __init__(self, operation: Callable[[], None], *, name: str, state_path: Path) -> None:
+        self._operation = operation
+        self._state_path = state_path.resolve()
+        self._done = threading.Event()
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        with _STATE_WORKERS_LOCK:
+            if self._state_path in _STATE_RECOVERY_LEASES:
+                raise RuntimeError("state recovery lease blocks new portfolio transitions")
+            _STATE_WORKERS.setdefault(self._state_path, set()).add(self)
+        self._thread.start()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def _run(self) -> None:
+        try:
+            self._operation()
+        except BaseException as error:
+            self._error = error
+        finally:
+            self._done.set()
+            with _STATE_WORKERS_LOCK:
+                workers = _STATE_WORKERS.get(self._state_path)
+                if workers is not None:
+                    workers.discard(self)
+                    if not workers:
+                        _STATE_WORKERS.pop(self._state_path, None)
+
+    def result(self) -> None:
+        if not self.done:
+            raise RuntimeError("state transition worker is not terminal")
+        if self._error is not None:
+            raise self._error
+
+
+def state_transition_workers_terminal(path: Path) -> bool:
+    with _STATE_WORKERS_LOCK:
+        return not _STATE_WORKERS.get(path.resolve())
+
+
+def acquire_state_recovery_lease(path: Path) -> bool:
+    resolved = path.resolve()
+    with _STATE_WORKERS_LOCK:
+        if _STATE_WORKERS.get(resolved) or resolved in _STATE_RECOVERY_LEASES:
+            return False
+        _STATE_RECOVERY_LEASES.add(resolved)
+        return True
+
+
+def release_state_recovery_lease(path: Path) -> None:
+    resolved = path.resolve()
+    with _STATE_WORKERS_LOCK:
+        if resolved not in _STATE_RECOVERY_LEASES:
+            raise RuntimeError("state recovery lease is not held")
+        _STATE_RECOVERY_LEASES.remove(resolved)
+
+
+async def _await_daemon_state_worker(
+    worker: _DaemonStateWorker,
+    *,
+    deadline_monotonic: float,
+) -> None:
+    loop = asyncio.get_running_loop()
+    while not worker.done:
+        remaining = deadline_monotonic - loop.time()
+        if remaining <= 0:
+            raise StateTransitionDeadlineError(
+                "SQLite state transition did not finish before its terminal deadline"
+            )
+        try:
+            await asyncio.sleep(min(0.005, remaining))
+        except asyncio.CancelledError:
+            # The native thread cannot be cancelled.  Continue only until the
+            # fixed terminal deadline, then surface an explicit indeterminate
+            # transition while the daemon worker cannot block process exit.
+            continue
+    worker.result()
+
+
+def _connect(path: Path, *, busy_timeout_ms: int = 30000) -> sqlite3.Connection:
+    database = sqlite3.connect(path, timeout=busy_timeout_ms / 1000)
+    database.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     database.execute("PRAGMA foreign_keys=ON")
     return database
 
@@ -239,9 +524,228 @@ def _initialise_state_sync(path: Path) -> None:
             "3",
             "4",
             "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "10",
+            "11",
+            "12",
+            "13",
             SCHEMA_VERSION,
         }:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
+        calibration_columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_observations)")
+        }
+        if (
+            existing is not None
+            and existing[0] == "7"
+            and "size_bucket_base_quantity" in calibration_columns
+        ):
+            for table in (
+                "route_calibration_observations",
+                "route_calibration_parameters",
+                "route_calibration_episodes",
+            ):
+                database.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy_v7")
+            for statement in SCHEMA_STATEMENTS:
+                database.execute(statement)
+        episode_columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(route_calibration_episodes)")
+        }
+        if "spread_bucket_index" not in episode_columns:
+            # Schema v10 allowed only one open episode per route/size.  Preserve
+            # its timeout/adverse evidence across the migration when the
+            # persisted entry levels identify its bucket.  If that mapping is
+            # unavailable, retain the row in bucket zero but deactivate the
+            # parameter so it cannot be exposed until a fresh calibration.
+            database.execute(
+                "ALTER TABLE route_calibration_episodes "
+                "RENAME TO route_calibration_episodes_legacy_v10"
+            )
+            database.execute(
+                """
+                CREATE TABLE route_calibration_episodes (
+                    route TEXT NOT NULL,
+                    size_bucket_multiplier TEXT NOT NULL,
+                    epoch_id TEXT NOT NULL,
+                    spread_bucket_index INTEGER NOT NULL
+                        CHECK (spread_bucket_index BETWEEN 0 AND 4),
+                    entry_spread_bps TEXT NOT NULL,
+                    convergence_target_bps TEXT NOT NULL,
+                    peak_spread_bps TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    PRIMARY KEY(
+                        route, size_bucket_multiplier, epoch_id, spread_bucket_index
+                    )
+                )
+                """
+            )
+            legacy_episodes = database.execute(
+                """
+                SELECT route, size_bucket_multiplier, epoch_id, entry_spread_bps,
+                       convergence_target_bps, peak_spread_bps, started_at
+                FROM route_calibration_episodes_legacy_v10
+                """
+            ).fetchall()
+            for episode in legacy_episodes:
+                route_value = str(episode[0])
+                size_value = str(episode[1])
+                entry_spread = Decimal(str(episode[3]))
+                bucket_index = 0
+                mapped = False
+                parameter_row = database.execute(
+                    """
+                    SELECT payload_json FROM route_calibration_parameters
+                    WHERE route = ? AND size_bucket_multiplier = ?
+                    """,
+                    (route_value, size_value),
+                ).fetchone()
+                if parameter_row is not None:
+                    try:
+                        payload = json.loads(str(parameter_row[0]))
+                        levels = tuple(Decimal(str(value)) for value in payload["entry_levels_bps"])
+                        if len(levels) == 5 and entry_spread >= levels[0]:
+                            bucket_index = max(
+                                index
+                                for index, lower_bound in enumerate(levels)
+                                if entry_spread >= lower_bound
+                            )
+                            mapped = True
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        mapped = False
+                database.execute(
+                    """
+                    INSERT INTO route_calibration_episodes(
+                        route, size_bucket_multiplier, epoch_id, spread_bucket_index,
+                        entry_spread_bps, convergence_target_bps, peak_spread_bps, started_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        route_value,
+                        size_value,
+                        str(episode[2]),
+                        bucket_index,
+                        str(episode[3]),
+                        str(episode[4]),
+                        str(episode[5]),
+                        str(episode[6]),
+                    ),
+                )
+                if not mapped:
+                    database.execute(
+                        """
+                        UPDATE route_calibration_parameters
+                        SET active = 0, transient_blocked = 1
+                        WHERE route = ? AND size_bucket_multiplier = ?
+                        """,
+                        (route_value, size_value),
+                    )
+            database.execute("DROP TABLE route_calibration_episodes_legacy_v10")
+        calibration_columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_observations)")
+        }
+        if "reason" not in calibration_columns:
+            database.execute(
+                """
+                ALTER TABLE route_calibration_observations
+                ADD COLUMN reason TEXT NOT NULL DEFAULT 'CALIBRATION_INSUFFICIENT'
+                """
+            )
+        parameter_columns = {
+            str(row[1])
+            for row in database.execute("PRAGMA table_info(route_calibration_parameters)")
+        }
+        if "active" not in parameter_columns:
+            database.execute(
+                """
+                ALTER TABLE route_calibration_parameters
+                ADD COLUMN active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+                """
+            )
+        if "transient_blocked" not in parameter_columns:
+            database.execute(
+                """
+                ALTER TABLE route_calibration_parameters
+                ADD COLUMN transient_blocked INTEGER NOT NULL DEFAULT 0
+                    CHECK (transient_blocked IN (0, 1))
+                """
+            )
+        risk_runtime_columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(risk_stage_runtime)")
+        }
+        if "completion_frozen" not in risk_runtime_columns:
+            database.execute(
+                "ALTER TABLE risk_stage_runtime ADD COLUMN completion_frozen INTEGER "
+                "NOT NULL DEFAULT 0 CHECK (completion_frozen IN (0, 1))"
+            )
+        risk_result_columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(risk_stage_results)")
+        }
+        legacy_risk_results = not {
+            "journal_event_watermark",
+            "completed_actions_sha256",
+            "journal_pair_actions_sha256",
+        }.issubset(risk_result_columns)
+        if legacy_risk_results:
+            database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS risk_stage_results_legacy_v13_archive (
+                    stage TEXT NOT NULL,
+                    qualification_hash TEXT NOT NULL,
+                    runtime_policy_sha256 TEXT NOT NULL,
+                    evidence_sha256 TEXT NOT NULL,
+                    stable_flat_verified INTEGER NOT NULL,
+                    completed_by TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    archived_at TEXT NOT NULL
+                )
+                """
+            )
+            database.execute(
+                """
+                INSERT INTO risk_stage_results_legacy_v13_archive(
+                    stage, qualification_hash, runtime_policy_sha256, evidence_sha256,
+                    stable_flat_verified, completed_by, completed_at, archived_at
+                )
+                SELECT stage, qualification_hash, runtime_policy_sha256, evidence_sha256,
+                       stable_flat_verified, completed_by, completed_at, ?
+                FROM risk_stage_results
+                """,
+                (datetime.now(UTC).isoformat(),),
+            )
+        if "journal_event_watermark" not in risk_result_columns:
+            database.execute(
+                "ALTER TABLE risk_stage_results ADD COLUMN journal_event_watermark "
+                "INTEGER NOT NULL DEFAULT -1"
+            )
+        if "completed_actions_sha256" not in risk_result_columns:
+            database.execute(
+                "ALTER TABLE risk_stage_results ADD COLUMN completed_actions_sha256 "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "journal_pair_actions_sha256" not in risk_result_columns:
+            database.execute(
+                "ALTER TABLE risk_stage_results ADD COLUMN journal_pair_actions_sha256 "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if legacy_risk_results:
+            database.execute("DELETE FROM risk_stage_results")
+            database.execute(
+                """
+                UPDATE risk_stage_runtime
+                SET stage = ?, qualification_hash = NULL, runtime_policy_sha256 = NULL,
+                    promoted_by = 'schema-v14-fail-closed-migration', promoted_at = ?,
+                    completion_frozen = 0
+                WHERE singleton = 1
+                """,
+                (RiskStage.SHADOW.value, datetime.now(UTC).isoformat()),
+            )
+        for statement in _SCHEMA_INDEX_STATEMENTS:
+            database.execute(statement)
         for table in _EPOCH_OBSERVATION_TABLES:
             columns = {str(row[1]) for row in database.execute(f"PRAGMA table_info({table})")}
             if "epoch_id" not in columns:
@@ -263,6 +767,19 @@ def _initialise_state_sync(path: Path) -> None:
             ) VALUES (1, 0, 0, 'PENDING', ?)
             """,
             (datetime.now(UTC).isoformat(),),
+        )
+        database.execute(
+            """
+            INSERT OR IGNORE INTO risk_stage_runtime(
+                singleton, stage, qualification_hash, runtime_policy_sha256,
+                promoted_by, promoted_at
+            ) VALUES (1, ?, NULL, NULL, 'system', ?)
+            """,
+            (RiskStage.SHADOW.value, datetime.now(UTC).isoformat()),
+        )
+        database.execute(
+            "INSERT OR IGNORE INTO live_entry_controls("
+            "singleton, risk_stage_completion_frozen) VALUES (1, 0)"
         )
         database.commit()
 
@@ -631,8 +1148,11 @@ async def read_service_health(
     )
 
 
-def _read_runtime_controls_sync(path: Path) -> RuntimeControls:
-    with _connect(path) as database:
+def _read_runtime_controls_sync(
+    path: Path,
+    busy_timeout_ms: int = 30000,
+) -> RuntimeControls:
+    with _connect(path, busy_timeout_ms=busy_timeout_ms) as database:
         row = database.execute(
             """
             SELECT paused, killed, reconciliation_state, updated_at
@@ -651,6 +1171,61 @@ def _read_runtime_controls_sync(path: Path) -> RuntimeControls:
 
 async def read_runtime_controls(path: Path) -> RuntimeControls:
     return await asyncio.to_thread(_read_runtime_controls_sync, path)
+
+
+class _RuntimeControlsReadWorker:
+    def __init__(self, path: Path, busy_timeout_ms: int) -> None:
+        self._path = path
+        self._busy_timeout_ms = busy_timeout_ms
+        self._done = threading.Event()
+        self._result: RuntimeControls | None = None
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="runtime-controls-read",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def _run(self) -> None:
+        try:
+            self._result = _read_runtime_controls_sync(self._path, self._busy_timeout_ms)
+        except BaseException as error:
+            self._error = error
+        finally:
+            self._done.set()
+
+    def result(self) -> RuntimeControls:
+        if not self.done:
+            raise RuntimeError("runtime controls read is not terminal")
+        if self._error is not None:
+            raise self._error
+        if self._result is None:
+            raise RuntimeError("runtime controls read returned no result")
+        return self._result
+
+
+async def read_runtime_controls_bounded(
+    path: Path,
+    *,
+    timeout_seconds: float = 0.1,
+    busy_timeout_ms: int = 50,
+) -> RuntimeControls:
+    if timeout_seconds <= 0 or busy_timeout_ms <= 0:
+        raise ValueError("runtime controls read bounds must be positive")
+    worker = _RuntimeControlsReadWorker(path, busy_timeout_ms)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    while not worker.done:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("runtime controls read exceeded its deadline")
+        await asyncio.sleep(min(0.005, remaining))
+    return worker.result()
 
 
 def _update_runtime_controls_sync(
@@ -672,7 +1247,12 @@ def _update_runtime_controls_sync(
         next_reconciliation = (
             str(current[2]) if reconciliation_state is None else reconciliation_state
         )
-        if next_reconciliation not in {"PENDING", "CONSISTENT", "INCONSISTENT"}:
+        if next_reconciliation not in {
+            "PENDING",
+            "CONSISTENT",
+            "INCONSISTENT",
+            "INDETERMINATE",
+        }:
             raise ValueError("invalid reconciliation state")
         database.execute(
             """
@@ -845,7 +1425,60 @@ def _tranche_from_payload(payload: dict[str, Any]) -> Tranche:
     )
 
 
-def _save_tranche_sync(path: Path, tranche: Tranche, now: datetime) -> None:
+def _risk_request_to_payload(request: RiskRequest) -> dict[str, Any]:
+    return {
+        "reservation_id": request.reservation_id,
+        "route_id": request.route_id,
+        "base": request.base,
+        "tranche_id": request.tranche_id,
+        "projected_stress_usdt": str(request.projected_stress_usdt),
+        "exit_depth_sufficient": request.exit_depth_sufficient,
+        "venues": [
+            {
+                "venue": projection.venue.value,
+                "equity_usdt": str(projection.equity_usdt),
+                "projected_notional_usdt": str(projection.projected_notional_usdt),
+                "projected_margin_used_usdt": str(projection.projected_margin_used_usdt),
+                "venue_stress_usdt": str(projection.venue_stress_usdt),
+            }
+            for projection in request.venues
+        ],
+    }
+
+
+def _risk_request_from_payload(payload: dict[str, Any]) -> RiskRequest:
+    exit_depth_sufficient = payload["exit_depth_sufficient"]
+    if not isinstance(exit_depth_sufficient, bool):
+        raise ValueError("persisted risk depth flag must be boolean")
+    return RiskRequest(
+        reservation_id=str(payload["reservation_id"]),
+        route_id=str(payload["route_id"]),
+        base=str(payload["base"]),
+        tranche_id=str(payload["tranche_id"]),
+        projected_stress_usdt=Decimal(str(payload["projected_stress_usdt"])),
+        venues=tuple(
+            VenueProjection(
+                venue=Venue(str(item["venue"])),
+                equity_usdt=Decimal(str(item["equity_usdt"])),
+                projected_notional_usdt=Decimal(str(item["projected_notional_usdt"])),
+                projected_margin_used_usdt=Decimal(str(item["projected_margin_used_usdt"])),
+                venue_stress_usdt=Decimal(str(item["venue_stress_usdt"])),
+            )
+            for item in payload["venues"]
+        ),
+        exit_depth_sufficient=exit_depth_sufficient,
+    )
+
+
+def _save_tranche_sync(
+    path: Path,
+    tranche: Tranche,
+    now: datetime,
+    deadline_monotonic: float | None,
+    risk_reservation: RiskRequest | None,
+) -> None:
+    if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+        raise TimeoutError("simulated tranche persistence deadline expired")
     payload = json.dumps(_tranche_to_payload(tranche), sort_keys=True, separators=(",", ":"))
     with _connect(path) as database:
         database.execute("BEGIN IMMEDIATE")
@@ -860,11 +1493,116 @@ def _save_tranche_sync(path: Path, tranche: Tranche, now: datetime) -> None:
             """,
             (tranche.tranche_id, tranche.state.value, payload, now.isoformat()),
         )
+        reservation_states = {
+            PairActionState.PARTIALLY_HEDGED,
+            PairActionState.HEDGED,
+            PairActionState.CLOSING,
+            PairActionState.UNKNOWN_ORDER,
+            PairActionState.RECOVERING,
+            PairActionState.EMERGENCY_HEDGED,
+        }
+        if risk_reservation is not None:
+            if (
+                tranche.state not in reservation_states
+                or risk_reservation.reservation_id != tranche.tranche_id
+                or risk_reservation.tranche_id != tranche.tranche_id
+                or risk_reservation.route_id != tranche.route.value
+                or risk_reservation.base != tranche.route.base
+                or risk_reservation.projected_stress_usdt != tranche.projected_stress_usdt
+                or {projection.venue for projection in risk_reservation.venues}
+                != {tranche.route.long_venue, tranche.route.short_venue}
+            ):
+                database.rollback()
+                raise ValueError("risk reservation does not match persisted tranche")
+            reservation_payload = json.dumps(
+                _risk_request_to_payload(risk_reservation),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            database.execute(
+                """
+                INSERT INTO shadow_risk_reservations(
+                    tranche_id, reservation_id, payload_json, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(tranche_id) DO UPDATE SET
+                    reservation_id = excluded.reservation_id,
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    tranche.tranche_id,
+                    risk_reservation.reservation_id,
+                    reservation_payload,
+                    now.isoformat(),
+                ),
+            )
+        elif tranche.state not in reservation_states:
+            database.execute(
+                "DELETE FROM shadow_risk_reservations WHERE tranche_id = ?",
+                (tranche.tranche_id,),
+            )
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            database.rollback()
+            raise TimeoutError("simulated tranche persistence deadline expired")
         database.commit()
 
 
-async def save_tranche(path: Path, tranche: Tranche, now: datetime | None = None) -> None:
-    await asyncio.to_thread(_save_tranche_sync, path, tranche, now or datetime.now(UTC))
+async def save_tranche(
+    path: Path,
+    tranche: Tranche,
+    now: datetime | None = None,
+    *,
+    deadline_monotonic: float | None = None,
+    risk_reservation: RiskRequest | None = None,
+) -> None:
+    loop = asyncio.get_running_loop()
+    if deadline_monotonic is not None and loop.time() >= deadline_monotonic:
+        raise TimeoutError("simulated tranche persistence deadline expired")
+    terminal_deadline = min(
+        deadline_monotonic or float("inf"),
+        loop.time() + STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS,
+    )
+    worker = _DaemonStateWorker(
+        lambda: _save_tranche_sync(
+            path,
+            tranche,
+            now or datetime.now(UTC),
+            deadline_monotonic,
+            risk_reservation,
+        ),
+        name=f"state-save-tranche-{tranche.tranche_id}",
+        state_path=path,
+    )
+    await _await_daemon_state_worker(worker, deadline_monotonic=terminal_deadline)
+
+
+def _delete_tranche_sync(path: Path, tranche_id: str) -> None:
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        database.execute(
+            "DELETE FROM simulated_tranches WHERE tranche_id = ?",
+            (tranche_id,),
+        )
+        database.commit()
+
+
+async def delete_tranche(
+    path: Path,
+    tranche_id: str,
+    *,
+    timeout_seconds: float = STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS,
+) -> None:
+    if timeout_seconds <= 0:
+        raise ValueError("tranche deletion timeout must be positive")
+    worker = _DaemonStateWorker(
+        lambda: _delete_tranche_sync(path, tranche_id),
+        name=f"state-delete-tranche-{tranche_id}",
+        state_path=path,
+    )
+    await _await_daemon_state_worker(
+        worker,
+        deadline_monotonic=asyncio.get_running_loop().time() + timeout_seconds,
+    )
 
 
 def _load_tranches_sync(path: Path) -> tuple[Tranche, ...]:
@@ -877,6 +1615,47 @@ def _load_tranches_sync(path: Path) -> tuple[Tranche, ...]:
 
 async def load_tranches(path: Path) -> tuple[Tranche, ...]:
     return await asyncio.to_thread(_load_tranches_sync, path)
+
+
+def _load_shadow_portfolio_sync(
+    path: Path,
+    busy_timeout_ms: int = 30000,
+) -> tuple[tuple[Tranche, ...], tuple[RiskRequest, ...]]:
+    with _connect(path, busy_timeout_ms=busy_timeout_ms) as database:
+        database.execute("BEGIN")
+        tranche_rows = database.execute(
+            "SELECT tranche_id, payload_json FROM simulated_tranches ORDER BY tranche_id"
+        ).fetchall()
+        reservation_rows = database.execute(
+            """
+            SELECT tranche_id, reservation_id, payload_json
+            FROM shadow_risk_reservations ORDER BY reservation_id
+            """
+        ).fetchall()
+        database.commit()
+    tranches = tuple(_tranche_from_payload(json.loads(str(row[1]))) for row in tranche_rows)
+    requests = tuple(
+        _risk_request_from_payload(json.loads(str(row[2]))) for row in reservation_rows
+    )
+    if any(
+        str(row[0]) != tranche.tranche_id
+        for row, tranche in zip(tranche_rows, tranches, strict=True)
+    ):
+        raise ValueError("persisted tranche row identity does not match its payload")
+    if any(
+        str(row[0]) != request.tranche_id or str(row[1]) != request.reservation_id
+        for row, request in zip(reservation_rows, requests, strict=True)
+    ):
+        raise ValueError("persisted risk row identity does not match its payload")
+    return tranches, requests
+
+
+async def load_shadow_portfolio(
+    path: Path,
+    *,
+    busy_timeout_ms: int = 30000,
+) -> tuple[tuple[Tranche, ...], tuple[RiskRequest, ...]]:
+    return await asyncio.to_thread(_load_shadow_portfolio_sync, path, busy_timeout_ms)
 
 
 def _save_shadow_snapshot_sync(path: Path, payload: dict[str, Any], now: datetime) -> None:
@@ -979,6 +1758,339 @@ async def live_confirmation_valid(path: Path, now: datetime | None = None) -> bo
     return await asyncio.to_thread(
         _live_confirmation_valid_sync,
         path,
+        now or datetime.now(UTC),
+    )
+
+
+def _risk_stage_from_row(row: tuple[object, ...]) -> RiskStageState:
+    return RiskStageState(
+        stage=RiskStage(str(row[0])),
+        qualification_hash=str(row[1]) if row[1] is not None else None,
+        runtime_policy_sha256=str(row[2]) if row[2] is not None else None,
+        promoted_by=str(row[3]),
+        promoted_at=datetime.fromisoformat(str(row[4])),
+        completion_frozen=bool(row[5]),
+    )
+
+
+def _read_risk_stage_sync(path: Path) -> RiskStageState:
+    with _connect(path) as database:
+        row = database.execute(
+            """
+            SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, promoted_at,
+                   completion_frozen
+            FROM risk_stage_runtime WHERE singleton = 1
+            """
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("risk stage state is unavailable")
+    return _risk_stage_from_row(row)
+
+
+async def read_risk_stage(path: Path) -> RiskStageState:
+    return await asyncio.to_thread(_read_risk_stage_sync, path)
+
+
+def _record_risk_stage_result_sync(
+    path: Path,
+    stage: RiskStage,
+    qualification_hash: str,
+    runtime_policy_sha256: str,
+    evidence_sha256: str,
+    stable_flat_verified: bool,
+    actor: str,
+    journal_event_watermark: int,
+    completed_actions_sha256: str,
+    journal_pair_actions_sha256: str,
+    expected_pair_action_ids: tuple[str, ...],
+    now: datetime,
+) -> RiskStageResult:
+    if stage == RiskStage.SHADOW:
+        raise ValueError("shadow does not produce a live risk-stage result")
+    if not actor.strip():
+        raise ValueError("risk stage result actor must be non-empty")
+    for value, label in (
+        (qualification_hash, "qualification"),
+        (runtime_policy_sha256, "runtime policy"),
+        (evidence_sha256, "evidence"),
+        (completed_actions_sha256, "completed actions"),
+        (journal_pair_actions_sha256, "journal pair actions"),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"risk stage result requires an exact {label} hash")
+    if not stable_flat_verified:
+        raise ValueError("risk stage result requires independently verified stable FLAT")
+    if journal_event_watermark < 0:
+        raise ValueError("risk stage result requires a non-negative journal watermark")
+    if tuple(sorted(expected_pair_action_ids)) != expected_pair_action_ids or len(
+        set(expected_pair_action_ids)
+    ) != len(expected_pair_action_ids):
+        raise ValueError("risk stage result pair action IDs must be unique and sorted")
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        database.row_factory = sqlite3.Row
+        runtime = database.execute(
+            "SELECT stage, qualification_hash, runtime_policy_sha256, promoted_at "
+            "FROM risk_stage_runtime WHERE singleton = 1"
+        ).fetchone()
+        if runtime is None or RiskStage(str(runtime[0])) != stage:
+            database.rollback()
+            raise RuntimeError("risk stage changed before its result was recorded")
+        if str(runtime[1]) != qualification_hash or str(runtime[2]) != runtime_policy_sha256:
+            database.rollback()
+            raise ValueError("risk stage result identity does not match current promotion")
+        active_count = int(
+            database.execute(
+                "SELECT count(*) FROM live_pair_actions WHERE state <> 'FLAT'"
+            ).fetchone()[0]
+        )
+        if active_count:
+            database.rollback()
+            raise RuntimeError("risk stage completion requires zero active live actions")
+        observed_ids, observed_completed_sha256 = LiveOrderJournal(
+            path
+        ).completed_normal_snapshot_in_transaction(
+            database,
+            datetime.fromisoformat(str(runtime[3])),
+            qualification_hash,
+        )
+        if observed_ids != expected_pair_action_ids:
+            database.rollback()
+            raise RuntimeError("live action journal changed before stage completion freeze")
+        if observed_completed_sha256 != completed_actions_sha256:
+            database.rollback()
+            raise RuntimeError(
+                "completed paired-cycle content changed before stage completion freeze"
+            )
+        observed_watermark = int(
+            database.execute("SELECT count(*) FROM live_order_events").fetchone()[0]
+        ) + int(database.execute("SELECT count(*) FROM live_journal_audit_events").fetchone()[0])
+        if observed_watermark != journal_event_watermark:
+            database.rollback()
+            raise RuntimeError("live journal watermark changed before stage completion freeze")
+        existing = database.execute(
+            "SELECT qualification_hash, runtime_policy_sha256, evidence_sha256, "
+            "stable_flat_verified, completed_by, completed_at, journal_event_watermark, "
+            "completed_actions_sha256, journal_pair_actions_sha256 "
+            "FROM risk_stage_results WHERE stage = ?",
+            (stage.value,),
+        ).fetchone()
+        values = (
+            qualification_hash,
+            runtime_policy_sha256,
+            evidence_sha256,
+            1,
+            actor,
+            now.isoformat(),
+            journal_event_watermark,
+            completed_actions_sha256,
+            journal_pair_actions_sha256,
+        )
+        if existing is None:
+            database.execute(
+                "INSERT INTO risk_stage_results(stage, qualification_hash, "
+                "runtime_policy_sha256, evidence_sha256, stable_flat_verified, "
+                "completed_by, completed_at, journal_event_watermark, "
+                "completed_actions_sha256, journal_pair_actions_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (stage.value, *values),
+            )
+        elif tuple(existing[:4]) != values[:4] or tuple(existing[6:9]) != values[6:9]:
+            database.rollback()
+            raise RuntimeError("risk stage result is immutable and already differs")
+        database.execute("UPDATE risk_stage_runtime SET completion_frozen = 1 WHERE singleton = 1")
+        database.execute(
+            "UPDATE live_entry_controls SET risk_stage_completion_frozen = 1 WHERE singleton = 1"
+        )
+        database.commit()
+    with _connect(path) as database:
+        row = database.execute(
+            "SELECT qualification_hash, runtime_policy_sha256, evidence_sha256, "
+            "stable_flat_verified, completed_by, completed_at, journal_event_watermark, "
+            "completed_actions_sha256, journal_pair_actions_sha256 "
+            "FROM risk_stage_results WHERE stage = ?",
+            (stage.value,),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("risk stage result was not persisted")
+    return RiskStageResult(
+        stage=stage,
+        qualification_hash=str(row[0]),
+        runtime_policy_sha256=str(row[1]),
+        evidence_sha256=str(row[2]),
+        stable_flat_verified=bool(row[3]),
+        completed_by=str(row[4]),
+        completed_at=datetime.fromisoformat(str(row[5])),
+        journal_event_watermark=int(row[6]),
+        completed_actions_sha256=str(row[7]),
+        journal_pair_actions_sha256=str(row[8]),
+    )
+
+
+async def record_risk_stage_result(
+    path: Path,
+    stage: RiskStage,
+    qualification_hash: str,
+    runtime_policy_sha256: str,
+    evidence_sha256: str,
+    stable_flat_verified: bool,
+    actor: str,
+    journal_event_watermark: int,
+    completed_actions_sha256: str,
+    journal_pair_actions_sha256: str,
+    expected_pair_action_ids: tuple[str, ...],
+    now: datetime | None = None,
+) -> RiskStageResult:
+    return await asyncio.to_thread(
+        _record_risk_stage_result_sync,
+        path,
+        stage,
+        qualification_hash,
+        runtime_policy_sha256,
+        evidence_sha256,
+        stable_flat_verified,
+        actor,
+        journal_event_watermark,
+        completed_actions_sha256,
+        journal_pair_actions_sha256,
+        expected_pair_action_ids,
+        now or datetime.now(UTC),
+    )
+
+
+def _promote_risk_stage_sync(
+    path: Path,
+    expected_current: RiskStage,
+    target: RiskStage,
+    qualification_hash: str,
+    runtime_policy_sha256: str,
+    actor: str,
+    confirmation: str,
+    now: datetime,
+) -> RiskStageState:
+    if not actor.strip():
+        raise ValueError("risk stage promotion actor must be non-empty")
+    if not re.fullmatch(r"[0-9a-f]{64}", qualification_hash):
+        raise ValueError("risk stage promotion requires an exact qualification hash")
+    if not re.fullmatch(r"[0-9a-f]{64}", runtime_policy_sha256):
+        raise ValueError("risk stage promotion requires an exact runtime policy hash")
+    if confirmation != f"PROMOTE:{target.value}":
+        raise ValueError("risk stage promotion confirmation does not match the target")
+    expected_index = RISK_STAGE_ORDER.index(expected_current)
+    if (
+        expected_index + 1 >= len(RISK_STAGE_ORDER)
+        or RISK_STAGE_ORDER[expected_index + 1] != target
+    ):
+        raise ValueError("risk stage promotion must advance exactly one locked stage")
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        database.row_factory = sqlite3.Row
+        row = database.execute(
+            """
+            SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, promoted_at,
+                   completion_frozen
+            FROM risk_stage_runtime WHERE singleton = 1
+            """
+        ).fetchone()
+        if row is None:
+            database.rollback()
+            raise RuntimeError("risk stage state is unavailable")
+        current = _risk_stage_from_row(row)
+        if current.stage != expected_current:
+            database.rollback()
+            raise RuntimeError(
+                f"risk stage changed concurrently: expected {expected_current.value}, "
+                f"observed {current.stage.value}"
+            )
+        if expected_current != RiskStage.SHADOW:
+            result = database.execute(
+                "SELECT qualification_hash, runtime_policy_sha256, stable_flat_verified, "
+                "journal_event_watermark, journal_pair_actions_sha256, "
+                "completed_actions_sha256 "
+                "FROM risk_stage_results WHERE stage = ?",
+                (expected_current.value,),
+            ).fetchone()
+            if (
+                result is None
+                or current.qualification_hash is None
+                or str(result[0]) != current.qualification_hash
+                or str(result[1]) != runtime_policy_sha256
+                or not bool(result[2])
+                or not current.completion_frozen
+            ):
+                database.rollback()
+                raise RuntimeError(
+                    "current risk stage has no matching stable-FLAT completion result"
+                )
+            active_count = int(
+                database.execute(
+                    "SELECT count(*) FROM live_pair_actions WHERE state <> 'FLAT'"
+                ).fetchone()[0]
+            )
+            observed_watermark = int(
+                database.execute("SELECT count(*) FROM live_order_events").fetchone()[0]
+            ) + int(
+                database.execute("SELECT count(*) FROM live_journal_audit_events").fetchone()[0]
+            )
+            observed_ids, observed_completed_sha256 = LiveOrderJournal(
+                path
+            ).completed_normal_snapshot_in_transaction(
+                database,
+                current.promoted_at,
+                current.qualification_hash,
+            )
+            observed_actions_sha256 = hashlib.sha256(
+                json.dumps(observed_ids, separators=(",", ":")).encode()
+            ).hexdigest()
+            if (
+                active_count
+                or observed_watermark != int(result[3])
+                or observed_actions_sha256 != str(result[4])
+                or observed_completed_sha256 != str(result[5])
+            ):
+                database.rollback()
+                raise RuntimeError("live journal changed after risk-stage completion freeze")
+        database.execute(
+            """
+            UPDATE risk_stage_runtime
+            SET stage = ?, qualification_hash = ?, runtime_policy_sha256 = ?,
+                promoted_by = ?, promoted_at = ?, completion_frozen = 0
+            WHERE singleton = 1
+            """,
+            (
+                target.value,
+                qualification_hash,
+                runtime_policy_sha256,
+                actor,
+                now.isoformat(),
+            ),
+        )
+        database.execute(
+            "UPDATE live_entry_controls SET risk_stage_completion_frozen = 0 WHERE singleton = 1"
+        )
+        database.commit()
+    return _read_risk_stage_sync(path)
+
+
+async def promote_risk_stage(
+    path: Path,
+    expected_current: RiskStage,
+    target: RiskStage,
+    qualification_hash: str,
+    runtime_policy_sha256: str,
+    actor: str,
+    confirmation: str,
+    now: datetime | None = None,
+) -> RiskStageState:
+    return await asyncio.to_thread(
+        _promote_risk_stage_sync,
+        path,
+        expected_current,
+        target,
+        qualification_hash,
+        runtime_policy_sha256,
+        actor,
+        confirmation,
         now or datetime.now(UTC),
     )
 

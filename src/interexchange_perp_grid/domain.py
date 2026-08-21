@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -10,6 +10,14 @@ class Venue(StrEnum):
     BINANCE_USDM = "binanceusdm"
     BYBIT = "bybit"
     OKX = "okx"
+    BITGET = "bitget"
+    KUCOIN_FUTURES = "kucoinfutures"
+    BINGX = "bingx"
+    MEXC = "mexc"
+
+
+WAVE1_VENUES = (Venue.BINANCE_USDM, Venue.BYBIT, Venue.OKX)
+NO_FIXED_MINIMUM_NOTIONAL_VENUES = frozenset({Venue.OKX, Venue.KUCOIN_FUTURES, Venue.MEXC})
 
 
 class BookSide(StrEnum):
@@ -17,10 +25,16 @@ class BookSide(StrEnum):
     ASK = "ask"
 
 
+class ProductType(StrEnum):
+    LINEAR_USDT_PERPETUAL = "linear_usdt_perpetual"
+
+
 @dataclass(frozen=True, slots=True, order=True)
 class InstrumentKey:
     base: str
     settle: str
+    quote: str = "USDT"
+    product_type: ProductType = ProductType.LINEAR_USDT_PERPETUAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,10 +52,25 @@ class Instrument:
     minimum_notional: Decimal | None
     taker_fee_rate: Decimal | None
     fee_source: str | None
+    active: bool = True
+    listed_at: datetime | None = None
+    product_type: ProductType = ProductType.LINEAR_USDT_PERPETUAL
+    no_fixed_minimum_notional: bool = False
+
+    def __post_init__(self) -> None:
+        if self.listed_at is not None and self.listed_at.tzinfo is None:
+            raise ValueError("instrument listing timestamp must be timezone-aware")
+        if self.listed_at is not None and self.listed_at.utcoffset() is None:
+            raise ValueError("instrument listing timestamp must have a UTC offset")
 
     @property
     def key(self) -> InstrumentKey:
-        return InstrumentKey(self.base, self.settle)
+        return InstrumentKey(
+            base=self.base,
+            settle=self.settle,
+            quote=self.quote,
+            product_type=self.product_type,
+        )
 
     @property
     def base_amount_step(self) -> Decimal:
@@ -50,6 +79,13 @@ class Instrument:
     @property
     def minimum_base_amount(self) -> Decimal:
         return self.minimum_amount_contracts * self.contract_size_base
+
+    def listing_age_seconds(self, now: datetime) -> Decimal | None:
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("listing-age clock must be timezone-aware")
+        if self.listed_at is None:
+            return None
+        return Decimal(str((now.astimezone(UTC) - self.listed_at.astimezone(UTC)).total_seconds()))
 
 
 @dataclass(frozen=True, slots=True)

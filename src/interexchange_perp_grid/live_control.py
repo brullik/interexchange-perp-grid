@@ -6,9 +6,9 @@ import json
 import os
 import secrets
 import time
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass
-from decimal import Decimal
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from decimal import Decimal, DecimalException
 
 from interexchange_perp_grid.client_ids import (
     is_bot_client_order_id,
@@ -18,9 +18,11 @@ from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import ExecutionIntent, OrderPurpose, Side
 from interexchange_perp_grid.live_coordinator import CanaryVenueAdapter
 from interexchange_perp_grid.live_journal import (
+    JournalLeg,
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
+    request_payload_hash,
 )
 from interexchange_perp_grid.live_reconciliation import (
     FlatBarrierPolicy,
@@ -28,6 +30,7 @@ from interexchange_perp_grid.live_reconciliation import (
     ReconciliationReport,
     collect_private_states,
     combined_event_watermark,
+    find_private_order_by_client_id,
     flat_barrier_failure_reason,
     reconcile_private_states,
     wait_for_stable_flat,
@@ -44,6 +47,7 @@ from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 EMERGENCY_CONFIRMATION = "I_CONFIRM_EMERGENCY_FLATTEN_ALL_LIVE_EXPOSURE"
+_ACCOUNT_FLATTEN_LOCKS: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +99,7 @@ class LiveControlService:
     async def snapshot(self) -> dict[str, object]:
         await self._journal.initialise()
         states = await collect_private_states(self._adapters, self._account_instruments)
-        active = await self._journal.active()
+        active = await self._journal.active_actions()
         positions = [
             {
                 "venue": position.venue.value,
@@ -122,11 +126,22 @@ class LiveControlService:
             }
             for venue, state in sorted(states.items(), key=lambda item: item[0].value)
         ]
+        private_state_known = all(
+            state.error is None
+            and state.completeness == SnapshotCompleteness.COMPLETE
+            and state.account_wide
+            and not state.unknown_active_records
+            and state.raw_open_order_count == len(state.open_orders)
+            and state.raw_nonzero_position_count == len(state.positions)
+            for state in states.values()
+        )
+        risk = _live_risk_snapshot(active, positions, private_state_known=private_state_known)
         return {
             "source": "PRIVATE_EXCHANGE",
             "status": {
-                "journal_state": active.state.value if active else LiveActionState.FLAT.value,
-                "pair_action_id": active.pair_action_id if active else None,
+                "journal_state": _journal_state(active),
+                "pair_action_id": active[0].pair_action_id if len(active) == 1 else None,
+                "pair_action_ids": tuple(action.pair_action_id for action in active),
                 "private_state_errors": {
                     venue.value: state.error
                     for venue, state in states.items()
@@ -159,6 +174,7 @@ class LiveControlService:
                     )
                 )
             },
+            "risk": risk,
         }
 
     async def cancel_all_live(self) -> LiveControlResult:
@@ -203,13 +219,13 @@ class LiveControlService:
                 for state in refreshed.values()
             )
         )
-        active = await self._journal.active()
+        active = await self._journal.active_actions()
         return LiveControlResult(
             success,
             "CANCEL_ALL_LIVE" if bot_only else "CANCEL_ALL_ACCOUNT_ORDERS",
             0,
             cancelled,
-            active.state if active else None,
+            _terminal_state(active),
             None,
             None
             if success
@@ -226,6 +242,136 @@ class LiveControlService:
         return await self._flatten("KILL_CANCEL_FLATTEN")
 
     async def _flatten(self, action_name: str) -> LiveControlResult:
+        async with _account_flatten_lock(self._journal):
+            lease_token = await self._journal.acquire_account_flatten_lease()
+            if lease_token is None:
+                return LiveControlResult(
+                    False,
+                    action_name,
+                    0,
+                    0,
+                    None,
+                    None,
+                    "Another account-wide flatten is in progress; keep live disabled.",
+                    reason=ReasonCode.RECONCILIATION_INCOMPLETE,
+                )
+            try:
+                await self._reconcile_attempted_legs_from_exchange()
+                resumed_submits = await self._resume_attempted_emergency_legs()
+                result = await self._flatten_owned(action_name)
+                if resumed_submits:
+                    result = replace(
+                        result,
+                        orders_sent=result.orders_sent + resumed_submits,
+                    )
+            except BaseException:
+                # Indeterminate network work keeps exclusive ownership. A restarted process
+                # may adopt only after the old process incarnation is no longer live.
+                raise
+            await self._journal.release_account_flatten_lease(lease_token)
+            return result
+
+    async def _reconcile_attempted_legs_from_exchange(self) -> None:
+        """Persist exchange-visible outcomes that a killed process did not journal locally."""
+        active = await self._journal.active_actions()
+        unresolved = tuple(
+            (action.pair_action_id, leg)
+            for action in active
+            for leg in action.legs
+            if leg.submit_attempted and leg.status in {None, PrivateOrderStatus.UNKNOWN}
+        )
+        await asyncio.gather(
+            *(
+                self._reconcile_attempted_leg(pair_action_id, leg)
+                for pair_action_id, leg in unresolved
+            ),
+            return_exceptions=True,
+        )
+
+    async def _reconcile_attempted_leg(
+        self,
+        pair_action_id: str,
+        leg: JournalLeg,
+    ) -> None:
+        instrument = self._instrument(leg.venue, leg.symbol)
+        order = await find_private_order_by_client_id(
+            self._adapters[leg.venue],
+            leg.venue,
+            leg.client_order_id,
+            instrument,
+        )
+        if order is None:
+            return
+        await self._journal.record_order_event(
+            pair_action_id,
+            order,
+            (
+                f"restart:{order.order_id or 'none'}:{order.status.value}:"
+                f"{order.filled_base_quantity}:{order.observed_at.isoformat()}"
+            ),
+        )
+
+    async def _resume_attempted_emergency_legs(self) -> int:
+        active = await self._journal.active_actions()
+        submissions = 0
+        for action in active:
+            for leg in action.legs:
+                if (
+                    not leg.submit_attempted
+                    or leg.protected_price is not None
+                    or leg.status
+                    in {
+                        PrivateOrderStatus.FILLED,
+                        PrivateOrderStatus.CANCELLED,
+                        PrivateOrderStatus.REJECTED,
+                    }
+                ):
+                    continue
+                submissions += await self._resume_attempted_emergency_leg(action, leg)
+        return submissions
+
+    async def _resume_attempted_emergency_leg(
+        self,
+        action: LiveJournalAction,
+        leg: JournalLeg,
+    ) -> int:
+        instrument = self._instrument(leg.venue, leg.symbol)
+        request = translate_protected_order(
+            ExecutionIntent(
+                client_order_id=leg.client_order_id,
+                venue=leg.venue,
+                side=leg.side,
+                purpose=OrderPurpose.EMERGENCY_CLOSE,
+                quantity=leg.intended_base_quantity,
+                worst_acceptable_price=None,
+                unbounded_market=True,
+            ),
+            instrument,
+        )
+        if request_payload_hash(request) != leg.request_payload_hash:
+            raise RuntimeError("journaled emergency request cannot be reconstructed exactly")
+        adapter = self._adapters[leg.venue]
+        order = await find_private_order_by_client_id(
+            adapter,
+            leg.venue,
+            leg.client_order_id,
+            instrument,
+        )
+        if order is None:
+            raise RuntimeError("journaled emergency order remains unknown")
+        await self._journal.record_order_event(
+            action.pair_action_id,
+            order,
+            (
+                f"{order.order_id or 'none'}:{order.status.value}:"
+                f"{order.filled_base_quantity}:{order.observed_at.isoformat()}"
+            ),
+        )
+        if order.status == PrivateOrderStatus.UNKNOWN:
+            raise RuntimeError("journaled emergency order remains unknown")
+        return 0
+
+    async def _flatten_owned(self, action_name: str) -> LiveControlResult:
         cancellation = await self._cancel_orders(bot_only=False)
         states = await collect_private_states(
             self._adapters,
@@ -233,7 +379,15 @@ class LiveControlService:
             reconciliation_trigger="PRE_CLOSE",
         )
         positions = tuple(position for state in states.values() for position in state.positions)
-        active = await self._journal.active()
+        active_actions = await self._journal.active_actions()
+        if len(active_actions) > 1:
+            return await self._flatten_multiple(
+                action_name,
+                cancellation,
+                positions,
+                active_actions,
+            )
+        active = active_actions[0] if active_actions else None
         if not positions:
             barrier = await self._stable_report(active)
             report = barrier.report
@@ -345,6 +499,7 @@ class LiveControlService:
             ),
             return_exceptions=True,
         )
+        _raise_on_indeterminate_submit(submitted)
         orders_sent = len(requests)
         if active is not None and active.state == LiveActionState.SUBMITTING:
             active = await self._journal.transition(
@@ -403,6 +558,158 @@ class LiveControlService:
             flat_barrier_failure_reason(barrier),
         )
 
+    async def _flatten_multiple(
+        self,
+        action_name: str,
+        cancellation: LiveControlResult,
+        positions: tuple[PositionSnapshot, ...],
+        active: tuple[LiveJournalAction, ...],
+    ) -> LiveControlResult:
+        if not positions:
+            barrier = await self._stable_report_many(active)
+            if barrier.verified:
+                active, barrier = await self._mark_flat_many(active, action_name, barrier)
+                if barrier.verified:
+                    return LiveControlResult(
+                        True,
+                        action_name,
+                        0,
+                        cancellation.cancelled_orders,
+                        _terminal_state(active),
+                        barrier.report,
+                        None,
+                        True,
+                        barrier.timed_out,
+                        barrier.consecutive_snapshots,
+                        barrier.event_watermark,
+                        None,
+                    )
+            active = await self._quarantine_many(active, barrier.report, action_name)
+            return LiveControlResult(
+                False,
+                action_name,
+                0,
+                cancellation.cancelled_orders,
+                _terminal_state(active),
+                barrier.report,
+                "Stable FLAT barrier was not verified; keep live disabled.",
+                barrier.verified,
+                barrier.timed_out,
+                barrier.consecutive_snapshots,
+                barrier.event_watermark,
+                flat_barrier_failure_reason(barrier),
+            )
+
+        requests = tuple(
+            translate_protected_order(
+                ExecutionIntent(
+                    client_order_id=venue_client_order_id(
+                        f"emergency-{time.time_ns()}-{secrets.token_hex(2)}",
+                        "close",
+                        index,
+                    ),
+                    venue=position.venue,
+                    side=Side.SELL if position.side == Side.BUY else Side.BUY,
+                    purpose=OrderPurpose.EMERGENCY_CLOSE,
+                    quantity=position.base_quantity,
+                    worst_acceptable_price=None,
+                    unbounded_market=True,
+                ),
+                self._instrument(position.venue, position.symbol),
+            )
+            for index, position in enumerate(positions)
+        )
+        owners: list[LiveJournalAction] = []
+        for position in positions:
+            matched = tuple(
+                action
+                for action in active
+                if any(
+                    leg.venue == position.venue and leg.symbol == position.symbol
+                    for leg in action.legs
+                )
+            )
+            if len(matched) != 1:
+                quarantined = await self._quarantine_many(
+                    active,
+                    await self._report_many(active),
+                    action_name,
+                )
+                return LiveControlResult(
+                    False,
+                    action_name,
+                    0,
+                    cancellation.cancelled_orders,
+                    _terminal_state(quarantined),
+                    None,
+                    "Private position ownership is ambiguous; keep live disabled.",
+                    reason=ReasonCode.RECONCILIATION_INCOMPLETE,
+                )
+            owners.append(matched[0])
+
+        recovering = tuple(
+            await asyncio.gather(
+                *(self._move_to_recovering(action, action_name) for action in active)
+            )
+        )
+        recovering_by_id = {action.pair_action_id: action for action in recovering}
+        for owner, request, position in zip(owners, requests, positions, strict=True):
+            current_owner = recovering_by_id[owner.pair_action_id]
+            await self._journal.append_order_leg(
+                current_owner.pair_action_id,
+                request,
+                position.base_quantity,
+                None,
+            )
+            await self._journal.mark_leg_submit_attempted(
+                current_owner.pair_action_id,
+                request.client_order_id,
+            )
+        submitted = await asyncio.gather(
+            *(
+                self._submit_emergency(recovering_by_id[owner.pair_action_id], request)
+                for owner, request in zip(owners, requests, strict=True)
+            ),
+            return_exceptions=True,
+        )
+        _raise_on_indeterminate_submit(submitted)
+        barrier = await self._stable_report_many(recovering)
+        if barrier.verified:
+            recovered, barrier = await self._mark_flat_many(recovering, action_name, barrier)
+            if barrier.verified:
+                return LiveControlResult(
+                    True,
+                    action_name,
+                    len(requests),
+                    cancellation.cancelled_orders,
+                    _terminal_state(recovered),
+                    barrier.report,
+                    None,
+                    True,
+                    barrier.timed_out,
+                    barrier.consecutive_snapshots,
+                    barrier.event_watermark,
+                    None,
+                )
+        quarantined = await self._quarantine_many(recovering, barrier.report, action_name)
+        return LiveControlResult(
+            False,
+            action_name,
+            len(requests),
+            cancellation.cancelled_orders,
+            _terminal_state(quarantined),
+            barrier.report,
+            (
+                "FAILED_QUARANTINED: keep live disabled; inspect every involved exchange, "
+                "cancel remaining bot orders, and manually flatten residual positions."
+            ),
+            barrier.verified,
+            barrier.timed_out,
+            barrier.consecutive_snapshots,
+            barrier.event_watermark,
+            flat_barrier_failure_reason(barrier),
+        )
+
     async def _submit_emergency(
         self,
         active: LiveJournalAction,
@@ -440,6 +747,7 @@ class LiveControlService:
             self._adapters,
             self._account_instruments,
             reconciliation_trigger="TERMINAL_FLAT",
+            recent_instruments=self._recent_instruments((active,) if active is not None else ()),
         )
         return reconcile_private_states(
             active,
@@ -464,6 +772,38 @@ class LiveControlService:
             self._flat_barrier_policy,
         )
 
+    async def _report_many(
+        self,
+        active: Sequence[LiveJournalAction],
+    ) -> ReconciliationReport:
+        loaded = await asyncio.gather(*(self._journal.load(item.pair_action_id) for item in active))
+        current = tuple(action for action in loaded if action is not None)
+        states = await collect_private_states(
+            self._adapters,
+            self._account_instruments,
+            reconciliation_trigger="TERMINAL_FLAT",
+            recent_instruments=self._recent_instruments(current),
+        )
+        return reconcile_private_states(
+            current,
+            states,
+            await self._journal.known_client_order_ids(),
+            set(self._adapters),
+        )
+
+    async def _stable_report_many(
+        self,
+        active: Sequence[LiveJournalAction],
+    ) -> FlatBarrierResult:
+        return await wait_for_stable_flat(
+            lambda: self._report_many(active),
+            lambda: combined_event_watermark(
+                self._adapters,
+                self._journal.event_watermark,
+            ),
+            self._flat_barrier_policy,
+        )
+
     async def _cancel(self, order: PrivateOrder) -> PrivateOrder:
         assert order.order_id is not None
         return await self._adapters[order.venue].cancel_order(
@@ -476,6 +816,21 @@ class LiveControlService:
         if instrument is None:
             raise RuntimeError(f"instrument registry has no {venue.value}:{symbol}")
         return instrument
+
+    def _recent_instruments(
+        self,
+        active: Sequence[LiveJournalAction],
+    ) -> dict[Venue, tuple[Instrument, ...]]:
+        symbols_by_venue: dict[Venue, set[str]] = {venue: set() for venue in self._adapters}
+        for action in active:
+            for leg in action.legs:
+                if leg.submit_attempted:
+                    symbols_by_venue.setdefault(leg.venue, set()).add(leg.symbol)
+        return {
+            venue: tuple(self._instrument(venue, symbol) for symbol in sorted(symbols))
+            or (self._account_instruments[venue],)
+            for venue, symbols in symbols_by_venue.items()
+        }
 
     def _emergency_route(self) -> DirectedRouteKey:
         if self._route is not None:
@@ -571,6 +926,65 @@ class LiveControlService:
             ),
         )
 
+    async def _mark_flat_many(
+        self,
+        active: Sequence[LiveJournalAction],
+        action_name: str,
+        barrier: FlatBarrierResult,
+    ) -> tuple[tuple[LiveJournalAction, ...], FlatBarrierResult]:
+        if not barrier.verified:
+            raise RuntimeError(flat_barrier_failure_reason(barrier).value)
+        loaded = await asyncio.gather(*(self._journal.load(item.pair_action_id) for item in active))
+        current = tuple(action for action in loaded if action is not None)
+        if len(current) != len(active):
+            raise RuntimeError("flat barrier action disappeared")
+        recovering = tuple(
+            await asyncio.gather(
+                *(self._move_to_recovering(action, action_name) for action in current)
+            )
+        )
+        observed_before = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if observed_before != barrier.event_watermark:
+            failed = await self._quarantine_many(recovering, barrier.report, action_name)
+            return (
+                failed,
+                FlatBarrierResult(
+                    False,
+                    barrier.report,
+                    0,
+                    observed_before,
+                    False,
+                    ReasonCode.FLAT_BARRIER_EVENT_RACE,
+                ),
+            )
+        journal_watermark = await self._journal.event_watermark()
+        commit = await self._journal.commit_flat_barrier_many(
+            tuple(action.pair_action_id for action in recovering),
+            journal_watermark,
+            {"action": action_name, "verified": True},
+        )
+        observed_after = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if commit.committed and observed_after == barrier.event_watermark:
+            return commit.actions, barrier
+        failed = await self._quarantine_many(commit.actions, barrier.report, action_name)
+        return (
+            failed,
+            FlatBarrierResult(
+                False,
+                barrier.report,
+                0,
+                observed_after,
+                False,
+                ReasonCode.FLAT_BARRIER_EVENT_RACE,
+            ),
+        )
+
     async def _quarantine(
         self,
         active: LiveJournalAction,
@@ -594,6 +1008,39 @@ class LiveControlService:
             recovery_action=action_name,
         )
 
+    async def _quarantine_many(
+        self,
+        active: Sequence[LiveJournalAction],
+        report: ReconciliationReport,
+        action_name: str,
+    ) -> tuple[LiveJournalAction, ...]:
+        return tuple(
+            await asyncio.gather(
+                *(self._quarantine(action, report, action_name) for action in active)
+            )
+        )
+
+
+def _raise_on_indeterminate_submit(results: Sequence[object]) -> None:
+    failure = next((result for result in results if isinstance(result, BaseException)), None)
+    if failure is not None:
+        raise RuntimeError(
+            "emergency submit is indeterminate; exclusive flatten ownership retained"
+        ) from failure
+
+
+def _account_flatten_lock(journal: LiveOrderJournal) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    key = str(journal.path.resolve())
+    existing = _ACCOUNT_FLATTEN_LOCKS.get(key)
+    if existing is not None and existing[0] is loop:
+        return existing[1]
+    if existing is not None and existing[1].locked():
+        raise RuntimeError("account-wide flatten remains active on another event loop")
+    lock = asyncio.Lock()
+    _ACCOUNT_FLATTEN_LOCKS[key] = (loop, lock)
+    return lock
+
 
 def emergency_unlock_valid(
     confirmation: str,
@@ -612,6 +1059,109 @@ def emergency_unlock_valid(
 
 def render_control_result(result: LiveControlResult) -> str:
     return json.dumps(asdict(result), default=str, sort_keys=True)
+
+
+def _live_risk_snapshot(
+    active: LiveJournalAction | Sequence[LiveJournalAction] | None,
+    positions: Sequence[Mapping[str, object]],
+    *,
+    private_state_known: bool,
+) -> dict[str, object]:
+    actions = _actions(active)
+    if not private_state_known:
+        return {"status": "INVALID_RISK_DATA", "reason": "PRIVATE_STATE_UNAVAILABLE"}
+    if not actions:
+        if positions:
+            return {
+                "status": "INVALID_RISK_DATA",
+                "reason": "UNJOURNALED_PRIVATE_EXPOSURE",
+            }
+        return {
+            "status": "OK",
+            "scope": "JOURNAL_RESERVATION",
+            "reservation_count": 0,
+            "per_route_stress_usdt": {},
+            "portfolio_stress_usdt": "0",
+        }
+    if not _private_positions_match_journal(actions, positions):
+        return {
+            "status": "INVALID_RISK_DATA",
+            "reason": "PRIVATE_POSITION_JOURNAL_MISMATCH",
+        }
+    per_route: dict[str, str] = {}
+    portfolio_stress = Decimal(0)
+    for action in actions:
+        try:
+            projected_stress = Decimal(str(action.risk_reservation["projected_stress_usdt"]))
+            if (
+                not projected_stress.is_finite()
+                or projected_stress < 0
+                or projected_stress > Decimal("5")
+            ):
+                raise ValueError("projected route stress is outside the locked limit")
+            portfolio_stress += projected_stress
+            if not portfolio_stress.is_finite() or portfolio_stress > Decimal("50"):
+                raise ValueError("projected portfolio stress is outside the locked limit")
+        except (DecimalException, KeyError, ValueError):
+            return {"status": "INVALID_RISK_DATA", "reason": "RISK_RESERVATION_UNKNOWN"}
+        per_route[action.route.value] = str(projected_stress)
+    return {
+        "status": "OK",
+        "scope": "JOURNAL_RESERVATION",
+        "reservation_count": len(actions),
+        "per_route_stress_usdt": per_route,
+        "portfolio_stress_usdt": str(portfolio_stress),
+    }
+
+
+def _private_positions_match_journal(
+    active: Sequence[LiveJournalAction],
+    positions: Sequence[Mapping[str, object]],
+) -> bool:
+    expected: dict[tuple[str, str], Decimal] = {}
+    actual: dict[tuple[str, str], Decimal] = {}
+    try:
+        for leg in (leg for action in active for leg in action.legs):
+            signed = leg.filled_base_quantity if leg.side == Side.BUY else -leg.filled_base_quantity
+            key = (leg.venue.value, leg.symbol)
+            expected[key] = expected.get(key, Decimal(0)) + signed
+        for position in positions:
+            quantity = Decimal(str(position["base_quantity"]))
+            side = Side(str(position["side"]))
+            venue = Venue(str(position["venue"])).value
+            symbol = str(position["symbol"])
+            if not quantity.is_finite() or quantity <= 0 or not venue or not symbol:
+                return False
+            key = (venue, symbol)
+            signed = quantity if side == Side.BUY else -quantity
+            actual[key] = actual.get(key, Decimal(0)) + signed
+    except (DecimalException, KeyError, ValueError):
+        return False
+    return {key: value for key, value in expected.items() if value != 0} == {
+        key: value for key, value in actual.items() if value != 0
+    }
+
+
+def _actions(
+    active: LiveJournalAction | Sequence[LiveJournalAction] | None,
+) -> tuple[LiveJournalAction, ...]:
+    if active is None:
+        return ()
+    if isinstance(active, LiveJournalAction):
+        return (active,)
+    return tuple(active)
+
+
+def _terminal_state(active: Sequence[LiveJournalAction]) -> LiveActionState | None:
+    states = {action.state for action in active}
+    return next(iter(states)) if len(states) == 1 else None
+
+
+def _journal_state(active: Sequence[LiveJournalAction]) -> str:
+    if not active:
+        return LiveActionState.FLAT.value
+    state = _terminal_state(active)
+    return state.value if state is not None else "MULTIPLE"
 
 
 def _position_pnl(position: PositionSnapshot) -> Decimal:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
@@ -272,11 +273,21 @@ class PairExecutionCoordinator:
         tranche: Tranche,
         long_result: SimulatedOrderResult,
         short_result: SimulatedOrderResult,
-    ) -> None:
+        *,
+        mutation_guard: Callable[[], bool] | None = None,
+    ) -> bool:
         self._require_state(tranche, {PairActionState.RISK_RESERVED})
         self._validate_open_legs(tranche, long_result, short_result)
+        # The shadow decision deadline must be checked at the mutation
+        # boundary, not merely by its async caller.  This guard is evaluated
+        # after validation and immediately before any state/fill mutation, so
+        # a synchronous delay around this method cannot leave an unowned
+        # HEDGED tranche after the caller has failed the decision closed.
+        if mutation_guard is not None and not mutation_guard():
+            return False
         tranche.state = PairActionState.ORDERS_SENT
         self._apply_open_results(tranche, long_result, short_result)
+        return True
 
     def resolve_unknown(
         self,
@@ -287,6 +298,30 @@ class PairExecutionCoordinator:
         self._require_state(tranche, {PairActionState.UNKNOWN_ORDER})
         self._validate_open_legs(tranche, long_result, short_result)
         self._apply_open_results(tranche, long_result, short_result)
+
+    def rollback_unpublished_open(self, tranche: Tranche) -> None:
+        """Undo a purely simulated open that missed its publication deadline.
+
+        This coordinator has no network side effects; its fills exist only on
+        the supplied in-memory tranche.  The shadow caller may therefore
+        restore the pre-submit state until it publishes the tranche into the
+        durable runtime.  Live coordinators intentionally have no equivalent
+        rollback and must reconcile real exchange truth instead.
+        """
+
+        self._require_state(
+            tranche,
+            {
+                PairActionState.ORDERS_SENT,
+                PairActionState.PARTIALLY_HEDGED,
+                PairActionState.HEDGED,
+                PairActionState.UNKNOWN_ORDER,
+            },
+        )
+        tranche.entry_long_fills.clear()
+        tranche.entry_short_fills.clear()
+        tranche.state = PairActionState.RISK_RESERVED
+        tranche.reason = ReasonCode.RISK_RESERVED
 
     def _apply_open_results(
         self,

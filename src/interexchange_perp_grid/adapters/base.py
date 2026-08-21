@@ -29,9 +29,17 @@ class ExchangeAdapter(ABC):
     async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
         raise NotImplementedError
 
+    async def unwatch_bbo(self, symbols: tuple[str, ...]) -> None:
+        del symbols
+        raise RuntimeError("broad BBO unsubscribe capability is required")
+
     @abstractmethod
     async def watch_order_book(self, instrument: Instrument, limit: int = 50) -> OrderBookSnapshot:
         raise NotImplementedError
+
+    async def unwatch_order_book(self, instrument: Instrument, limit: int = 50) -> None:
+        del instrument, limit
+        raise RuntimeError("candidate L2 unsubscribe capability is required")
 
     @abstractmethod
     async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:

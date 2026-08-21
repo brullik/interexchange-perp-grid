@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import pytest
 
+from interexchange_perp_grid.adapters.bingx_swap import SequenceQualifiedBingxExchange
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
@@ -122,7 +123,12 @@ class FakePrivateExchange:
         del order_type, price
         self.create_calls += 1
         return self.order(
-            str(params.get("orderLinkId") or params.get("clOrdId") or "client-1"),
+            str(
+                params.get("orderLinkId")
+                or params.get("clOrdId")
+                or params.get("clientOid")
+                or "client-1"
+            ),
             amount=str(amount),
             filled=str(amount),
             status="closed",
@@ -200,7 +206,17 @@ class FakePrivateExchange:
         }
 
 
-@pytest.mark.parametrize("venue", [Venue.BYBIT, Venue.OKX, Venue.BINANCE_USDM])
+@pytest.mark.parametrize(
+    "venue",
+    [
+        Venue.BYBIT,
+        Venue.OKX,
+        Venue.BINANCE_USDM,
+        Venue.BITGET,
+        Venue.KUCOIN_FUTURES,
+        Venue.BINGX,
+    ],
+)
 @pytest.mark.asyncio
 async def test_wave_one_private_capabilities_and_account_are_normalised(venue: Venue) -> None:
     exchange = FakePrivateExchange()
@@ -269,6 +285,8 @@ def _linear_market(symbol: str = "BTC/USDT:USDT") -> dict[str, object]:
         "base": base,
         "quote": "USDT",
         "settle": "USDT",
+        "active": True,
+        "created": 1_609_459_200_000,
         "contract": True,
         "swap": True,
         "linear": True,
@@ -298,6 +316,24 @@ class LargeAccountWideExchange(FakePrivateExchange):
             50,
         ),
         (Venue.OKX, {"instType": "SWAP"}, {"instType": "SWAP"}, 100),
+        (
+            Venue.BITGET,
+            {"productType": "USDT-FUTURES"},
+            {"productType": "USDT-FUTURES", "marginCoin": "USDT"},
+            100,
+        ),
+        (
+            Venue.KUCOIN_FUTURES,
+            {"type": "swap", "uta": False},
+            {"uta": False},
+            50,
+        ),
+        (
+            Venue.BINGX,
+            {"type": "swap", "subType": "linear"},
+            {"subType": "linear"},
+            None,
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -322,6 +358,37 @@ async def test_wave1_snapshot_is_account_wide_and_request_bounded(
     assert snapshot.completeness == SnapshotCompleteness.COMPLETE
     assert snapshot.raw_open_order_count == 1
     assert snapshot.raw_nonzero_position_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pinned_bingx_positions_consumes_subtype_without_extra_rest_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = SequenceQualifiedBingxExchange({})
+    market = _linear_market()
+    market["id"] = "BTC-USDT"
+    market.update(
+        {
+            "type": "swap",
+            "spot": False,
+            "margin": False,
+            "future": False,
+            "option": False,
+        }
+    )
+    exchange.set_markets([market])
+    captured: dict[str, object] = {}
+
+    async def capture(params: dict[str, object]) -> dict[str, object]:
+        captured.update(params)
+        return {"code": 0, "msg": "", "data": []}
+
+    monkeypatch.setattr(exchange, "swapV2PrivateGetUserPositions", capture)
+
+    result = await exchange.fetch_positions(None, {"subType": "linear"})
+
+    assert result == []
+    assert captured == {}
 
 
 @pytest.mark.asyncio
@@ -426,6 +493,41 @@ class AccountWideStreamExchange(LargeAccountWideExchange):
                 ("account", {}),
             ],
         ),
+        (
+            Venue.BITGET,
+            [
+                (
+                    "orders",
+                    {
+                        "type": "swap",
+                        "subType": "linear",
+                        "productType": "USDT-FUTURES",
+                        "uta": False,
+                    },
+                ),
+                ("positions", {"instType": "USDT-FUTURES", "uta": False}),
+                (
+                    "account",
+                    {"type": "swap", "instType": "USDT-FUTURES", "uta": False},
+                ),
+            ],
+        ),
+        (
+            Venue.KUCOIN_FUTURES,
+            [
+                ("orders", {"type": "swap", "uta": False}),
+                ("positions", {"uta": False}),
+                ("account", {"type": "swap", "uta": False}),
+            ],
+        ),
+        (
+            Venue.BINGX,
+            [
+                ("orders", {"type": "swap", "subType": "linear"}),
+                ("positions", {"type": "swap", "subType": "linear"}),
+                ("account", {"type": "swap", "subType": "linear"}),
+            ],
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -461,9 +563,10 @@ async def test_account_wide_private_streams_are_normalised_and_monotonic(
 
 
 class OneWayClosedPositionStreamExchange(AccountWideStreamExchange):
-    def __init__(self, side: str | None) -> None:
+    def __init__(self, side: str | None, *, position_side: str | None = None) -> None:
         super().__init__()
         self.side = side
+        self.position_side = position_side
 
     async def watch_positions(
         self,
@@ -481,25 +584,30 @@ class OneWayClosedPositionStreamExchange(AccountWideStreamExchange):
                 "contracts": "0",
                 "entryPrice": None,
                 "markPrice": "101",
+                "info": (
+                    {"positionSide": self.position_side} if self.position_side is not None else {}
+                ),
             }
         ]
 
 
 @pytest.mark.parametrize(
-    ("venue", "side"),
+    ("venue", "side", "position_side"),
     [
-        (Venue.BYBIT, None),
-        (Venue.BINANCE_USDM, "both"),
+        (Venue.BYBIT, None, None),
+        (Venue.BINANCE_USDM, "both", None),
+        (Venue.KUCOIN_FUTURES, None, "BOTH"),
     ],
 )
 @pytest.mark.asyncio
 async def test_one_way_side_less_zero_position_closes_both_cached_sides(
     venue: Venue,
     side: str | None,
+    position_side: str | None,
 ) -> None:
     adapter = CcxtPrivateAdapter(
         venue,
-        exchange=OneWayClosedPositionStreamExchange(side),
+        exchange=OneWayClosedPositionStreamExchange(side, position_side=position_side),
     )
 
     event = await adapter.watch_account_wide_positions()
@@ -509,6 +617,43 @@ async def test_one_way_side_less_zero_position_closes_both_cached_sides(
         (Side.SELL, Decimal(0)),
     }
     assert event.unknown_active_records == ()
+
+
+@pytest.mark.parametrize(
+    ("position_side", "expected_side"),
+    [("LONG", Side.BUY), ("SHORT", Side.SELL)],
+)
+@pytest.mark.asyncio
+async def test_kucoin_hedge_mode_zero_position_closes_only_its_raw_side(
+    position_side: str,
+    expected_side: Side,
+) -> None:
+    adapter = CcxtPrivateAdapter(
+        Venue.KUCOIN_FUTURES,
+        exchange=OneWayClosedPositionStreamExchange(None, position_side=position_side),
+    )
+
+    event = await adapter.watch_account_wide_positions()
+
+    assert [(position.side, position.base_quantity) for position in event.positions] == [
+        (expected_side, Decimal(0))
+    ]
+    assert event.unknown_active_records == ()
+
+
+@pytest.mark.asyncio
+async def test_kucoin_side_less_zero_position_without_raw_mode_fails_closed() -> None:
+    adapter = CcxtPrivateAdapter(
+        Venue.KUCOIN_FUTURES,
+        exchange=OneWayClosedPositionStreamExchange(None),
+    )
+
+    event = await adapter.watch_account_wide_positions()
+
+    assert event.positions == ()
+    assert [record.reason for record in event.unknown_active_records] == [
+        "QUANTITY_OR_SIDE_UNKNOWN"
+    ]
 
 
 @pytest.mark.asyncio

@@ -1,14 +1,36 @@
-# Runbook владельца: C4 shadow, qualification epoch и recovery
+# Runbook владельца: software RC, qualification epoch и recovery
 
 ## Текущий запрет
 
-Допустимый финальный статус C4 — `C4_REWORK_V2_FINAL_HEAD_CI_GREEN_PENDING_INDEPENDENT_REVIEW`. До отдельного независимого принятия всех P0 пунктов C5 и реальные ордера запрещены. Не добавляйте production credentials и не включайте live для проверки C4: CI обязан завершиться с `production_submit_calls=0`.
+Software-only контур готовится как `SOFTWARE_RELEASE_V1_RC`; это не live-разрешение. Реальные ордера запрещены до завершения внешних owner actions, точной 24-часовой qualification, независимых live gates и отдельного решения владельца о минимальном canary. Не добавляйте production credentials и не включайте live для software-проверок: CI обязан завершаться с `production_submit_calls=0`.
+
+## 0. One-command Ubuntu 24.04 bootstrap и автономный runtime
+
+На чистом Ubuntu 24.04 из exact release checkout выполните:
+
+```bash
+sudo scripts/ipegctl bootstrap
+sudo ipegctl owner-onboard
+sudo ipegctl deploy --image ghcr.io/brullik/interexchange-perp-grid@sha256:<digest> \
+  --release-sha <full-main-sha>
+sudo ipegctl doctor
+sudo ipegctl status
+```
+
+`owner-onboard` работает только в локальном TTY, записывает Telegram/Wave1 credentials в
+`/etc/ipeg/ipeg.env` mode `0600` и принудительно оставляет `IPEG_MODE=shadow` и
+`IPEG_LIVE_ENABLED=false`. Не вставляйте значения из wizard в GitHub, чат или artifacts.
+Systemd unit `ipeg.service` держит контейнер и встроенный `AutonomousOrchestrator` запущенными
+после выхода Codex: он idempotently начинает/возобновляет exact immutable qualification epoch,
+публикует blockers через `ipegctl status`, финализирует только collection epoch и никогда не
+включает canary/live. `ipegctl canary-arm` остаётся fail-closed до отдельного
+`LIVE_CANARY_CONSENT`.
 
 Fail-closed действует при stale/несинхронизированных данных, sequence gap, неполном raw private snapshot, неизвестном состоянии ордера, недоступном risk engine, несовпадении journal/exchange, нестабильном FLAT или неопределённой возможности emergency venue. Один процесс `app` непрерывно владеет единственным Telegram poller и `LiveSafetySupervisor`; ручной перезапуск или повторный `canary-run` не является способом recovery.
 
 ## 1. Точная сборка и локальная проверка
 
-На чистом checkout `codex/fast-track-mvp`:
+На чистом checkout `codex/multi-instrument-shadow`:
 
 ```bash
 python3.12 -m venv .venv
@@ -34,7 +56,8 @@ scripts/release-build.sh registry.example/interexchange-perp-grid:$(git rev-pars
 
 ```bash
 cp .env.example .env
-scripts/shadow-deploy.sh \
+chmod 0600 .env
+bash scripts/shadow-deploy.sh \
   registry.example/interexchange-perp-grid@sha256:<64-hex-digest> \
   <full-40-char-release-sha>
 docker compose ps
@@ -44,13 +67,13 @@ docker compose exec -T app interexchange-grid health --config /app/config/defaul
 Ожидается healthy `app`, `mode=shadow`, `live_orders_allowed=false`, supervisor `IDLE`/`FLAT_NO_ACTIVE_ACTION`. Upgrade сначала делает online SQLite backup и только затем меняет immutable image:
 
 ```bash
-scripts/shadow-upgrade.sh <NEW_IMAGE@sha256:DIGEST> <NEW_FULL_SHA>
+bash scripts/shadow-upgrade.sh <NEW_IMAGE@sha256:DIGEST> <NEW_FULL_SHA>
 ```
 
 Rollback использует ранее проверенные digest/SHA и также делает backup текущего состояния:
 
 ```bash
-scripts/shadow-rollback.sh <PREVIOUS_IMAGE@sha256:DIGEST> <PREVIOUS_FULL_SHA>
+bash scripts/shadow-rollback.sh <PREVIOUS_IMAGE@sha256:DIGEST> <PREVIOUS_FULL_SHA>
 ```
 
 Отдельный backup и проверяемое восстановление:
@@ -65,6 +88,8 @@ docker compose run --rm app interexchange-grid restore-state \
   --backup /app/state/backups/manual.sqlite3
 docker compose up --detach --wait app
 ```
+
+Deploy отказывает, если `.env` отсутствует, отслеживается Git или имеет mode не `0600`. Успешная identity атомарно записывается в игнорируемый `.ipeg-deployment-state`. Upgrade делает backup; при плохом health автоматически останавливает новый image, восстанавливает SQLite backup, поднимает предыдущие digest/SHA и всё равно возвращает ненулевой код исходной ошибки. Если rollback также не прошёл, deployment остаётся fail-closed и требует ручной проверки.
 
 После любого deploy/upgrade/rollback/restore проверьте `health`, supervisor outcome и фактические private orders/positions. При активном journal supervisor автоматически входит в `RECOVERY_ONLY`; не создавайте новый pair action.
 
@@ -101,6 +126,8 @@ docker compose exec -T app interexchange-grid qualification-epoch-finalize \
   --epoch-id <EPOCH_ID> --config /app/config/defaults.yaml
 ```
 
+`qualification-epoch-status` возвращает elapsed/remaining duration, completion ratio, точные per-venue required/current/remaining synchronized snapshots и funding checkpoints, quality/error counters, unresolved order/exposure и полный список blockers. Не выполняйте finalize, пока `ready_to_finalize=false`; это означает только готовность закрыть observation epoch. `qualification_ready` остаётся false до привязки replay evidence и устранения всех runtime blockers. Само истечение 24 часов не является qualification.
+
 Только для finalized epoch соберите runtime evidence и qualification evidence:
 
 ```bash
@@ -120,9 +147,29 @@ docker compose exec -T app interexchange-grid qualify \
 
 Ожидается `accepted=true`, exact epoch FK и совпадающие route/release/source/config/image/data hashes. Изменение любого identity field, direction или файла immutable Parquet manifest инвалидирует qualification. Все три Wave 1 private preflight, включая фактические amount step/minimum/depth/fee emergency venue, обязаны пройти до записи canary intent.
 
-## 4. Canary после независимого разрешения C5
+## 4. Risk stage и canary после внешних gates
 
-Этот раздел не является разрешением запускать C5. После отдельного независимого принятия C4 владелец самостоятельно создаёт restricted credentials для выделенных Wave 1 subaccounts: только чтение account/orders/positions и futures trading, IP allowlist; withdrawal, transfer, wallet/address-book и API-key management запрещены. Секреты существуют только в VPS `.env`, никогда в Git/логах/evidence. Это внешнее действие невозможно выполнить средствами Codex. Проверка: `private-probe --venue <venue>` возвращает успешные обязательные capability checks для каждой Wave 1 venue; до этого live остаётся выключенным.
+Этот раздел не является разрешением запускать C5. Владелец самостоятельно создаёт restricted credentials для выделенных Wave 1 subaccounts: только чтение account/orders/positions и futures trading, IP allowlist; withdrawal, transfer, wallet/address-book и API-key management запрещены. Секреты существуют только в VPS `.env` mode `0600`, никогда в Git/логах/evidence. Это внешнее действие невозможно выполнить средствами Codex. Проверка: `private-probe --venue <venue>` возвращает успешные обязательные capability checks для каждой Wave 1 venue; до этого live остаётся выключенным.
+
+Текущий persisted stage и точная locked risk table:
+
+```bash
+docker compose exec -T app interexchange-grid risk-stage-status \
+  --config /app/config/defaults.yaml
+```
+
+Promotion допускает только один соседний переход `shadow -> canary -> pilot_a -> pilot_b -> wave1_prod -> full`, требует current exact qualification, image digest, actor и точную фразу `PROMOTE:<target>`. Нельзя пропускать stage, откатывать stage этой командой или менять limits вне `RUNTIME_POLICY.yaml`. Сам первый переход является live-money решением владельца и не выполняется Codex без отдельного разрешения.
+
+После отдельного live-money разрешения владельца первый переход выполняется так:
+
+```bash
+docker compose exec -T app interexchange-grid risk-stage-promote \
+  --expected-current shadow --target canary --actor OWNER \
+  --confirmation PROMOTE:canary \
+  --qualification /app/state/qualification.json \
+  --container-image-digest sha256:<EXACT_DIGEST> \
+  --repo-root /app --config /app/config/defaults.yaml
+```
 
 Не останавливайте `app`. В единственном работающем Telegram poller получите challenge и подтвердите owner gate:
 
@@ -149,6 +196,16 @@ docker compose exec -T app interexchange-grid health --config /app/config/defaul
 ```
 
 Успех — только exchange-verified стабильный `FLAT`: минимум два последовательных полных raw private snapshot, quiet period и неизменный event watermark. `HEDGED` допустим только после private-confirmed позиций и не является terminal success. При kill/restart supervisor сначала восстанавливает тот же action без повторного owner/qualification entry gate и не разрешает новый.
+
+Перед следующим соседним promotion сохраните JSON результата текущего stage с точными полями `stage`, `stable_flat_verified=true`, `active_action_count=0`, затем привяжите его hash к state:
+
+```bash
+docker compose exec -T app interexchange-grid risk-stage-complete \
+  --stage canary --actor OWNER --evidence /app/state/canary-result.json \
+  --config /app/config/defaults.yaml
+```
+
+Без этого неизменяемого результата следующий `risk-stage-promote` fail closed. Для каждого последующего stage повторяются qualification/current-image проверки, отдельное owner confirmation, фактический прогон и stable-FLAT completion; одна qualification не может автоматически провести все stages.
 
 ## 5. Аварийное управление
 
