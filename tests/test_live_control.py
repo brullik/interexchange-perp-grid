@@ -175,7 +175,11 @@ class PortfolioEmergencyExchange:
     def seed_position(self, symbol: str, signed_quantity: Decimal) -> None:
         if symbol not in self._instruments or signed_quantity == 0:
             raise ValueError("portfolio simulator position must reference a known non-zero symbol")
-        self._positions[symbol] = signed_quantity
+        combined = self._positions.get(symbol, Decimal(0)) + signed_quantity
+        if combined == 0:
+            self._positions.pop(symbol, None)
+        else:
+            self._positions[symbol] = combined
 
     def seed_order(self, order: PrivateOrder) -> None:
         if order.venue != self.venue or order.symbol not in self._instruments:
@@ -321,22 +325,24 @@ async def _seed_portfolio_recovery(
     action_count: int,
     *,
     action_state: LiveActionState = LiveActionState.HEDGED,
+    tranches_per_route: int = 1,
 ) -> tuple[
     LiveOrderJournal,
     dict[Venue, PortfolioEmergencyExchange],
     dict[tuple[Venue, str], Instrument],
 ]:
+    if action_count < 1 or tranches_per_route < 1:
+        raise ValueError("portfolio recovery counts must be positive")
+    route_count = (action_count + tranches_per_route - 1) // tranches_per_route
     instruments = {
         (venue, instrument.symbol): instrument
         for venue in Venue
-        for instrument in tuple(
-            _portfolio_instrument(venue, index) for index in range(action_count)
-        )
+        for instrument in tuple(_portfolio_instrument(venue, index) for index in range(route_count))
     }
     adapters = {
         venue: PortfolioEmergencyExchange(
             venue,
-            tuple(instruments[(venue, f"A{index:03d}/USDT:USDT")] for index in range(action_count)),
+            tuple(instruments[(venue, f"A{index:03d}/USDT:USDT")] for index in range(route_count)),
         )
         for venue in Venue
     }
@@ -344,7 +350,9 @@ async def _seed_portfolio_recovery(
     await journal.initialise()
     observed = datetime.now(UTC)
     for index in range(action_count):
-        base = f"A{index:03d}"
+        route_index = index // tranches_per_route
+        tranche_index = index % tranches_per_route
+        base = f"A{route_index:03d}"
         symbol = f"{base}/USDT:USDT"
         action_id = f"portfolio-recovery-{index:02d}"
         long_request = VenueOrderRequest(
@@ -367,12 +375,12 @@ async def _seed_portfolio_recovery(
         await journal.prepare(
             action_id,
             DirectedRouteKey(base, Venue.BINANCE_USDM, Venue.OKX),
-            f"tranche-{index:02d}",
+            f"tranche-{tranche_index:02d}",
             long_request,
             short_request,
             {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
             {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
-            {"projected_stress_usdt": "5"},
+            {"projected_stress_usdt": str(Decimal("5") / Decimal(tranches_per_route))},
             "a" * 64,
         )
         if action_state == LiveActionState.PREPARED:
@@ -690,24 +698,19 @@ async def test_live_reads_reject_extreme_finite_decimal_risk_without_overflow(
 ) -> None:
     service, _ = _service(tmp_path, long_outcomes=())
     await service._journal.initialise()
-    await service._journal.prepare(
-        "extreme-risk",
-        DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX),
-        "tranche-extreme",
-        _seed_request(Venue.BINANCE_USDM, "extreme-long", Side.BUY),
-        _seed_request(Venue.OKX, "extreme-short", Side.SELL),
-        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
-        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
-        {"projected_stress_usdt": "1e999999999"},
-        "d" * 64,
-    )
-
-    snapshot = await service.snapshot()
-
-    assert snapshot["risk"] == {
-        "status": "INVALID_RISK_DATA",
-        "reason": "RISK_RESERVATION_UNKNOWN",
-    }
+    with pytest.raises(RuntimeError, match="maximum live route stress"):
+        await service._journal.prepare(
+            "extreme-risk",
+            DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX),
+            "tranche-extreme",
+            _seed_request(Venue.BINANCE_USDM, "extreme-long", Side.BUY),
+            _seed_request(Venue.OKX, "extreme-short", Side.SELL),
+            {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+            {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+            {"projected_stress_usdt": "1e999999999"},
+            "d" * 64,
+        )
+    assert await service._journal.active_actions() == ()
 
 
 @pytest.mark.asyncio
@@ -885,6 +888,98 @@ async def test_ten_route_private_reconciliation_closes_twenty_positions_atomical
         *(adapter.fetch_active_snapshot() for adapter in adapters.values())
     )
     assert all(not snapshot.positions for snapshot in snapshots)
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_ten_routes_with_five_tranches_as_aggregate_positions(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "five-tranche-portfolio-state.sqlite3"
+    journal, adapters, instruments = await _seed_portfolio_recovery(
+        path,
+        50,
+        tranches_per_route=5,
+    )
+    seeded = await journal.active_actions()
+    assert len(seeded) == 50
+    assert len({action.route for action in seeded}) == 10
+    assert all(
+        len({action.tranche_id for action in seeded if action.route == route}) == 5
+        for route in {action.route for action in seeded}
+    )
+
+    restarted = LiveOrderJournal(path)
+    await restarted.initialise()
+    restored = await restarted.active_actions()
+    assert tuple(action.pair_action_id for action in restored) == tuple(
+        action.pair_action_id for action in seeded
+    )
+    service = LiveControlService(restarted, adapters, instruments)
+    snapshot = await service.snapshot()
+    risk = snapshot["risk"]
+    assert isinstance(risk, dict)
+    assert risk["portfolio_stress_usdt"] == "50"
+    per_route = risk["per_route_stress_usdt"]
+    assert isinstance(per_route, dict)
+    assert set(per_route.values()) == {"5"}
+    result = await service.emergency_flatten()
+
+    assert result.success is True
+    assert result.orders_sent == 100
+    assert result.terminal_state == LiveActionState.FLAT
+    assert result.flat_barrier_verified is True
+    assert await restarted.active_actions() == ()
+    assert adapters[Venue.BINANCE_USDM].submit_calls == 50
+    assert adapters[Venue.OKX].submit_calls == 50
+    assert adapters[Venue.BYBIT].submit_calls == 0
+    snapshots = await asyncio.gather(
+        *(adapter.fetch_active_snapshot() for adapter in adapters.values())
+    )
+    assert all(not snapshot.positions for snapshot in snapshots)
+
+
+@pytest.mark.asyncio
+async def test_shared_route_recovery_rejects_position_not_equal_to_tranche_ownership(
+    tmp_path: Path,
+) -> None:
+    journal, adapters, instruments = await _seed_portfolio_recovery(
+        tmp_path / "mismatched-tranche-ownership.sqlite3",
+        5,
+        tranches_per_route=5,
+    )
+    adapters[Venue.BINANCE_USDM]._positions["A000/USDT:USDT"] = Decimal("0.004")
+
+    result = await LiveControlService(journal, adapters, instruments).emergency_flatten()
+
+    assert result.success is False
+    assert result.reason == ReasonCode.RECONCILIATION_INCOMPLETE
+    assert result.orders_sent == 0
+    assert all(adapter.submit_calls == 0 for adapter in adapters.values())
+    active = await journal.active_actions()
+    assert len(active) == 5
+    assert all(action.state == LiveActionState.QUARANTINED for action in active)
+
+
+@pytest.mark.asyncio
+async def test_shared_route_recovery_rejects_missing_owned_position_before_any_submit(
+    tmp_path: Path,
+) -> None:
+    journal, adapters, instruments = await _seed_portfolio_recovery(
+        tmp_path / "missing-tranche-position.sqlite3",
+        5,
+        tranches_per_route=5,
+    )
+    adapters[Venue.OKX]._positions.pop("A000/USDT:USDT")
+
+    result = await LiveControlService(journal, adapters, instruments).emergency_flatten()
+
+    assert result.success is False
+    assert result.reason == ReasonCode.RECONCILIATION_INCOMPLETE
+    assert result.orders_sent == 0
+    assert all(adapter.submit_calls == 0 for adapter in adapters.values())
+    active = await journal.active_actions()
+    assert len(active) == 5
+    assert all(action.state == LiveActionState.QUARANTINED for action in active)
 
 
 @pytest.mark.asyncio

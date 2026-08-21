@@ -884,7 +884,11 @@ def private_transition_recovery_smoke(
     ],
     hold_after_active: Annotated[bool, typer.Option("--hold-after-active")] = False,
     ready: Annotated[Path | None, typer.Option("--ready")] = None,
-    action_count: Annotated[int, typer.Option("--action-count", min=1, max=10)] = 10,
+    action_count: Annotated[int, typer.Option("--action-count", min=1, max=50)] = 10,
+    tranches_per_route: Annotated[
+        int,
+        typer.Option("--tranches-per-route", min=1, max=5),
+    ] = 1,
 ) -> None:
     """Prove killed-process recovery through production private reconciliation."""
     result = asyncio.run(
@@ -895,6 +899,7 @@ def private_transition_recovery_smoke(
             transition_state=transition_state,
             ready_path=ready.resolve() if ready is not None else None,
             action_count=action_count,
+            tranches_per_route=tranches_per_route,
         )
     )
     typer.echo(json.dumps(result, default=str, sort_keys=True))

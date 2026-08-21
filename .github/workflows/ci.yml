@@ -310,6 +310,30 @@ jobs:
               | tee "state/ops-evidence/private-recovery-${state_slug}.json" \
               | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["restarted_transition_state"] == sys.argv[1]; assert p["expected_action_count"] == 10; assert p["recovered_action_count"] == 10; assert p["flat_barrier_verified"] is True; assert p["priority_scheduler_restart_proof"] is True; assert p["new_entry_shed_while_p0_active"] is True; assert p["production_exchange_transports_opened"] == 0' "$state"
           done
+          FIVE_TRANCHE_NAME="ipeg-c4-recovery-${GITHUB_RUN_ID}-five-tranche"
+          FIVE_TRANCHE_STATE="/smoke/five-tranche.sqlite3"
+          FIVE_TRANCHE_PRIVATE="/smoke/five-tranche-private"
+          FIVE_TRANCHE_READY="/smoke/five-tranche.ready"
+          docker run --detach --name "$FIVE_TRANCHE_NAME" --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+            interexchange-grid private-transition-recovery-smoke \
+            --state "$FIVE_TRANCHE_STATE" --ready "$FIVE_TRANCHE_READY" \
+            --hold-after-active --transition-state HEDGED \
+            --private-state-dir "$FIVE_TRANCHE_PRIVATE" \
+            --action-count 50 --tranches-per-route 5
+          for attempt in $(seq 1 60); do
+            [ "$(docker exec "$FIVE_TRANCHE_NAME" sh -c "wc -l < '$FIVE_TRANCHE_READY'" 2>/dev/null || true)" = 50 ] && break
+            sleep 1
+          done
+          test "$(docker exec "$FIVE_TRANCHE_NAME" sh -c "wc -l < '$FIVE_TRANCHE_READY'")" = 50
+          docker kill "$FIVE_TRANCHE_NAME"
+          docker rm "$FIVE_TRANCHE_NAME"
+          docker run --rm --volume "$SMOKE_VOLUME:/smoke" "$IMAGE_ID" \
+            interexchange-grid private-transition-recovery-smoke \
+            --state "$FIVE_TRANCHE_STATE" --transition-state HEDGED \
+            --private-state-dir "$FIVE_TRANCHE_PRIVATE" \
+            --action-count 50 --tranches-per-route 5 \
+            | tee "state/ops-evidence/private-recovery-five-tranche.json" \
+            | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["expected_action_count"] == 50; assert p["recovered_action_count"] == 50; assert p["simulated_private_submit_calls"] == 100; assert p["flat_barrier_verified"] is True; assert p["priority_scheduler_restart_proof"] is True; assert p["new_entry_shed_while_p0_active"] is True; assert p["production_exchange_transports_opened"] == 0'
           docker volume rm "$SMOKE_VOLUME"
       - name: Validate deployment scripts
         run: |
