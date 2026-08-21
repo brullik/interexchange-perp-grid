@@ -148,11 +148,28 @@ class PublicMarketEngine:
         adapter_factory: AdapterFactory | None = None,
         recorder: ParquetMarketRecorder | None = None,
         *,
+        public_venues: tuple[Venue, ...] | None = None,
         now_factory: Callable[[], datetime] | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
         reconnect_jitter: ReconnectJitter = _default_reconnect_jitter,
     ) -> None:
         self.settings = settings
+        configured_public_venues = tuple(Venue(value) for value in settings.venues.public_runtime)
+        selected_public_venues = (
+            tuple(Venue(value) for value in settings.venues.wave1_public)
+            if public_venues is None
+            else public_venues
+        )
+        if len(selected_public_venues) != len(set(selected_public_venues)):
+            raise ValueError("public runtime venues must be unique")
+        if not set(selected_public_venues) <= set(configured_public_venues):
+            raise ValueError("public runtime venues must be configured in a venue wave")
+        self._wave1_public_venues = frozenset(
+            Venue(value) for value in settings.venues.wave1_public
+        )
+        if not self._wave1_public_venues <= set(selected_public_venues):
+            raise ValueError("public runtime must preserve every Wave 1 venue")
+        self._configured_public_venues = selected_public_venues
         self._adapter_factory = adapter_factory or CcxtProAdapter
         self._recorder = recorder or ParquetMarketRecorder(Path(settings.storage.parquet_dir))
         self._now_factory = now_factory or (lambda: datetime.now(UTC))
@@ -186,6 +203,8 @@ class PublicMarketEngine:
         self._retiring_bbo_unsubscribes: dict[Venue, asyncio.Task[None]] = {}
         self._bbo_unsubscribe_failures: set[Venue] = set()
         self._retiring_adapter_closers: dict[Venue, asyncio.Task[None]] = {}
+        self._venue_initialise_attempts: dict[Venue, object] = {}
+        self._retiring_venue_initialisers: dict[asyncio.Task[None], Venue] = {}
         self._adapter_recycle_locks: dict[Venue, asyncio.Lock] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._active_public_scans: set[asyncio.Task[object]] = set()
@@ -277,13 +296,18 @@ class PublicMarketEngine:
                 return
             if not self._adapters:
                 staged_adapters: dict[Venue, ExchangeAdapter] = {}
-                try:
-                    for value in self.settings.venues.wave1_public:
-                        venue = Venue(value)
+                for venue in self._configured_public_venues:
+                    try:
                         staged_adapters[venue] = self._adapter_factory(venue)
-                except Exception:
-                    await self._close_unpublished_adapters(staged_adapters)
-                    raise
+                    except Exception as error:
+                        if venue in self._wave1_public_venues:
+                            await self._close_unpublished_adapters(staged_adapters)
+                            raise
+                        self._quarantine(
+                            venue,
+                            f"adapter creation failed: {type(error).__name__}: {error}",
+                        )
+                        self._record_venue_refresh(venue)
                 self._adapters = staged_adapters
             configured = tuple(self._adapters)
             await asyncio.gather(
@@ -349,23 +373,82 @@ class PublicMarketEngine:
             raise RuntimeError(f"public adapter factory rollback failed: {'; '.join(failures)}")
         self._adapters.clear()
 
-    async def _initialise_venue_with_timeout(self, venue: Venue, timeout_seconds: int) -> None:
+    async def _initialise_venue_with_timeout(
+        self,
+        venue: Venue,
+        timeout_seconds: float,
+    ) -> None:
+        self._cleanup_retired_venue_initialisers()
+        if venue in self._venue_initialise_attempts or self._venue_has_retiring_initialiser(venue):
+            if not self._closed:
+                self._quarantine(venue, "previous capability probe remains nonterminal")
+            return
+        attempt = object()
+        self._venue_initialise_attempts[venue] = attempt
+        task = asyncio.create_task(
+            self._initialise_venue(venue, attempt),
+            name=f"public-initialise-{venue.value}",
+        )
         try:
-            await asyncio.wait_for(self._initialise_venue(venue), timeout=timeout_seconds)
-        except TimeoutError:
+            done, _pending = await asyncio.wait((task,), timeout=timeout_seconds)
+            if task in done:
+                task.result()
+                return
+            self._retire_venue_initialiser(venue, attempt, task)
             if self._closed:
                 return
             self._quarantine(venue, f"capability probe timed out after {timeout_seconds}s")
             self._record_venue_refresh(venue)
+        except asyncio.CancelledError:
+            self._retire_venue_initialiser(venue, attempt, task)
+            raise
+        finally:
+            if self._venue_initialise_attempts.get(venue) is attempt:
+                self._venue_initialise_attempts.pop(venue, None)
 
-    async def _initialise_venue(self, venue: Venue) -> None:
+    def _retire_venue_initialiser(
+        self,
+        venue: Venue,
+        attempt: object,
+        task: asyncio.Task[None],
+    ) -> None:
+        if self._venue_initialise_attempts.get(venue) is attempt:
+            self._venue_initialise_attempts.pop(venue, None)
+        if task.done():
+            self._consume_watcher(task)
+            return
+        task.cancel()
+        self._retiring_venue_initialisers[task] = venue
+        task.add_done_callback(self._complete_retired_venue_initialiser)
+
+    def _complete_retired_venue_initialiser(self, task: asyncio.Task[None]) -> None:
+        self._retiring_venue_initialisers.pop(task, None)
+        self._consume_watcher(task)
+
+    def _cleanup_retired_venue_initialisers(self) -> None:
+        for task in tuple(self._retiring_venue_initialisers):
+            if not task.done():
+                continue
+            self._retiring_venue_initialisers.pop(task, None)
+            self._consume_watcher(task)
+
+    def _venue_has_retiring_initialiser(self, venue: Venue) -> bool:
+        return any(
+            task_venue == venue and not task.done()
+            for task, task_venue in self._retiring_venue_initialisers.items()
+        )
+
+    def _venue_initialise_attempt_is_current(self, venue: Venue, attempt: object) -> bool:
+        return not self._closed and self._venue_initialise_attempts.get(venue) is attempt
+
+    async def _initialise_venue(self, venue: Venue, attempt: object) -> None:
         adapter = self._adapters[venue]
         report: CapabilityReport | None = None
         instruments: tuple[Instrument, ...] = ()
         failure_reason: str | None = None
         try:
             report = await adapter.probe_public_capabilities()
-            if self._closed:
+            if not self._venue_initialise_attempt_is_current(venue, attempt):
                 return
             if not report.public_ready:
                 failure_reason = f"missing capabilities: {', '.join(report.missing)}"
@@ -375,16 +458,16 @@ class PublicMarketEngine:
                 failure_reason = f"clock skew {report.clock_skew_ms}ms exceeds policy"
             else:
                 instruments = await adapter.discover_instruments()
-                if self._closed:
+                if not self._venue_initialise_attempt_is_current(venue, attempt):
                     return
                 if not instruments:
                     failure_reason = "no qualified linear USDT perpetual instruments"
         except Exception as error:
-            if self._closed:
+            if not self._venue_initialise_attempt_is_current(venue, attempt):
                 return
             failure_reason = f"capability probe failed: {type(error).__name__}: {error}"
 
-        if self._closed:
+        if not self._venue_initialise_attempt_is_current(venue, attempt):
             return
         if report is not None:
             self._capabilities[venue] = report
@@ -531,6 +614,7 @@ class PublicMarketEngine:
                 and venue not in self._retiring_bbo_unsubscribes
                 and venue not in self._bbo_unsubscribe_failures
                 and venue not in self._retiring_adapter_closers
+                and not self._venue_has_retiring_initialiser(venue)
                 and not self._venue_has_retiring_candidate_l2(venue)
                 and not self._venue_has_retiring_route_calibration_funding(venue)
             ):
@@ -621,6 +705,11 @@ class PublicMarketEngine:
                     for key, task in self._retiring_route_calibration_funding_transports.items()
                     if key[0] == venue
                 ),
+                *(
+                    task
+                    for task, task_venue in self._retiring_venue_initialisers.items()
+                    if task_venue == venue
+                ),
             )
             if task is not None and not task.done()
         )
@@ -640,6 +729,7 @@ class PublicMarketEngine:
             venue in self._retiring_bbo_watchers
             or venue in self._retiring_bbo_transports
             or venue in self._retiring_bbo_unsubscribes
+            or self._venue_has_retiring_initialiser(venue)
             or self._venue_has_retiring_candidate_l2(venue)
             or self._venue_has_retiring_route_calibration_funding(venue)
         ):
@@ -858,9 +948,13 @@ class PublicMarketEngine:
             if now_ns >= retry_at_ns
         }
         requested_venues = (
-            set(self._adapters)
+            set(self._configured_public_venues)
             if force
-            else {venue for venue in (*reconnected, *due_reconnects) if venue in self._adapters}
+            else {
+                venue
+                for venue in (*reconnected, *due_reconnects)
+                if venue in self._configured_public_venues
+            }
         )
         observed_refresh_generations = {
             venue: self._venue_refresh_generations.get(venue, 0) for venue in requested_venues
@@ -894,14 +988,40 @@ class PublicMarketEngine:
     ) -> UniverseSnapshot:
         now_ns = self._monotonic_ns()
         due = self._universe.refresh_due(now_ns)
+        refresh_scope = (
+            set(self._configured_public_venues)
+            if force or self._broad_bbo_admitted
+            else set(self._wave1_public_venues) | set(reconnected)
+        )
         due_reconnects = {
             venue
             for venue, retry_at_ns in self._reconnect_after_ns.items()
-            if now_ns >= retry_at_ns
+            if now_ns >= retry_at_ns and venue in refresh_scope
         }
+        missing_targets = {
+            venue
+            for venue in refresh_scope
+            if venue not in self._adapters
+            and (force or due or venue in reconnected or venue in due_reconnects)
+        }
+        restored_targets: set[Venue] = set()
+        for venue in sorted(missing_targets, key=str):
+            try:
+                replacement = self._adapter_factory(venue)
+            except Exception as error:
+                self._quarantine(
+                    venue,
+                    f"adapter creation failed: {type(error).__name__}: {error}",
+                )
+                self._record_venue_refresh(venue)
+                continue
+            self._mark_venue_unavailable(venue, "capability validation pending")
+            self._record_venue_refresh(venue)
+            self._adapters[venue] = replacement
+            restored_targets.add(venue)
         requested_reconnects = {
             venue for venue in (*reconnected, *due_reconnects) if venue in self._adapters
-        }
+        } | restored_targets
         explicit_reconnects = set(reconnected)
         retired_targets = tuple(
             sorted(
@@ -913,6 +1033,7 @@ class PublicMarketEngine:
                     or venue in self._retiring_bbo_unsubscribes
                     or venue in self._bbo_unsubscribe_failures
                     or venue in self._retiring_adapter_closers
+                    or self._venue_has_retiring_initialiser(venue)
                     or self._venue_has_retiring_candidate_l2(venue)
                     or self._venue_has_retiring_route_calibration_funding(venue)
                 },
@@ -952,12 +1073,14 @@ class PublicMarketEngine:
             tuple(
                 venue
                 for venue in self._adapters
+                if venue in refresh_scope
                 if venue not in recycled_targets
                 if venue not in self._retiring_bbo_watchers
                 and venue not in self._retiring_bbo_transports
                 and venue not in self._retiring_bbo_unsubscribes
                 and venue not in self._bbo_unsubscribe_failures
                 and venue not in self._retiring_adapter_closers
+                and not self._venue_has_retiring_initialiser(venue)
                 and not self._venue_has_retiring_candidate_l2(venue)
                 and not self._venue_has_retiring_route_calibration_funding(venue)
             )
@@ -1004,7 +1127,7 @@ class PublicMarketEngine:
         broad_demand = (
             len({venue for venue, _ in snapshot.known_bbo_keys})
             if snapshot is not None
-            else len(self.settings.venues.wave1_public)
+            else len(self._configured_public_venues)
         )
         active_l2 = sum(
             1
@@ -1026,6 +1149,7 @@ class PublicMarketEngine:
             now=self._now_factory(),
             maximum_report_age_seconds=self.settings.universe.instrument_refresh_seconds,
             require_all_profiles=False,
+            public_runtime_enabled=frozenset(self._configured_public_venues),
         )
 
     async def set_broad_bbo_admitted(self, admitted: bool) -> None:
@@ -2511,6 +2635,9 @@ class PublicMarketEngine:
 
     async def close(self) -> None:
         self._closed = True
+        self._venue_initialise_attempts.clear()
+        for initialiser in self._retiring_venue_initialisers:
+            initialiser.cancel()
         self._bbo_changed.set()
         for key, funding_worker in tuple(self._route_calibration_funding_tasks.items()):
             self._retire_route_calibration_funding_task(key, funding_worker)
@@ -2583,6 +2710,7 @@ class PublicMarketEngine:
     ) -> None:
         close_failures: list[str] = []
         timed_out_closer_venues: set[Venue] = set()
+        self._cleanup_retired_venue_initialisers()
         self._cleanup_retired_bbo_tasks()
         self._cleanup_retired_candidate_l2_tasks()
         for venue, closer in tuple(self._retiring_adapter_closers.items()):
@@ -2655,6 +2783,7 @@ class PublicMarketEngine:
         retiring_funding_transports = tuple(
             set(self._retiring_route_calibration_funding_transports.values())
         )
+        retiring_initialisers = tuple(self._retiring_venue_initialisers)
         for watcher in retiring_watchers:
             watcher.cancel()
         for bbo_transport in retiring_transports:
@@ -2671,6 +2800,8 @@ class PublicMarketEngine:
             funding_worker.cancel()
         for funding_transport in retiring_funding_transports:
             funding_transport.cancel()
+        for initialiser in retiring_initialisers:
+            initialiser.cancel()
         if retiring_watchers:
             await asyncio.wait(
                 retiring_watchers,
@@ -2711,6 +2842,11 @@ class PublicMarketEngine:
                 retiring_funding_transports,
                 timeout=max(0, shutdown_deadline - asyncio.get_running_loop().time()),
             )
+        if retiring_initialisers:
+            await asyncio.wait(
+                retiring_initialisers,
+                timeout=max(0, shutdown_deadline - asyncio.get_running_loop().time()),
+            )
         if retiring_watchers or retiring_transports:
             for watcher in retiring_watchers:
                 if not watcher.done():
@@ -2736,6 +2872,10 @@ class PublicMarketEngine:
         for funding_transport in retiring_funding_transports:
             if not funding_transport.done():
                 funding_transport.add_done_callback(self._consume_funding_transport)
+        for initialiser in retiring_initialisers:
+            if not initialiser.done():
+                initialiser.add_done_callback(self._consume_watcher)
+        self._cleanup_retired_venue_initialisers()
         self._cleanup_retired_bbo_tasks()
         self._cleanup_retired_candidate_l2_tasks()
         self._cleanup_retired_route_calibration_funding_tasks()
@@ -2780,6 +2920,11 @@ class PublicMarketEngine:
                 | {
                     key[0]
                     for key, task in self._retiring_route_calibration_funding_transports.items()
+                    if not task.done()
+                }
+                | {
+                    venue
+                    for task, venue in self._retiring_venue_initialisers.items()
                     if not task.done()
                 }
                 | timed_out_closer_venues

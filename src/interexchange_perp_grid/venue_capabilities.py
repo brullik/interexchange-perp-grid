@@ -62,6 +62,7 @@ def build_venue_capability_matrix(
     now: datetime | None = None,
     maximum_report_age_seconds: int = 300,
     require_all_profiles: bool = True,
+    public_runtime_enabled: frozenset[Venue] | None = None,
 ) -> VenueCapabilityMatrix:
     observed_now = now or datetime.now(UTC)
     if observed_now.tzinfo is None or observed_now.utcoffset() is None:
@@ -69,9 +70,13 @@ def build_venue_capability_matrix(
     if maximum_report_age_seconds <= 0:
         raise ValueError("capability report maximum age must be positive")
     waves = _configured_waves(settings, require_all_profiles=require_all_profiles)
-    public_enabled = frozenset(Venue(value) for value in settings.venues.wave1_public) & frozenset(
-        WAVE1_VENUES
+    public_enabled = (
+        frozenset(Venue(value) for value in settings.venues.public_runtime)
+        if public_runtime_enabled is None
+        else public_runtime_enabled
     )
+    if not public_enabled <= frozenset(waves):
+        raise ValueError("public runtime contains a venue outside the configured waves")
     live_allowlist = frozenset(
         Venue(value) for value in settings.venues.canary_primary + settings.venues.canary_alternate
     ) & frozenset(WAVE1_VENUES)

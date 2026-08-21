@@ -26,7 +26,7 @@
   "EX-OKX-PUBLIC": ["tests/test_adapters.py::test_broad_bbo_uses_only_a_batch_stream_with_matching_unsubscribe"],
   "EX-OKX-PRIVATE": ["tests/test_private_adapter.py::test_wave_one_private_capabilities_and_account_are_normalised"],
   "EX-BITGET-PUBLIC": ["tests/test_adapters.py::test_bitget_classic_batch_ticker_unsubscribe_matches_official_frame"],
-  "EX-BITGET-PRIVATE": ["tests/test_venue_capabilities.py::test_default_matrix_covers_all_seven_without_enabling_expansion"],
+  "EX-BITGET-PRIVATE": ["tests/test_venue_capabilities.py::test_default_matrix_enables_qualified_expansion_public_without_live_authority"],
   "EX-KUCOIN_CLASSIC-PUBLIC": ["tests/test_adapters.py::test_kucoin_futures_bbo_batches_at_100_with_exact_matching_unsubscribe"],
   "EX-KUCOIN_CLASSIC-PRIVATE": ["tests/test_private_adapter.py::test_kucoin_hedge_mode_zero_position_closes_only_its_raw_side"],
   "EX-BINGX-PUBLIC": ["tests/test_bingx_swap.py::test_bingx_incremental_depth_subscribe_and_unsubscribe_are_symmetric"],

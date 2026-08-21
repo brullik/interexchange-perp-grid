@@ -92,6 +92,33 @@ def hedged_tranche() -> Tranche:
     )
 
 
+def test_default_continuous_evaluator_wires_every_configured_public_venue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingPublicEngine:
+        def __init__(self, settings: object, **kwargs: object) -> None:
+            del settings
+            captured.update(kwargs)
+
+    monkeypatch.setattr(shadow_module, "PublicMarketEngine", CapturingPublicEngine)
+    settings = load_settings(
+        CONFIG,
+        {
+            "IPEG_SQLITE_PATH": str(tmp_path / "state.sqlite3"),
+            "IPEG_PARQUET_DIR": str(tmp_path / "market"),
+        },
+    )
+
+    ContinuousShadowEvaluator(settings)
+
+    assert captured["public_venues"] == tuple(
+        Venue(value) for value in settings.venues.public_runtime
+    )
+
+
 def persisted_risk(tranche: Tranche) -> RiskRequest:
     return RiskRequest(
         reservation_id=tranche.tranche_id,

@@ -356,6 +356,23 @@ class CoordinatedProbeBroadFakeAdapter(BroadFakeAdapter):
         return await super().probe_public_capabilities()
 
 
+class CancellationResistantProbeBroadFakeAdapter(BroadFakeAdapter):
+    def __init__(self, venue: Venue, received_ns: int) -> None:
+        super().__init__(venue, received_ns)
+        self.probe_started = asyncio.Event()
+        self.release_probe = asyncio.Event()
+        self.probe_cancelled = 0
+
+    async def probe_public_capabilities(self) -> CapabilityReport:
+        self.probe_started.set()
+        while not self.release_probe.is_set():
+            try:
+                await self.release_probe.wait()
+            except asyncio.CancelledError:
+                self.probe_cancelled += 1
+        return await super().probe_public_capabilities()
+
+
 class CoordinatedDiscoveryBroadFakeAdapter(BroadFakeAdapter):
     def __init__(self, venue: Venue, received_ns: int) -> None:
         super().__init__(venue, received_ns)
@@ -502,6 +519,181 @@ async def test_wave1_public_scan_does_not_require_private_credentials(
     assert len(result.bbo) == 3
     assert len(result.quotes) == 6
     assert result.quarantined == ()
+
+
+@pytest.mark.asyncio
+async def test_continuous_runtime_qualifies_expansion_public_without_live_authority(
+    tmp_path: Path,
+) -> None:
+    adapters = {
+        venue: FakeAdapter(venue, fail_probe=venue in {Venue.BINGX, Venue.MEXC}) for venue in Venue
+    }
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        public_venues=tuple(Venue),
+    )
+
+    result = await engine.scan_once("BTC", Decimal("0.001"), timeout_seconds=1)
+    matrix = result.venue_capability_matrix
+    await engine.close()
+
+    assert len(result.bbo) == 5
+    assert len(result.quotes) == 20
+    assert {record.venue for record in result.quarantined} == {Venue.BINGX, Venue.MEXC}
+    assert matrix is not None
+    for venue in (Venue.BITGET, Venue.KUCOIN_FUTURES):
+        row = matrix.for_venue(venue)
+        assert row.public_runtime == CapabilityState.QUALIFIED
+        assert row.live_capability == CapabilityState.DISABLED
+        assert CapabilityReason.LIVE_ALLOWLIST_DISABLED in row.reasons
+    for venue in (Venue.BINGX, Venue.MEXC):
+        row = matrix.for_venue(venue)
+        assert row.public_runtime == CapabilityState.QUARANTINED
+        assert row.live_capability == CapabilityState.DISABLED
+    assert all(adapter.closed for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_continuous_runtime_retries_failed_expansion_adapter_factory(
+    tmp_path: Path,
+) -> None:
+    adapters = {
+        venue: FakeAdapter(venue, fail_probe=venue in {Venue.BINGX, Venue.MEXC}) for venue in Venue
+    }
+    bitget_attempts = 0
+
+    def adapter_factory(venue: Venue) -> FakeAdapter:
+        nonlocal bitget_attempts
+        if venue == Venue.BITGET:
+            bitget_attempts += 1
+            if bitget_attempts == 1:
+                raise ConnectionError("fixture factory outage")
+        return adapters[venue]
+
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapter_factory,
+        recorder=ParquetMarketRecorder(tmp_path),
+        public_venues=tuple(Venue),
+    )
+
+    await engine.initialise(timeout_seconds=1)
+    assert engine.venue_capability_matrix().for_venue(Venue.BITGET).public_runtime == (
+        CapabilityState.QUARANTINED
+    )
+    first, second = await asyncio.gather(
+        engine.refresh_universe(timeout_seconds=1, force=True),
+        engine.refresh_universe(timeout_seconds=1, force=True),
+    )
+    matrix = engine.venue_capability_matrix()
+    await engine.close()
+
+    assert bitget_attempts == 2
+    assert first.generation == second.generation
+    assert matrix.for_venue(Venue.BITGET).public_runtime == CapabilityState.QUALIFIED
+    assert CapabilityReason.VENUE_QUARANTINED not in matrix.for_venue(Venue.BITGET).reasons
+
+
+@pytest.mark.asyncio
+async def test_expansion_probe_timeout_is_hard_and_late_result_cannot_qualify(
+    tmp_path: Path,
+) -> None:
+    clock = time.monotonic_ns()
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+    }
+    resistant = CancellationResistantProbeBroadFakeAdapter(Venue.BITGET, clock)
+    adapters[Venue.BITGET] = resistant
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        public_venues=tuple(Venue),
+    )
+
+    started = time.monotonic()
+    await engine.initialise(timeout_seconds=1)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.2
+    assert resistant.probe_cancelled >= 1
+    assert engine.venue_capability_matrix().for_venue(Venue.BITGET).public_runtime == (
+        CapabilityState.QUARANTINED
+    )
+
+    resistant.release_probe.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert engine.venue_capability_matrix().for_venue(Venue.BITGET).public_runtime == (
+        CapabilityState.QUARANTINED
+    )
+    assert Venue.BITGET not in engine._instruments
+    await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_reports_nonterminal_expansion_probe_and_retry_drains_it(
+    tmp_path: Path,
+) -> None:
+    clock = time.monotonic_ns()
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock) for venue in Venue
+    }
+    resistant = CancellationResistantProbeBroadFakeAdapter(Venue.BITGET, clock)
+    adapters[Venue.BITGET] = resistant
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        public_venues=tuple(Venue),
+    )
+
+    await engine.initialise(timeout_seconds=1)
+    for _ in range(8):
+        await engine.refresh_universe(timeout_seconds=1, force=True)
+    assert len(engine._retiring_venue_initialisers) == 1
+    assert resistant.probe_cancelled == 1
+    with pytest.raises(RuntimeError, match=r"shutdown deadline exceeded.*bitget"):
+        await engine.close()
+
+    resistant.release_probe.set()
+    await asyncio.sleep(0)
+    await engine.close()
+    assert engine._retiring_venue_initialisers == {}
+
+
+@pytest.mark.asyncio
+async def test_broad_shed_defers_periodic_expansion_probes(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: BroadFakeAdapter(venue, clock[0]) for venue in Venue}
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        public_venues=tuple(Venue),
+        monotonic_ns=lambda: clock[0],
+    )
+
+    await engine.initialise(timeout_seconds=1)
+    await engine.set_broad_bbo_admitted(False)
+    initial_probe_calls = {venue: adapter.probe_calls for venue, adapter in adapters.items()}
+    clock[0] += 7 * 60 * 60 * 1_000_000_000
+
+    await engine.refresh_universe(timeout_seconds=1)
+
+    for venue in engine._wave1_public_venues:
+        assert adapters[venue].probe_calls == initial_probe_calls[venue] + 1
+    for venue in set(Venue) - engine._wave1_public_venues:
+        assert adapters[venue].probe_calls == initial_probe_calls[venue]
+    await engine.close()
 
 
 @pytest.mark.asyncio
