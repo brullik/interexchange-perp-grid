@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import subprocess
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass
@@ -64,6 +65,7 @@ from interexchange_perp_grid.live_reconciliation import (
     shutdown_private_requests,
 )
 from interexchange_perp_grid.market_data import BookRegistry, DataQualityAssessment
+from interexchange_perp_grid.native_runtime import resolve_runtime_artifact_digest
 from interexchange_perp_grid.private_cache import Wave1PrivateStateSupervisor
 from interexchange_perp_grid.private_domain import PrivateCapabilityReport, VenueOrderRequest
 from interexchange_perp_grid.private_execution import (
@@ -1095,7 +1097,10 @@ async def run_canary_once(
         emergency_venue = _wave1_emergency_venue(settings, route)
     except ValueError:
         return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route)
-    image_digest = os.environ.get("IPEG_CONTAINER_IMAGE_DIGEST")
+    try:
+        image_digest = resolve_runtime_artifact_digest(repo_root, config_path)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING, route)
     qualification_valid, _ = qualification_is_current(
         evidence,
         repo_root,

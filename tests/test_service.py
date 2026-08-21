@@ -9,7 +9,7 @@ import interexchange_perp_grid.service as service_module
 from interexchange_perp_grid.autonomous_orchestrator import AutonomousOrchestrator
 from interexchange_perp_grid.config import load_settings
 from interexchange_perp_grid.reason_codes import ReasonCode
-from interexchange_perp_grid.service import BootstrapService
+from interexchange_perp_grid.service import BootstrapService, run_for_duration
 from interexchange_perp_grid.shadow import ContinuousShadowEvaluator
 from interexchange_perp_grid.state import read_service_health
 
@@ -135,3 +135,34 @@ async def test_service_owns_one_persistent_autonomous_orchestrator(
         await asyncio.wait_for(task, timeout=2)
 
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_service_runs_full_interval_and_stops_cleanly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def fake_run(self: object, stop_event: asyncio.Event) -> None:
+        del self
+        started.set()
+        await stop_event.wait()
+        stopped.set()
+
+    monkeypatch.setattr(BootstrapService, "run", fake_run)
+
+    await run_for_duration(settings, 0.02)
+
+    assert started.is_set()
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_bounded_service_rejects_invalid_duration(tmp_path: Path) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
+
+    with pytest.raises(ValueError, match="service duration"):
+        await run_for_duration(settings, 0)

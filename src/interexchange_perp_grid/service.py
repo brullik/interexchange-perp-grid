@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +32,29 @@ from interexchange_perp_grid.state import (
 )
 from interexchange_perp_grid.supervisor import LiveSafetySupervisor, RecoveryRunner
 from interexchange_perp_grid.telegram_control import run_telegram_bot
+
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_AWAYMODE_REQUIRED = 0x00000040
+
+
+@contextmanager
+def _prevent_windows_sleep() -> Iterator[None]:
+    if sys.platform != "win32":
+        yield
+        return
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    previous = kernel32.SetThreadExecutionState(
+        _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_AWAYMODE_REQUIRED
+    )
+    if previous == 0:
+        raise RuntimeError("Windows sleep prevention could not be armed")
+    try:
+        yield
+    finally:
+        kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
 
 
 @dataclass(slots=True)
@@ -162,3 +188,28 @@ async def run_until_signal(settings: Settings) -> None:
     finally:
         for handled_signal in installed_signals:
             loop.remove_signal_handler(handled_signal)
+
+
+async def run_for_duration(settings: Settings, duration_seconds: float) -> None:
+    if not 0 < duration_seconds <= 86_400:
+        raise ValueError("service duration must be in (0, 86400]")
+    with _prevent_windows_sleep():
+        stop_event = asyncio.Event()
+        service = asyncio.create_task(
+            BootstrapService(settings).run(stop_event),
+            name="bounded-bootstrap-service",
+        )
+        try:
+            try:
+                await asyncio.wait_for(asyncio.shield(service), timeout=duration_seconds)
+            except TimeoutError:
+                stop_event.set()
+                await service
+                return
+            raise RuntimeError("service stopped before the requested duration")
+        finally:
+            stop_event.set()
+            if not service.done():
+                service.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await service
