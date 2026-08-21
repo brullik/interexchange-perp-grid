@@ -58,8 +58,12 @@ if [[ "$*" == *"deployment-upgrade-gate"*"--action release"* ]] \
   && [[ "${FAKE_UPGRADE_GATE_RELEASE_FAIL:-0}" == 1 ]]; then
   exit 7
 fi
+if [[ "$*" == *"backup-state"* ]] && [[ "${FAKE_BACKUP_FAIL:-0}" == 1 ]]; then
+  exit 4
+fi
 if [[ "$*" == *"interexchange-grid health"* ]] \
-  && [[ "${IPEG_RELEASE_SHA:-}" == "${FAKE_FAIL_SHA:-never}" ]]; then
+  && { [[ "${IPEG_RELEASE_SHA:-}" == "${FAKE_FAIL_SHA:-never}" ]] \
+    || [[ "${IPEG_RELEASE_SHA:-}" == "${FAKE_FAIL_SECOND_SHA:-never}" ]]; }; then
   exit 17
 fi
 exit 0
@@ -175,9 +179,12 @@ def test_failed_upgrade_restores_backup_and_previous_digest(tmp_path: Path) -> N
     assert "restore-state" in log
     assert f"{NEW_SHA}|compose up" in log
     assert f"{OLD_SHA}|compose up" in log
-    assert log.count("deployment-upgrade-gate --config /app/config/defaults.yaml") == 2
-    assert log.index("--action arm") < log.index("compose stop app")
+    assert log.count("deployment-upgrade-gate --config /app/config/defaults.yaml") == 3
+    assert log.index("compose pause app") < log.index("--action arm")
+    assert log.index("backup-state") < log.index("--action arm")
+    assert log.index("--action arm") < log.index("compose kill app")
     assert log.rindex("--action release") > log.rindex(f"{OLD_SHA}|compose up")
+    assert f"{OLD_SHA}|compose run --rm --no-deps app interexchange-grid backup-state" in log
 
 
 def test_upgrade_refuses_to_stop_app_when_durable_live_actions_are_active(tmp_path: Path) -> None:
@@ -195,7 +202,9 @@ def test_upgrade_refuses_to_stop_app_when_durable_live_actions_are_active(tmp_pa
     assert "aborted before shutdown" in result.stderr
     log = docker_log.read_text(encoding="utf-8")
     assert "--action arm" in log
-    assert "compose stop app" not in log
+    assert "compose pause app" in log
+    assert "compose unpause app" in log
+    assert "compose kill app" not in log
     assert "backup-state" not in log
     assert f"{NEW_SHA}|compose up" not in log
 
@@ -212,7 +221,11 @@ def test_successful_upgrade_releases_entry_freeze_only_after_exact_health(tmp_pa
 
     assert result.returncode == 0, result.stderr
     log = docker_log.read_text(encoding="utf-8")
-    assert log.index("--action arm") < log.index("compose stop app")
+    assert log.index("compose pause app") < log.index("--action arm")
+    assert log.index("backup-state") < log.index("--action arm")
+    assert log.index("--action arm") < log.index("compose kill app")
+    assert "compose run --rm --no-deps app interexchange-grid deployment-upgrade-gate" in log
+    assert f"{NEW_SHA}|image inspect {NEW_IMAGE}" in log
     assert log.index("interexchange-grid deployment-identity") < log.rindex("--action release")
     assert state_path.read_text(encoding="utf-8") == (
         f"image_ref={NEW_IMAGE}\nrelease_sha={NEW_SHA}\n"
@@ -235,6 +248,50 @@ def test_upgrade_fails_closed_when_healthy_service_cannot_release_entry_freeze(
     assert result.returncode == 7
     assert "freeze could not be released" in result.stderr
     assert "--action release" in docker_log.read_text(encoding="utf-8")
+
+
+def test_failed_rollback_keeps_legacy_gate_armed_and_never_releases_entry(
+    tmp_path: Path,
+) -> None:
+    environment, state_path, docker_log = _fake_environment(tmp_path)
+    state_path.write_text(
+        f"image_ref={OLD_IMAGE}\nrelease_sha={OLD_SHA}\n",
+        encoding="utf-8",
+    )
+    environment["FAKE_APP_RUNNING"] = "1"
+    environment["FAKE_FAIL_SHA"] = NEW_SHA
+    environment["FAKE_FAIL_SECOND_SHA"] = OLD_SHA
+
+    result = _run(UPGRADE, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+
+    assert result.returncode == 5
+    assert "rollback failed" in result.stderr
+    log = docker_log.read_text(encoding="utf-8")
+    old_start = log.rindex(f"{OLD_SHA}|compose up")
+    assert log.rindex("--action arm") < old_start
+    assert "--action release" not in log[old_start:]
+
+
+def test_backup_failure_releases_gate_while_stopped_then_restarts_exact_old_image(
+    tmp_path: Path,
+) -> None:
+    environment, state_path, docker_log = _fake_environment(tmp_path)
+    state_path.write_text(
+        f"image_ref={OLD_IMAGE}\nrelease_sha={OLD_SHA}\n",
+        encoding="utf-8",
+    )
+    environment["FAKE_APP_RUNNING"] = "1"
+    environment["FAKE_BACKUP_FAIL"] = "1"
+
+    result = _run(UPGRADE, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+
+    assert result.returncode == 4
+    assert "paused-state backup failed" in result.stderr
+    log = docker_log.read_text(encoding="utf-8")
+    assert "compose pause app" in log
+    assert "compose unpause app" in log
+    assert "compose kill app" not in log
+    assert "deployment-upgrade-gate" not in log
 
 
 def test_bootstrap_stages_exact_ubuntu_systemd_control_plane(tmp_path: Path) -> None:

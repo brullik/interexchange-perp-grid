@@ -144,7 +144,14 @@ async def test_deployment_upgrade_gate_is_atomic_durable_and_blocks_only_new_ent
     armed = await journal.arm_deployment_upgrade()
     assert armed.entry_frozen
     assert armed.active_action_count == 0
-    with pytest.raises(RuntimeError, match="deployment upgrade freeze"):
+    with sqlite3.connect(path) as database:
+        assert database.execute(
+            "SELECT risk_stage_completion_frozen FROM live_entry_controls WHERE singleton = 1"
+        ).fetchone() == (1,)
+        assert database.execute(
+            "SELECT owner_token FROM live_control_leases WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+        ).fetchone() == ("deployment-upgrade-gate-v1",)
+    with pytest.raises(RuntimeError, match="freeze blocks new live"):
         await _prepare(journal)
     emergency_request = replace(
         _request(Venue.BINANCE_USDM, "emergency-close", Side.SELL),
@@ -152,7 +159,7 @@ async def test_deployment_upgrade_gate_is_atomic_durable_and_blocks_only_new_ent
         price=None,
         time_in_force=None,
     )
-    with pytest.raises(RuntimeError, match="deployment upgrade freeze"):
+    with pytest.raises(RuntimeError, match="freeze blocks new live"):
         await journal.prepare_emergency(
             "emergency-1",
             _ROUTE,
@@ -165,11 +172,38 @@ async def test_deployment_upgrade_gate_is_atomic_durable_and_blocks_only_new_ent
 
     restarted = LiveOrderJournal(path)
     await restarted.initialise()
-    with pytest.raises(RuntimeError, match="deployment upgrade freeze"):
+    with pytest.raises(RuntimeError, match="freeze blocks new live"):
         await _prepare(restarted)
     released = await restarted.release_deployment_upgrade()
     assert not released.entry_frozen
     assert (await _prepare(restarted)).state == LiveActionState.PREPARED
+
+
+@pytest.mark.asyncio
+async def test_upgrade_gate_preserves_an_existing_owner_risk_stage_freeze(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "UPDATE live_entry_controls SET risk_stage_completion_frozen = 1 WHERE singleton = 1"
+        )
+        database.commit()
+
+    await journal.arm_deployment_upgrade()
+    await journal.release_deployment_upgrade()
+
+    with sqlite3.connect(path) as database:
+        assert database.execute(
+            "SELECT risk_stage_completion_frozen FROM live_entry_controls WHERE singleton = 1"
+        ).fetchone() == (1,)
+        assert (
+            database.execute(
+                "SELECT owner_token FROM live_control_leases "
+                "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+            ).fetchone()
+            is None
+        )
 
 
 @pytest.mark.asyncio
@@ -183,7 +217,7 @@ async def test_upgrade_gate_retains_freeze_until_all_live_actions_are_flat(tmp_p
     assert armed.active_action_count == 1
     with pytest.raises(RuntimeError, match="zero active live actions"):
         await journal.release_deployment_upgrade()
-    with pytest.raises(RuntimeError, match="deployment upgrade freeze"):
+    with pytest.raises(RuntimeError, match="freeze blocks new live"):
         await _prepare(
             journal,
             "pair-2",

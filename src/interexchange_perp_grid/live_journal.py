@@ -24,6 +24,7 @@ from interexchange_perp_grid.private_domain import (
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _PROCESS_INCARCATION = secrets.token_hex(32)
+_DEPLOYMENT_UPGRADE_LEASE_TOKEN = "deployment-upgrade-gate-v1"
 
 
 class LiveActionState(StrEnum):
@@ -340,6 +341,8 @@ class LiveOrderJournal:
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     upgrade_entry_frozen INTEGER NOT NULL DEFAULT 0
                         CHECK (upgrade_entry_frozen IN (0, 1)),
+                    previous_risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0
+                        CHECK (previous_risk_stage_completion_frozen IN (0, 1)),
                     updated_at TEXT NOT NULL
                 );
                 """
@@ -350,9 +353,19 @@ class LiveOrderJournal:
             )
             database.execute(
                 "INSERT OR IGNORE INTO live_deployment_controls("
-                "singleton, upgrade_entry_frozen, updated_at) VALUES (1, 0, ?)",
+                "singleton, upgrade_entry_frozen, previous_risk_stage_completion_frozen, "
+                "updated_at) VALUES (1, 0, 0, ?)",
                 (datetime.now(UTC).isoformat(),),
             )
+            deployment_columns = {
+                str(row[1])
+                for row in database.execute("PRAGMA table_info(live_deployment_controls)")
+            }
+            if "previous_risk_stage_completion_frozen" not in deployment_columns:
+                database.execute(
+                    "ALTER TABLE live_deployment_controls ADD COLUMN "
+                    "previous_risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0"
+                )
             columns = {
                 str(row[1]) for row in database.execute("PRAGMA table_info(live_order_legs)")
             }
@@ -464,20 +477,110 @@ class LiveOrderJournal:
         observed = now.isoformat()
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
+            gate = database.execute(
+                "SELECT upgrade_entry_frozen, previous_risk_stage_completion_frozen "
+                "FROM live_deployment_controls WHERE singleton = 1"
+            ).fetchone()
+            if gate is None:
+                database.rollback()
+                raise RuntimeError("deployment upgrade gate state is unavailable")
             active_action_count = int(
                 database.execute(
                     "SELECT COUNT(*) FROM live_pair_actions WHERE state <> ?",
                     (LiveActionState.FLAT.value,),
                 ).fetchone()[0]
             )
-            if not frozen and active_action_count:
-                database.rollback()
-                raise RuntimeError("deployment upgrade release requires zero active live actions")
-            database.execute(
-                "UPDATE live_deployment_controls "
-                "SET upgrade_entry_frozen = ?, updated_at = ? WHERE singleton = 1",
-                (int(frozen), observed),
-            )
+            currently_frozen = bool(gate["upgrade_entry_frozen"])
+            if frozen and not currently_frozen:
+                stage = database.execute(
+                    "SELECT risk_stage_completion_frozen FROM live_entry_controls "
+                    "WHERE singleton = 1"
+                ).fetchone()
+                if stage is None:
+                    database.rollback()
+                    raise RuntimeError("legacy live entry freeze is unavailable")
+                existing_lease = database.execute(
+                    "SELECT owner_token FROM live_control_leases "
+                    "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+                ).fetchone()
+                if existing_lease is not None:
+                    database.rollback()
+                    raise RuntimeError("account-wide recovery already owns the live entry gate")
+                previous_stage_freeze = int(bool(stage["risk_stage_completion_frozen"]))
+                database.execute(
+                    "UPDATE live_entry_controls SET risk_stage_completion_frozen = 1 "
+                    "WHERE singleton = 1"
+                )
+                database.execute(
+                    "INSERT INTO live_control_leases("
+                    "lease_key, owner_token, owner_pid, owner_incarnation, "
+                    "owner_process_identity, acquired_at) "
+                    "VALUES ('ACCOUNT_WIDE_FLATTEN', ?, 0, ?, ?, ?)",
+                    (
+                        _DEPLOYMENT_UPGRADE_LEASE_TOKEN,
+                        _DEPLOYMENT_UPGRADE_LEASE_TOKEN,
+                        _DEPLOYMENT_UPGRADE_LEASE_TOKEN,
+                        observed,
+                    ),
+                )
+                database.execute(
+                    "UPDATE live_deployment_controls "
+                    "SET upgrade_entry_frozen = 1, "
+                    "previous_risk_stage_completion_frozen = ?, updated_at = ? "
+                    "WHERE singleton = 1",
+                    (previous_stage_freeze, observed),
+                )
+            elif frozen:
+                stage = database.execute(
+                    "SELECT risk_stage_completion_frozen FROM live_entry_controls "
+                    "WHERE singleton = 1"
+                ).fetchone()
+                lease = database.execute(
+                    "SELECT owner_token FROM live_control_leases "
+                    "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+                ).fetchone()
+                if (
+                    stage is None
+                    or not bool(stage["risk_stage_completion_frozen"])
+                    or lease is None
+                    or str(lease["owner_token"]) != _DEPLOYMENT_UPGRADE_LEASE_TOKEN
+                ):
+                    database.rollback()
+                    raise RuntimeError("deployment upgrade legacy gate ownership is unavailable")
+            elif not frozen:
+                if active_action_count:
+                    database.rollback()
+                    raise RuntimeError(
+                        "deployment upgrade release requires zero active live actions"
+                    )
+                lease = database.execute(
+                    "SELECT owner_token FROM live_control_leases "
+                    "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+                ).fetchone()
+                if (
+                    not currently_frozen
+                    or lease is None
+                    or str(lease["owner_token"]) != (_DEPLOYMENT_UPGRADE_LEASE_TOKEN)
+                ):
+                    database.rollback()
+                    raise RuntimeError("deployment upgrade gate ownership is unavailable")
+                database.execute(
+                    "DELETE FROM live_control_leases "
+                    "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN' AND owner_token = ?",
+                    (_DEPLOYMENT_UPGRADE_LEASE_TOKEN,),
+                )
+                database.execute(
+                    "UPDATE live_entry_controls SET risk_stage_completion_frozen = ? "
+                    "WHERE singleton = 1",
+                    (int(bool(gate["previous_risk_stage_completion_frozen"])),),
+                )
+                database.execute(
+                    "UPDATE live_deployment_controls "
+                    "SET upgrade_entry_frozen = 0, "
+                    "previous_risk_stage_completion_frozen = 0, updated_at = ? "
+                    "WHERE singleton = 1",
+                    (observed,),
+                )
             database.commit()
         return DeploymentUpgradeGate(frozen, active_action_count, now)
 
