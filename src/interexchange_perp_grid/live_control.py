@@ -666,6 +666,61 @@ class LiveControlService:
                 flat_barrier_failure_reason(barrier),
             )
 
+        expected_by_key: dict[tuple[Venue, str], list[tuple[LiveJournalAction, Decimal]]] = {}
+        for action in active:
+            action_exposure: dict[tuple[Venue, str], Decimal] = {}
+            for leg in action.legs:
+                key = (leg.venue, leg.symbol)
+                signed = (
+                    leg.filled_base_quantity if leg.side == Side.BUY else -leg.filled_base_quantity
+                )
+                action_exposure[key] = action_exposure.get(key, Decimal(0)) + signed
+            for key, signed in action_exposure.items():
+                if signed != 0:
+                    expected_by_key.setdefault(key, []).append((action, signed))
+
+        actual_by_key: dict[tuple[Venue, str], Decimal] = {}
+        for position in positions:
+            key = (position.venue, position.symbol)
+            signed = (
+                position.base_quantity if position.side == Side.BUY else -position.base_quantity
+            )
+            actual_by_key[key] = actual_by_key.get(key, Decimal(0)) + signed
+        actual_by_key = {key: signed for key, signed in actual_by_key.items() if signed != 0}
+        expected_totals = {
+            key: sum((signed for _, signed in owners), Decimal(0))
+            for key, owners in expected_by_key.items()
+        }
+        ownership_matches = expected_totals == actual_by_key and all(
+            signed * expected_totals[key] > 0
+            for key, owners in expected_by_key.items()
+            for _, signed in owners
+        )
+        if not ownership_matches:
+            quarantined = await self._quarantine_many(
+                active,
+                await self._report_many(active),
+                action_name,
+            )
+            return LiveControlResult(
+                False,
+                action_name,
+                0,
+                cancellation.cancelled_orders,
+                _terminal_state(quarantined),
+                None,
+                "Private position ownership is ambiguous; keep live disabled.",
+                reason=ReasonCode.RECONCILIATION_INCOMPLETE,
+            )
+        owned_exposures = [
+            (owner, venue, symbol, signed)
+            for (venue, symbol), owners in sorted(
+                expected_by_key.items(),
+                key=lambda item: (item[0][0].value, item[0][1]),
+            )
+            for owner, signed in owners
+        ]
+
         requests = tuple(
             translate_protected_order(
                 ExecutionIntent(
@@ -674,44 +729,18 @@ class LiveControlService:
                         "close",
                         index,
                     ),
-                    venue=position.venue,
-                    side=Side.SELL if position.side == Side.BUY else Side.BUY,
+                    venue=venue,
+                    side=Side.SELL if signed > 0 else Side.BUY,
                     purpose=OrderPurpose.EMERGENCY_CLOSE,
-                    quantity=position.base_quantity,
+                    quantity=abs(signed),
                     worst_acceptable_price=None,
                     unbounded_market=True,
                 ),
-                self._instrument(position.venue, position.symbol),
+                self._instrument(venue, symbol),
             )
-            for index, position in enumerate(positions)
+            for index, (owner, venue, symbol, signed) in enumerate(owned_exposures)
         )
-        owners: list[LiveJournalAction] = []
-        for position in positions:
-            matched = tuple(
-                action
-                for action in active
-                if any(
-                    leg.venue == position.venue and leg.symbol == position.symbol
-                    for leg in action.legs
-                )
-            )
-            if len(matched) != 1:
-                quarantined = await self._quarantine_many(
-                    active,
-                    await self._report_many(active),
-                    action_name,
-                )
-                return LiveControlResult(
-                    False,
-                    action_name,
-                    0,
-                    cancellation.cancelled_orders,
-                    _terminal_state(quarantined),
-                    None,
-                    "Private position ownership is ambiguous; keep live disabled.",
-                    reason=ReasonCode.RECONCILIATION_INCOMPLETE,
-                )
-            owners.append(matched[0])
+        owners = tuple(owner for owner, _, _, _ in owned_exposures)
 
         recovering = tuple(
             await asyncio.gather(
@@ -719,12 +748,17 @@ class LiveControlService:
             )
         )
         recovering_by_id = {action.pair_action_id: action for action in recovering}
-        for owner, request, position in zip(owners, requests, positions, strict=True):
+        for owner, request, (_, _, _, signed) in zip(
+            owners,
+            requests,
+            owned_exposures,
+            strict=True,
+        ):
             current_owner = recovering_by_id[owner.pair_action_id]
             await self._journal.append_order_leg(
                 current_owner.pair_action_id,
                 request,
-                position.base_quantity,
+                abs(signed),
                 None,
             )
             await self._journal.mark_leg_submit_attempted(
@@ -1170,7 +1204,10 @@ def _live_risk_snapshot(
                 raise ValueError("projected portfolio stress is outside the locked limit")
         except (DecimalException, KeyError, ValueError):
             return {"status": "INVALID_RISK_DATA", "reason": "RISK_RESERVATION_UNKNOWN"}
-        per_route[action.route.value] = str(projected_stress)
+        route_stress = Decimal(per_route.get(action.route.value, "0")) + projected_stress
+        if not route_stress.is_finite() or route_stress > Decimal("5"):
+            return {"status": "INVALID_RISK_DATA", "reason": "RISK_RESERVATION_UNKNOWN"}
+        per_route[action.route.value] = str(route_stress)
     return {
         "status": "OK",
         "scope": "JOURNAL_RESERVATION",

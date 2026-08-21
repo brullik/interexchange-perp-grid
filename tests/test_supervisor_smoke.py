@@ -118,7 +118,7 @@ async def test_restart_smoke_rejects_nonfinite_durable_stress(tmp_path: Path) ->
             ('{"projected_stress_usdt":"NaN"}', "docker-supervisor-recovery-00"),
         )
 
-    with pytest.raises(RuntimeError, match="route stress exceeds"):
+    with pytest.raises(RuntimeError, match="risk reservation is invalid"):
         await run_supervisor_recovery_smoke(state, hold_after_active=False)
 
     journal = LiveOrderJournal(state)
@@ -258,3 +258,45 @@ async def test_private_priority_restart_recovers_maximum_ten_actions(tmp_path: P
     assert result["expected_action_count"] == result["recovered_action_count"] == 10
     assert result["priority_scheduler_restart_proof"] is True
     assert result["new_entry_shed_while_p0_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_private_restart_recovers_ten_routes_with_five_tranches_each(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "private-priority-fifty.sqlite3"
+    private_state = tmp_path / "private-priority-fifty"
+    ready = tmp_path / "private-priority-fifty.ready"
+    killed_process = asyncio.create_task(
+        run_private_transition_recovery_smoke(
+            state,
+            private_state,
+            hold_after_active=True,
+            transition_state=RecoverySmokeTransition.HEDGED,
+            ready_path=ready,
+            action_count=50,
+            tranches_per_route=5,
+        )
+    )
+    ready_content = await _wait_for_ready_content(ready, killed_process, expected_lines=50)
+    assert len(ready_content.splitlines()) == 50
+    killed_process.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await killed_process
+
+    result = await run_private_transition_recovery_smoke(
+        state,
+        private_state,
+        hold_after_active=False,
+        transition_state=RecoverySmokeTransition.HEDGED,
+        action_count=50,
+        tranches_per_route=5,
+    )
+
+    assert result["status"] == "PASS"
+    assert result["expected_action_count"] == result["recovered_action_count"] == 50
+    assert result["simulated_private_submit_calls"] == 100
+    assert result["flat_barrier_verified"] is True
+    assert result["priority_scheduler_restart_proof"] is True
+    assert result["new_entry_shed_while_p0_active"] is True
+    assert await LiveOrderJournal(state).active_actions() == ()

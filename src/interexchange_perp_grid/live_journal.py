@@ -8,7 +8,7 @@ import secrets
 import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -169,7 +169,11 @@ class JournalEventQuarantinedError(RuntimeError):
     pass
 
 
-MAX_ACTIVE_LIVE_ACTIONS = 10
+MAX_ACTIVE_LIVE_ROUTES = 10
+MAX_TRANCHES_PER_LIVE_ROUTE = 5
+MAX_ACTIVE_LIVE_ACTIONS = MAX_ACTIVE_LIVE_ROUTES * MAX_TRANCHES_PER_LIVE_ROUTE
+MAX_LIVE_ROUTE_STRESS_USDT = Decimal("5")
+MAX_LIVE_PORTFOLIO_STRESS_USDT = Decimal("50")
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +262,8 @@ class LiveOrderJournal:
                     qualification_hash TEXT NOT NULL,
                     residual_delta TEXT NOT NULL,
                     recovery_action TEXT,
+                    emergency_exclusive INTEGER NOT NULL DEFAULT 0
+                        CHECK (emergency_exclusive IN (0, 1)),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -334,6 +340,14 @@ class LiveOrderJournal:
             }
             if "last_event_at" not in columns:
                 database.execute("ALTER TABLE live_order_legs ADD COLUMN last_event_at TEXT")
+            action_columns = {
+                str(row[1]) for row in database.execute("PRAGMA table_info(live_pair_actions)")
+            }
+            if "emergency_exclusive" not in action_columns:
+                database.execute(
+                    "ALTER TABLE live_pair_actions ADD COLUMN emergency_exclusive "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             control_columns = {
                 str(row[1]) for row in database.execute("PRAGMA table_info(live_control_leases)")
             }
@@ -354,16 +368,41 @@ class LiveOrderJournal:
                 )
             database.execute("BEGIN IMMEDIATE")
             try:
+                initial_transitions = database.execute(
+                    "SELECT pair_action_id, details_json FROM live_action_transitions "
+                    "WHERE from_state IS NULL"
+                ).fetchall()
+                authoritative_emergency_ids: set[str] = set()
+                for transition in initial_transitions:
+                    try:
+                        details = json.loads(str(transition["details_json"]))
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(details, dict) and details.get("emergency") is True:
+                        pair_action_id = str(transition["pair_action_id"])
+                        authoritative_emergency_ids.add(pair_action_id)
+                        database.execute(
+                            "UPDATE live_pair_actions SET emergency_exclusive = 1 "
+                            "WHERE pair_action_id = ?",
+                            (pair_action_id,),
+                        )
                 active_rows = database.execute(
                     """
-                SELECT pair_action_id, route_base, long_venue, short_venue, created_at,
-                       recovery_action
+                SELECT pair_action_id, route_base, long_venue, short_venue, tranche_id,
+                       risk_reservation_json, created_at, recovery_action,
+                       emergency_exclusive
                     FROM live_pair_actions WHERE state <> ? ORDER BY created_at, pair_action_id
                     """,
                     (LiveActionState.FLAT.value,),
                 ).fetchall()
-                if len(active_rows) > MAX_ACTIVE_LIVE_ACTIONS:
-                    raise RuntimeError("legacy active live actions exceed the maximum limit")
+                if any(
+                    bool(row["emergency_exclusive"])
+                    != (str(row["pair_action_id"]) in authoritative_emergency_ids)
+                    for row in active_rows
+                ):
+                    raise RuntimeError("legacy emergency live action identity is inconsistent")
+                self._validate_active_portfolio_rows(active_rows)
+                database.execute("DELETE FROM live_action_leases")
                 for row in active_rows:
                     route = DirectedRouteKey(
                         str(row["route_base"]),
@@ -376,8 +415,7 @@ class LiveOrderJournal:
                         route,
                         str(row["created_at"]),
                         idempotent=True,
-                        emergency_exclusive=str(row["recovery_action"] or "")
-                        == "EMERGENCY_FLATTEN",
+                        emergency_exclusive=bool(row["emergency_exclusive"]),
                     )
                 database.commit()
             except Exception:
@@ -445,24 +483,12 @@ class LiveOrderJournal:
             if stage_freeze is not None and bool(stage_freeze["risk_stage_completion_frozen"]):
                 database.rollback()
                 raise RuntimeError("risk-stage completion freeze blocks new live entry")
-            conflicting = database.execute(
-                "SELECT pair_action_id FROM live_action_leases WHERE lease_key IN (?, ?) LIMIT 1",
-                (f"base:{route.base}", f"route:{route.value}"),
-            ).fetchone()
-            if conflicting is not None:
-                database.rollback()
-                raise RuntimeError(
-                    f"live route lease is already held by {conflicting['pair_action_id']}"
-                )
-            active_count = int(
-                database.execute(
-                    "SELECT count(*) FROM live_pair_actions WHERE state <> ?",
-                    (LiveActionState.FLAT.value,),
-                ).fetchone()[0]
+            self._validate_new_tranche_in_transaction(
+                database,
+                route,
+                tranche_id,
+                risk_reservation,
             )
-            if active_count >= MAX_ACTIVE_LIVE_ACTIONS:
-                database.rollback()
-                raise RuntimeError("maximum active live action limit reached")
             created = now.isoformat()
             database.execute(
                 """
@@ -642,8 +668,8 @@ class LiveOrderJournal:
                 INSERT INTO live_pair_actions (
                     pair_action_id, route_base, long_venue, short_venue, tranche_id,
                     state, risk_reservation_json, qualification_hash, residual_delta,
-                    recovery_action, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '0', 'EMERGENCY_FLATTEN', ?, ?)
+                    recovery_action, emergency_exclusive, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '0', 'EMERGENCY_FLATTEN', 1, ?, ?)
                 """,
                 (
                     pair_action_id,
@@ -1011,7 +1037,8 @@ class LiveOrderJournal:
     ) -> None:
         row = database.execute(
             "SELECT state, residual_delta, recovery_action, route_base, long_venue, "
-            "short_venue FROM live_pair_actions "
+            "short_venue, tranche_id, risk_reservation_json, emergency_exclusive "
+            "FROM live_pair_actions "
             "WHERE pair_action_id = ?",
             (pair_action_id,),
         ).fetchone()
@@ -1021,25 +1048,25 @@ class LiveOrderJournal:
         if state not in _TRANSITIONS[previous]:
             raise ValueError(f"invalid live action transition {previous.value}->{state.value}")
         if previous == LiveActionState.FLAT and state != LiveActionState.FLAT:
-            active_count = int(
-                database.execute(
-                    "SELECT count(*) FROM live_pair_actions WHERE state <> ?",
-                    (LiveActionState.FLAT.value,),
-                ).fetchone()[0]
-            )
-            if active_count >= MAX_ACTIVE_LIVE_ACTIONS:
-                raise RuntimeError("maximum active live action limit reached")
             route = DirectedRouteKey(
                 str(row["route_base"]),
                 Venue(str(row["long_venue"])),
                 Venue(str(row["short_venue"])),
+            )
+            self._validate_new_tranche_in_transaction(
+                database,
+                route,
+                str(row["tranche_id"]),
+                None
+                if bool(row["emergency_exclusive"])
+                else json.loads(str(row["risk_reservation_json"])),
             )
             self._acquire_leases_in_transaction(
                 database,
                 pair_action_id,
                 route,
                 now.isoformat(),
-                emergency_exclusive=str(row["recovery_action"] or "") == "EMERGENCY_FLATTEN",
+                emergency_exclusive=bool(row["emergency_exclusive"]),
             )
         next_delta = (
             str(residual_delta) if residual_delta is not None else str(row["residual_delta"])
@@ -1475,6 +1502,135 @@ class LiveOrderJournal:
             raise ValueError("route base must be canonical uppercase")
 
     @staticmethod
+    def _validate_active_portfolio_rows(rows: list[sqlite3.Row]) -> None:
+        if len(rows) > MAX_ACTIVE_LIVE_ACTIONS:
+            raise RuntimeError("legacy active live actions exceed the maximum limit")
+        routes_by_base: dict[str, tuple[str, str]] = {}
+        tranche_ids_by_route: dict[tuple[str, str, str], set[str]] = {}
+        stress_by_route: dict[tuple[str, str, str], Decimal] = {}
+        portfolio_stress = Decimal(0)
+        emergency_count = 0
+        for row in rows:
+            base = str(row["route_base"])
+            venues = (str(row["long_venue"]), str(row["short_venue"]))
+            existing = routes_by_base.setdefault(base, venues)
+            if existing != venues:
+                raise RuntimeError("legacy active live actions contain multiple routes per base")
+            route_identity = (base, *venues)
+            tranche_ids = tranche_ids_by_route.setdefault(route_identity, set())
+            tranche_id = str(row["tranche_id"])
+            if tranche_id in tranche_ids:
+                raise RuntimeError("legacy active live route contains duplicate tranche IDs")
+            tranche_ids.add(tranche_id)
+            if len(tranche_ids) > MAX_TRANCHES_PER_LIVE_ROUTE:
+                raise RuntimeError("legacy active live route exceeds the tranche limit")
+            is_emergency = bool(row["emergency_exclusive"])
+            emergency_count += is_emergency
+            if not is_emergency:
+                stress = LiveOrderJournal._projected_stress(
+                    json.loads(str(row["risk_reservation_json"]))
+                )
+                if stress > MAX_LIVE_ROUTE_STRESS_USDT:
+                    raise RuntimeError("legacy active live route exceeds the stress limit")
+                stress_by_route[route_identity] = (
+                    stress_by_route.get(route_identity, Decimal(0)) + stress
+                )
+                portfolio_stress += stress
+        if len(tranche_ids_by_route) > MAX_ACTIVE_LIVE_ROUTES:
+            raise RuntimeError("legacy active live routes exceed the maximum limit")
+        if emergency_count and len(rows) != 1:
+            raise RuntimeError("legacy emergency live action is not exclusive")
+        if any(stress > MAX_LIVE_ROUTE_STRESS_USDT for stress in stress_by_route.values()):
+            raise RuntimeError("legacy active live route exceeds the stress limit")
+        if portfolio_stress > MAX_LIVE_PORTFOLIO_STRESS_USDT:
+            raise RuntimeError("legacy active live portfolio exceeds the stress limit")
+
+    @staticmethod
+    def _validate_new_tranche_in_transaction(
+        database: sqlite3.Connection,
+        route: DirectedRouteKey,
+        tranche_id: str,
+        risk_reservation: object | None,
+    ) -> None:
+        emergency = database.execute(
+            "SELECT pair_action_id FROM live_pair_actions "
+            "WHERE state <> ? AND emergency_exclusive = 1 LIMIT 1",
+            (LiveActionState.FLAT.value,),
+        ).fetchone()
+        if emergency is not None:
+            raise RuntimeError("global emergency live action lease is already held")
+        if risk_reservation is None:
+            return
+        new_stress = LiveOrderJournal._projected_stress(risk_reservation)
+        if new_stress > MAX_LIVE_ROUTE_STRESS_USDT:
+            raise RuntimeError("maximum live route stress reached")
+        rows = database.execute(
+            "SELECT long_venue, short_venue, tranche_id, risk_reservation_json, "
+            "emergency_exclusive FROM live_pair_actions "
+            "WHERE state <> ? AND route_base = ?",
+            (LiveActionState.FLAT.value, route.base),
+        ).fetchall()
+        exact_rows = [
+            row
+            for row in rows
+            if str(row["long_venue"]) == route.long_venue.value
+            and str(row["short_venue"]) == route.short_venue.value
+        ]
+        if rows and len(exact_rows) != len(rows):
+            raise RuntimeError("one active live route per base is required")
+        if any(str(row["tranche_id"]) == tranche_id for row in exact_rows):
+            raise RuntimeError("live route tranche ID is already active")
+        if len(exact_rows) >= MAX_TRANCHES_PER_LIVE_ROUTE:
+            raise RuntimeError("maximum live tranches per route reached")
+        route_stress = new_stress + sum(
+            (
+                LiveOrderJournal._projected_stress(json.loads(str(row["risk_reservation_json"])))
+                for row in exact_rows
+                if not bool(row["emergency_exclusive"])
+            ),
+            Decimal(0),
+        )
+        if route_stress > MAX_LIVE_ROUTE_STRESS_USDT:
+            raise RuntimeError("maximum live route stress reached")
+        portfolio_stress = new_stress + sum(
+            (
+                LiveOrderJournal._projected_stress(json.loads(str(row["risk_reservation_json"])))
+                for row in database.execute(
+                    "SELECT risk_reservation_json, emergency_exclusive "
+                    "FROM live_pair_actions "
+                    "WHERE state <> ?",
+                    (LiveActionState.FLAT.value,),
+                ).fetchall()
+                if not bool(row["emergency_exclusive"])
+            ),
+            Decimal(0),
+        )
+        if portfolio_stress > MAX_LIVE_PORTFOLIO_STRESS_USDT:
+            raise RuntimeError("maximum live portfolio stress reached")
+        if not exact_rows:
+            route_count = int(
+                database.execute(
+                    "SELECT count(*) FROM (SELECT DISTINCT route_base, long_venue, short_venue "
+                    "FROM live_pair_actions WHERE state <> ?)",
+                    (LiveActionState.FLAT.value,),
+                ).fetchone()[0]
+            )
+            if route_count >= MAX_ACTIVE_LIVE_ROUTES:
+                raise RuntimeError("maximum active live route limit reached")
+
+    @staticmethod
+    def _projected_stress(risk_reservation: object) -> Decimal:
+        if not isinstance(risk_reservation, dict):
+            raise RuntimeError("live risk reservation is invalid")
+        try:
+            stress = Decimal(str(risk_reservation["projected_stress_usdt"]))
+        except (DecimalException, KeyError, ValueError):
+            raise RuntimeError("live risk reservation is invalid") from None
+        if not stress.is_finite() or stress <= 0:
+            raise RuntimeError("live risk reservation is invalid")
+        return stress
+
+    @staticmethod
     def _acquire_leases_in_transaction(
         database: sqlite3.Connection,
         pair_action_id: str,
@@ -1505,8 +1661,8 @@ class LiveOrderJournal:
                     "global emergency live action requires exclusive active ownership"
                 )
         leases = [
-            (f"base:{route.base.strip().upper()}", "BASE"),
-            (f"route:{route.value}", "ROUTE"),
+            (f"base:{route.base.strip().upper()}:{pair_action_id}", "BASE"),
+            (f"route:{route.value}:{pair_action_id}", "ROUTE"),
         ]
         if emergency_exclusive:
             leases.insert(0, ("global:emergency", "ROUTE"))

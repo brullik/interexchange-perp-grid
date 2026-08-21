@@ -390,7 +390,7 @@ async def test_stage_result_rechecks_completed_cycle_content_inside_freeze_trans
     )
     with sqlite3.connect(state_path) as database:
         database.execute(
-            "INSERT INTO live_pair_actions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO live_pair_actions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "cycle-1",
                 "BTC",
@@ -402,6 +402,7 @@ async def test_stage_result_rechecks_completed_cycle_content_inside_freeze_trans
                 "a" * 64,
                 "0",
                 None,
+                0,
                 promoted_at.isoformat(),
                 promoted_at.isoformat(),
             ),

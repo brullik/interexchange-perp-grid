@@ -66,7 +66,11 @@ class PersistentPrivateSmokeExchange:
     def seed_position(self, symbol: str, signed_quantity: Decimal) -> None:
         payload = self._read()
         positions = dict(payload["positions"])
-        positions[symbol] = str(signed_quantity)
+        combined = Decimal(str(positions.get(symbol, "0"))) + signed_quantity
+        if combined == 0:
+            positions.pop(symbol, None)
+        else:
+            positions[symbol] = str(combined)
         payload["positions"] = positions
         self._write(payload)
 
@@ -238,9 +242,15 @@ async def run_private_transition_recovery_smoke(
     transition_state: RecoverySmokeTransition,
     ready_path: Path | None = None,
     action_count: int = 10,
+    tranches_per_route: int = 1,
 ) -> dict[str, object]:
-    if not 1 <= action_count <= 10:
-        raise ValueError("private transition smoke action count must be between 1 and 10")
+    if not 1 <= action_count <= 50:
+        raise ValueError("private transition smoke action count must be between 1 and 50")
+    if not 1 <= tranches_per_route <= 5:
+        raise ValueError("private transition smoke tranche count must be between 1 and 5")
+    route_count = (action_count + tranches_per_route - 1) // tranches_per_route
+    if route_count > 10:
+        raise ValueError("private transition smoke route count must not exceed 10")
     state = LiveActionState(transition_state.value)
     journal = LiveOrderJournal(state_path)
     await journal.initialise()
@@ -253,12 +263,12 @@ async def run_private_transition_recovery_smoke(
     instruments = {
         (venue, instrument.symbol): instrument
         for venue in WAVE1_VENUES
-        for instrument in (_instrument(venue, index) for index in range(action_count))
+        for instrument in (_instrument(venue, index) for index in range(route_count))
     }
     adapters = {
         venue: PersistentPrivateSmokeExchange(
             venue,
-            tuple(instruments[(venue, f"A{index:03d}/USDT:USDT")] for index in range(action_count)),
+            tuple(instruments[(venue, f"A{index:03d}/USDT:USDT")] for index in range(route_count)),
             private_state_dir / f"{venue.value}.json",
         )
         for venue in WAVE1_VENUES
@@ -268,7 +278,16 @@ async def run_private_transition_recovery_smoke(
             adapter.initialise(reset=True)
         existing = tuple(
             await asyncio.gather(
-                *(_seed_action(journal, adapters, index, state) for index in range(action_count))
+                *(
+                    _seed_action(
+                        journal,
+                        adapters,
+                        index,
+                        state,
+                        tranches_per_route=tranches_per_route,
+                    )
+                    for index in range(action_count)
+                )
             )
         )
     else:
@@ -381,8 +400,12 @@ async def _seed_action(
     adapters: dict[Venue, PersistentPrivateSmokeExchange],
     index: int,
     state: LiveActionState,
+    *,
+    tranches_per_route: int,
 ) -> LiveJournalAction:
-    base = f"A{index:03d}"
+    route_index = index // tranches_per_route
+    tranche_index = index % tranches_per_route
+    base = f"A{route_index:03d}"
     symbol = f"{base}/USDT:USDT"
     action_id = f"private-transition-{index:02d}"
     long_request = _request(Venue.BINANCE_USDM, Side.BUY, action_id, "long", symbol)
@@ -390,12 +413,15 @@ async def _seed_action(
     action = await journal.prepare(
         action_id,
         DirectedRouteKey(base, Venue.BINANCE_USDM, Venue.OKX),
-        f"private-transition-{index:02d}",
+        f"private-transition-tranche-{tranche_index:02d}",
         long_request,
         short_request,
         {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
         {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
-        {"projected_stress_usdt": "5", "production_submit_calls": 0},
+        {
+            "projected_stress_usdt": str(Decimal("5") / Decimal(tranches_per_route)),
+            "production_submit_calls": 0,
+        },
         "0" * 64,
     )
     if state == LiveActionState.PREPARED:

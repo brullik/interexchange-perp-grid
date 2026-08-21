@@ -188,7 +188,7 @@ async def _recovering_action(
         short_request,
         {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
         {Venue.BINANCE_USDM: Decimal(100), Venue.OKX: Decimal(100)},
-        {},
+        {"projected_stress_usdt": "0.8"},
         "a" * 64,
     )
     await journal.mark_submit_attempted(

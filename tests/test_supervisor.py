@@ -54,7 +54,11 @@ async def _prepare(journal: LiveOrderJournal) -> LiveJournalAction:
         short_request,
         {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
         {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
-        {"supervisor_intent": "LIVE_CANARY", "supervisor_queued": True},
+        {
+            "supervisor_intent": "LIVE_CANARY",
+            "supervisor_queued": True,
+            "projected_stress_usdt": "0.8",
+        },
         "a" * 64,
     )
 
@@ -82,7 +86,10 @@ async def _prepare_named(
         short_request,
         {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
         {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
-        {"supervisor_intent": "MULTI_ACTION_RECOVERY"},
+        {
+            "supervisor_intent": "MULTI_ACTION_RECOVERY",
+            "projected_stress_usdt": "0.8",
+        },
         "b" * 64,
     )
 

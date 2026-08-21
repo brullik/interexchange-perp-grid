@@ -5,7 +5,7 @@ This is the only mutable project-status document.
 ## Current state
 
 - **State:** SOFTWARE_COMPLETION_REMEDIATION
-- **Current checkpoint:** protected `main` `9ccb6c08cb798a659f86321f9883a5c2cb04a13d` and prerelease [`v1.0.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v1.0.0-rc1) remain immutable, green, fail-closed software candidates, but a requirement-by-requirement master-goal audit invalidated the earlier `SOFTWARE_COMPLETE` claim. Active scoped branch `codex/telegram-control-completeness` closes the first concrete PROD-11 gap. Remaining P1 work is durable five-tranche-per-route live ownership, continuous capability-gated Wave2/Wave3 public runtime, exposure-safe upgrade, and complete owner-onboarding/canary handoff
+- **Current checkpoint:** protected `main` `7f8524bb42dbf5da56b91a79d11352d81a159109` includes the exact-reviewed Telegram remediation and remains a green, fail-closed software candidate; the earlier `SOFTWARE_COMPLETE` claim remains withdrawn. Exact code head `202039c02525ddec14f0f5c843902768e52031c4` closes durable 10-route × 5-tranche live ownership and transition-complete restart recovery and passed all five CI jobs plus exact artifacts; this evidence-only status rebind is accepted only after its own fresh exact-head CI and final all-zero review. Remaining independent P1 work is continuous capability-gated Wave2/Wave3 public runtime, exposure-safe upgrade, and complete owner-onboarding/canary handoff
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -33,7 +33,8 @@ This is the only mutable project-status document.
 | Phase 4.4 multi-symbol private emergency recovery | COMPLETE | Exact code head `c7cfa9f`; production `LiveControlService` reconciles and atomically stable-FLAT-closes 10 routes/20 positions across exact venue-symbol histories; one rejected route does not block the other reductions; durable account-wide ownership is restart-adoptable by verified process identity and reusable across one-shot control objects; accepted journaled client IDs are reconciled without duplicate submit; an unobservable attempted submit retains the exclusive lease and requires explicit external resolution rather than unsafe retry. Private reconciliation owns and coalesces bounded cached/forced account, fee, and history requests across caller timeouts and exposes explicit bounded shutdown failure. Exact run `32390979997` passed all five jobs with replay `9414849317`, C4 critical `9414831961`, C4.3 `9414824434`, and security `9414822131`; independent review P0/P1/P2=0. PROD-08 remains PARTIAL pending transition-complete process-kill/private-transport chaos evidence |
 | Phase 4.5 transition-complete private restart chaos | COMPLETE | Exact head `f67afc4`; a fresh process recovers the maximum 10-action set independently from every active durable state (`PREPARED`, `SUBMITTING`, `ACKNOWLEDGED`, `PARTIAL`, `FILLED`, `REJECTED`, `UNKNOWN`, `RECOVERING`, `HEDGED`, `CLOSING`, `QUARANTINED`) through a separately persisted account-wide private simulator, production `LiveControlService`, exact client-ID reconciliation, and stable-FLAT. Exchange-visible outcomes missing from the killed process journal are ingested idempotently; missing/UNKNOWN outcomes never authorize retry or FLAT. Client-ID lookup is single-flight, bounded to one second, retained for explicit shutdown, and isolated so one normal lookup failure does not block other risk reductions. Exact run `32397471622` passed all five jobs, including the 11-state × 10-action Docker kill/restart loop, with replay `9417235987`, C4 critical `9417217665`, C4.3 `9417206863`, and security `9417198123`; independent review P0/P1/P2=0. PROD-08 is COMPLETE; PROD-10 remains PARTIAL pending Phase 4.6 |
 | Phase 4.6 full priority scheduler and overload chaos | COMPLETE | Exact head `7458cf0`; one bounded in-process scheduler owns P0 emergency flatten, P1 unmatched hedge, P2 normal close, P3 private reconciliation, P4 new entry, P5 Candidate L2, and P6 broad/history. Four priority-reserved lanes plus two general workers prevent lower critical work or a full queue from blocking P0; exact-key single-flight survives caller cancellation; active keys, queued work, workers, and shutdown are bounded. Critical recovery atomically blocks P4 at the portfolio gate, sheds queued P4-P6, preserves active L2/risk reduction, and is exercised through the production supervisor mapping and 10-action restart smoke. Exact run `32405032176` passed all five jobs with replay `9420004626`, C4.3 `9419966478`, C4 critical `9419959185`, and security `9419950486`; independent exact review reported P0=0/P1=0/P2=0. PROD-10 is COMPLETE |
-| Telegram locked command completeness remediation | LOCAL_GATE_PASS / EXACT_GATE_REQUIRED | Production router now implements every locked read command (`/health`, `/routes`, `/orders`, `/exchanges`, and `/qualification` included), returns bounded truthful service/route/order/capability/epoch payloads, and explicitly marks shadow reads `PRIVATE_STATE_UNAVAILABLE`. Durable FINALIZED qualification remains visible; stale capability reports fail closed; live `/orders` combines strict account-wide open/recent private records with active journal action/leg ownership; 10 route and 101 order identities remain visible within Telegram bounds. Snapshot and mandatory audit persistence share one bounded command budget; cancellation-resistant reads remain tracked and shutdown failure is explicit. PROD-11 manifest mapping names the exact all-command regression. Local full gate: lock64, Ruff113, mypy111, pytest 665 passed/6 platform-skipped, doctor shadow/live=false, diff-check; independent dirty-snapshot review P0/P1/P2=0. Exact CI and exact-head review remain required before merge |
+| Telegram locked command completeness remediation | COMPLETE | Exact head `ec4eb191` passed run `32451989969` 5/5 with five exact artifacts and independent P0/P1/P2=0 review, then Draft PR #7 was promoted and squash-merged to protected main as `7f8524bb`. Production router implements every locked read command (`/health`, `/routes`, `/orders`, `/exchanges`, and `/qualification` included), bounded truthful service/route/order/capability/epoch payloads, strict account-wide order identity, durable FINALIZED qualification visibility, stale capability fail-close, one shared snapshot/audit command budget, and explicit cancellation-resistant shutdown ownership. No live authority or credential was added |
+| Durable 10-route × 5-tranche live ownership remediation | EXACT_CODE_GATE_PASS / EVIDENCE_REBIND | The SQLite journal now admits at most five unique tranche IDs and summed 5 USDT stress on one canonical route per base, with at most 10 routes/50 USDT portfolio stress/50 active actions; it rebuilds derived leases after restart, rejects duplicate/sixth/eleventh/conflicting/corrupt legacy state, and distinguishes standalone emergency exclusivity from ordinary multi-action recovery. Multi-action recovery compares the complete durable and exchange venue-symbol exposure maps before submit, journals one idempotent reduce-only close leg per nonzero tranche exposure, and reaches one atomic stable-FLAT barrier. Exact code head `202039c` passed run `32456702576` 5/5. Operations artifact `9437604847` proves 71 acceptance tests, all 11 restart states, 50 recovered HEDGED actions, exactly 100 simulated reducing closes, one stable-FLAT barrier, and zero production transports; replay `9437527891` is 88/88, C4 critical `9437503880` is 30/30 with zero production submits, C4.3 `9437511269` is 8/8 with zero false success/submits, and security `9437495493` reports zero vulnerabilities/secret findings. Local gate: lock64, Ruff113, mypy111, pytest 674 passed/6 platform-skipped, doctor shadow/live=false, YAML/diff-check. This STATUS-only evidence rebind changes no code and is accepted only by fresh exact-head CI plus final P0/P1/P2=0 review; canary remains locked to one tranche |
 | C5 owner-operated canary | FORBIDDEN | Must not start until every software-completion remediation, qualification gate, external onboarding action, and separate short-lived live consent passes |
 | Phase 5.1 Bitget Classic code candidate | COMPLETE | Bitget is now a typed venue profile with a Classic-only CCXT Pro transport, exact 4096-byte batch ticker framing and matching unsubscribe acknowledgement, raw books15 sequence propagation/regression rejection, exact linear-USDT discovery, split account-wide read-only snapshot/stream params, and final pinned protected IOC `clientOid`/crossed/force mapping. Wave 1 remains exactly Binance USD-M/Bybit/OKX; Bitget is explicitly denied at the live-canary submit boundary. Exact code head `2bee950`; local locked gate: lock64, Ruff96, mypy94, pytest547, doctor shadow/live=false, Bandit medium/high0, diff-check; exact run `32411553358` passed all five jobs and produced replay, C4 critical, C4.3, and security artifacts bound to the exact SHA; independent exact-head review P0=0/P1=0/P2=0. No credentials or network evidence were fabricated. |
 | Phase 5.2 KuCoin Futures Classic code candidate | COMPLETE | KuCoin Futures is now a typed Classic-only venue profile with exact batch-BBO topic framing and matching unsubscribe, raw Level-50 sequence propagation, strict linear-USDT/no-fixed-notional proof, account-wide Classic position stream, read-only private snapshots/streams, and pinned protected cross/IOC `clientOid` request mapping. Raw `positionSide` preserves independent hedge sides when zero-position tombstones arrive; ambiguous side-less records fail closed. Wave 1 remains exactly Binance USD-M/Bybit/OKX and KuCoin is denied at the live-canary boundary. Exact code head `d37ded5`; local gate lock64/Ruff97/mypy95/pytest566/doctor shadow-live=false/Bandit0/diff-check passed; exact run `32415664858` passed all five jobs with replay `9423845774`, C4 critical `9423825785`, C4.3 `9423818033`, and security `9423805574`; independent exact review P0/P1/P2=0. |
@@ -152,21 +153,27 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 ## Last verified command
 
 ```text
-2026-08-21 Telegram command-completeness remediation, Windows equivalent of every
+2026-08-21 durable 10-route x 5-tranche live-ownership remediation, Windows equivalent of every
 Makefile verify target: PASS
 - exact lock validation: PASS (64 packages)
 - Ruff format/check: PASS (113 files)
 - mypy --strict: PASS (111 source/test files)
-- pytest: 665 passed, 6 platform-only skips
+- pytest: 674 passed, 6 platform-only skips
 - interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
 - git diff --check: PASS
 
-The master-goal audit found that exact main returned UNKNOWN_COMMAND for five required Telegram
-operations even though PROD-11 had been marked complete. The scoped remediation implements all
-locked commands with authenticated bounded audit, bounded rendering, explicit no-private-state
-behavior, stale capability fail-close, durable qualification identity, and strict account-wide
-open/recent private plus active-journal order visibility.
-No credential, live authority, production submit, transfer, or withdrawal path was added.
+The scoped remediation persists and restart-restores 10 routes x 5 unique tranches, enforces summed
+5 USDT route/50 USDT portfolio stress, rejects every identity/ownership overflow or corruption, and
+adds an exact-head Docker kill/restart proof for 50 actions, 100 exact per-tranche reducing closes,
+and one account-wide stable-FLAT barrier. Aggregate private exposure must equal the complete durable
+tranche exposure map before any close is submitted. Canary remains one-tranche-only; no credential,
+live authority, production submit, transfer, or withdrawal path was added.
+
+Exact code head `202039c02525ddec14f0f5c843902768e52031c4` passed run `32456702576`
+5/5. Operations artifact `9437604847` proves 50 recovered actions, 100 simulated closes,
+stable-FLAT, and zero production transports; replay `9437527891`, C4 critical `9437503880`,
+C4.3 `9437511269`, and security `9437495493` are exact-head-bound and passed. This
+STATUS-only evidence rebind requires its own fresh exact-head CI and final review before Ready.
 ```
 
 ```text
@@ -178,9 +185,10 @@ No credential, live authority, production submit, transfer, or withdrawal path w
 - release manifest artifact: 9434727031
 - GHCR release + SHA tags: sha256:c6785d343ddbc5c2af1dd3eb6926edec0e154865a2d7e7bedf18199d5c719895
 
-This is SOFTWARE_COMPLETE, not live authorization. Default shadow mode, C5 prohibition, missing
-credentials, signed regional/VPS evidence, 24-hour qualification, and irreversible live-money
-approval continue to fail closed.
+This historical release was later found incomplete by the master-goal audit and no longer supports
+a SOFTWARE_COMPLETE claim. Default shadow mode, C5 prohibition, missing credentials, signed
+regional/VPS evidence, 24-hour qualification, and irreversible live-money approval continue to
+fail closed.
 ```
 
 ```text
