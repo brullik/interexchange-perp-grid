@@ -18,6 +18,7 @@ from interexchange_perp_grid.public_engine import ScanResult
 runner = CliRunner()
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CONFIG = Path("config/defaults.yaml")
+UPGRADE_OWNER = f"deployment-upgrade-{'b' * 40}"
 
 
 def test_cli_and_public_scan_help_render() -> None:
@@ -25,6 +26,37 @@ def test_cli_and_public_scan_help_render() -> None:
     public_help = runner.invoke(app, ["public-scan", "--help"])
     assert public_help.exit_code == 0
     assert "--quantity" in ANSI_ESCAPE.sub("", public_help.output)
+
+
+def test_deployment_upgrade_gate_cli_persists_and_releases_freeze(tmp_path: Path) -> None:
+    environment = {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")}
+
+    armed = runner.invoke(
+        app,
+        [
+            "deployment-upgrade-gate",
+            "--action",
+            "arm",
+            "--owner-token",
+            UPGRADE_OWNER,
+        ],
+        env=environment,
+    )
+    released = runner.invoke(
+        app,
+        [
+            "deployment-upgrade-gate",
+            "--action",
+            "release",
+            "--owner-token",
+            UPGRADE_OWNER,
+        ],
+        env=environment,
+    )
+
+    assert armed.exit_code == released.exit_code == 0
+    assert '"entry_frozen": true' in armed.output
+    assert '"entry_frozen": false' in released.output
 
 
 def test_public_scan_rejects_non_decimal_quantity_before_network() -> None:
