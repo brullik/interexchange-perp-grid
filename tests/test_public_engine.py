@@ -1704,6 +1704,9 @@ async def test_six_hour_refresh_resubscribes_watchers_to_new_symbols(tmp_path: P
     clock = [1_000_000_000]
     adapters = {venue: BroadFakeAdapter(venue, clock[0]) for venue in WAVE1_VENUES}
     settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    settings = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"max_broad_bbo_instruments": 101})}
+    )
     engine = PublicMarketEngine(
         settings,
         adapter_factory=adapters.__getitem__,

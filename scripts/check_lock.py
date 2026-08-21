@@ -7,14 +7,14 @@ import tomllib
 from pathlib import Path
 
 from packaging.requirements import Requirement
-from packaging.utils import canonicalize_name
+from packaging.utils import NormalizedName, canonicalize_name
 from packaging.version import Version
 
 _PIN = re.compile(r"^(?P<name>[A-Za-z0-9_.-]+)==(?P<version>[^\s;]+)$")
 
 
-def read_lock(path: Path) -> dict[str, str]:
-    locked: dict[str, str] = {}
+def read_lock(path: Path) -> dict[NormalizedName, str]:
+    locked: dict[NormalizedName, str] = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -40,7 +40,7 @@ def project_requirements(path: Path) -> tuple[Requirement, ...]:
     return tuple(Requirement(str(value)) for value in values)
 
 
-def check_project(lock: dict[str, str], path: Path) -> None:
+def check_project(lock: dict[NormalizedName, str], path: Path) -> None:
     for requirement in project_requirements(path):
         name = canonicalize_name(requirement.name)
         version = lock.get(name)
@@ -50,7 +50,7 @@ def check_project(lock: dict[str, str], path: Path) -> None:
             raise ValueError(f"locked {name}=={version} violates {requirement.specifier}")
 
 
-def check_installed(lock: dict[str, str]) -> None:
+def check_installed(lock: dict[NormalizedName, str]) -> None:
     installed = {
         canonicalize_name(distribution.metadata["Name"]): distribution.version
         for distribution in importlib.metadata.distributions()

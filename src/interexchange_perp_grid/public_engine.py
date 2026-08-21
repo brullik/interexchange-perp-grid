@@ -188,6 +188,8 @@ class PublicMarketEngine:
             InstrumentRegistry(
                 minimum_listing_age_days=settings.universe.live_min_listing_age_days,
                 enforce_listing_age=True,
+                maximum_common_instruments=settings.universe.max_broad_bbo_instruments,
+                preferred_bases=(settings.shadow.base,),
             ),
             refresh_seconds=settings.universe.instrument_refresh_seconds,
         )
@@ -846,6 +848,11 @@ class PublicMarketEngine:
             self._consume_transport(task)
             return
         task.cancel()
+        if not self._closed and venue not in self._bbo_subscription_started:
+            # The subscribe call did not return a qualified update, so matching
+            # network ownership is unknowable. Recycle the adapter instead of
+            # issuing a broad unsubscribe for topics that may never have acked.
+            self._bbo_unsubscribe_failures.add(venue)
         existing = self._retiring_bbo_transports.get(venue)
         if existing is not None and existing is not task and not existing.done():
             raise RuntimeError("multiple retiring BBO transports for one venue")
@@ -875,8 +882,9 @@ class PublicMarketEngine:
         venue: Venue,
         symbols: tuple[str, ...],
     ) -> tuple[BboQuote, ...]:
+        quotes = await self._adapters[venue].watch_bbo(symbols)
         self._bbo_subscription_started.add(venue)
-        return await self._adapters[venue].watch_bbo(symbols)
+        return quotes
 
     async def _run_bbo_watcher(self, venue: Venue) -> None:
         loop = asyncio.get_running_loop()
@@ -891,7 +899,13 @@ class PublicMarketEngine:
                 if self._closed:
                     return
                 if not quotes:
-                    raise RuntimeError("batch BBO stream returned no updates")
+                    remaining = qualified_deadline - loop.time()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            "batch BBO stream made no qualified progress before staleness deadline"
+                        )
+                    await asyncio.sleep(min(0.01, remaining))
+                    continue
                 accepted = self._bbo_cache.ingest(
                     quotes,
                     now_monotonic_ns=self._monotonic_ns(),

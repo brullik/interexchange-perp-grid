@@ -53,11 +53,19 @@ class InstrumentRegistry:
         *,
         minimum_listing_age_days: int,
         enforce_listing_age: bool,
+        maximum_common_instruments: int | None = None,
+        preferred_bases: tuple[str, ...] = (),
     ) -> None:
         if minimum_listing_age_days < 14:
             raise ValueError("live listing age must be at least 14 days")
         self._minimum_listing_age_seconds = Decimal(minimum_listing_age_days * 86400)
         self._enforce_listing_age = enforce_listing_age
+        if maximum_common_instruments is not None and maximum_common_instruments < 2:
+            raise ValueError("common instrument limit must be at least two")
+        if any(not base or base != base.upper() for base in preferred_bases):
+            raise ValueError("preferred universe bases must be non-empty uppercase symbols")
+        self._maximum_common_instruments = maximum_common_instruments
+        self._preferred_bases = preferred_bases
 
     def build(
         self,
@@ -77,6 +85,16 @@ class InstrumentRegistry:
             if filtered:
                 eligible[venue] = filtered
         common = match_common_instruments(eligible)
+        if (
+            self._maximum_common_instruments is not None
+            and len(common) > self._maximum_common_instruments
+        ):
+            preferred = tuple(
+                item for base in self._preferred_bases for item in common if item.key.base == base
+            )
+            preferred_keys = {item.key for item in preferred}
+            remainder = tuple(item for item in common if item.key not in preferred_keys)
+            common = (preferred + remainder)[: self._maximum_common_instruments]
         routes = tuple(
             UniverseRoute(long_instrument, short_instrument)
             for item in common
