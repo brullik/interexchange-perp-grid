@@ -787,6 +787,7 @@ class PublicMarketEngine:
             if task.done():
                 self._bbo_watchers.pop(venue, None)
                 self._bbo_watcher_symbols.pop(venue, None)
+                self._bbo_qualified_venues.discard(venue)
                 self._consume_watcher(task)
             elif venue not in desired or symbols_changed:
                 previous_symbols = self._bbo_watcher_symbols.get(venue, ())
