@@ -1,43 +1,39 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-15T23:00:05Z",
-  "state": "PHASE3_1_EXACT_64E5_TECHNICAL_PASS_EVIDENCE_GATE",
-  "phase": "Phase 3.1 — Multi-instrument universe and broad BBO prefilter",
+  "updated_at": "2026-08-21T10:40:12Z",
+  "state": "SOFTWARE_COMPLETE_WAITING_OWNER_ONBOARDING",
+  "phase": "Software v1 release candidate and external handoff",
   "repository": "brullik/interexchange-perp-grid",
-  "branch": "codex/multi-instrument-shadow",
-  "pr": 5,
-  "head_sha": "64e5c86e07766512eb7406797850d8cbd18a9e98",
-  "ci_run": 31913360363,
-  "artifact": "c4-3-proof-64e5c86e07766512eb7406797850d8cbd18a9e98",
+  "branch": "main",
+  "pr": null,
+  "head_sha": "9d99e5bb774386de9314ad2cab125096675442a1",
+  "ci_run": 32473019160,
+  "artifact": "ghcr.io/brullik/interexchange-perp-grid@sha256:2c49fd425cdc9d247d9cc729e83ecb0f53e3c735d7e815ab279cee140bfe26da",
   "completed_criteria": [
-    "C4.3 exact-head GitHub Actions run 31892459783 and six-file artifact passed",
-    "C4.3 independent adversarial and release verification passed with P0/P1/P2 all zero",
-    "PR 1 was squash-merged and annotated prerelease v0.1.0-rc1 plus both GHCR tags were published and independently verified",
-    "Wave 1 private snapshot uses two bounded account-wide calls and fails closed at documented page limits",
-    "Wave 1 latest-value cache enforces persisted and ordered event watermarks, bounded reorder recovery, completeness, two-second age, hard timeouts, and measured 250 ms p95",
-    "Native Bybit V5 u/seq guard is installed in the CCXT Pro factory and handles explicit u=1 reset",
-    "Telegram shadow mode remains healthy without runtime credentials",
-    "Phase 2 exact head 3bc15a3 passed independent adversarial and release verification with P0/P1/P2 all zero",
-    "PR 4 was squash-merged as 0e87a1e and post-merge run 31904798345 passed all five jobs",
-    "Phase 3.1 exact code head 64e5c86e passed five GitHub jobs, four exact artifacts, and independent adversarial/release technical review with P0=0 and P1=0",
-    "Exact and local Phase 3.1 gates passed: lock64, Ruff over 88 files, strict mypy over 86 source files, 307 tests, and doctor shadow/live denied",
-    "Deterministic large universe proves 102 safe common instruments, 608 directed routes, 14-day age boundary, safe ambiguity isolation, and activity rejection",
-    "The normalized committed Wave 1 fixture proves one common instrument and six directed routes with native Bybit minimum notional and explicit known-no-fixed-notional OKX semantics",
-    "Broad BBO cache coalesces 100000 updates within known-key memory bounds, distinguishes stale from never-observed quotes, and measures latency from actual qualified quote receipt through prefilter ranking",
-    "BBO watchers have a hard progress deadline, cancellation-safe one-per-venue retirement, idempotent transactional startup, single-flight bounded refresh and adapter recycle, tracked broad and selected-route scans, one startup/refresh/scan shutdown lifecycle contract, cancellation-safe partial-factory rollback and cancellation-aware two-phase Parquet publication, explicit shutdown and adapter-teardown failure, six-hour symbol resubscription, and jittered failure streaks reset only by an accepted quote",
-    "Closing and reinstantiating the public engine reproduces identical universe, route, and cache bounds without leaked watcher tasks"
+    "All 42 criteria in config/FINAL_ACCEPTANCE_MANIFEST.json passed in the exact main operations artifact 9443378332 without production exchange transports",
+    "Protected main 9d99e5bb774386de9314ad2cab125096675442a1 passed post-merge GitHub Actions run 32473019160 in all five jobs",
+    "Independent exact-head review of the final onboarding checkpoint reported P0=0 P1=0 P2=0",
+    "The owner wizard and autonomous runtime enforce the locked BTC:bybit>okx qualification route and fail closed without factual account-safety confirmation",
+    "Annotated prerelease v1.0.0-rc2 targets exact main and publisher run 32473449873 produced one immutable release and SHA digest",
+    "Release manifest artifact 9443436103 binds v1.0.0-rc2 and exact main to sha256:2c49fd425cdc9d247d9cc729e83ecb0f53e3c735d7e815ab279cee140bfe26da",
+    "Default mode remains shadow, live_orders_allowed=false, production submit evidence is zero, and canary consent remains separate"
   ],
-  "active_work": [
-    "Commit and push this evidence-only binding to the independently reviewed exact code checkpoint 64e5c86e",
-    "Obtain fresh exact-head CI and final independent P0/P1/P2=0 verification before Phase 3.2"
-  ],
+  "active_work": [],
   "blockers": [
-    "REPOSITORY_VISIBILITY_PUBLIC"
+    "REPOSITORY_VISIBILITY_PUBLIC",
+    "VPS_ACCESS_REQUIRED",
+    "TELEGRAM_CREDENTIALS_REQUIRED",
+    "WAVE1_RESTRICTED_CREDENTIALS_REQUIRED",
+    "DEDICATED_SUBACCOUNT_FUNDING_CONFIRMATION_REQUIRED",
+    "REAL_24H_QUALIFICATION_EVIDENCE_REQUIRED",
+    "SEPARATE_LIVE_CANARY_CONSENT_REQUIRED"
   ],
   "owner_action_file": "OWNER_ACTION.json",
-  "next_action": "Keep PR 5 draft, publish the evidence-only 64e5 checkpoint binding, and require fresh exact-head CI plus independent P0/P1/P2=0 verification before Phase 3.2.",
+  "next_action": "Complete the single ONE_TIME_ONBOARDING action out of band; the installed AutonomousOrchestrator then runs exact shadow qualification while live and canary remain fail closed.",
   "known_limitations": [
-    "The current repository visibility is PUBLIC.",
-    "Operational evidence and secrets remain forbidden while the repository is PUBLIC."
+    "SOFTWARE_COMPLETE is not DONE: no VPS deployment, real credential probe, 24-hour qualification, canary, pilot, or production operation is claimed.",
+    "The repository is still PUBLIC, so operational evidence and every secret remain forbidden from GitHub.",
+    "Wave 2 and Wave 3 remain capability-gated or quarantined and have no live authority.",
+    "The public-shadow cost model is not a private-account profitability guarantee."
   ]
 }
