@@ -14,6 +14,17 @@ if [[ ! "$target_image" =~ @sha256:[0-9a-f]{64}$ ]] \
   echo "upgrade requires an immutable image digest and full release SHA" >&2
   exit 2
 fi
+if ! command -v flock >/dev/null 2>&1; then
+  echo "flock is required for serialized upgrades" >&2
+  exit 8
+fi
+upgrade_lock="${deployment_state}.upgrade.lock"
+exec 9>"$upgrade_lock"
+if ! flock -n 9; then
+  echo "another deployment upgrade is already in progress" >&2
+  exit 8
+fi
+upgrade_owner="deployment-upgrade-${target_sha}"
 previous_image=""
 previous_sha=""
 if [[ -f "$deployment_state" ]]; then
@@ -32,12 +43,15 @@ fi
 backup_name="pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ).sqlite3"
 backup_created=false
 upgrade_gate_armed=false
-run_upgrade_gate() {
+run_target_compose() {
   IPEG_IMAGE_REF="$target_image" \
   IPEG_RELEASE_SHA="$target_sha" \
   IPEG_CONTAINER_IMAGE_DIGEST="${target_image##*@}" \
-    docker compose run --rm --no-deps app interexchange-grid deployment-upgrade-gate \
-      --config /app/config/defaults.yaml --action "$1"
+    docker compose "$@"
+}
+run_upgrade_gate() {
+  run_target_compose run --rm --no-deps app interexchange-grid deployment-upgrade-gate \
+      --config /app/config/defaults.yaml --action "$1" --owner-token "$upgrade_owner"
 }
 run_previous_compose() {
   IPEG_IMAGE_REF="$previous_image" \
@@ -52,11 +66,16 @@ release_upgrade_gate() {
   fi
   upgrade_gate_armed=false
 }
+app_was_running=false
 if docker compose ps --status running --services | grep -qx app; then
-  if [[ -z "$previous_image" || -z "$previous_sha" ]]; then
-    echo "running service has no verified immutable deployment identity" >&2
-    exit 3
-  fi
+  app_was_running=true
+fi
+if [[ "$app_was_running" == true ]] \
+  && [[ -z "$previous_image" || -z "$previous_sha" ]]; then
+  echo "running service has no verified immutable deployment identity" >&2
+  exit 3
+fi
+if [[ -n "$previous_image" && -n "$previous_sha" ]]; then
   IPEG_IMAGE_REF="$target_image" docker compose pull app
   target_revision="$(IPEG_RELEASE_SHA="$target_sha" docker image inspect "$target_image" \
     --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
@@ -64,21 +83,35 @@ if docker compose ps --status running --services | grep -qx app; then
     echo "upgrade image revision label does not match the requested release SHA" >&2
     exit 3
   fi
-  docker compose pause app
+  if [[ "$app_was_running" == true ]]; then
+    docker compose pause app
+  fi
   if ! run_previous_compose run --rm --no-deps app interexchange-grid backup-state \
     --config /app/config/defaults.yaml --target "/app/state/backups/${backup_name}"; then
-    docker compose unpause app
+    if [[ "$app_was_running" == true ]]; then
+      docker compose unpause app
+    elif ! bash "$(dirname "$0")/shadow-deploy.sh" "$previous_image" "$previous_sha"; then
+      echo "backup failed and the previous recovery service could not restart" >&2
+      exit 5
+    fi
     echo "upgrade aborted because the paused-state backup failed" >&2
     exit 4
   fi
   backup_created=true
   if ! run_upgrade_gate arm; then
-    docker compose unpause app
-    echo "upgrade aborted before shutdown; old service resumed for risk reduction" >&2
+    if [[ "$app_was_running" == true ]]; then
+      docker compose unpause app
+    elif ! bash "$(dirname "$0")/shadow-deploy.sh" "$previous_image" "$previous_sha"; then
+      echo "upgrade blocked and the previous recovery service could not restart" >&2
+      exit 5
+    fi
+    echo "upgrade aborted before deployment; old service resumed for risk reduction" >&2
     exit 6
   fi
   upgrade_gate_armed=true
-  docker compose kill app
+  if [[ "$app_was_running" == true ]]; then
+    docker compose kill app
+  fi
 fi
 if bash "$(dirname "$0")/shadow-deploy.sh" "$1" "$2"; then
   :
@@ -94,7 +127,7 @@ else
   export IPEG_CONTAINER_IMAGE_DIGEST="${previous_image##*@}"
   docker compose stop app
   if [[ "$backup_created" == true ]]; then
-    docker compose run --rm --no-deps app interexchange-grid restore-state \
+    run_target_compose run --rm --no-deps app interexchange-grid restore-state \
       --config /app/config/defaults.yaml \
       --backup "/app/state/backups/${backup_name}"
   fi

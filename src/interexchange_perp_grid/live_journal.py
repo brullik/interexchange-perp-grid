@@ -24,7 +24,7 @@ from interexchange_perp_grid.private_domain import (
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _PROCESS_INCARCATION = secrets.token_hex(32)
-_DEPLOYMENT_UPGRADE_LEASE_TOKEN = "deployment-upgrade-gate-v1"
+_DEPLOYMENT_UPGRADE_LEASE_PREFIX = "deployment-upgrade-"
 
 
 class LiveActionState(StrEnum):
@@ -343,6 +343,7 @@ class LiveOrderJournal:
                         CHECK (upgrade_entry_frozen IN (0, 1)),
                     previous_risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0
                         CHECK (previous_risk_stage_completion_frozen IN (0, 1)),
+                    owner_token TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
                 """
@@ -365,6 +366,11 @@ class LiveOrderJournal:
                 database.execute(
                     "ALTER TABLE live_deployment_controls ADD COLUMN "
                     "previous_risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0"
+                )
+            if "owner_token" not in deployment_columns:
+                database.execute(
+                    "ALTER TABLE live_deployment_controls ADD COLUMN "
+                    "owner_token TEXT NOT NULL DEFAULT ''"
                 )
             columns = {
                 str(row[1]) for row in database.execute("PRAGMA table_info(live_order_legs)")
@@ -453,32 +459,87 @@ class LiveOrderJournal:
                 database.rollback()
                 raise
 
-    async def arm_deployment_upgrade(self, now: datetime | None = None) -> DeploymentUpgradeGate:
+    async def arm_deployment_upgrade(
+        self,
+        owner_token: str,
+        now: datetime | None = None,
+    ) -> DeploymentUpgradeGate:
         return await asyncio.to_thread(
             self._set_deployment_upgrade_gate_sync,
             True,
+            owner_token,
             now or datetime.now(UTC),
         )
 
+    async def arm_legacy_deployment_upgrade(
+        self,
+        owner_token: str,
+        now: datetime | None = None,
+    ) -> DeploymentUpgradeGate:
+        """Arm only controls understood by the currently deployed legacy image."""
+        return await asyncio.to_thread(
+            self._arm_legacy_deployment_upgrade_sync,
+            owner_token,
+            now or datetime.now(UTC),
+        )
+
+    def _arm_legacy_deployment_upgrade_sync(
+        self,
+        owner_token: str,
+        now: datetime,
+    ) -> DeploymentUpgradeGate:
+        self._validate_deployment_upgrade_owner(owner_token)
+        observed = now.isoformat()
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            existing_lease = database.execute(
+                "SELECT owner_token FROM live_control_leases "
+                "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+            ).fetchone()
+            if existing_lease is None:
+                database.execute(
+                    "INSERT INTO live_control_leases("
+                    "lease_key, owner_token, owner_pid, owner_incarnation, "
+                    "owner_process_identity, acquired_at) "
+                    "VALUES ('ACCOUNT_WIDE_FLATTEN', ?, 0, ?, ?, ?)",
+                    (owner_token, owner_token, owner_token, observed),
+                )
+            elif str(existing_lease["owner_token"]) != owner_token:
+                database.rollback()
+                raise RuntimeError("account-wide recovery already owns the live entry gate")
+            active_action_count = int(
+                database.execute(
+                    "SELECT COUNT(*) FROM live_pair_actions WHERE state <> ?",
+                    (LiveActionState.FLAT.value,),
+                ).fetchone()[0]
+            )
+            database.commit()
+        return DeploymentUpgradeGate(True, active_action_count, now)
+
     async def release_deployment_upgrade(
-        self, now: datetime | None = None
+        self,
+        owner_token: str,
+        now: datetime | None = None,
     ) -> DeploymentUpgradeGate:
         return await asyncio.to_thread(
             self._set_deployment_upgrade_gate_sync,
             False,
+            owner_token,
             now or datetime.now(UTC),
         )
 
     def _set_deployment_upgrade_gate_sync(
         self,
         frozen: bool,
+        owner_token: str,
         now: datetime,
     ) -> DeploymentUpgradeGate:
+        self._validate_deployment_upgrade_owner(owner_token)
         observed = now.isoformat()
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             gate = database.execute(
-                "SELECT upgrade_entry_frozen, previous_risk_stage_completion_frozen "
+                "SELECT upgrade_entry_frozen, owner_token "
                 "FROM live_deployment_controls WHERE singleton = 1"
             ).fetchone()
             if gate is None:
@@ -492,58 +553,36 @@ class LiveOrderJournal:
             )
             currently_frozen = bool(gate["upgrade_entry_frozen"])
             if frozen and not currently_frozen:
-                stage = database.execute(
-                    "SELECT risk_stage_completion_frozen FROM live_entry_controls "
-                    "WHERE singleton = 1"
-                ).fetchone()
-                if stage is None:
-                    database.rollback()
-                    raise RuntimeError("legacy live entry freeze is unavailable")
                 existing_lease = database.execute(
                     "SELECT owner_token FROM live_control_leases "
                     "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
                 ).fetchone()
-                if existing_lease is not None:
+                if existing_lease is None:
+                    database.execute(
+                        "INSERT INTO live_control_leases("
+                        "lease_key, owner_token, owner_pid, owner_incarnation, "
+                        "owner_process_identity, acquired_at) "
+                        "VALUES ('ACCOUNT_WIDE_FLATTEN', ?, 0, ?, ?, ?)",
+                        (owner_token, owner_token, owner_token, observed),
+                    )
+                elif str(existing_lease["owner_token"]) != owner_token:
                     database.rollback()
                     raise RuntimeError("account-wide recovery already owns the live entry gate")
-                previous_stage_freeze = int(bool(stage["risk_stage_completion_frozen"]))
-                database.execute(
-                    "UPDATE live_entry_controls SET risk_stage_completion_frozen = 1 "
-                    "WHERE singleton = 1"
-                )
-                database.execute(
-                    "INSERT INTO live_control_leases("
-                    "lease_key, owner_token, owner_pid, owner_incarnation, "
-                    "owner_process_identity, acquired_at) "
-                    "VALUES ('ACCOUNT_WIDE_FLATTEN', ?, 0, ?, ?, ?)",
-                    (
-                        _DEPLOYMENT_UPGRADE_LEASE_TOKEN,
-                        _DEPLOYMENT_UPGRADE_LEASE_TOKEN,
-                        _DEPLOYMENT_UPGRADE_LEASE_TOKEN,
-                        observed,
-                    ),
-                )
                 database.execute(
                     "UPDATE live_deployment_controls "
-                    "SET upgrade_entry_frozen = 1, "
-                    "previous_risk_stage_completion_frozen = ?, updated_at = ? "
+                    "SET upgrade_entry_frozen = 1, owner_token = ?, updated_at = ? "
                     "WHERE singleton = 1",
-                    (previous_stage_freeze, observed),
+                    (owner_token, observed),
                 )
             elif frozen:
-                stage = database.execute(
-                    "SELECT risk_stage_completion_frozen FROM live_entry_controls "
-                    "WHERE singleton = 1"
-                ).fetchone()
                 lease = database.execute(
                     "SELECT owner_token FROM live_control_leases "
                     "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
                 ).fetchone()
                 if (
-                    stage is None
-                    or not bool(stage["risk_stage_completion_frozen"])
+                    str(gate["owner_token"]) != owner_token
                     or lease is None
-                    or str(lease["owner_token"]) != _DEPLOYMENT_UPGRADE_LEASE_TOKEN
+                    or str(lease["owner_token"]) != owner_token
                 ):
                     database.rollback()
                     raise RuntimeError("deployment upgrade legacy gate ownership is unavailable")
@@ -559,30 +598,35 @@ class LiveOrderJournal:
                 ).fetchone()
                 if (
                     not currently_frozen
+                    or str(gate["owner_token"]) != owner_token
                     or lease is None
-                    or str(lease["owner_token"]) != (_DEPLOYMENT_UPGRADE_LEASE_TOKEN)
+                    or str(lease["owner_token"]) != owner_token
                 ):
                     database.rollback()
                     raise RuntimeError("deployment upgrade gate ownership is unavailable")
                 database.execute(
                     "DELETE FROM live_control_leases "
                     "WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN' AND owner_token = ?",
-                    (_DEPLOYMENT_UPGRADE_LEASE_TOKEN,),
-                )
-                database.execute(
-                    "UPDATE live_entry_controls SET risk_stage_completion_frozen = ? "
-                    "WHERE singleton = 1",
-                    (int(bool(gate["previous_risk_stage_completion_frozen"])),),
+                    (owner_token,),
                 )
                 database.execute(
                     "UPDATE live_deployment_controls "
-                    "SET upgrade_entry_frozen = 0, "
+                    "SET upgrade_entry_frozen = 0, owner_token = '', "
                     "previous_risk_stage_completion_frozen = 0, updated_at = ? "
                     "WHERE singleton = 1",
                     (observed,),
                 )
             database.commit()
         return DeploymentUpgradeGate(frozen, active_action_count, now)
+
+    @staticmethod
+    def _validate_deployment_upgrade_owner(owner_token: str) -> None:
+        if (
+            not owner_token.startswith(_DEPLOYMENT_UPGRADE_LEASE_PREFIX)
+            or len(owner_token) != len(_DEPLOYMENT_UPGRADE_LEASE_PREFIX) + 40
+            or any(character not in "0123456789abcdef" for character in owner_token[-40:])
+        ):
+            raise ValueError("deployment upgrade owner token must bind one full release SHA")
 
     @staticmethod
     def _require_deployment_entry_open(database: sqlite3.Connection) -> None:

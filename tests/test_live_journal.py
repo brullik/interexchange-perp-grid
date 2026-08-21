@@ -32,6 +32,7 @@ from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _ROUTE = DirectedRouteKey("BTC", Venue.BINANCE_USDM, Venue.OKX)
 _QUALIFICATION = "a" * 64
+_UPGRADE_OWNER = f"deployment-upgrade-{'b' * 40}"
 
 
 def test_client_order_ids_fit_every_wave1_venue_contract() -> None:
@@ -141,16 +142,16 @@ async def test_deployment_upgrade_gate_is_atomic_durable_and_blocks_only_new_ent
     journal = LiveOrderJournal(path)
     await journal.initialise()
 
-    armed = await journal.arm_deployment_upgrade()
+    armed = await journal.arm_deployment_upgrade(_UPGRADE_OWNER)
     assert armed.entry_frozen
     assert armed.active_action_count == 0
     with sqlite3.connect(path) as database:
         assert database.execute(
             "SELECT risk_stage_completion_frozen FROM live_entry_controls WHERE singleton = 1"
-        ).fetchone() == (1,)
+        ).fetchone() == (0,)
         assert database.execute(
             "SELECT owner_token FROM live_control_leases WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
-        ).fetchone() == ("deployment-upgrade-gate-v1",)
+        ).fetchone() == (_UPGRADE_OWNER,)
     with pytest.raises(RuntimeError, match="freeze blocks new live"):
         await _prepare(journal)
     emergency_request = replace(
@@ -174,7 +175,7 @@ async def test_deployment_upgrade_gate_is_atomic_durable_and_blocks_only_new_ent
     await restarted.initialise()
     with pytest.raises(RuntimeError, match="freeze blocks new live"):
         await _prepare(restarted)
-    released = await restarted.release_deployment_upgrade()
+    released = await restarted.release_deployment_upgrade(_UPGRADE_OWNER)
     assert not released.entry_frozen
     assert (await _prepare(restarted)).state == LiveActionState.PREPARED
 
@@ -184,14 +185,13 @@ async def test_upgrade_gate_preserves_an_existing_owner_risk_stage_freeze(tmp_pa
     path = tmp_path / "state.sqlite3"
     journal = LiveOrderJournal(path)
     await journal.initialise()
+    await journal.arm_deployment_upgrade(_UPGRADE_OWNER)
     with sqlite3.connect(path) as database:
         database.execute(
             "UPDATE live_entry_controls SET risk_stage_completion_frozen = 1 WHERE singleton = 1"
         )
         database.commit()
-
-    await journal.arm_deployment_upgrade()
-    await journal.release_deployment_upgrade()
+    await journal.release_deployment_upgrade(_UPGRADE_OWNER)
 
     with sqlite3.connect(path) as database:
         assert database.execute(
@@ -207,16 +207,58 @@ async def test_upgrade_gate_preserves_an_existing_owner_risk_stage_freeze(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_upgrade_gate_release_requires_exact_arm_owner(tmp_path: Path) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    other_owner = f"deployment-upgrade-{'c' * 40}"
+
+    await journal.arm_deployment_upgrade(_UPGRADE_OWNER)
+    with pytest.raises(RuntimeError, match="ownership is unavailable"):
+        await journal.arm_deployment_upgrade(other_owner)
+    with pytest.raises(RuntimeError, match="ownership is unavailable"):
+        await journal.release_deployment_upgrade(other_owner)
+    assert not (await journal.release_deployment_upgrade(_UPGRADE_OWNER)).entry_frozen
+
+
+@pytest.mark.asyncio
+async def test_legacy_upgrade_arm_blocks_active_entry_without_target_schema_migration(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    await _prepare(journal)
+    with sqlite3.connect(path) as database:
+        database.execute("DROP TABLE live_deployment_controls")
+        database.commit()
+
+    armed = await journal.arm_legacy_deployment_upgrade(_UPGRADE_OWNER)
+
+    assert armed.active_action_count == 1
+    with sqlite3.connect(path) as database:
+        assert database.execute(
+            "SELECT owner_token FROM live_control_leases WHERE lease_key = 'ACCOUNT_WIDE_FLATTEN'"
+        ).fetchone() == (_UPGRADE_OWNER,)
+        assert (
+            database.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'live_deployment_controls'"
+            ).fetchone()
+            is None
+        )
+
+
+@pytest.mark.asyncio
 async def test_upgrade_gate_retains_freeze_until_all_live_actions_are_flat(tmp_path: Path) -> None:
     journal = LiveOrderJournal(tmp_path / "state.sqlite3")
     await journal.initialise()
     action = await _prepare(journal)
 
-    armed = await journal.arm_deployment_upgrade()
+    armed = await journal.arm_deployment_upgrade(_UPGRADE_OWNER)
     assert armed.entry_frozen
     assert armed.active_action_count == 1
     with pytest.raises(RuntimeError, match="zero active live actions"):
-        await journal.release_deployment_upgrade()
+        await journal.release_deployment_upgrade(_UPGRADE_OWNER)
     with pytest.raises(RuntimeError, match="freeze blocks new live"):
         await _prepare(
             journal,
@@ -228,7 +270,7 @@ async def test_upgrade_gate_retains_freeze_until_all_live_actions_are_flat(tmp_p
 
     await journal.transition(action.pair_action_id, LiveActionState.QUARANTINED, {})
     await journal.transition(action.pair_action_id, LiveActionState.FLAT, {})
-    assert not (await journal.release_deployment_upgrade()).entry_frozen
+    assert not (await journal.release_deployment_upgrade(_UPGRADE_OWNER)).entry_frozen
 
 
 @pytest.mark.asyncio
@@ -237,7 +279,7 @@ async def test_upgrade_gate_and_new_entry_have_no_unowned_race(tmp_path: Path) -
         journal = LiveOrderJournal(tmp_path / f"race-{index}.sqlite3")
         await journal.initialise()
         gate_result, prepare_result = await asyncio.gather(
-            journal.arm_deployment_upgrade(),
+            journal.arm_deployment_upgrade(_UPGRADE_OWNER),
             _prepare(journal),
             return_exceptions=True,
         )
@@ -249,7 +291,7 @@ async def test_upgrade_gate_and_new_entry_have_no_unowned_race(tmp_path: Path) -
         else:
             assert isinstance(prepare_result, RuntimeError)
             assert gate_result.active_action_count == 0
-        assert not (await journal.release_deployment_upgrade()).entry_frozen
+        assert not (await journal.release_deployment_upgrade(_UPGRADE_OWNER)).entry_frozen
 
 
 @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from interexchange_perp_grid.public_engine import ScanResult
 runner = CliRunner()
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CONFIG = Path("config/defaults.yaml")
+UPGRADE_OWNER = f"deployment-upgrade-{'b' * 40}"
 
 
 def test_cli_and_public_scan_help_render() -> None:
@@ -32,12 +33,24 @@ def test_deployment_upgrade_gate_cli_persists_and_releases_freeze(tmp_path: Path
 
     armed = runner.invoke(
         app,
-        ["deployment-upgrade-gate", "--action", "arm"],
+        [
+            "deployment-upgrade-gate",
+            "--action",
+            "arm",
+            "--owner-token",
+            UPGRADE_OWNER,
+        ],
         env=environment,
     )
     released = runner.invoke(
         app,
-        ["deployment-upgrade-gate", "--action", "release"],
+        [
+            "deployment-upgrade-gate",
+            "--action",
+            "release",
+            "--owner-token",
+            UPGRADE_OWNER,
+        ],
         env=environment,
     )
 

@@ -501,6 +501,7 @@ def qualification_epoch_finalize(
 @app.command("deployment-upgrade-gate")
 def deployment_upgrade_gate(
     action: Annotated[str, typer.Option("--action")],
+    owner_token: Annotated[str, typer.Option("--owner-token")],
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
     """Atomically freeze new live entry before deployment or release it after recovery."""
@@ -510,13 +511,17 @@ def deployment_upgrade_gate(
 
     async def update_gate() -> tuple[DeploymentUpgradeGate, bool]:
         state_path = Path(settings.storage.sqlite_path)
-        await initialise_state(state_path)
         journal = LiveOrderJournal(state_path)
+        if action == "arm" and state_path.is_file():
+            legacy_result = await journal.arm_legacy_deployment_upgrade(owner_token)
+            if legacy_result.active_action_count > 0:
+                return legacy_result, True
+        await initialise_state(state_path)
         await journal.initialise()
         result = (
-            await journal.arm_deployment_upgrade()
+            await journal.arm_deployment_upgrade(owner_token)
             if action == "arm"
-            else await journal.release_deployment_upgrade()
+            else await journal.release_deployment_upgrade(owner_token)
         )
         return result, action == "arm" and result.active_action_count > 0
 
