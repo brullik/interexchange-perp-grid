@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.native_runtime import resolve_runtime_artifact_digest
 from interexchange_perp_grid.qualification import (
     QualificationPolicy,
     QualificationProgress,
@@ -195,8 +197,11 @@ class AutonomousOrchestrator:
     async def reconcile_once(self) -> AutonomousRuntimeStatus:
         now = datetime.now(UTC)
         release_sha = os.environ.get("IPEG_RELEASE_SHA", "").strip().lower()
-        image_digest = os.environ.get("IPEG_CONTAINER_IMAGE_DIGEST", "").strip().lower()
         raw_route = os.environ.get("IPEG_QUALIFICATION_ROUTE", "").strip()
+        try:
+            image_digest = resolve_runtime_artifact_digest(self.repo_root, self.config_path)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            image_digest = ""
         if not _RELEASE_SHA.fullmatch(release_sha) or not _IMAGE_DIGEST.fullmatch(image_digest):
             return await self._publish(
                 AutonomousRuntimeStatus(

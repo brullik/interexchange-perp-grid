@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
@@ -23,6 +24,12 @@ from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.laptop_workflow import (
+    LaptopQualificationIdentity,
+    build_laptop_pilot_report,
+    run_until_qualification_finalized,
+    write_laptop_pilot_report,
+)
 from interexchange_perp_grid.live_journal import (
     DeploymentUpgradeGate,
     LiveOrderJournal,
@@ -33,6 +40,11 @@ from interexchange_perp_grid.maintenance import (
     backup_sqlite,
     prune_market_history,
     restore_sqlite,
+)
+from interexchange_perp_grid.native_runtime import (
+    build_native_runtime_manifest,
+    resolve_runtime_artifact_digest,
+    write_native_runtime_manifest,
 )
 from interexchange_perp_grid.observability import configure_logging, render_metrics
 from interexchange_perp_grid.ops_evidence import build_operations_proof
@@ -83,7 +95,12 @@ from interexchange_perp_grid.risk_stages import (
     verify_risk_stage_completion_evidence,
 )
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
-from interexchange_perp_grid.service import run_until_signal
+from interexchange_perp_grid.service import (
+    load_bounded_service_receipt,
+    run_for_duration,
+    run_until_signal,
+    write_bounded_service_receipt,
+)
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import (
     QualificationEpoch,
@@ -370,6 +387,18 @@ def public_scan(
         raise typer.Exit(code=3)
 
 
+@app.command("native-runtime-manifest")
+def native_runtime_manifest(
+    output: Annotated[Path, typer.Option("--output")] = Path("state/native-runtime-manifest.json"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Bind native CPython, dependencies, source and config without Docker."""
+    manifest = build_native_runtime_manifest(repo_root.resolve(), config.resolve())
+    write_native_runtime_manifest(output.resolve(), manifest)
+    typer.echo(json.dumps(asdict(manifest), default=str, sort_keys=True))
+
+
 @app.command("run")
 def run_service(config: ConfigPath = Path("config/defaults.yaml")) -> None:
     """Run the safe asynchronous bootstrap service."""
@@ -380,6 +409,94 @@ def run_service(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         raise typer.Exit(code=2)
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(run_until_signal(settings))
+
+
+@app.command("run-for")
+def run_service_for(
+    duration_seconds: Annotated[
+        int,
+        typer.Option("--duration-seconds", min=1, max=86_400),
+    ],
+    receipt: Annotated[Path | None, typer.Option("--receipt")] = None,
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Run shadow/recovery service for one exact bounded observation interval."""
+    settings = _load(config)
+    decision = evaluate_live_order(settings, LiveContext())
+    if settings.app.mode == "live" or decision.allowed:
+        typer.echo("bounded service refuses live mode without runtime gates", err=True)
+        raise typer.Exit(code=2)
+    result = asyncio.run(run_for_duration(settings, duration_seconds))
+    if receipt is not None:
+        write_bounded_service_receipt(receipt.resolve(), result)
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+
+
+@app.command("laptop-qualification-run")
+def laptop_qualification_run(
+    maximum_hours: Annotated[
+        float,
+        typer.Option("--maximum-hours", min=24, max=30),
+    ] = 30,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Run native shadow until the exact 24-hour qualification finalizes."""
+    settings = _load(config)
+    if settings.app.mode != "shadow" or settings.live.enabled:
+        raise typer.BadParameter("laptop qualification requires shadow mode and live disabled")
+    release_sha = current_code_commit_sha(repo_root.resolve())
+    if release_sha is None:
+        raise typer.BadParameter("exact release commit SHA is unavailable")
+    runtime_digest = resolve_runtime_artifact_digest(repo_root.resolve(), config.resolve())
+    route = _parse_route(os.environ.get("IPEG_QUALIFICATION_ROUTE", ""))
+    if route.value != "BTC:bybit>okx":
+        raise typer.BadParameter("laptop qualification route must be BTC:bybit>okx")
+    epoch = asyncio.run(
+        run_until_qualification_finalized(
+            settings,
+            LaptopQualificationIdentity(route, release_sha, runtime_digest),
+            maximum_seconds=maximum_hours * 3600,
+        )
+    )
+    typer.echo(json.dumps(asdict(epoch), default=str, sort_keys=True))
+
+
+@app.command("laptop-pilot-report")
+def laptop_pilot_report(
+    started_at: Annotated[datetime, typer.Option("--started-at")],
+    ended_at: Annotated[datetime, typer.Option("--ended-at")],
+    qualification: Annotated[
+        Path,
+        typer.Option("--qualification", exists=True, dir_okay=False, readable=True),
+    ] = Path("state/qualification.json"),
+    service_receipt: Annotated[
+        Path,
+        typer.Option("--service-receipt", exists=True, dir_okay=False, readable=True),
+    ] = Path("state/laptop-service-receipt.json"),
+    output: Annotated[Path, typer.Option("--output")] = Path("state/laptop-pilot-report.json"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Prove one real paired canary followed by eight native service hours."""
+    settings = _load(config)
+    evidence = load_qualification(qualification.resolve())
+    bounded_service = load_bounded_service_receipt(service_receipt.resolve())
+    runtime_digest = resolve_runtime_artifact_digest(repo_root.resolve(), config.resolve())
+    report = asyncio.run(
+        build_laptop_pilot_report(
+            settings,
+            evidence,
+            started_at,
+            ended_at,
+            runtime_digest,
+            bounded_service,
+        )
+    )
+    write_laptop_pilot_report(output.resolve(), report)
+    typer.echo(json.dumps(asdict(report), default=str, sort_keys=True))
+    if report.status != "PASS":
+        raise typer.Exit(code=7)
 
 
 @app.command("shadow-status")

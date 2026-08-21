@@ -59,6 +59,31 @@ async def test_orchestrator_waits_fail_closed_without_owner_confirmation(
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_rejects_unverified_native_runtime_before_state_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setenv("IPEG_RELEASE_SHA", RELEASE_SHA)
+    monkeypatch.setenv("IPEG_RUNTIME_KIND", "native-python")
+    monkeypatch.setenv("IPEG_QUALIFICATION_ROUTE", "BTC:bybit>okx")
+    _confirm_onboarding(monkeypatch)
+
+    def invalid(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise ValueError("native runtime mismatch")
+
+    monkeypatch.setattr(orchestrator_module, "resolve_runtime_artifact_digest", invalid)
+    orchestrator = AutonomousOrchestrator(settings, use_progress_subprocess=False)
+
+    status = await orchestrator.reconcile_once()
+
+    assert status.state == "WAITING_DEPLOYMENT_IDENTITY"
+    assert status.blockers == ("EXACT_DEPLOYMENT_IDENTITY_REQUIRED",)
+    assert not orchestrator.state_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_waits_fail_closed_without_owner_route(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
