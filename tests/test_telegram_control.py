@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -8,12 +11,24 @@ from pathlib import Path
 import pytest
 
 from interexchange_perp_grid.config import load_settings
+from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.live_control import LiveControlResult
 from interexchange_perp_grid.live_journal import LiveActionState
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.shadow import ShadowRuntime
-from interexchange_perp_grid.state import live_confirmation_valid, read_command_audit
-from interexchange_perp_grid.telegram_control import TelegramCommandRouter, run_telegram_bot
+from interexchange_perp_grid.state import (
+    finalize_qualification_epoch,
+    live_confirmation_valid,
+    read_command_audit,
+    save_shadow_snapshot,
+    start_qualification_epoch,
+)
+from interexchange_perp_grid.strategy import DirectedRouteKey
+from interexchange_perp_grid.telegram_control import (
+    READ_COMMANDS,
+    TelegramCommandRouter,
+    run_telegram_bot,
+)
 
 CONFIG = Path("config/defaults.yaml")
 
@@ -32,6 +47,21 @@ class FakeLiveControl:
                     "symbol": "BTC/USDT:USDT",
                     "side": "BUY",
                     "base_quantity": "0.001",
+                }
+            ],
+            "orders": [
+                {
+                    "record_type": "PRIVATE_ORDER",
+                    "source": "PRIVATE_EXCHANGE",
+                    "venue": "okx",
+                    "client_order_id": "IPEG-ORDER-1",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "BUY",
+                    "status": "OPEN",
+                    "requested_base_quantity": "0.001",
+                    "filled_base_quantity": "0",
+                    "observed_at": "2026-08-15T12:00:00+00:00",
+                    "is_open": True,
                 }
             ],
             "balances": [{"venue": "okx", "equity_usdt": "100"}],
@@ -138,6 +168,8 @@ async def test_live_commands_use_private_state_and_challenge_protected_workflows
 
     assert "PRIVATE_EXCHANGE" in await router.handle(42, "/status", now)
     assert "base_quantity" in await router.handle(42, "/positions", now)
+    assert "IPEG-ORDER-1" in await router.handle(42, "/orders", now)
+    assert "PRIVATE_EXCHANGE" in await router.handle(42, "/orders", now)
     assert "equity_usdt" in await router.handle(42, "/balances", now)
     assert "unrealized_pnl_usdt" in await router.handle(42, "/pnl", now)
     live_risk = await router.handle(42, "/risk", now)
@@ -163,6 +195,93 @@ async def test_live_commands_use_private_state_and_challenge_protected_workflows
 
 
 @pytest.mark.asyncio
+async def test_all_locked_read_commands_are_available_audited_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "telegram.sqlite3")})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    router = TelegramCommandRouter(runtime, 42, 60)
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+    locked_commands = {
+        "/status",
+        "/health",
+        "/opportunities",
+        "/routes",
+        "/positions",
+        "/orders",
+        "/pnl",
+        "/risk",
+        "/data_health",
+        "/exchanges",
+        "/qualification",
+    }
+
+    assert locked_commands <= READ_COMMANDS
+    for command in sorted(locked_commands):
+        payload = json.loads(await router.handle(42, command, now))
+        assert payload["source"] == "SHADOW"
+        assert payload["private_state"] == ReasonCode.PRIVATE_STATE_UNAVAILABLE.value
+
+    health = json.loads(await router.handle(42, "/health", now))
+    assert health["service"]["healthy"] is False
+    assert health["service"]["reason"] == ReasonCode.SERVICE_STATE_MISSING.value
+    qualification = json.loads(await router.handle(42, "/qualification", now))
+    assert qualification["status"] == "NOT_RUNNING"
+    assert qualification["reason"] == "QUALIFICATION_EPOCH_UNAVAILABLE"
+    exchanges = json.loads(await router.handle(42, "/exchanges", now))
+    assert exchanges["capability_matrix"] is None
+    orders = json.loads(await router.handle(42, "/orders", now))
+    assert orders["status"] == "SHADOW_ONLY"
+    assert orders["orders"] == []
+
+    audits = await read_command_audit(runtime.state_path)
+    assert len(audits) == len(locked_commands) + 4
+    assert all(audit.outcome == "ACCEPTED" for audit in audits)
+    assert all(audit.reason == ReasonCode.TELEGRAM_COMMAND_ACCEPTED for audit in audits)
+
+
+@pytest.mark.asyncio
+async def test_qualification_and_exchange_visibility_is_durable_and_freshness_gated(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "telegram.sqlite3"
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    started_at = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
+    epoch = await start_qualification_epoch(
+        state_path,
+        DirectedRouteKey("BTC", Venue.BYBIT, Venue.OKX),
+        "a" * 40,
+        "b" * 64,
+        "c" * 64,
+        "sha256:" + "d" * 64,
+        started_at,
+    )
+    await finalize_qualification_epoch(state_path, epoch.epoch_id, started_at + timedelta(days=1))
+    await save_shadow_snapshot(
+        state_path,
+        {
+            "evaluated_at": datetime(2020, 1, 1, tzinfo=UTC).isoformat(),
+            "venue_capability_matrix": {"okx": {"status": "QUALIFIED"}},
+            "quarantined": [],
+        },
+        started_at,
+    )
+    router = TelegramCommandRouter(runtime, 42, 60)
+    now = datetime(2026, 8, 21, 12, 0, tzinfo=UTC)
+
+    qualification = json.loads(await router.handle(42, "/qualification", now))
+    assert qualification["status"] == "FINALIZED"
+    assert qualification["epoch_id"] == epoch.epoch_id
+    exchanges = json.loads(await router.handle(42, "/exchanges", now))
+    assert exchanges["status"] == "STALE"
+    assert exchanges["reason"] == "CAPABILITY_MATRIX_STALE"
+    assert exchanges["capability_matrix"] is None
+
+
+@pytest.mark.asyncio
 async def test_shadow_telegram_without_token_stays_fail_closed_and_nonfatal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -185,6 +304,67 @@ async def test_shadow_telegram_without_token_stays_fail_closed_and_nonfatal(
     assert task.done() is False
     stop_event.set()
     await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_read_command_has_one_bounded_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "telegram.sqlite3")})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+
+    release = asyncio.Event()
+
+    async def blocked_snapshot() -> dict[str, object]:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                continue
+        return {"mode": "shadow", "risk": {}, "positions": [], "market": {}}
+
+    monkeypatch.setattr(runtime, "snapshot", blocked_snapshot)
+    monkeypatch.setattr(
+        "interexchange_perp_grid.telegram_control.TELEGRAM_READ_DEADLINE_SECONDS", 0.01
+    )
+    router = TelegramCommandRouter(runtime, 42, 60)
+    response = json.loads(await asyncio.wait_for(router.handle(42, "/status"), timeout=0.25))
+    assert response["status"] == "UNAVAILABLE"
+    assert response["reason"] == "TELEGRAM_READ_DEADLINE"
+    assert len(router._retiring_reads) == 1
+    with pytest.raises(RuntimeError, match=r"read task.*nonterminal"):
+        await router.close(0.01)
+    release.set()
+    await asyncio.sleep(0.01)
+    assert not router._retiring_reads
+    await router.close(0.01)
+
+
+@pytest.mark.asyncio
+async def test_read_deadline_includes_mandatory_audit_persistence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "telegram.sqlite3"
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    runtime = ShadowRuntime(settings)
+    await runtime.start()
+    router = TelegramCommandRouter(runtime, 42, 60)
+    monkeypatch.setattr(
+        "interexchange_perp_grid.telegram_control.TELEGRAM_READ_DEADLINE_SECONDS", 0.05
+    )
+    locker = sqlite3.connect(state_path, isolation_level=None)
+    locker.execute("BEGIN IMMEDIATE")
+    started = asyncio.get_running_loop().time()
+    try:
+        response = await asyncio.wait_for(router.handle(42, "/status"), timeout=0.20)
+    finally:
+        locker.rollback()
+        locker.close()
+    assert response == "AUDIT_PERSISTENCE_UNAVAILABLE"
+    assert asyncio.get_running_loop().time() - started < 0.15
 
 
 @pytest.mark.asyncio
@@ -256,7 +436,11 @@ async def test_shadow_commands_render_bounded_ten_route_portfolio_risk_and_pnl(
                 "portfolio_stress_usdt": "50",
             },
             "positions": positions,
-            "market": {"data_health": [], "quarantined": []},
+            "market": {
+                "data_health": [],
+                "quarantined": [],
+                "opportunities": [{"blob": "Y" * 10000}],
+            },
         }
 
     monkeypatch.setattr(runtime, "snapshot", snapshot)
@@ -314,7 +498,11 @@ async def test_shadow_visibility_bounds_long_routes_and_rejects_malformed_number
             "persistence_indeterminate": False,
             "risk": risk,
             "positions": positions,
-            "market": {"data_health": [], "quarantined": []},
+            "market": {
+                "data_health": [],
+                "quarantined": [],
+                "opportunities": [{"blob": "Y" * 10000}],
+            },
         }
 
     monkeypatch.setattr(runtime, "snapshot", snapshot)
@@ -324,6 +512,10 @@ async def test_shadow_visibility_bounds_long_routes_and_rejects_malformed_number
         response = await router.handle(42, command, now)
         assert len(response) <= 4096
         assert "#" in response
+    routes = await router.handle(42, "/routes", now)
+    assert len(routes) <= 4096
+    for route in long_routes:
+        assert TelegramCommandRouter._bounded_label(route) in routes
 
     positions[0]["net_pnl_usdt"] = "NaN"
     malformed = await router.handle(42, "/positions", now)
@@ -333,7 +525,7 @@ async def test_shadow_visibility_bounds_long_routes_and_rejects_malformed_number
     malformed_risk = await router.handle(42, "/risk", now)
     assert "INVALID_RISK_DATA" in malformed_risk
     audits = await read_command_audit(runtime.state_path)
-    assert len(audits) == 6
+    assert len(audits) == 7
 
     risk.clear()
     risk.update(
@@ -369,6 +561,22 @@ async def test_live_visibility_oversize_is_bounded_and_explicitly_omits_detail(
                 }
                 for _ in range(50)
             ],
+            "orders": [
+                {
+                    "record_type": "PRIVATE_ORDER",
+                    "source": "PRIVATE_EXCHANGE",
+                    "venue": "okx",
+                    "client_order_id": f"IPEG-VERY-LONG-ORDER-{index}-{'Z' * 100}",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "BUY",
+                    "status": "OPEN",
+                    "requested_base_quantity": "0.001",
+                    "filled_base_quantity": "0",
+                    "observed_at": "2026-08-20T12:00:00+00:00",
+                    "is_open": True,
+                }
+                for index in range(101)
+            ],
             "pnl": {"unrealized_pnl_usdt": "1"},
             "risk": {
                 "reservation_count": 50,
@@ -383,11 +591,35 @@ async def test_live_visibility_oversize_is_bounded_and_explicitly_omits_detail(
 
     status = await router.handle(42, "/status", now)
     positions = await router.handle(42, "/positions", now)
+    orders = await router.handle(42, "/orders", now)
     assert len(status) <= 4096
     assert len(positions) <= 4096
+    assert len(orders) <= 4096
     assert "DETAIL_OMITTED" in status
     assert "DETAIL_OMITTED" in positions
+    assert "DETAIL_OMITTED" in orders
     assert '"position_count": 50' in status
+    assert '"shown_order_ref_count": 101' in orders
+    assert '"omitted_order_ref_count": 0' in orders
+    for index in range(101):
+        identifier = f"IPEG-VERY-LONG-ORDER-{index}-{'Z' * 100}"
+        assert (
+            TelegramCommandRouter._compact_reference(
+                TelegramCommandRouter._bounded_label(identifier)
+            )
+            in orders
+        )
+    all_refs: list[str] = []
+    for index in range(101):
+        identifier = f"IPEG-VERY-LONG-ORDER-{index}-{'Z' * 100}"
+        compact = TelegramCommandRouter._compact_reference(
+            TelegramCommandRouter._bounded_label(identifier)
+        )
+        all_refs.append(f"{compact}:OPEN")
+    expected_digest = hashlib.sha256(
+        json.dumps(all_refs, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert expected_digest in orders
 
 
 @pytest.mark.asyncio
@@ -477,6 +709,27 @@ async def test_all_live_outputs_are_bounded_and_malformed_private_state_fails_cl
         response = await router.handle(42, f"{command} BOUND", now)
         assert len(response) <= 4096
         assert "DETAIL_OMITTED" in response
+
+
+def test_live_order_visibility_rejects_incomplete_and_cross_wired_records() -> None:
+    malformed = (
+        {"status": "OPEN"},
+        {
+            "record_type": "PRIVATE_ORDER",
+            "source": "LIVE_JOURNAL",
+            "status": "OPEN",
+        },
+        {
+            "record_type": "JOURNAL_LEG",
+            "source": "PRIVATE_EXCHANGE",
+            "status": "SUBMITTING",
+        },
+    )
+    for record in malformed:
+        assert TelegramCommandRouter._live_orders_summary([record]) == {
+            "source": "PRIVATE_EXCHANGE",
+            "status": "INVALID_PRIVATE_ORDER_DATA",
+        }
 
 
 @pytest.mark.asyncio
