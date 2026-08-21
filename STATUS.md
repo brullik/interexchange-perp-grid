@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** SOFTWARE_RC_EXACT_GATE_PASS_AWAITING_MERGE
-- **Current checkpoint:** exact code head `bc4cc77caa36d9b6d54da0c9c7b87ba0d28f24cd` completed the autonomous VPS/risk-stage remediation. Exact integer/global 5/50 caps, locked Ed25519 completion evidence, canonical normal paired-cycle proof, atomic journal freeze/watermark/content binding, promotion-time revalidation, and fail-closed v13-to-v14 reset/re-attestation passed the full 666-test local gate, exact Linux CI `32446447344` 5/5, SHA-bound artifacts, and independent P0=0/P1=0/P2=0 review. This evidence-only status update needs its own exact CI/review before protected-main squash merge and v1 RC publication; live remains forbidden
+- **State:** SOFTWARE_COMPLETE
+- **Current checkpoint:** protected `main` squash merge `6b0ebf85e1578852c8ba31b3d49144a27f17a3ff` completed the software-only product. Post-merge CI `32447657564` passed 5/5. Annotated tag and prerelease [`v1.0.0-rc1`](https://github.com/brullik/interexchange-perp-grid/releases/tag/v1.0.0-rc1) are published; publisher run `32448023653` and manifest artifact `9434727031` bind both GHCR tags to immutable digest `sha256:c6785d343ddbc5c2af1dd3eb6926edec0e154865a2d7e7bedf18199d5c719895`. Software is complete; live activation remains separately forbidden pending owner-controlled C5 gates
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -41,7 +41,7 @@ This is the only mutable project-status document.
 | Phase 5.5 seven-venue capability matrix + FT-02 isolation | COMPLETE | One typed matrix reports qualified, quarantined, or disabled state for all seven venue profiles while startup rejects any Wave 1 reclassification. Public scans expose current six-hour-bound reports and isolate one quarantined venue without stopping healthy Wave 1 routes. PREPARED live-canary recovery revalidates current public/private capability, account state, clock, books, funding, economics, journal/reconciliation/risk, protected marketable IOC caps, and final pause/kill immediately before submit; every transport, control-read, and teardown path is owned and bounded. Code head `7506517` passed exact run `32429457353` 5/5 with replay `9428595773` (80 scenarios), C4 critical `9428577449` (30/30), C4.3 `9428574423` (8/8, zero false success/submits), and security `9428569687` (zero vulnerabilities/secret findings); independent exact technical review P0/P1=0. No credentials, expansion submit authority, or real order was added. |
 | FT-03 reproducible Germany/Japan latency evidence | SOFTWARE_READY / OWNER_ACTION | Exact Wave 1 feed/API/private-event samples use exchange timestamps, qualified clock skew and monotonic API RTT; raw NDJSON and reports bind executing code/config/host/attestation/instrument; provider evidence requires a checkout-pinned Ed25519 trust root; final selection rebuilds raw evidence and keeps Germany unless Japan improves weighted p95 by at least 20% with no cell p99 worsening above 50%. The default trust-root sentinel and absent credentials/VPS evidence fail closed. Code head `04a4794` passed exact run `32435546614` 5/5 with replay `9430648766` (80 scenarios), C4 critical `9430638548` (30/30, zero submits), C4.3 `9430634489` (8/8, zero false success/submits), and security `9430627269` (zero vulnerabilities/secrets); independent review P0/P1/P2=0. |
 | Operations final proof | COMPLETE | Code checkpoint `bc4cc77`; deploy requires an untracked `.env` at mode 0600 and verifies the running exact SHA/digest in shadow; successful identity is atomic and idempotent. Upgrade stops the app for a consistent backup and automatically restores both SQLite state and the previous immutable image after failed health. Qualification progress exposes duration, synchronized-event, funding, replay, unresolved order/exposure, quality, PnL, strategy, and exception blockers. SQLite schema v14 binds strict stage limits and signed evidence to the current release/qualification; only canonical four-leg normal paired cycles count; completion atomically freezes normal entry with complete journal identity; promotion rechecks it; emergency reduction remains available; and legacy weak stage results are archived while runtime resets to SHADOW for sequential re-attestation. Exact run `32446447344` passed all five jobs. Operations `9434329359` passed Ubuntu 24.04 rollback/restart and 42/42 criteria through 68 tests with zero production transports; replay `9434246792` passed 83 scenarios; C4 critical `9434227604` passed 30/30 with zero submits; C4.3 `9434224999` passed 8/8 with zero false success/submits; security `9434217107` reports zero vulnerabilities/secrets. Local gate: lock64, Ruff113, mypy111, pytest666, doctor shadow/live=false, diff-check; independent review P0=0/P1=0/P2=0. |
-| Autonomous VPS runtime | EXACT_PASS / AWAITING_RELEASE | Exact code head `02789831ef26c61265804910a41596ad0d665c26` installs one-command Ubuntu 24.04 bootstrap, `/usr/local/sbin/ipegctl`, hardened systemd/Docker ownership, external mode-0600 onboarding, immutable OCI revision/SHA binding, and one service-owned `AutonomousOrchestrator`. Exact run `32443207014` passed all five jobs. Operations `9433253029`, replay `9433184226`, C4 critical `9433172177`, C4.3 `9433167340`, and security `9433161453` are exact-head artifacts; the operations proof covers 42/42 criteria and the C4 artifacts report zero production submits. The orchestrator may collect/finalize observation evidence only and cannot authorize canary/live. Independent final review, protected-main merge, and v1 RC release remain pending. |
+| Autonomous VPS runtime | SOFTWARE_RELEASED_RC1 | Exact code checkpoint `bc4cc77`, evidence head `82d99e7`, protected-main squash `6b0ebf85`, and post-merge run `32447657564` passed all locked gates. One-command Ubuntu 24.04 bootstrap, `/usr/local/sbin/ipegctl`, hardened systemd/Docker ownership, external mode-0600 onboarding, immutable OCI revision/SHA binding, one service-owned `AutonomousOrchestrator`, signed risk-stage evidence, and fail-closed schema-v14 promotion are complete. Annotated prerelease `v1.0.0-rc1` is published; publisher `32448023653` produced GHCR digest `sha256:c6785d343ddbc5c2af1dd3eb6926edec0e154865a2d7e7bedf18199d5c719895` and manifest artifact `9434727031`. The orchestrator cannot authorize canary/live. |
 | C6 venue expansion | SOFTWARE_COMPLETE / OWNER_EVIDENCE | All four expansion adapters plus the seven-venue capability matrix, FT-02 isolation, FT-03 evidence tooling, and operations gates are exact-head verified. Real Germany/Japan measurements, account capability evidence, and a successful owner-operated canary remain external prerequisites; Wave 1 and the live-canary allowlist remain unchanged. |
 
 ## Decisions made during implementation
@@ -149,6 +149,20 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - **Fail-closed behavior:** the all-zero trust-root sentinel rejects every supplied key, Germany remains the default, no C5 deployment or live order is authorized, and no region claim is made until the complete signed evidence exists.
 
 ## Last verified command
+
+```text
+2026-08-21 SOFTWARE_COMPLETE release evidence
+- protected main merge: 6b0ebf85e1578852c8ba31b3d49144a27f17a3ff
+- post-merge CI 32447657564: PASS 5/5
+- annotated prerelease: v1.0.0-rc1
+- publisher run 32448023653: PASS
+- release manifest artifact: 9434727031
+- GHCR release + SHA tags: sha256:c6785d343ddbc5c2af1dd3eb6926edec0e154865a2d7e7bedf18199d5c719895
+
+This is SOFTWARE_COMPLETE, not live authorization. Default shadow mode, C5 prohibition, missing
+credentials, signed regional/VPS evidence, 24-hour qualification, and irreversible live-money
+approval continue to fail closed.
+```
 
 ```text
 2026-08-21 autonomous VPS/risk-stage attestation checkpoint, Windows equivalent of every
