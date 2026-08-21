@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -426,3 +427,90 @@ def test_ipegctl_exposes_locked_commands_and_refuses_canary_without_consent(
         "logs",
     ):
         assert command in text
+    assert 'qualification_route="BTC:bybit>okx"' in text
+    assert "IPEG_OWNER_ONBOARDING_CONFIRMED=true" in text
+    assert "withdrawal, transfer, wallet, address-book" in text
+    assert "VPS IP allowlist" in text
+    assert "dedicated subaccounts are funded" in text
+    assert "Qualification route (BASE:long>short)" not in text
+
+
+def test_owner_onboard_is_atomic_locked_and_mode_0600(tmp_path: Path) -> None:
+    script = shutil.which("script")
+    sudo = shutil.which("sudo")
+    if script is None or sudo is None:
+        pytest.skip("owner onboarding integration requires script and sudo")
+    sudo_probe = subprocess.run([sudo, "-n", "true"], check=False, capture_output=True, timeout=5)
+    if sudo_probe.returncode != 0:
+        pytest.skip("owner onboarding integration requires passwordless sudo")
+
+    env_file = tmp_path / "ipeg.env"
+    command = " ".join(
+        (
+            shlex.quote(sudo),
+            "env",
+            f"IPEG_ENV_FILE={shlex.quote(str(env_file))}",
+            shlex.quote(str(IPEGCTL)),
+            "owner-onboard",
+        )
+    )
+
+    declined = subprocess.run(
+        [script, "--quiet", "--return", "--command", command, "/dev/null"],
+        input="NO\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert declined.returncode == 3
+    assert not env_file.exists()
+
+    answers = [
+        "CONFIRM",
+        "CONFIRM",
+        "CONFIRM",
+        "CONFIRM",
+        "42",
+        "telegram-token",
+        "binance-key",
+        "binance-secret",
+        "",
+        "bybit-key",
+        "bybit-secret",
+        "",
+        "okx-key",
+        "okx-secret",
+        "okx-passphrase",
+    ]
+    accepted = subprocess.run(
+        [script, "--quiet", "--return", "--command", command, "/dev/null"],
+        input="\n".join(answers) + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    contents_result = subprocess.run(
+        [sudo, "cat", str(env_file)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert contents_result.returncode == 0, contents_result.stderr
+    contents = contents_result.stdout
+    assert "IPEG_MODE=shadow" in contents
+    assert "IPEG_LIVE_ENABLED=false" in contents
+    assert "IPEG_OWNER_ONBOARDING_CONFIRMED=true" in contents
+    assert "IPEG_QUALIFICATION_ROUTE=BTC:bybit>okx" in contents
+    mode_result = subprocess.run(
+        [sudo, "stat", "--format=%a", str(env_file)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert mode_result.returncode == 0, mode_result.stderr
+    assert mode_result.stdout.strip() == "600"

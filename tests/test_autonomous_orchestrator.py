@@ -35,6 +35,29 @@ def _settings(tmp_path: Path):  # type: ignore[no-untyped-def]
     )
 
 
+def _confirm_onboarding(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("IPEG_OWNER_ONBOARDING_CONFIRMED", "true")
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_waits_fail_closed_without_owner_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setenv("IPEG_RELEASE_SHA", RELEASE_SHA)
+    monkeypatch.setenv("IPEG_CONTAINER_IMAGE_DIGEST", IMAGE_DIGEST)
+    monkeypatch.setenv("IPEG_QUALIFICATION_ROUTE", "BTC:bybit>okx")
+    monkeypatch.delenv("IPEG_OWNER_ONBOARDING_CONFIRMED", raising=False)
+    orchestrator = AutonomousOrchestrator(settings, use_progress_subprocess=False)
+
+    status = await orchestrator.reconcile_once()
+
+    assert status.state == "WAITING_OWNER_ONBOARDING"
+    assert status.live_authorized is False
+    assert status.blockers == ("OWNER_ONBOARDING_CONFIRMATION_REQUIRED",)
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_waits_fail_closed_without_owner_route(
     tmp_path: Path,
@@ -44,6 +67,7 @@ async def test_orchestrator_waits_fail_closed_without_owner_route(
     monkeypatch.setenv("IPEG_RELEASE_SHA", RELEASE_SHA)
     monkeypatch.setenv("IPEG_CONTAINER_IMAGE_DIGEST", IMAGE_DIGEST)
     monkeypatch.delenv("IPEG_QUALIFICATION_ROUTE", raising=False)
+    _confirm_onboarding(monkeypatch)
     orchestrator = AutonomousOrchestrator(settings, use_progress_subprocess=False)
 
     status = await orchestrator.reconcile_once()
@@ -57,6 +81,25 @@ async def test_orchestrator_waits_fail_closed_without_owner_route(
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_rejects_non_locked_qualification_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setenv("IPEG_RELEASE_SHA", RELEASE_SHA)
+    monkeypatch.setenv("IPEG_CONTAINER_IMAGE_DIGEST", IMAGE_DIGEST)
+    monkeypatch.setenv("IPEG_QUALIFICATION_ROUTE", "ETH:binanceusdm>bybit")
+    _confirm_onboarding(monkeypatch)
+    orchestrator = AutonomousOrchestrator(settings, use_progress_subprocess=False)
+
+    status = await orchestrator.reconcile_once()
+
+    assert status.state == "WAITING_OWNER_ONBOARDING"
+    assert status.blockers == ("QUALIFICATION_ROUTE_LOCK_MISMATCH",)
+    assert not orchestrator.state_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_idempotently_starts_exact_immutable_epoch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -65,6 +108,7 @@ async def test_orchestrator_idempotently_starts_exact_immutable_epoch(
     monkeypatch.setenv("IPEG_RELEASE_SHA", RELEASE_SHA)
     monkeypatch.setenv("IPEG_CONTAINER_IMAGE_DIGEST", IMAGE_DIGEST)
     monkeypatch.setenv("IPEG_QUALIFICATION_ROUTE", "BTC:bybit>okx")
+    _confirm_onboarding(monkeypatch)
     orchestrator = AutonomousOrchestrator(settings, use_progress_subprocess=False)
 
     first = await orchestrator.reconcile_once()
@@ -92,6 +136,7 @@ async def test_production_progress_worker_reports_epoch_without_blocking_service
     monkeypatch.setenv("IPEG_RELEASE_SHA", RELEASE_SHA)
     monkeypatch.setenv("IPEG_CONTAINER_IMAGE_DIGEST", IMAGE_DIGEST)
     monkeypatch.setenv("IPEG_QUALIFICATION_ROUTE", "BTC:bybit>okx")
+    _confirm_onboarding(monkeypatch)
     orchestrator = AutonomousOrchestrator(settings)
 
     status = await asyncio.wait_for(orchestrator.reconcile_once(), timeout=10)
@@ -110,6 +155,7 @@ async def test_orchestrator_finalizes_collection_but_never_authorizes_live(
     monkeypatch.setenv("IPEG_RELEASE_SHA", RELEASE_SHA)
     monkeypatch.setenv("IPEG_CONTAINER_IMAGE_DIGEST", IMAGE_DIGEST)
     monkeypatch.setenv("IPEG_QUALIFICATION_ROUTE", "BTC:bybit>okx")
+    _confirm_onboarding(monkeypatch)
 
     async def ready(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
