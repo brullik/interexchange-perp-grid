@@ -200,7 +200,7 @@ def test_upgrade_refuses_to_stop_app_when_durable_live_actions_are_active(tmp_pa
     result = _run(UPGRADE, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
 
     assert result.returncode == 6
-    assert "aborted before shutdown" in result.stderr
+    assert "aborted before deployment" in result.stderr
     log = docker_log.read_text(encoding="utf-8")
     assert "--action arm" in log
     assert "compose pause app" in log
@@ -298,8 +298,11 @@ def test_upgrade_fails_closed_when_healthy_service_cannot_release_entry_freeze(
     result = _run(UPGRADE, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
 
     assert result.returncode == 7
-    assert "freeze could not be released" in result.stderr
-    assert "--action release" in docker_log.read_text(encoding="utf-8")
+    assert "could not release the upgrade entry freeze" in result.stderr
+    log = docker_log.read_text(encoding="utf-8")
+    assert "restore-state" in log
+    assert f"{OLD_SHA}|compose up --detach --no-build --wait --wait-timeout 180 app" in log
+    assert "--action release" in log
 
 
 def test_failed_rollback_keeps_legacy_gate_armed_and_never_releases_entry(

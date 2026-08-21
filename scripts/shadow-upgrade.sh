@@ -61,7 +61,7 @@ run_previous_compose() {
 }
 release_upgrade_gate() {
   if ! run_upgrade_gate release; then
-    echo "deployment is healthy but the upgrade entry freeze could not be released" >&2
+    echo "target deployment could not release the upgrade entry freeze" >&2
     return 1
   fi
   upgrade_gate_armed=false
@@ -113,10 +113,15 @@ if [[ -n "$previous_image" && -n "$previous_sha" ]]; then
     docker compose kill app
   fi
 fi
+upgrade_status=0
 if bash "$(dirname "$0")/shadow-deploy.sh" "$1" "$2"; then
-  :
+  if [[ "$upgrade_gate_armed" == true ]] && ! release_upgrade_gate; then
+    upgrade_status=7
+  fi
 else
   upgrade_status=$?
+fi
+if [[ "$upgrade_status" -ne 0 ]]; then
   if [[ -z "$previous_image" || -z "$previous_sha" ]]; then
     echo "upgrade failed and no previous deployment identity is available" >&2
     exit "$upgrade_status"
@@ -145,9 +150,6 @@ else
   fi
   echo "automatic rollback completed" >&2
   exit "$upgrade_status"
-fi
-if [[ "$upgrade_gate_armed" == true ]] && ! release_upgrade_gate; then
-  exit 7
 fi
 if [[ "$backup_created" == true ]]; then
   echo "state_backup=/app/state/backups/${backup_name}"
