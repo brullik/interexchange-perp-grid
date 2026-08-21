@@ -332,7 +332,7 @@ jobs:
             --state "$FIVE_TRANCHE_STATE" --transition-state HEDGED \
             --private-state-dir "$FIVE_TRANCHE_PRIVATE" \
             --action-count 50 --tranches-per-route 5 \
-            | tee "state/ops-evidence/private-recovery-five-tranche.json" \
+            | tee "state/ops-evidence/private-five-tranche-recovery.json" \
             | python -c 'import json,sys; p=json.load(sys.stdin); assert p["status"] == "PASS"; assert p["expected_action_count"] == 50; assert p["recovered_action_count"] == 50; assert p["simulated_private_submit_calls"] == 100; assert p["flat_barrier_verified"] is True; assert p["priority_scheduler_restart_proof"] is True; assert p["new_entry_shed_while_p0_active"] is True; assert p["production_exchange_transports_opened"] == 0'
           docker volume rm "$SMOKE_VOLUME"
       - name: Validate deployment scripts
