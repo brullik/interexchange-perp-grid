@@ -69,6 +69,7 @@ market_data:
 universe:
   live_min_listing_age_days: 14
   instrument_refresh_seconds: 21600
+  max_broad_bbo_instruments: 100
   max_dynamic_l2_candidates: 30
   decision_debounce_ms: 100
 

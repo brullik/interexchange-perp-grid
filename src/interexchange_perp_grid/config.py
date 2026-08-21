@@ -159,6 +159,7 @@ class MarketDataConfig(StrictModel):
 class UniverseConfig(StrictModel):
     live_min_listing_age_days: int = Field(ge=14, le=3650)
     instrument_refresh_seconds: int = Field(ge=60, le=86400)
+    max_broad_bbo_instruments: int = Field(ge=30, le=400)
     max_dynamic_l2_candidates: int = Field(ge=1, le=30)
     decision_debounce_ms: int = Field(ge=1, le=1000)
 

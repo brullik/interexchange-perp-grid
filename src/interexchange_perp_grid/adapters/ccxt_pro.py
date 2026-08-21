@@ -313,6 +313,23 @@ class CcxtProAdapter(ExchangeAdapter):
             clock_skew_ms=self._clock_skew_ms,
         )
 
+    def _normalise_bbo_batch(
+        self,
+        raw_result: Mapping[object, object],
+        symbols: tuple[str, ...],
+    ) -> tuple[BboQuote, ...]:
+        quotes: list[BboQuote] = []
+        for raw in raw_result.values():
+            if not isinstance(raw, Mapping) or raw.get("symbol") not in symbols:
+                continue
+            try:
+                quotes.append(self._normalise_bbo(raw))
+            except ValueError:
+                # Batch ticker transports may include one temporarily empty market.
+                # Reject that symbol without poisoning every healthy venue quote.
+                continue
+        return tuple(quotes)
+
     async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
         if not symbols:
             return ()
@@ -322,32 +339,26 @@ class CcxtProAdapter(ExchangeAdapter):
             raw_result = await self._exchange.watch_bids_asks(list(symbols))
             if not isinstance(raw_result, Mapping):
                 raise TypeError("CCXT watch_bids_asks must return a mapping")
-            return tuple(
-                self._normalise_bbo(raw)
-                for raw in raw_result.values()
-                if isinstance(raw, Mapping) and raw.get("symbol") in symbols
-            )
+            return self._normalise_bbo_batch(raw_result, symbols)
         if stream_kind == "tickers":
             self._bbo_subscription_kind = stream_kind
+            requested_symbols = None if self.venue == Venue.BINANCE_USDM else list(symbols)
             raw_result = await self._exchange.watch_tickers(
-                list(symbols),
+                requested_symbols,
                 self._bbo_ticker_params(),
             )
             if not isinstance(raw_result, Mapping):
                 raise TypeError("CCXT watch_tickers must return a mapping")
-            return tuple(
-                self._normalise_bbo(raw)
-                for raw in raw_result.values()
-                if isinstance(raw, Mapping) and raw.get("symbol") in symbols
-            )
+            return self._normalise_bbo_batch(raw_result, symbols)
         raise RuntimeError("batch BBO stream capability is required")
 
     async def unwatch_bbo(self, symbols: tuple[str, ...]) -> None:
         if self._bbo_subscription_kind == "bids_asks":
             await self._exchange.un_watch_bids_asks(list(symbols))
         elif self._bbo_subscription_kind == "tickers":
+            requested_symbols = None if self.venue == Venue.BINANCE_USDM else list(symbols)
             await self._exchange.un_watch_tickers(
-                list(symbols),
+                requested_symbols,
                 self._bbo_ticker_params(),
             )
         else:
@@ -475,4 +486,36 @@ class CcxtProAdapter(ExchangeAdapter):
         )
 
     async def close(self) -> None:
-        await self._exchange.close()
+        close_connector = getattr(self._exchange, "close_connector", None)
+        close_proxy_sessions = getattr(self._exchange, "close_proxy_sessions", None)
+        ws_close = getattr(self._exchange, "ws_close", None)
+        if (
+            not callable(close_connector)
+            or not callable(close_proxy_sessions)
+            or not callable(ws_close)
+        ):
+            await self._exchange.close()
+            return
+
+        # CCXT closes WebSockets before its shared aiohttp connector. A peer that
+        # does not complete the WebSocket close handshake can therefore consume
+        # the engine's entire shutdown deadline. Stop the connector first so all
+        # pending public reads are unblocked, then drain CCXT's normal owners.
+        clients = getattr(self._exchange, "clients", {})
+        if isinstance(clients, Mapping):
+            for client in clients.values():
+                futures = getattr(client, "futures", {})
+                if not isinstance(futures, Mapping):
+                    continue
+                for future in futures.values():
+                    cancel = getattr(future, "cancel", None)
+                    if callable(cancel):
+                        cancel()
+        await close_connector()
+        await ws_close()
+        session = getattr(self._exchange, "session", None)
+        if session is not None:
+            if getattr(self._exchange, "own_session", False):
+                await session.close()
+            self._exchange.session = None
+        await close_proxy_sessions()

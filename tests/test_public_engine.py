@@ -442,6 +442,28 @@ class DelayedBroadFakeAdapter(BroadFakeAdapter):
         return await super().watch_bbo(symbols)
 
 
+class SlowFirstBroadFakeAdapter(BroadFakeAdapter):
+    async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
+        if self.bbo_calls == 0:
+            await asyncio.sleep(0.05)
+        return await super().watch_bbo(symbols)
+
+
+class FailThenSlowReconnectBroadFakeAdapter(BroadFakeAdapter):
+    def __init__(self, venue: Venue, received_ns: int) -> None:
+        super().__init__(venue, received_ns)
+        self.failed = asyncio.Event()
+
+    async def watch_bbo(self, symbols: tuple[str, ...]) -> tuple[BboQuote, ...]:
+        if self.bbo_calls == 1:
+            self.bbo_calls += 1
+            self.failed.set()
+            raise ConnectionError("fixture disconnect after qualified update")
+        if self.bbo_calls == 2:
+            await asyncio.sleep(0.05)
+        return await super().watch_bbo(symbols)
+
+
 class OneLateBatchBroadFakeAdapter(BroadFakeAdapter):
     def __init__(self, venue: Venue, received_ns: int) -> None:
         super().__init__(venue, received_ns)
@@ -800,6 +822,67 @@ async def test_broad_bbo_scans_100_common_instruments_and_isolates_one_venue(
     assert adapters[Venue.OKX].bbo_calls == 1
     assert all(adapter.bbo_calls >= 1 for adapter in adapters.values())
     assert all(adapter.bbo_subscription_changes == 1 for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_first_bbo_progress_has_bounded_handshake_allowance(tmp_path: Path) -> None:
+    clock = 1_000_000_000
+    adapters = {venue: SlowFirstBroadFakeAdapter(venue, clock) for venue in WAVE1_VENUES}
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    settings = settings.model_copy(
+        update={"market_data": settings.market_data.model_copy(update={"max_bbo_age_ms": 10})}
+    )
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock,
+    )
+
+    result = await engine.scan_broad_bbo(timeout_seconds=1)
+    await engine.close()
+
+    assert result.quarantined == ()
+    assert result.cache.entries == result.cache.known_keys == 300
+    assert engine._bbo_qualified_venues == set(WAVE1_VENUES)
+
+
+@pytest.mark.asyncio
+async def test_reconnected_bbo_gets_fresh_handshake_allowance(tmp_path: Path) -> None:
+    clock = [1_000_000_000]
+    adapters: dict[Venue, BroadFakeAdapter] = {
+        venue: BroadFakeAdapter(venue, clock[0]) for venue in WAVE1_VENUES
+    }
+    reconnecting = FailThenSlowReconnectBroadFakeAdapter(Venue.OKX, clock[0])
+    adapters[Venue.OKX] = reconnecting
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    settings = settings.model_copy(
+        update={"market_data": settings.market_data.model_copy(update={"max_bbo_age_ms": 10})}
+    )
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+        reconnect_jitter=lambda venue, attempt: Decimal(1),
+    )
+
+    await engine.scan_broad_bbo(timeout_seconds=1)
+    await asyncio.wait_for(reconnecting.failed.wait(), timeout=1)
+    for _ in range(100):
+        if Venue.OKX in engine._quarantined:
+            break
+        await asyncio.sleep(0)
+    assert Venue.OKX in engine._quarantined
+    clock[0] += 1_000_000_000
+    for adapter in adapters.values():
+        adapter.received_ns = clock[0]
+    recovered = await engine.scan_broad_bbo(timeout_seconds=1)
+    await engine.close()
+
+    assert recovered.quarantined == ()
+    assert recovered.cache.entries == recovered.cache.known_keys == 300
+    assert reconnecting.bbo_calls >= 3
 
 
 @pytest.mark.asyncio
@@ -1704,6 +1787,9 @@ async def test_six_hour_refresh_resubscribes_watchers_to_new_symbols(tmp_path: P
     clock = [1_000_000_000]
     adapters = {venue: BroadFakeAdapter(venue, clock[0]) for venue in WAVE1_VENUES}
     settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    settings = settings.model_copy(
+        update={"universe": settings.universe.model_copy(update={"max_broad_bbo_instruments": 101})}
+    )
     engine = PublicMarketEngine(
         settings,
         adapter_factory=adapters.__getitem__,

@@ -11,6 +11,7 @@ class ClassicKucoinFuturesExchange(ccxtpro.kucoinfutures):  # type: ignore[misc]
     """Pinned KuCoin Futures Classic transport with symmetric public streams."""
 
     _MAX_BBO_SYMBOLS = 100
+    _MAX_BBO_SUBSCRIPTIONS_PER_SESSION = 400
 
     def describe(self) -> Any:
         return self.deep_extend(
@@ -36,6 +37,8 @@ class ClassicKucoinFuturesExchange(ccxtpro.kucoinfutures):  # type: ignore[misc]
         selected = self.market_symbols(symbols, None, False, True, False)
         if not selected:
             raise ValueError("KuCoin Futures BBO subscription requires symbols")
+        if len(selected) > self._MAX_BBO_SUBSCRIPTIONS_PER_SESSION:
+            raise ValueError("KuCoin Futures BBO universe exceeds 400 subscriptions per session")
         if params:
             raise ValueError("unqualified KuCoin Futures BBO parameters")
         base_watch = super().watch_bids_asks

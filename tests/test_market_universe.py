@@ -119,6 +119,30 @@ def test_large_live_universe_filters_age_activity_and_ambiguity(
     }
 
 
+def test_broad_universe_is_bounded_and_keeps_configured_base() -> None:
+    by_venue = {
+        venue: (
+            *(_instrument(venue, f"A{index:03d}") for index in range(150)),
+            _instrument(venue, "BTC"),
+        )
+        for venue in WAVE1_VENUES
+    }
+    snapshot = InstrumentRegistry(
+        minimum_listing_age_days=14,
+        enforce_listing_age=True,
+        maximum_common_instruments=100,
+        preferred_bases=("BTC",),
+    ).build(by_venue, now=NOW, monotonic_ns=1, generation=1)
+
+    assert len(snapshot.common) == 100
+    assert snapshot.common[0].key.base == "BTC"
+    assert {item.key.base for item in snapshot.common} == {
+        "BTC",
+        *(f"A{index:03d}" for index in range(99)),
+    }
+    assert len(snapshot.known_bbo_keys) == 300
+
+
 def test_registry_rejects_cross_quote_and_incomplete_contract_metadata() -> None:
     registry = InstrumentRegistry(minimum_listing_age_days=14, enforce_listing_age=True)
     valid = _instrument(Venue.BYBIT, "BTC")

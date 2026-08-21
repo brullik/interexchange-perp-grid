@@ -178,12 +178,12 @@ class PairedBatchTickerExchange:
     }
 
     def __init__(self) -> None:
-        self.watch_calls: list[tuple[list[str], dict[str, str]]] = []
-        self.unwatch_calls: list[tuple[list[str], dict[str, str]]] = []
+        self.watch_calls: list[tuple[list[str] | None, dict[str, str]]] = []
+        self.unwatch_calls: list[tuple[list[str] | None, dict[str, str]]] = []
 
     async def watch_tickers(
         self,
-        symbols: list[str],
+        symbols: list[str] | None,
         params: dict[str, str],
     ) -> dict[str, object]:
         self.watch_calls.append((symbols, params))
@@ -191,10 +191,60 @@ class PairedBatchTickerExchange:
 
     async def un_watch_tickers(
         self,
-        symbols: list[str],
+        symbols: list[str] | None,
         params: dict[str, str],
     ) -> None:
         self.unwatch_calls.append((symbols, params))
+
+
+class MixedQualityBatchTickerExchange(PairedBatchTickerExchange):
+    async def watch_tickers(
+        self,
+        symbols: list[str] | None,
+        params: dict[str, str],
+    ) -> dict[str, object]:
+        self.watch_calls.append((symbols, params))
+        assert symbols is not None
+        return {
+            "BTC/USDT:USDT": {
+                "symbol": "BTC/USDT:USDT",
+                "bid": "100",
+                "ask": "101",
+                "bidVolume": "2",
+                "askVolume": "3",
+                "timestamp": 1_700_000_000_000,
+            },
+            "EMPTY/USDT:USDT": {
+                "symbol": "EMPTY/USDT:USDT",
+                "bid": None,
+                "ask": None,
+                "timestamp": 1_700_000_000_000,
+            },
+        }
+
+
+class OrderedCloseExchange:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.session = self
+        self.own_session = True
+        self.clients = {"public": self}
+        self.futures = {"ticker": self}
+
+    def cancel(self) -> None:
+        self.calls.append("future")
+
+    async def close_connector(self) -> None:
+        self.calls.append("connector")
+
+    async def ws_close(self) -> None:
+        self.calls.append("websocket")
+
+    async def close(self) -> None:
+        self.calls.append("session")
+
+    async def close_proxy_sessions(self) -> None:
+        self.calls.append("proxy")
 
 
 class CapturingClassicBitgetExchange(ClassicBitgetExchange):
@@ -328,6 +378,41 @@ async def test_bitget_classic_ticker_frames_are_bounded_and_ack_dispatches() -> 
 
 
 @pytest.mark.asyncio
+async def test_kucoin_bbo_rejects_universe_above_session_subscription_limit() -> None:
+    class CapacityKucoinExchange(ClassicKucoinFuturesExchange):
+        async def load_markets(self, reload: bool = False, params: object = None) -> object:
+            del reload, params
+            return self.markets
+
+        def market_symbols(
+            self,
+            symbols: list[str] | None,
+            type: str | None = None,
+            allow_empty: bool = False,
+            same_type_only: bool = False,
+            symbols_are_ids: bool = False,
+        ) -> list[str]:
+            del type, allow_empty, same_type_only, symbols_are_ids
+            return symbols or []
+
+    exchange = CapacityKucoinExchange()
+    symbols = [f"A{index:03d}/USDT:USDT" for index in range(401)]
+    exchange.markets = {
+        symbol: {
+            "symbol": symbol,
+            "id": symbol.split("/", 1)[0] + "USDTM",
+            "type": "swap",
+            "swap": True,
+            "contract": True,
+        }
+        for symbol in symbols
+    }
+
+    with pytest.raises(ValueError, match="exceeds 400 subscriptions"):
+        await exchange.watch_bids_asks(symbols)
+
+
+@pytest.mark.asyncio
 async def test_broad_bbo_rejects_unbounded_per_symbol_ticker_fallback() -> None:
     exchange = TickerOnlyExchange()
     adapter = CcxtProAdapter(Venue.BYBIT, exchange=exchange)
@@ -359,9 +444,53 @@ async def test_broad_bbo_uses_only_a_batch_stream_with_matching_unsubscribe(
     assert await adapter.watch_bbo(symbols) == ()
     await adapter.unwatch_bbo(symbols)
 
-    expected_call = (list(symbols), expected_params)
+    expected_call = (
+        None if venue == Venue.BINANCE_USDM else list(symbols),
+        expected_params,
+    )
     assert exchange.watch_calls == [expected_call]
     assert exchange.unwatch_calls == [expected_call]
+
+
+@pytest.mark.asyncio
+async def test_broad_bbo_isolates_one_invalid_symbol_without_quarantining_batch() -> None:
+    exchange = MixedQualityBatchTickerExchange()
+    adapter = CcxtProAdapter(Venue.BYBIT, exchange=exchange)
+    instruments = (
+        Instrument(
+            venue=Venue.BYBIT,
+            symbol=symbol,
+            exchange_symbol=symbol.replace("/", "").split(":", 1)[0],
+            base=symbol.split("/", 1)[0],
+            quote="USDT",
+            settle="USDT",
+            contract_size_base=Decimal("1"),
+            amount_step_contracts=Decimal("0.001"),
+            price_tick=Decimal("0.1"),
+            minimum_amount_contracts=Decimal("0.001"),
+            minimum_notional=None,
+            taker_fee_rate=Decimal("0.0005"),
+            fee_source="fixture",
+        )
+        for symbol in ("BTC/USDT:USDT", "EMPTY/USDT:USDT")
+    )
+    adapter._instruments = {instrument.symbol: instrument for instrument in instruments}
+
+    quotes = await adapter.watch_bbo(tuple(adapter._instruments))
+
+    assert len(quotes) == 1
+    assert quotes[0].symbol == "BTC/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_adapter_shutdown_aborts_connector_before_websocket_handshake() -> None:
+    exchange = OrderedCloseExchange()
+    adapter = CcxtProAdapter(Venue.BYBIT, exchange=exchange)
+
+    await adapter.close()
+
+    assert exchange.calls == ["future", "connector", "websocket", "session", "proxy"]
+    assert exchange.session is None
 
 
 @pytest.mark.parametrize("venue", (*WAVE1_VENUES, Venue.BITGET))
