@@ -1,29 +1,36 @@
 {
   "schema_version": 1,
-  "action_id": "REPOSITORY-MAKE-PRIVATE-20260815",
-  "type": "REPOSITORY_MAKE_PRIVATE",
-  "reason": "The repository is currently PUBLIC. The autonomous safety protocol requires PRIVATE visibility before any operational evidence or secrets are added. Codex cannot make this persistent access-control change without the owner's explicit authorization.",
+  "action_id": "ONE-TIME-ONBOARDING-V1-RC2-20260821",
+  "type": "ONE_TIME_ONBOARDING",
+  "reason": "All software-only acceptance work is complete and v1.0.0-rc2 is published. Codex cannot deploy or collect real qualification evidence because this environment has no owner VPS access, Telegram credentials, restricted exchange credentials, dedicated-subaccount funding confirmation, or permission to make the public repository private. These external facts and secrets must be supplied out of band and must never be placed in Git, GitHub, artifacts, or chat.",
   "required_inputs": [
-    "Explicit owner authorization to change brullik/interexchange-perp-grid from PUBLIC to PRIVATE"
+    "An Ubuntu 24.04 VPS in Germany with root SSH/bootstrap access supplied out of band",
+    "Telegram bot token and numeric owner chat ID",
+    "Dedicated Binance USD-M, Bybit, and OKX subaccounts funded for shadow qualification",
+    "One restricted API key per dedicated Wave 1 subaccount with read and futures-trade permission, withdrawal/transfer/wallet/address-book/API-management disabled, and the VPS IP allowlisted",
+    "Owner authorization to change brullik/interexchange-perp-grid from PUBLIC to PRIVATE before operational evidence is uploaded"
   ],
   "steps": [
-    "Review whether existing collaborators and public consumers are prepared for loss of public access.",
-    "In GitHub repository Settings, open Danger Zone, choose Change repository visibility, select Private, and confirm brullik/interexchange-perp-grid.",
-    "Run: gh repo view brullik/interexchange-perp-grid --json visibility,isPrivate"
+    "Change brullik/interexchange-perp-grid visibility to Private and validate with: gh repo view brullik/interexchange-perp-grid --json visibility,isPrivate",
+    "On the Ubuntu 24.04 VPS, install the exact v1.0.0-rc2 checkout and run: sudo scripts/bootstrap-ubuntu.sh",
+    "Run: sudo ipegctl owner-onboard; enter the Telegram and restricted Wave 1 credentials only in this local terminal and type CONFIRM only for the factual account-safety prompts",
+    "Deploy the exact image with: sudo ipegctl deploy --image ghcr.io/brullik/interexchange-perp-grid@sha256:2c49fd425cdc9d247d9cc729e83ecb0f53e3c735d7e815ab279cee140bfe26da --release-sha 9d99e5bb774386de9314ad2cab125096675442a1",
+    "Validate with: sudo ipegctl doctor && sudo ipegctl status",
+    "Start shadow-only operation with: sudo ipegctl start-shadow; do not provide live-canary consent during onboarding"
   ],
   "unblock_conditions": [
-    "The validation command reports visibility=PRIVATE and isPrivate=true.",
-    "No credential, token, operational evidence, or production secret was added to Git or GitHub during the change."
+    "The repository query reports visibility=PRIVATE and isPrivate=true.",
+    "/etc/ipeg/ipeg.env is owned by root, has mode 0600, and is not tracked by Git.",
+    "ipegctl doctor reports PASS, mode=shadow, live_orders_allowed=false, release SHA 9d99e5bb774386de9314ad2cab125096675442a1, and image digest sha256:2c49fd425cdc9d247d9cc729e83ecb0f53e3c735d7e815ab279cee140bfe26da.",
+    "ipegctl status reports a qualification epoch for BTC:bybit>okx or an explicit fail-closed external blocker.",
+    "No withdrawal, transfer, or live-canary permission was granted."
   ],
   "forbidden_to_include": [
-    "GitHub access tokens",
-    "VPS credentials",
-    "Telegram credentials",
-    "Exchange API keys or secrets",
-    "Any live-money consent"
+    "SSH private keys or passwords",
+    "Telegram bot token",
+    "Exchange API keys, secrets, or passphrases",
+    "Wallet, withdrawal, transfer, address-book, or API-management permission",
+    "Live-canary consent or any real-order authorization"
   ],
-  "independent_work_remaining": [
-    "Phase 2 Wave 1 data/private core exact-head review and merge",
-    "All remaining software-only master-plan phases that do not publish operational evidence or secrets"
-  ]
+  "independent_work_remaining": []
 }
