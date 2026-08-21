@@ -113,6 +113,71 @@ class LiveControlService:
             for state in states.values()
             for position in state.positions
         ]
+        private_orders_by_key = {
+            (order.venue, order.order_id, order.client_order_id): (order, is_open)
+            for state in states.values()
+            for is_open, collection in ((False, state.recent_orders), (True, state.open_orders))
+            for order in collection
+        }
+        orders = [
+            {
+                "record_type": "PRIVATE_ORDER",
+                "source": "PRIVATE_EXCHANGE",
+                "venue": order.venue.value,
+                "order_id": order.order_id,
+                "client_order_id": order.client_order_id,
+                "symbol": order.symbol,
+                "side": order.side.value,
+                "status": order.status.value,
+                "requested_base_quantity": str(order.requested_base_quantity),
+                "filled_base_quantity": str(order.filled_base_quantity),
+                "average_price": str(order.average_price) if order.average_price else None,
+                "limit_price": str(order.limit_price) if order.limit_price else None,
+                "fee_usdt": str(order.fee_usdt) if order.fee_usdt is not None else None,
+                "observed_at": order.observed_at.isoformat(),
+                "is_open": is_open,
+            }
+            for order, is_open in private_orders_by_key.values()
+        ]
+        orders.extend(
+            {
+                "record_type": "JOURNAL_LEG",
+                "source": "LIVE_JOURNAL",
+                "pair_action_id": action.pair_action_id,
+                "tranche_id": action.tranche_id,
+                "route": action.route.value,
+                "action_state": action.state.value,
+                "venue": leg.venue.value,
+                "client_order_id": leg.client_order_id,
+                "order_id": leg.order_id,
+                "symbol": leg.symbol,
+                "side": leg.side.value,
+                "status": (
+                    leg.status.value
+                    if leg.status is not None
+                    else ("SUBMITTING" if leg.submit_attempted else "PREPARED")
+                ),
+                "intended_base_quantity": str(leg.intended_base_quantity),
+                "filled_base_quantity": str(leg.filled_base_quantity),
+                "updated_at": action.updated_at.isoformat(),
+            }
+            for action in active
+            for leg in action.legs
+        )
+        orders.extend(
+            {
+                "record_type": "JOURNAL_ACTION",
+                "source": "LIVE_JOURNAL",
+                "pair_action_id": action.pair_action_id,
+                "tranche_id": action.tranche_id,
+                "route": action.route.value,
+                "action_state": action.state.value,
+                "status": action.state.value,
+                "updated_at": action.updated_at.isoformat(),
+            }
+            for action in active
+            if not action.legs
+        )
         balances = [
             {
                 "venue": venue.value,
@@ -161,6 +226,7 @@ class LiveControlService:
                 ),
             },
             "positions": positions,
+            "orders": orders,
             "balances": balances,
             "pnl": {
                 "unrealized_pnl_usdt": str(

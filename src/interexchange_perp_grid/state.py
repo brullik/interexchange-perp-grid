@@ -1291,8 +1291,9 @@ def _record_command_audit_sync(
     outcome: str,
     reason: ReasonCode,
     now: datetime,
+    busy_timeout_ms: int,
 ) -> None:
-    with _connect(path) as database:
+    with _connect(path, busy_timeout_ms=busy_timeout_ms) as database:
         database.execute("BEGIN IMMEDIATE")
         database.execute(
             """
@@ -1311,9 +1312,12 @@ async def record_command_audit(
     outcome: str,
     reason: ReasonCode,
     now: datetime | None = None,
+    busy_timeout_ms: int = 30000,
 ) -> None:
     if not actor.strip() or not command.strip() or not outcome.strip():
         raise ValueError("audit fields must be non-empty")
+    if busy_timeout_ms <= 0:
+        raise ValueError("audit busy timeout must be positive")
     await asyncio.to_thread(
         _record_command_audit_sync,
         path,
@@ -1322,6 +1326,7 @@ async def record_command_audit(
         outcome,
         reason,
         now or datetime.now(UTC),
+        busy_timeout_ms,
     )
 
 

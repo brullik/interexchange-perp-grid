@@ -55,7 +55,9 @@ from interexchange_perp_grid.state import (
     mark_persistence_indeterminate,
     persistence_indeterminate_marker_exists,
     read_active_qualification_epoch,
+    read_qualification_epoch,
     read_runtime_controls,
+    read_service_health,
     read_shadow_snapshot,
     record_qualification_exception,
     record_qualification_scan,
@@ -525,6 +527,11 @@ class ShadowRuntime:
     async def snapshot(self) -> dict[str, object]:
         controls = await self.controls()
         persisted = await read_shadow_snapshot(self.state_path)
+        health = await read_service_health(
+            self.state_path,
+            self.settings.app.health_max_age_seconds,
+        )
+        qualification = await read_qualification_epoch(self.state_path)
         per_route_stress, portfolio_stress = self.risk.totals()
         return {
             "mode": self.settings.app.mode,
@@ -551,6 +558,47 @@ class ShadowRuntime:
                 }
                 for tranche in sorted(self.tranches.values(), key=lambda item: item.tranche_id)
             ],
+            "orders": [
+                {
+                    "tranche_id": tranche.tranche_id,
+                    "client_order_id": fill.client_order_id,
+                    "venue": fill.venue.value,
+                    "side": fill.side.value,
+                    "purpose": fill.purpose.value,
+                    "quantity": str(fill.quantity),
+                    "price": str(fill.price),
+                    "fee_usdt": str(fill.fee_usdt),
+                }
+                for tranche in sorted(self.tranches.values(), key=lambda item: item.tranche_id)
+                for fill in tranche.all_fills
+            ],
+            "health": {
+                "healthy": health.healthy,
+                "reason": health.reason.value,
+                "service_status": health.status,
+                "heartbeat_at": health.heartbeat_at.isoformat() if health.heartbeat_at else None,
+                "starts": health.starts,
+            },
+            "qualification": (
+                {
+                    "status": "NOT_RUNNING",
+                    "reason": "QUALIFICATION_EPOCH_UNAVAILABLE",
+                }
+                if qualification is None
+                else {
+                    "epoch_id": qualification.epoch_id,
+                    "status": qualification.status.value,
+                    "route": qualification.route.value,
+                    "release_sha": qualification.release_sha,
+                    "source_sha256": qualification.source_sha256,
+                    "config_sha256": qualification.config_sha256,
+                    "container_image_digest": qualification.container_image_digest,
+                    "started_at": qualification.started_at.isoformat(),
+                    "ended_at": (
+                        qualification.ended_at.isoformat() if qualification.ended_at else None
+                    ),
+                }
+            ),
             "market": persisted,
         }
 
@@ -1058,6 +1106,11 @@ def _scan_payload(
             str(result.prefilter_latency_ms) if result.prefilter_latency_ms is not None else None
         ),
         "candidate_l2": asdict(result.candidate_l2) if result.candidate_l2 is not None else None,
+        "venue_capability_matrix": (
+            asdict(result.venue_capability_matrix)
+            if result.venue_capability_matrix is not None
+            else None
+        ),
         "route_calibration": [asdict(assessment) for assessment in result.route_calibration],
         "opportunities": [asdict(quote) for quote in result.quotes],
         "data_health": [asdict(quality) for quality in result.data_quality],

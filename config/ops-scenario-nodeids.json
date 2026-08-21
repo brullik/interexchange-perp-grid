@@ -16,7 +16,7 @@
   "PROD-08": ["tests/test_supervisor.py::test_priority_scheduler_recovers_ten_actions_while_p4_p6_are_shed", "ci/docker-smoke::private-transition-recovery-matrix"],
   "PROD-09": ["tests/test_live_journal.py::test_prepare_is_atomic_durable_and_blocks_same_base_restart_entry"],
   "PROD-10": ["tests/test_priority_scheduler.py::test_all_critical_lanes_are_reserved_and_queue_is_bounded"],
-  "PROD-11": ["tests/test_service.py::test_service_owns_exactly_one_telegram_poller", "tests/test_telegram_control.py::test_owner_allowlist_challenge_controls_and_audit"],
+  "PROD-11": ["tests/test_service.py::test_service_owns_exactly_one_telegram_poller", "tests/test_telegram_control.py::test_owner_allowlist_challenge_controls_and_audit", "tests/test_telegram_control.py::test_all_locked_read_commands_are_available_audited_and_fail_closed"],
   "PROD-12": ["tests/test_shadow.py::test_restart_restores_activity_and_blocks_until_reconciled"],
 
   "EX-BINANCE-PUBLIC": ["tests/test_adapters.py::test_wave1_fixtures_accept_only_exact_linear_usdt_perpetuals"],

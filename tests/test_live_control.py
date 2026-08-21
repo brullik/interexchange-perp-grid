@@ -563,6 +563,14 @@ async def test_live_reads_are_actual_private_exchange_state(tmp_path: Path) -> N
     balances = snapshot["balances"]
     assert isinstance(balances, list)
     assert len(balances) == 3
+    orders = snapshot["orders"]
+    assert isinstance(orders, list)
+    assert any(
+        order["record_type"] == "PRIVATE_ORDER"
+        and order["client_order_id"] == "external-seed"
+        and order["status"] == PrivateOrderStatus.FILLED.value
+        for order in orders
+    )
     assert snapshot["risk"] == {
         "status": "INVALID_RISK_DATA",
         "reason": "UNJOURNALED_PRIVATE_EXPOSURE",
@@ -602,6 +610,11 @@ async def test_live_reads_expose_exact_active_journal_risk(tmp_path: Path) -> No
         "a" * 64,
     )
     snapshot = await service.snapshot()
+    orders = snapshot["orders"]
+    assert isinstance(orders, list)
+    assert {order["client_order_id"] for order in orders} == {"risk-long", "risk-short"}
+    assert all(order["record_type"] == "JOURNAL_LEG" for order in orders)
+    assert all(order["status"] == "PREPARED" for order in orders)
     assert snapshot["risk"] == {
         "status": "OK",
         "scope": "JOURNAL_RESERVATION",

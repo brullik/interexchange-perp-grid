@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException
@@ -17,7 +18,9 @@ from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_control import LiveControlResult, render_control_result
+from interexchange_perp_grid.live_journal import LiveActionState
 from interexchange_perp_grid.observability import get_logger
+from interexchange_perp_grid.private_domain import PrivateOrderStatus
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import record_command_audit, record_live_confirmation
@@ -32,14 +35,23 @@ DANGEROUS_COMMANDS = {
 }
 READ_COMMANDS = {
     "/status",
+    "/health",
     "/opportunities",
+    "/routes",
     "/positions",
+    "/orders",
     "/pnl",
     "/risk",
     "/data_health",
+    "/exchanges",
+    "/qualification",
     "/balances",
 }
 TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_READ_DEADLINE_SECONDS = 1.0
+TELEGRAM_READ_WORK_FRACTION = 0.70
+TELEGRAM_AUDIT_FRACTION = 0.20
+MAX_RETIRED_TELEGRAM_READS = 16
 ROUTE_LABEL_LIMIT = 96
 MAX_VISIBILITY_DECIMAL = Decimal("1e18")
 
@@ -98,6 +110,7 @@ class TelegramCommandRouter:
         self._token_factory = token_factory or (lambda: secrets.token_hex(3).upper())
         self._challenge: tuple[str, datetime] | None = None
         self._live_control = live_control
+        self._retiring_reads: set[asyncio.Task[str]] = set()
 
     async def handle(
         self,
@@ -141,7 +154,34 @@ class TelegramCommandRouter:
             return reason.value
 
         if command in READ_COMMANDS:
-            response = await self._read_response(command)
+            if len(self._retiring_reads) >= MAX_RETIRED_TELEGRAM_READS:
+                response = self._render_response(
+                    command,
+                    self._shadow_envelope(
+                        {"status": "UNAVAILABLE", "reason": "TELEGRAM_READ_DEADLINE"}
+                    ),
+                )
+            else:
+                read_task = asyncio.create_task(
+                    self._read_response(command, observed_at),
+                    name=f"telegram-read-{command.removeprefix('/')}",
+                )
+                self._retiring_reads.add(read_task)
+                read_task.add_done_callback(self._consume_read_task)
+                done, _ = await asyncio.wait(
+                    (read_task,),
+                    timeout=TELEGRAM_READ_DEADLINE_SECONDS * TELEGRAM_READ_WORK_FRACTION,
+                )
+                if read_task in done:
+                    response = read_task.result()
+                else:
+                    read_task.cancel()
+                    response = self._render_response(
+                        command,
+                        self._shadow_envelope(
+                            {"status": "UNAVAILABLE", "reason": "TELEGRAM_READ_DEADLINE"}
+                        ),
+                    )
         elif command == "/pause":
             await self._runtime.pause()
             response = "paused=true"
@@ -196,13 +236,21 @@ class TelegramCommandRouter:
             return "UNKNOWN_COMMAND"
 
         response = self._bound_text_response(command, response)
-        await self._audit(
-            actor,
-            command,
-            "ACCEPTED",
-            ReasonCode.TELEGRAM_COMMAND_ACCEPTED,
-            observed_at,
-        )
+        try:
+            await self._audit(
+                actor,
+                command,
+                "ACCEPTED",
+                ReasonCode.TELEGRAM_COMMAND_ACCEPTED,
+                observed_at,
+            )
+        except sqlite3.Error as error:
+            get_logger().error(
+                "telegram_audit_unavailable",
+                command=command,
+                error_type=type(error).__name__,
+            )
+            return "AUDIT_PERSISTENCE_UNAVAILABLE"
         return response
 
     def _consume_challenge(self, arguments: list[str], now: datetime) -> bool:
@@ -212,23 +260,50 @@ class TelegramCommandRouter:
         self._challenge = None
         return now <= expires_at and secrets.compare_digest(arguments[0], expected)
 
-    async def _read_response(self, command: str) -> str:
+    def _consume_read_task(self, task: asyncio.Task[str]) -> None:
+        self._retiring_reads.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            get_logger().warning(
+                "telegram_read_task_failed",
+                error_type=type(error).__name__,
+            )
+
+    async def close(self, timeout_seconds: float = TELEGRAM_READ_DEADLINE_SECONDS) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("Telegram shutdown timeout must be positive")
+        tasks = tuple(self._retiring_reads)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
+            if pending:
+                raise RuntimeError(
+                    f"Telegram shutdown failed: {len(pending)} read task(s) nonterminal"
+                )
+
+    async def _read_response(self, command: str, observed_at: datetime) -> str:
         if self._live_control is not None and command in {
             "/status",
             "/positions",
+            "/orders",
             "/pnl",
             "/risk",
             "/balances",
         }:
             try:
-                live = await self._live_control.snapshot()
+                live = await asyncio.wait_for(
+                    self._live_control.snapshot(), timeout=TELEGRAM_READ_DEADLINE_SECONDS
+                )
             except Exception as error:
                 get_logger().warning(
                     "telegram_private_state_unavailable",
                     operation=command.removeprefix("/"),
                     error_type=type(error).__name__,
                 )
-                shadow_payload = await self._shadow_read_payload(command)
+                shadow_payload = await self._shadow_read_payload(command, observed_at)
                 return self._render_response(
                     command,
                     {
@@ -247,15 +322,24 @@ class TelegramCommandRouter:
                 }
             elif command == "/positions":
                 live_payload = self._live_positions_summary(live.get(key))
+            elif command == "/orders":
+                live_payload = self._live_orders_summary(live.get(key))
             elif command == "/pnl":
                 live_payload = self._live_pnl_summary(live.get(key))
             else:
                 live_payload = live.get(key, {"status": "UNAVAILABLE"})
             return self._render_response(command, live_payload)
-        return self._render_response(command, await self._shadow_read_payload(command))
+        return self._render_response(command, await self._shadow_read_payload(command, observed_at))
 
-    async def _shadow_read_payload(self, command: str) -> object:
-        snapshot = await self._runtime.snapshot()
+    async def _shadow_read_payload(self, command: str, observed_at: datetime) -> object:
+        try:
+            snapshot = await asyncio.wait_for(
+                self._runtime.snapshot(), timeout=TELEGRAM_READ_DEADLINE_SECONDS
+            )
+        except TimeoutError:
+            return self._shadow_envelope(
+                {"status": "UNAVAILABLE", "reason": "TELEGRAM_READ_DEADLINE"}
+            )
         market = snapshot.get("market")
         market_payload = market if isinstance(market, dict) else {}
         positions_value = snapshot.get("positions")
@@ -275,6 +359,12 @@ class TelegramCommandRouter:
             }
         elif command == "/positions":
             payload = portfolio
+        elif command == "/orders":
+            orders = snapshot.get("orders")
+            payload = {
+                "status": "SHADOW_ONLY",
+                "orders": orders if isinstance(orders, list) else [],
+            }
         elif command == "/pnl":
             payload = {
                 "route_pnl": [
@@ -290,14 +380,269 @@ class TelegramCommandRouter:
             payload = {"source": "SHADOW", "risk": self._risk_summary(snapshot.get("risk"))}
         elif command == "/opportunities":
             payload = market_payload.get("opportunities", [])
+        elif command == "/routes":
+            payload = {
+                "active_routes": portfolio["routes"],
+                "opportunities": market_payload.get("opportunities", []),
+                "candidate_l2": market_payload.get("candidate_l2"),
+            }
         elif command == "/data_health":
             payload = {
                 "data_health": market_payload.get("data_health", []),
                 "quarantined": market_payload.get("quarantined", []),
             }
+        elif command == "/health":
+            payload = {
+                "service": snapshot.get(
+                    "health",
+                    {"healthy": False, "reason": "SERVICE_STATE_MISSING"},
+                ),
+                "data_health": market_payload.get("data_health", []),
+                "quarantined": market_payload.get("quarantined", []),
+                "persistence_indeterminate": snapshot.get("persistence_indeterminate", True),
+            }
+        elif command == "/exchanges":
+            payload = self._exchange_summary(market_payload, observed_at)
+        elif command == "/qualification":
+            payload = snapshot.get(
+                "qualification",
+                {"status": "UNAVAILABLE", "reason": "QUALIFICATION_STATE_UNKNOWN"},
+            )
         else:
             payload = market_payload.get("balances", {"status": "UNAVAILABLE"})
-        return payload
+        return self._shadow_envelope(payload)
+
+    def _shadow_envelope(self, payload: object) -> dict[str, object]:
+        envelope: dict[str, object] = {"source": "SHADOW"}
+        if self._live_control is None:
+            envelope["private_state"] = ReasonCode.PRIVATE_STATE_UNAVAILABLE.value
+        if isinstance(payload, dict):
+            envelope.update(payload)
+        else:
+            envelope["data"] = payload
+        return envelope
+
+    def _exchange_summary(
+        self,
+        market_payload: dict[str, object],
+        observed_at: datetime,
+    ) -> dict[str, object]:
+        evaluated_raw = market_payload.get("evaluated_at")
+        evaluated_at: datetime | None = None
+        if isinstance(evaluated_raw, str):
+            try:
+                evaluated_at = datetime.fromisoformat(evaluated_raw)
+            except ValueError:
+                evaluated_at = None
+        matrix = market_payload.get("venue_capability_matrix")
+        if evaluated_at is None or evaluated_at.tzinfo is None or not isinstance(matrix, dict):
+            return {
+                "status": "UNKNOWN",
+                "reason": "CAPABILITY_MATRIX_UNAVAILABLE",
+                "evaluated_at": evaluated_raw if isinstance(evaluated_raw, str) else None,
+                "capability_matrix": None,
+                "quarantined": market_payload.get("quarantined", []),
+            }
+        age_seconds = (observed_at.astimezone(UTC) - evaluated_at.astimezone(UTC)).total_seconds()
+        if age_seconds < 0 or age_seconds > self._runtime.settings.app.health_max_age_seconds:
+            return {
+                "status": "STALE",
+                "reason": "CAPABILITY_MATRIX_STALE",
+                "evaluated_at": evaluated_at.isoformat(),
+                "age_seconds": max(age_seconds, 0.0),
+                "capability_matrix": None,
+                "quarantined": market_payload.get("quarantined", []),
+            }
+        return {
+            "status": "CURRENT",
+            "evaluated_at": evaluated_at.isoformat(),
+            "age_seconds": age_seconds,
+            "capability_matrix": matrix,
+            "quarantined": market_payload.get("quarantined", []),
+        }
+
+    @staticmethod
+    def _live_orders_summary(value: object) -> dict[str, object]:
+        if not isinstance(value, list):
+            return {"source": "PRIVATE_EXCHANGE", "status": "INVALID_PRIVATE_ORDER_DATA"}
+        allowed_statuses = {
+            *(status.value for status in PrivateOrderStatus),
+            "PREPARED",
+            "SUBMITTING",
+            *(state.value for state in LiveActionState),
+        }
+        rendered: list[dict[str, object]] = []
+        for raw in value:
+            if not isinstance(raw, dict):
+                return {
+                    "source": "PRIVATE_EXCHANGE",
+                    "status": "INVALID_PRIVATE_ORDER_DATA",
+                }
+            record_type = raw.get("record_type", "PRIVATE_ORDER")
+            status = raw.get("status")
+            source = raw.get("source", "PRIVATE_EXCHANGE")
+            if (
+                record_type not in {"PRIVATE_ORDER", "JOURNAL_LEG", "JOURNAL_ACTION"}
+                or not isinstance(status, str)
+                or status not in allowed_statuses
+                or source not in {"PRIVATE_EXCHANGE", "LIVE_JOURNAL"}
+            ):
+                return {
+                    "source": "PRIVATE_EXCHANGE",
+                    "status": "INVALID_PRIVATE_ORDER_DATA",
+                }
+            required: set[str]
+            if record_type == "PRIVATE_ORDER":
+                required = {
+                    "record_type",
+                    "source",
+                    "venue",
+                    "client_order_id",
+                    "symbol",
+                    "side",
+                    "requested_base_quantity",
+                    "filled_base_quantity",
+                    "observed_at",
+                    "is_open",
+                }
+                record_valid = (
+                    source == "PRIVATE_EXCHANGE"
+                    and status in {item.value for item in PrivateOrderStatus}
+                    and isinstance(raw.get("is_open"), bool)
+                )
+            elif record_type == "JOURNAL_LEG":
+                required = {
+                    "record_type",
+                    "source",
+                    "pair_action_id",
+                    "tranche_id",
+                    "route",
+                    "action_state",
+                    "venue",
+                    "client_order_id",
+                    "symbol",
+                    "side",
+                    "intended_base_quantity",
+                    "filled_base_quantity",
+                    "updated_at",
+                }
+                record_valid = (
+                    source == "LIVE_JOURNAL"
+                    and raw.get("action_state") in {state.value for state in LiveActionState}
+                    and status
+                    in {
+                        *(item.value for item in PrivateOrderStatus),
+                        "PREPARED",
+                        "SUBMITTING",
+                    }
+                )
+            else:
+                required = {
+                    "record_type",
+                    "source",
+                    "pair_action_id",
+                    "tranche_id",
+                    "route",
+                    "action_state",
+                    "updated_at",
+                }
+                record_valid = (
+                    source == "LIVE_JOURNAL"
+                    and raw.get("action_state") == status
+                    and status in {state.value for state in LiveActionState}
+                )
+            if not record_valid or not required <= raw.keys():
+                return {
+                    "source": "PRIVATE_EXCHANGE",
+                    "status": "INVALID_PRIVATE_ORDER_DATA",
+                }
+            if (
+                "venue" in required and raw.get("venue") not in {venue.value for venue in Venue}
+            ) or ("side" in required and raw.get("side") not in {side.value for side in Side}):
+                return {
+                    "source": "PRIVATE_EXCHANGE",
+                    "status": "INVALID_PRIVATE_ORDER_DATA",
+                }
+            item: dict[str, object] = {
+                "record_type": record_type,
+                "source": source,
+                "status": status,
+            }
+            for key in (
+                "venue",
+                "order_id",
+                "client_order_id",
+                "symbol",
+                "side",
+                "pair_action_id",
+                "tranche_id",
+                "route",
+                "action_state",
+                "observed_at",
+                "updated_at",
+            ):
+                raw_label = raw.get(key)
+                if raw_label is not None:
+                    if not isinstance(raw_label, str) or not raw_label:
+                        return {
+                            "source": "PRIVATE_EXCHANGE",
+                            "status": "INVALID_PRIVATE_ORDER_DATA",
+                        }
+                    item[key] = TelegramCommandRouter._bounded_label(raw_label)
+            for timestamp_key in ("observed_at", "updated_at"):
+                timestamp_raw = raw.get(timestamp_key)
+                if timestamp_raw is None:
+                    continue
+                try:
+                    timestamp = datetime.fromisoformat(str(timestamp_raw))
+                except ValueError:
+                    return {
+                        "source": "PRIVATE_EXCHANGE",
+                        "status": "INVALID_PRIVATE_ORDER_DATA",
+                    }
+                if timestamp.tzinfo is None:
+                    return {
+                        "source": "PRIVATE_EXCHANGE",
+                        "status": "INVALID_PRIVATE_ORDER_DATA",
+                    }
+            for key in (
+                "requested_base_quantity",
+                "intended_base_quantity",
+                "filled_base_quantity",
+                "average_price",
+                "limit_price",
+                "fee_usdt",
+            ):
+                raw_amount = raw.get(key)
+                if raw_amount is None:
+                    continue
+                try:
+                    amount = Decimal(str(raw_amount))
+                except (DecimalException, ValueError):
+                    return {
+                        "source": "PRIVATE_EXCHANGE",
+                        "status": "INVALID_PRIVATE_ORDER_DATA",
+                    }
+                if not amount.is_finite() or amount.copy_abs() > MAX_VISIBILITY_DECIMAL:
+                    return {
+                        "source": "PRIVATE_EXCHANGE",
+                        "status": "INVALID_PRIVATE_ORDER_DATA",
+                    }
+                if key not in {"fee_usdt"} and amount < 0:
+                    return {
+                        "source": "PRIVATE_EXCHANGE",
+                        "status": "INVALID_PRIVATE_ORDER_DATA",
+                    }
+                item[key] = str(amount)
+            if isinstance(raw.get("is_open"), bool):
+                item["is_open"] = raw["is_open"]
+            rendered.append(item)
+        return {
+            "source": "PRIVATE_EXCHANGE",
+            "status": "OK",
+            "order_count": len(rendered),
+            "orders": rendered,
+        }
 
     @staticmethod
     def _portfolio_summary(value: object) -> _PortfolioSummary:
@@ -460,7 +805,28 @@ class TelegramCommandRouter:
         if len(value) <= ROUTE_LABEL_LIMIT:
             return value
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
-        return f"{value[: ROUTE_LABEL_LIMIT - 15]}...#{digest}"
+        return f"{value[: ROUTE_LABEL_LIMIT - 16]}...#{digest}"
+
+    @staticmethod
+    def _compact_reference(value: str) -> str:
+        if len(value) <= 24:
+            return value
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+        return f"{value[:8]}#{digest}"
+
+    @staticmethod
+    def _compact_order_reference(order: dict[object, object]) -> str:
+        identifier = (
+            order.get("client_order_id")
+            or order.get("order_id")
+            or order.get("pair_action_id")
+            or "UNKNOWN_ORDER"
+        )
+        status = order.get("status", "UNKNOWN")
+        return (
+            f"{TelegramCommandRouter._compact_reference(str(identifier))}:"
+            f"{TelegramCommandRouter._compact_reference(str(status))}"
+        )
 
     @staticmethod
     def _live_positions_summary(value: object) -> dict[str, object]:
@@ -619,8 +985,53 @@ class TelegramCommandRouter:
                 for key, value in nested.items():
                     if isinstance(value, (dict, list, tuple)):
                         nested_summary[f"{key}_count"] = len(value)
+                if nested_key == "portfolio" and isinstance(nested.get("routes"), list):
+                    nested_summary["routes"] = [
+                        {
+                            "route": TelegramCommandRouter._bounded_label(
+                                str(route.get("route", "INVALID_ROUTE"))
+                            ),
+                            "tranche_count": route.get("tranche_count", 0),
+                        }
+                        for route in nested["routes"]
+                        if isinstance(route, dict)
+                    ][:10]
                 summary[nested_key] = nested_summary
+            active_routes = payload.get("active_routes")
+            if isinstance(active_routes, list):
+                summary["active_routes"] = [
+                    {
+                        "route": TelegramCommandRouter._bounded_label(
+                            str(route.get("route", "INVALID_ROUTE"))
+                        ),
+                        "tranche_count": route.get("tranche_count", 0),
+                    }
+                    for route in active_routes
+                    if isinstance(route, dict)
+                ][:10]
+            orders = payload.get("orders")
+            if isinstance(orders, list):
+                all_order_refs = [
+                    TelegramCommandRouter._compact_order_reference(order)
+                    for order in orders
+                    if isinstance(order, dict)
+                ]
+                summary["order_refs"] = all_order_refs
+                summary["shown_order_ref_count"] = len(all_order_refs)
+                summary["omitted_order_ref_count"] = 0
+                summary["all_order_refs_sha256"] = hashlib.sha256(
+                    json.dumps(all_order_refs, separators=(",", ":")).encode()
+                ).hexdigest()
         rendered = json.dumps(summary, sort_keys=True, default=str)
+        order_refs = summary.get("order_refs")
+        order_ref_total = len(order_refs) if isinstance(order_refs, list) else 0
+        while (
+            len(rendered) > TELEGRAM_MESSAGE_LIMIT and isinstance(order_refs, list) and order_refs
+        ):
+            order_refs.pop()
+            summary["shown_order_ref_count"] = len(order_refs)
+            summary["omitted_order_ref_count"] = order_ref_total - len(order_refs)
+            rendered = json.dumps(summary, sort_keys=True, default=str)
         if len(rendered) > TELEGRAM_MESSAGE_LIMIT:
             raise RuntimeError("bounded Telegram diagnostic exceeds platform limit")
         return rendered
@@ -672,6 +1083,10 @@ class TelegramCommandRouter:
             outcome,
             reason,
             now,
+            busy_timeout_ms=max(
+                1,
+                int(TELEGRAM_READ_DEADLINE_SECONDS * TELEGRAM_AUDIT_FRACTION * 1000),
+            ),
         )
 
 
@@ -722,3 +1137,4 @@ async def run_telegram_bot(
         await application.updater.stop()
         await application.stop()
         await application.shutdown()
+        await router.close()
