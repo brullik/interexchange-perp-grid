@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from interexchange_perp_grid.canary_runtime import (
+    OWNER_CONFIRMATION,
     _coordinate_live_action,
     _rebuild_active_plan,
     _resume_active_canary,
@@ -472,6 +473,42 @@ async def test_owner_gate_denial_performs_no_network_or_adapter_construction(
     )
 
     assert result.reason == ReasonCode.OWNER_CONFIRMATION_MISSING
+    assert result.orders_sent == 0
+    assert constructed == 0
+
+
+@pytest.mark.asyncio
+async def test_shadow_risk_stage_blocks_canary_before_network_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import interexchange_perp_grid.canary_runtime as runtime_module
+
+    constructed = 0
+
+    class ForbiddenAdapter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            nonlocal constructed
+            del args, kwargs
+            constructed += 1
+            raise AssertionError("network adapter constructed before risk stage gate")
+
+    monkeypatch.setattr(runtime_module, "CcxtProAdapter", ForbiddenAdapter)
+    monkeypatch.setattr(runtime_module, "CcxtPrivateAdapter", ForbiddenAdapter)
+    settings = load_settings(
+        Path("config/defaults.yaml"),
+        {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")},
+    )
+
+    result = await run_canary_once(
+        settings,
+        Path("config/defaults.yaml"),
+        tmp_path / "missing-qualification.json",
+        Path("."),
+        OWNER_CONFIRMATION,
+    )
+
+    assert result.reason == ReasonCode.CANARY_POLICY_VIOLATION
     assert result.orders_sent == 0
     assert constructed == 0
 

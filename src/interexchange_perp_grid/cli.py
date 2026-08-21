@@ -4,6 +4,8 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
+import re
 import subprocess
 import sys
 from dataclasses import asdict
@@ -20,12 +22,14 @@ from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.maintenance import (
     backup_sqlite,
     prune_market_history,
     restore_sqlite,
 )
 from interexchange_perp_grid.observability import configure_logging, render_metrics
+from interexchange_perp_grid.ops_evidence import build_operations_proof
 from interexchange_perp_grid.private_domain import PrivateCapabilityReport
 from interexchange_perp_grid.private_transition_smoke import (
     run_private_transition_recovery_smoke,
@@ -33,12 +37,16 @@ from interexchange_perp_grid.private_transition_smoke import (
 from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
 from interexchange_perp_grid.qualification import (
     QualificationPolicy,
+    QualificationProgress,
     QualificationRuntimeEvidence,
+    build_qualification_progress,
     build_runtime_evidence_from_state,
     code_hash,
     config_hash,
     current_code_commit_sha,
+    load_qualification,
     load_runtime_evidence,
+    qualification_is_current,
     run_qualification,
     write_runtime_evidence,
 )
@@ -64,16 +72,23 @@ from interexchange_perp_grid.region_latency import (
 )
 from interexchange_perp_grid.release_evidence import REPLAY_TEST_FILES, run_replay_proof
 from interexchange_perp_grid.release_preflight import evaluate_release_preflight
+from interexchange_perp_grid.risk_stages import load_locked_risk_stage_table
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.service import run_until_signal
 from interexchange_perp_grid.shadow import ShadowRuntime
 from interexchange_perp_grid.state import (
     QualificationEpoch,
+    RiskStage,
+    RiskStageResult,
+    RiskStageState,
     ServiceHealth,
     finalize_qualification_epoch,
     initialise_state,
+    promote_risk_stage,
     read_qualification_epoch,
+    read_risk_stage,
     read_service_health,
+    record_risk_stage_result,
     start_qualification_epoch,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
@@ -106,6 +121,29 @@ def _load(config: Path) -> Settings:
     settings = load_settings(config)
     configure_logging(settings.app.log_level)
     return settings
+
+
+def _qualification_policy(settings: Settings) -> QualificationPolicy:
+    return QualificationPolicy(
+        minimum_duration_seconds=settings.shadow.qualification_min_duration_seconds,
+        minimum_synchronised_snapshots_per_venue=(
+            settings.shadow.qualification_min_synchronised_snapshots_per_venue
+        ),
+        minimum_funding_checkpoints_per_venue=(
+            settings.shadow.qualification_min_funding_checkpoints_per_venue
+        ),
+        maximum_inter_snapshot_gap_seconds=(
+            settings.shadow.qualification_max_inter_snapshot_gap_seconds
+        ),
+        maximum_sequence_gaps=settings.shadow.qualification_max_sequence_gaps,
+        maximum_stale_snapshots=settings.shadow.qualification_max_stale_snapshots,
+        maximum_sequence_unknown_snapshots=(
+            settings.shadow.qualification_max_sequence_unknown_snapshots
+        ),
+        maximum_clock_skew_snapshots=settings.shadow.qualification_max_clock_skew_snapshots,
+        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+        maximum_snapshot_age_ms=settings.market_data.max_l2_age_ms,
+    )
 
 
 def _current_region_evidence_identity(repo_root: Path, config: Path) -> tuple[str, str]:
@@ -212,6 +250,43 @@ def health(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         raise typer.Exit(code=1)
 
 
+@app.command("deployment-identity")
+def deployment_identity(
+    expected_release_sha: Annotated[str, typer.Option("--expected-release-sha")],
+    expected_image_digest: Annotated[str, typer.Option("--expected-image-digest")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Fail unless the running shadow container has the exact deployed identity."""
+    settings = _load(config)
+    release_sha = os.environ.get("IPEG_RELEASE_SHA", "").strip().lower()
+    image_digest = os.environ.get("IPEG_CONTAINER_IMAGE_DIGEST", "").strip().lower()
+    expected_release = expected_release_sha.strip().lower()
+    expected_image = expected_image_digest.strip().lower()
+    passed = (
+        re.fullmatch(r"[0-9a-f]{40}", expected_release) is not None
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_image) is not None
+        and release_sha == expected_release
+        and image_digest == expected_image
+        and settings.app.mode == "shadow"
+        and settings.live.enabled is False
+        and settings.execution.normal_unbounded_market_allowed is False
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "status": "PASS" if passed else "FAIL",
+                "release_sha": release_sha,
+                "image_digest": image_digest,
+                "mode": settings.app.mode,
+                "live_enabled": settings.live.enabled,
+            },
+            sort_keys=True,
+        )
+    )
+    if not passed:
+        raise typer.Exit(code=8)
+
+
 @app.command()
 def metrics() -> None:
     """Print the current Prometheus metric exposition."""
@@ -311,26 +386,7 @@ def qualify(
 ) -> None:
     """Write exact-route, release/image/data-bound qualification evidence."""
     settings = _load(config)
-    policy = QualificationPolicy(
-        minimum_duration_seconds=settings.shadow.qualification_min_duration_seconds,
-        minimum_synchronised_snapshots_per_venue=(
-            settings.shadow.qualification_min_synchronised_snapshots_per_venue
-        ),
-        minimum_funding_checkpoints_per_venue=(
-            settings.shadow.qualification_min_funding_checkpoints_per_venue
-        ),
-        maximum_inter_snapshot_gap_seconds=(
-            settings.shadow.qualification_max_inter_snapshot_gap_seconds
-        ),
-        maximum_sequence_gaps=settings.shadow.qualification_max_sequence_gaps,
-        maximum_stale_snapshots=settings.shadow.qualification_max_stale_snapshots,
-        maximum_sequence_unknown_snapshots=(
-            settings.shadow.qualification_max_sequence_unknown_snapshots
-        ),
-        maximum_clock_skew_snapshots=(settings.shadow.qualification_max_clock_skew_snapshots),
-        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
-        maximum_snapshot_age_ms=settings.market_data.max_l2_age_ms,
-    )
+    policy = _qualification_policy(settings)
     result = run_qualification(
         repo_root.resolve(),
         config.resolve(),
@@ -381,18 +437,24 @@ def qualification_epoch_status(
     epoch_id: Annotated[str | None, typer.Option("--epoch-id")] = None,
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
-    """Print the current or selected immutable qualification epoch as JSON."""
+    """Print exact 24h progress, remaining work, and fail-closed blockers as JSON."""
     settings = _load(config)
 
-    async def status() -> QualificationEpoch | None:
+    async def status() -> QualificationProgress:
         state_path = Path(settings.storage.sqlite_path)
         await initialise_state(state_path)
-        return await read_qualification_epoch(state_path, epoch_id)
+        return await build_qualification_progress(
+            state_path,
+            Path(settings.storage.parquet_dir),
+            epoch_id,
+            _qualification_policy(settings),
+        )
 
-    epoch = asyncio.run(status())
-    if epoch is None:
-        raise typer.Exit(code=4)
-    typer.echo(json.dumps(asdict(epoch), default=str, sort_keys=True))
+    try:
+        progress = asyncio.run(status())
+    except KeyError:
+        raise typer.Exit(code=4) from None
+    typer.echo(json.dumps(asdict(progress), default=str, sort_keys=True))
 
 
 @app.command("qualification-epoch-finalize")
@@ -409,6 +471,152 @@ def qualification_epoch_finalize(
         return await finalize_qualification_epoch(state_path, epoch_id)
 
     typer.echo(json.dumps(asdict(asyncio.run(finalize())), default=str, sort_keys=True))
+
+
+@app.command("risk-stage-status")
+def risk_stage_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+    """Print the persisted stage and exact locked limits without authorizing promotion."""
+    settings = _load(config)
+    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+
+    async def status() -> RiskStageState:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        return await read_risk_stage(state_path)
+
+    typer.echo(
+        json.dumps(
+            {"state": asdict(asyncio.run(status())), "locked_table": asdict(table)},
+            default=str,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("risk-stage-promote")
+def risk_stage_promote(
+    expected_current: Annotated[RiskStage, typer.Option("--expected-current")],
+    target: Annotated[RiskStage, typer.Option("--target")],
+    actor: Annotated[str, typer.Option("--actor")],
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    qualification: Annotated[
+        Path,
+        typer.Option("--qualification", exists=True, dir_okay=False, readable=True),
+    ],
+    container_image_digest: Annotated[
+        str,
+        typer.Option("--container-image-digest", envvar="IPEG_CONTAINER_IMAGE_DIGEST"),
+    ],
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Persist one adjacent owner-confirmed promotion after exact qualification validation."""
+    settings = _load(config)
+    evidence = load_qualification(qualification.resolve())
+    current, reason = qualification_is_current(
+        evidence,
+        repo_root.resolve(),
+        config.resolve(),
+        Path(settings.storage.parquet_dir).resolve(),
+        settings.live.qualification_max_age_seconds,
+        current_container_image_digest=container_image_digest.lower(),
+    )
+    if not current:
+        raise typer.BadParameter(f"qualification is not current: {reason.value}")
+    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+
+    async def promote() -> RiskStageState:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        if await journal.active_actions():
+            raise RuntimeError("risk stage promotion requires zero active live actions")
+        return await promote_risk_stage(
+            state_path,
+            expected_current,
+            target,
+            evidence.qualification_hash,
+            table.runtime_policy_sha256,
+            actor,
+            confirmation,
+        )
+
+    result = asyncio.run(promote())
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+
+
+@app.command("risk-stage-complete")
+def risk_stage_complete(
+    stage: Annotated[RiskStage, typer.Option("--stage")],
+    actor: Annotated[str, typer.Option("--actor")],
+    evidence: Annotated[
+        Path,
+        typer.Option("--evidence", exists=True, dir_okay=False, readable=True),
+    ],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Bind one completed stage to stable-FLAT evidence before any next promotion."""
+    settings = _load(config)
+    evidence_bytes = evidence.resolve().read_bytes()
+    payload = json.loads(evidence_bytes)
+    if not isinstance(payload, dict):
+        raise typer.BadParameter("stage evidence must be one JSON object")
+    if payload.get("stage") != stage.value:
+        raise typer.BadParameter("stage evidence does not match --stage")
+    if payload.get("stable_flat_verified") is not True:
+        raise typer.BadParameter("stage evidence must prove stable_flat_verified=true")
+    if payload.get("active_action_count") != 0:
+        raise typer.BadParameter("stage evidence must prove active_action_count=0")
+    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+
+    async def complete() -> RiskStageResult:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        current = await read_risk_stage(state_path)
+        if current.stage != stage or current.qualification_hash is None:
+            raise RuntimeError("stage evidence does not match the current risk stage")
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        if await journal.active_actions():
+            raise RuntimeError("risk stage completion requires zero active live actions")
+        return await record_risk_stage_result(
+            state_path,
+            stage,
+            current.qualification_hash,
+            table.runtime_policy_sha256,
+            hashlib.sha256(evidence_bytes).hexdigest(),
+            True,
+            actor,
+        )
+
+    result = asyncio.run(complete())
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+
+
+@app.command("ops-proof")
+def ops_proof(
+    junit: Annotated[
+        Path,
+        typer.Option("--junit", exists=True, dir_okay=False, readable=True),
+    ],
+    output: Annotated[Path, typer.Option("--output")] = Path("state/ops-proof.json"),
+    evidence_dir: Annotated[Path, typer.Option("--evidence-dir")] = Path("state/ops-evidence"),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Validate raw Docker evidence and bind all final criteria to one exact SHA."""
+    result = build_operations_proof(
+        repo_root.resolve(),
+        config.resolve(),
+        config.resolve().parent / "RUNTIME_POLICY.yaml",
+        config.resolve().parent / "FINAL_ACCEPTANCE_MANIFEST.json",
+        config.resolve().parent / "ops-scenario-nodeids.json",
+        junit.resolve(),
+        evidence_dir.resolve(),
+        output.resolve(),
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
 
 
 @app.command("qualification-runtime")

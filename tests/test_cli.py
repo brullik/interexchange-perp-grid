@@ -39,3 +39,41 @@ def test_emergency_flatten_requires_separate_unlock_before_network() -> None:
     )
     assert result.exit_code == 6
     assert "EMERGENCY_UNLOCK_OR_QUALIFICATION_INVALID" in result.output
+
+
+def test_deployment_identity_requires_exact_container_environment() -> None:
+    release_sha = "a" * 40
+    image_digest = "sha256:" + "b" * 64
+    accepted = runner.invoke(
+        app,
+        [
+            "deployment-identity",
+            "--expected-release-sha",
+            release_sha,
+            "--expected-image-digest",
+            image_digest,
+        ],
+        env={
+            "IPEG_RELEASE_SHA": release_sha,
+            "IPEG_CONTAINER_IMAGE_DIGEST": image_digest,
+        },
+    )
+    rejected = runner.invoke(
+        app,
+        [
+            "deployment-identity",
+            "--expected-release-sha",
+            release_sha,
+            "--expected-image-digest",
+            image_digest,
+        ],
+        env={
+            "IPEG_RELEASE_SHA": "c" * 40,
+            "IPEG_CONTAINER_IMAGE_DIGEST": image_digest,
+        },
+    )
+
+    assert accepted.exit_code == 0
+    assert '"status": "PASS"' in accepted.output
+    assert rejected.exit_code == 8
+    assert '"status": "FAIL"' in rejected.output

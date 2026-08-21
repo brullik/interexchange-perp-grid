@@ -311,6 +311,11 @@ def _validate_locked_runtime_policy(raw: dict[str, object], path: Path) -> None:
     locked_data = _require_mapping(policy.get("data"), "runtime_policy.data")
     configured_strategy = _require_mapping(raw.get("strategy"), "strategy")
     locked_strategy = _require_mapping(policy.get("strategy"), "runtime_policy.strategy")
+    configured_live = _require_mapping(raw.get("live"), "live")
+    locked_risk_stages = _require_mapping(policy.get("risk_stages"), "runtime_policy.risk_stages")
+    locked_canary = _require_mapping(
+        locked_risk_stages.get("canary"), "runtime_policy.risk_stages.canary"
+    )
     configured_size_multipliers = _require_sequence(
         configured_strategy.get("calibration_size_multipliers"),
         "strategy.calibration_size_multipliers",
@@ -351,6 +356,22 @@ def _validate_locked_runtime_policy(raw: dict[str, object], path: Path) -> None:
         "calibration_funding_refresh_seconds": (
             configured_strategy.get("calibration_funding_refresh_seconds"),
             locked_strategy.get("calibration_funding_refresh_seconds"),
+        ),
+        "canary_max_routes": (
+            configured_live.get("canary_max_routes"),
+            locked_canary.get("routes"),
+        ),
+        "canary_max_tranches": (
+            configured_live.get("canary_max_tranches"),
+            locked_canary.get("tranches"),
+        ),
+        "canary_pair_stressed_loss_limit_usdt": (
+            str(configured_live.get("canary_pair_stressed_loss_limit_usdt")),
+            str(locked_canary.get("pair_usdt")),
+        ),
+        "canary_effective_leverage_cap": (
+            str(configured_live.get("canary_effective_leverage_cap")),
+            str(locked_canary.get("leverage")),
         ),
     }
     for name, (configured, locked) in comparisons.items():

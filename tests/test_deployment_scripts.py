@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEPLOY = REPO_ROOT / "scripts" / "shadow-deploy.sh"
+UPGRADE = REPO_ROOT / "scripts" / "shadow-upgrade.sh"
+OLD_IMAGE = f"ghcr.io/example/app@sha256:{'1' * 64}"
+NEW_IMAGE = f"ghcr.io/example/app@sha256:{'2' * 64}"
+OLD_SHA = "a" * 40
+NEW_SHA = "b" * 40
+
+
+def _bash() -> str:
+    executable = shutil.which("bash")
+    if executable is None:
+        pytest.skip("deployment scripts require bash")
+    probe = subprocess.run(
+        [executable, "-c", "exit 0"],
+        check=False,
+        capture_output=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip("deployment scripts require a usable bash runtime")
+    return executable
+
+
+def _fake_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker = binary_dir / "docker"
+    docker.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s|%s\\n' "${IPEG_RELEASE_SHA:-none}" "$*" >>"$FAKE_DOCKER_LOG"
+if [[ "$*" == "compose ps --status running --services" ]]; then
+  [[ "${FAKE_APP_RUNNING:-0}" == 1 ]] && printf 'app\\n'
+  exit 0
+fi
+if [[ "$*" == *"interexchange-grid health"* ]] \
+  && [[ "${IPEG_RELEASE_SHA:-}" == "${FAKE_FAIL_SHA:-never}" ]]; then
+  exit 17
+fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
+    git = binary_dir / "git"
+    git.write_text(
+        """#!/usr/bin/env bash
+if [[ "$*" == "rev-parse --is-inside-work-tree" ]]; then
+  printf 'true\\n'
+  exit 0
+fi
+if [[ "$*" == "ls-files --error-unmatch -- .env" ]]; then
+  exit 1
+fi
+exit 2
+""",
+        encoding="utf-8",
+    )
+    git.chmod(git.stat().st_mode | stat.S_IXUSR)
+    secrets = tmp_path / ".env"
+    secrets.write_text("IPEG_LIVE_ENABLED=false\n", encoding="utf-8")
+    secrets.chmod(0o600)
+    state_path = tmp_path / ".ipeg-deployment-state"
+    environment = {
+        **os.environ,
+        "PATH": f"{binary_dir}{os.pathsep}{os.environ['PATH']}",
+        "FAKE_DOCKER_LOG": str(docker_log),
+        "IPEG_DEPLOYMENT_STATE_PATH": str(state_path),
+    }
+    return environment, state_path, docker_log
+
+
+def _run(
+    script: Path,
+    *arguments: str,
+    cwd: Path,
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [_bash(), str(script), *arguments],
+        cwd=cwd,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def test_deploy_requires_external_secrets_with_mode_0600(tmp_path: Path) -> None:
+    environment, state_path, docker_log = _fake_environment(tmp_path)
+    (tmp_path / ".env").chmod(0o644)
+
+    result = _run(DEPLOY, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+
+    assert result.returncode == 3
+    assert "mode 0600" in result.stderr
+    assert not state_path.exists()
+    assert not docker_log.exists()
+
+
+def test_deploy_is_idempotent_and_persists_only_healthy_exact_identity(tmp_path: Path) -> None:
+    environment, state_path, docker_log = _fake_environment(tmp_path)
+
+    first = _run(DEPLOY, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+    second = _run(DEPLOY, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+
+    assert first.returncode == second.returncode == 0
+    assert state_path.read_text(encoding="utf-8") == (
+        f"image_ref={NEW_IMAGE}\nrelease_sha={NEW_SHA}\n"
+    )
+    log = docker_log.read_text(encoding="utf-8")
+    assert log.count("compose up --detach --no-build --wait --wait-timeout 180 app") == 2
+    assert log.count("interexchange-grid deployment-identity") == 2
+
+
+def test_failed_upgrade_restores_backup_and_previous_digest(tmp_path: Path) -> None:
+    environment, state_path, docker_log = _fake_environment(tmp_path)
+    state_path.write_text(
+        f"image_ref={OLD_IMAGE}\nrelease_sha={OLD_SHA}\n",
+        encoding="utf-8",
+    )
+    environment["FAKE_APP_RUNNING"] = "1"
+    environment["FAKE_FAIL_SHA"] = NEW_SHA
+
+    result = _run(UPGRADE, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+
+    assert result.returncode == 17
+    assert "automatic rollback completed" in result.stderr
+    assert state_path.read_text(encoding="utf-8") == (
+        f"image_ref={OLD_IMAGE}\nrelease_sha={OLD_SHA}\n"
+    )
+    log = docker_log.read_text(encoding="utf-8")
+    assert "backup-state" in log
+    assert "compose stop app" in log
+    assert "restore-state" in log
+    assert f"{NEW_SHA}|compose up" in log
+    assert f"{OLD_SHA}|compose up" in log

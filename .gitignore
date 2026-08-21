@@ -27,6 +27,7 @@ logs/
 artifacts/runtime/
 artifacts/c4-critical-proof-*/
 artifacts/c4-3-proof-*/
+.ipeg-deployment-state
 *.sqlite
 *.sqlite3
 *.db

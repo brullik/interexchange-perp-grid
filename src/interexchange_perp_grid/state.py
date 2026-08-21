@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -27,7 +28,7 @@ from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import RiskRequest, VenueProjection
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "12"
+SCHEMA_VERSION = "13"
 STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS = 1.0
 SCHEMA_STATEMENTS = (
     """
@@ -92,6 +93,27 @@ SCHEMA_STATEMENTS = (
         confirmed_until TEXT NOT NULL,
         confirmed_by TEXT NOT NULL,
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS risk_stage_runtime (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        stage TEXT NOT NULL,
+        qualification_hash TEXT,
+        runtime_policy_sha256 TEXT,
+        promoted_by TEXT NOT NULL,
+        promoted_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS risk_stage_results (
+        stage TEXT PRIMARY KEY,
+        qualification_hash TEXT NOT NULL,
+        runtime_policy_sha256 TEXT NOT NULL,
+        evidence_sha256 TEXT NOT NULL,
+        stable_flat_verified INTEGER NOT NULL CHECK (stable_flat_verified IN (0, 1)),
+        completed_by TEXT NOT NULL,
+        completed_at TEXT NOT NULL
     )
     """,
     """
@@ -260,6 +282,45 @@ class QualificationEpochStatus(StrEnum):
     RUNNING = "RUNNING"
     FINALIZED = "FINALIZED"
     CLOSED = "CLOSED"
+
+
+class RiskStage(StrEnum):
+    SHADOW = "shadow"
+    CANARY = "canary"
+    PILOT_A = "pilot_a"
+    PILOT_B = "pilot_b"
+    WAVE1_PROD = "wave1_prod"
+    FULL = "full"
+
+
+RISK_STAGE_ORDER = (
+    RiskStage.SHADOW,
+    RiskStage.CANARY,
+    RiskStage.PILOT_A,
+    RiskStage.PILOT_B,
+    RiskStage.WAVE1_PROD,
+    RiskStage.FULL,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RiskStageState:
+    stage: RiskStage
+    qualification_hash: str | None
+    runtime_policy_sha256: str | None
+    promoted_by: str
+    promoted_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RiskStageResult:
+    stage: RiskStage
+    qualification_hash: str
+    runtime_policy_sha256: str
+    evidence_sha256: str
+    stable_flat_verified: bool
+    completed_by: str
+    completed_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,6 +513,7 @@ def _initialise_state_sync(path: Path) -> None:
             "9",
             "10",
             "11",
+            "12",
             SCHEMA_VERSION,
         }:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
@@ -617,6 +679,15 @@ def _initialise_state_sync(path: Path) -> None:
             ) VALUES (1, 0, 0, 'PENDING', ?)
             """,
             (datetime.now(UTC).isoformat(),),
+        )
+        database.execute(
+            """
+            INSERT OR IGNORE INTO risk_stage_runtime(
+                singleton, stage, qualification_hash, runtime_policy_sha256,
+                promoted_by, promoted_at
+            ) VALUES (1, ?, NULL, NULL, 'system', ?)
+            """,
+            (RiskStage.SHADOW.value, datetime.now(UTC).isoformat()),
         )
         database.commit()
 
@@ -1595,6 +1666,236 @@ async def live_confirmation_valid(path: Path, now: datetime | None = None) -> bo
     return await asyncio.to_thread(
         _live_confirmation_valid_sync,
         path,
+        now or datetime.now(UTC),
+    )
+
+
+def _risk_stage_from_row(row: tuple[object, ...]) -> RiskStageState:
+    return RiskStageState(
+        stage=RiskStage(str(row[0])),
+        qualification_hash=str(row[1]) if row[1] is not None else None,
+        runtime_policy_sha256=str(row[2]) if row[2] is not None else None,
+        promoted_by=str(row[3]),
+        promoted_at=datetime.fromisoformat(str(row[4])),
+    )
+
+
+def _read_risk_stage_sync(path: Path) -> RiskStageState:
+    with _connect(path) as database:
+        row = database.execute(
+            """
+            SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, promoted_at
+            FROM risk_stage_runtime WHERE singleton = 1
+            """
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("risk stage state is unavailable")
+    return _risk_stage_from_row(row)
+
+
+async def read_risk_stage(path: Path) -> RiskStageState:
+    return await asyncio.to_thread(_read_risk_stage_sync, path)
+
+
+def _record_risk_stage_result_sync(
+    path: Path,
+    stage: RiskStage,
+    qualification_hash: str,
+    runtime_policy_sha256: str,
+    evidence_sha256: str,
+    stable_flat_verified: bool,
+    actor: str,
+    now: datetime,
+) -> RiskStageResult:
+    if stage == RiskStage.SHADOW:
+        raise ValueError("shadow does not produce a live risk-stage result")
+    if not actor.strip():
+        raise ValueError("risk stage result actor must be non-empty")
+    for value, label in (
+        (qualification_hash, "qualification"),
+        (runtime_policy_sha256, "runtime policy"),
+        (evidence_sha256, "evidence"),
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(f"risk stage result requires an exact {label} hash")
+    if not stable_flat_verified:
+        raise ValueError("risk stage result requires independently verified stable FLAT")
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        runtime = database.execute(
+            "SELECT stage, qualification_hash, runtime_policy_sha256 "
+            "FROM risk_stage_runtime WHERE singleton = 1"
+        ).fetchone()
+        if runtime is None or RiskStage(str(runtime[0])) != stage:
+            database.rollback()
+            raise RuntimeError("risk stage changed before its result was recorded")
+        if str(runtime[1]) != qualification_hash or str(runtime[2]) != runtime_policy_sha256:
+            database.rollback()
+            raise ValueError("risk stage result identity does not match current promotion")
+        existing = database.execute(
+            "SELECT qualification_hash, runtime_policy_sha256, evidence_sha256, "
+            "stable_flat_verified, completed_by, completed_at "
+            "FROM risk_stage_results WHERE stage = ?",
+            (stage.value,),
+        ).fetchone()
+        values = (
+            qualification_hash,
+            runtime_policy_sha256,
+            evidence_sha256,
+            1,
+            actor,
+            now.isoformat(),
+        )
+        if existing is None:
+            database.execute(
+                "INSERT INTO risk_stage_results(stage, qualification_hash, "
+                "runtime_policy_sha256, evidence_sha256, stable_flat_verified, "
+                "completed_by, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (stage.value, *values),
+            )
+        elif tuple(existing[:4]) != values[:4]:
+            database.rollback()
+            raise RuntimeError("risk stage result is immutable and already differs")
+        database.commit()
+    with _connect(path) as database:
+        row = database.execute(
+            "SELECT qualification_hash, runtime_policy_sha256, evidence_sha256, "
+            "stable_flat_verified, completed_by, completed_at "
+            "FROM risk_stage_results WHERE stage = ?",
+            (stage.value,),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("risk stage result was not persisted")
+    return RiskStageResult(
+        stage=stage,
+        qualification_hash=str(row[0]),
+        runtime_policy_sha256=str(row[1]),
+        evidence_sha256=str(row[2]),
+        stable_flat_verified=bool(row[3]),
+        completed_by=str(row[4]),
+        completed_at=datetime.fromisoformat(str(row[5])),
+    )
+
+
+async def record_risk_stage_result(
+    path: Path,
+    stage: RiskStage,
+    qualification_hash: str,
+    runtime_policy_sha256: str,
+    evidence_sha256: str,
+    stable_flat_verified: bool,
+    actor: str,
+    now: datetime | None = None,
+) -> RiskStageResult:
+    return await asyncio.to_thread(
+        _record_risk_stage_result_sync,
+        path,
+        stage,
+        qualification_hash,
+        runtime_policy_sha256,
+        evidence_sha256,
+        stable_flat_verified,
+        actor,
+        now or datetime.now(UTC),
+    )
+
+
+def _promote_risk_stage_sync(
+    path: Path,
+    expected_current: RiskStage,
+    target: RiskStage,
+    qualification_hash: str,
+    runtime_policy_sha256: str,
+    actor: str,
+    confirmation: str,
+    now: datetime,
+) -> RiskStageState:
+    if not actor.strip():
+        raise ValueError("risk stage promotion actor must be non-empty")
+    if not re.fullmatch(r"[0-9a-f]{64}", qualification_hash):
+        raise ValueError("risk stage promotion requires an exact qualification hash")
+    if not re.fullmatch(r"[0-9a-f]{64}", runtime_policy_sha256):
+        raise ValueError("risk stage promotion requires an exact runtime policy hash")
+    if confirmation != f"PROMOTE:{target.value}":
+        raise ValueError("risk stage promotion confirmation does not match the target")
+    expected_index = RISK_STAGE_ORDER.index(expected_current)
+    if (
+        expected_index + 1 >= len(RISK_STAGE_ORDER)
+        or RISK_STAGE_ORDER[expected_index + 1] != target
+    ):
+        raise ValueError("risk stage promotion must advance exactly one locked stage")
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute(
+            """
+            SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, promoted_at
+            FROM risk_stage_runtime WHERE singleton = 1
+            """
+        ).fetchone()
+        if row is None:
+            database.rollback()
+            raise RuntimeError("risk stage state is unavailable")
+        current = _risk_stage_from_row(row)
+        if current.stage != expected_current:
+            database.rollback()
+            raise RuntimeError(
+                f"risk stage changed concurrently: expected {expected_current.value}, "
+                f"observed {current.stage.value}"
+            )
+        if expected_current != RiskStage.SHADOW:
+            result = database.execute(
+                "SELECT qualification_hash, runtime_policy_sha256, stable_flat_verified "
+                "FROM risk_stage_results WHERE stage = ?",
+                (expected_current.value,),
+            ).fetchone()
+            if (
+                result is None
+                or str(result[0]) != qualification_hash
+                or str(result[1]) != runtime_policy_sha256
+                or not bool(result[2])
+            ):
+                database.rollback()
+                raise RuntimeError(
+                    "current risk stage has no matching stable-FLAT completion result"
+                )
+        database.execute(
+            """
+            UPDATE risk_stage_runtime
+            SET stage = ?, qualification_hash = ?, runtime_policy_sha256 = ?,
+                promoted_by = ?, promoted_at = ?
+            WHERE singleton = 1
+            """,
+            (
+                target.value,
+                qualification_hash,
+                runtime_policy_sha256,
+                actor,
+                now.isoformat(),
+            ),
+        )
+        database.commit()
+    return _read_risk_stage_sync(path)
+
+
+async def promote_risk_stage(
+    path: Path,
+    expected_current: RiskStage,
+    target: RiskStage,
+    qualification_hash: str,
+    runtime_policy_sha256: str,
+    actor: str,
+    confirmation: str,
+    now: datetime | None = None,
+) -> RiskStageState:
+    return await asyncio.to_thread(
+        _promote_risk_stage_sync,
+        path,
+        expected_current,
+        target,
+        qualification_hash,
+        runtime_policy_sha256,
+        actor,
+        confirmation,
         now or datetime.now(UTC),
     )
 

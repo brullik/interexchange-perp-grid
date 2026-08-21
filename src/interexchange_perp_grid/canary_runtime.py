@@ -81,6 +81,7 @@ from interexchange_perp_grid.qualification import (
 )
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import RiskDecision
+from interexchange_perp_grid.risk_stages import load_locked_risk_stage_table
 from interexchange_perp_grid.routes import (
     evaluate_directed_route,
     executable_vwap,
@@ -88,9 +89,11 @@ from interexchange_perp_grid.routes import (
 )
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.state import (
+    RiskStage,
     RuntimeControls,
     initialise_state,
     live_confirmation_valid,
+    read_risk_stage,
     read_runtime_controls,
     read_runtime_controls_bounded,
 )
@@ -1065,6 +1068,9 @@ async def run_canary_once(
         return await _resume_active_canary(settings, journal, active_actions[0])
     if active_actions:
         return _denied(ReasonCode.RECONCILIATION_INCOMPLETE, active_actions[0].route)
+    risk_stage = await read_risk_stage(state_path)
+    if risk_stage.stage == RiskStage.SHADOW:
+        return _denied(ReasonCode.CANARY_POLICY_VIOLATION)
     if not qualification_path.is_file():
         return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING)
     try:
@@ -1074,6 +1080,17 @@ async def run_canary_once(
     if evidence.route is None or evidence.strategy is None or evidence.replay_shadow is None:
         return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING)
     route = evidence.route
+    locked_stages = load_locked_risk_stage_table(
+        config_path.resolve().parent / "RUNTIME_POLICY.yaml"
+    )
+    stage_limits = next(
+        limits for limits in locked_stages.stages if limits.stage == risk_stage.stage
+    )
+    if (
+        risk_stage.qualification_hash != evidence.qualification_hash
+        or risk_stage.runtime_policy_sha256 != locked_stages.runtime_policy_sha256
+    ):
+        return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route)
     try:
         emergency_venue = _wave1_emergency_venue(settings, route)
     except ValueError:
@@ -1242,10 +1259,10 @@ async def run_canary_once(
             states,
             notional,
             projected_stress,
-            pair_stress_limit_usdt=settings.live.canary_pair_stressed_loss_limit_usdt,
-            portfolio_stress_limit_usdt=settings.risk.portfolio_stressed_loss_limit_usdt,
+            pair_stress_limit_usdt=stage_limits.pair_usdt,
+            portfolio_stress_limit_usdt=stage_limits.portfolio_usdt,
             free_margin_floor_ratio=settings.live.canary_free_margin_floor_ratio,
-            effective_leverage_cap=settings.live.canary_effective_leverage_cap,
+            effective_leverage_cap=stage_limits.leverage,
             exit_depth_sufficient=emergency_assessment.passed,
         )
         economic = evaluate_live_entry(
@@ -1282,8 +1299,8 @@ async def run_canary_once(
         policy = CanaryPolicy(
             route.base,
             route,
-            settings.live.canary_pair_stressed_loss_limit_usdt,
-            settings.live.canary_effective_leverage_cap,
+            stage_limits.pair_usdt,
+            stage_limits.leverage,
             settings.live.canary_free_margin_floor_ratio,
         )
         policy_passed, policy_reason = policy.evaluate(action)

@@ -116,6 +116,33 @@ def test_locked_calibration_safety_cannot_be_weakened(
         load_settings(config)
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("canary_max_routes", 2),
+        ("canary_max_tranches", 2),
+        ("canary_pair_stressed_loss_limit_usdt", "2"),
+        ("canary_effective_leverage_cap", "2"),
+    ),
+)
+def test_canary_runtime_limits_cannot_drift_from_locked_stage(
+    tmp_path: Path,
+    key: str,
+    value: object,
+) -> None:
+    raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    raw["live"][key] = value
+    config = tmp_path / "defaults.yaml"
+    config.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    (tmp_path / "RUNTIME_POLICY.yaml").write_text(
+        Path("config/RUNTIME_POLICY.yaml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=f"configuration {key} differs"):
+        load_settings(config)
+
+
 def test_risk_budget_relationship_is_enforced() -> None:
     settings = load_settings(CONFIG)
     raw = settings.model_dump(mode="json")
