@@ -312,6 +312,7 @@ def _validate_locked_runtime_policy(raw: dict[str, object], path: Path) -> None:
     configured_strategy = _require_mapping(raw.get("strategy"), "strategy")
     locked_strategy = _require_mapping(policy.get("strategy"), "runtime_policy.strategy")
     configured_live = _require_mapping(raw.get("live"), "live")
+    configured_risk = _require_mapping(raw.get("risk"), "risk")
     locked_risk_stages = _require_mapping(policy.get("risk_stages"), "runtime_policy.risk_stages")
     locked_canary = _require_mapping(
         locked_risk_stages.get("canary"), "runtime_policy.risk_stages.canary"
@@ -356,6 +357,18 @@ def _validate_locked_runtime_policy(raw: dict[str, object], path: Path) -> None:
         "calibration_funding_refresh_seconds": (
             configured_strategy.get("calibration_funding_refresh_seconds"),
             locked_strategy.get("calibration_funding_refresh_seconds"),
+        ),
+        "flat_barrier_consecutive_snapshots": (
+            configured_live.get("flat_barrier_consecutive_snapshots"),
+            locked_data.get("flat_barrier_snapshots"),
+        ),
+        "flat_barrier_quiet_period_seconds": (
+            str(configured_live.get("flat_barrier_quiet_period_seconds")),
+            str(locked_data.get("flat_barrier_quiet_seconds")),
+        ),
+        "risk_hard_max_hold_seconds": (
+            configured_risk.get("max_hold_seconds"),
+            locked_strategy.get("hard_max_hold_seconds"),
         ),
         "canary_max_routes": (
             configured_live.get("canary_max_routes"),

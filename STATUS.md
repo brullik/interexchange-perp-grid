@@ -4,8 +4,8 @@ This is the only mutable project-status document.
 
 ## Current state
 
-- **State:** SOFTWARE_RC_AUTONOMOUS_RUNTIME_AWAITING_EXACT_GATE
-- **Current checkpoint:** the previous operations proof exposed a master-goal gap: it did not install the required `ipegctl`/systemd control plane or a persistent qualification orchestrator. The local remediation adds one-command Ubuntu 24.04 bootstrap, external mode-0600 onboarding, exact image-label binding, and a subprocess-owned `AutonomousOrchestrator`; local lock/Ruff/mypy/649-test/doctor gates pass. Commit, exact Ubuntu proof, final review, protected-main merge, and v1 RC publication remain required before `SOFTWARE_COMPLETE`
+- **State:** SOFTWARE_RC_RISK_STAGE_ATTESTATION_LOCAL_PASS
+- **Current checkpoint:** the autonomous VPS/risk-stage remediation is locally complete on the dirty checkpoint derived from `02789831ef26c61265804910a41596ad0d665c26`. Exact integer/global 5/50 caps, locked Ed25519 completion evidence, canonical normal paired-cycle proof, atomic journal freeze/watermark/content binding, promotion-time revalidation, and fail-closed v13-to-v14 reset/re-attestation passed the full 666-test gate and independent P0=0/P1=0/P2=0 review. Commit, fresh exact-head CI/artifacts/review, protected-main merge, and v1 RC publication remain required before `SOFTWARE_COMPLETE`
 - **Live orders:** impossible by default
 - **Production credentials:** not present and not requested
 - **Current Wave 1:** Binance USD-M, Bybit, OKX
@@ -40,7 +40,8 @@ This is the only mutable project-status document.
 | Phase 5.4 MEXC capability-gated code candidate | COMPLETE | MEXC is a typed public/read-only profile with exact incremental-depth continuity and strict raw symbol/base/quote/settle/contract/price/amount/minimum qualification. Official all-contract tickers do not prove bid/ask and book ticker is per-symbol, so broad BBO is deliberately unavailable rather than using unbounded fan-out. Contract create/cancel are physically denied because the official endpoints remain under maintenance; private capability and live canary fail closed. Code head `fcb0e45` passed independent technical review P0/P1/P2=0. Test-hardening head `0f1221f` passed exact run `32423071724` 5/5 with replay `9426439525` (79 scenarios), C4 critical `9426417474` (30/30, zero production submits), C4.3 `9426419340` (8/8, zero false success/submits), and security `9426408589` (zero vulnerabilities/secret findings). Local gate: lock64, Ruff101, mypy99, pytest585, doctor shadow/live=false, diff-check. |
 | Phase 5.5 seven-venue capability matrix + FT-02 isolation | COMPLETE | One typed matrix reports qualified, quarantined, or disabled state for all seven venue profiles while startup rejects any Wave 1 reclassification. Public scans expose current six-hour-bound reports and isolate one quarantined venue without stopping healthy Wave 1 routes. PREPARED live-canary recovery revalidates current public/private capability, account state, clock, books, funding, economics, journal/reconciliation/risk, protected marketable IOC caps, and final pause/kill immediately before submit; every transport, control-read, and teardown path is owned and bounded. Code head `7506517` passed exact run `32429457353` 5/5 with replay `9428595773` (80 scenarios), C4 critical `9428577449` (30/30), C4.3 `9428574423` (8/8, zero false success/submits), and security `9428569687` (zero vulnerabilities/secret findings); independent exact technical review P0/P1=0. No credentials, expansion submit authority, or real order was added. |
 | FT-03 reproducible Germany/Japan latency evidence | SOFTWARE_READY / OWNER_ACTION | Exact Wave 1 feed/API/private-event samples use exchange timestamps, qualified clock skew and monotonic API RTT; raw NDJSON and reports bind executing code/config/host/attestation/instrument; provider evidence requires a checkout-pinned Ed25519 trust root; final selection rebuilds raw evidence and keeps Germany unless Japan improves weighted p95 by at least 20% with no cell p99 worsening above 50%. The default trust-root sentinel and absent credentials/VPS evidence fail closed. Code head `04a4794` passed exact run `32435546614` 5/5 with replay `9430648766` (80 scenarios), C4 critical `9430638548` (30/30, zero submits), C4.3 `9430634489` (8/8, zero false success/submits), and security `9430627269` (zero vulnerabilities/secrets); independent review P0/P1/P2=0. |
-| Operations final proof | COMPLETE | Code checkpoint `16bf1d2`; deploy requires an untracked `.env` at mode 0600 and verifies the running exact SHA/digest in shadow; successful identity is atomic and idempotent. Upgrade stops the app for a consistent backup and automatically restores both SQLite state and the previous immutable image after failed health. Qualification progress exposes duration, synchronized-event, funding, replay, unresolved order/exposure, quality, PnL, strategy, and exception blockers. SQLite schema v13 persists adjacent owner-confirmed stages bound to exact qualification/runtime-policy hashes; every promotion after canary additionally requires an immutable matching stable-FLAT stage result and zero active live actions. Exact run `32440216743` passed all five jobs. Downloaded operations artifact `9432249857` proves pinned Ubuntu 24.04, exact digest deploy twice, restart count 4, real unhealthy-image rollback with state restoration, all 11 private recovery states, 42/42 manifest criteria through 60 JUnit tests, and zero production transports. Replay `9432176964` is 80/80; C4 critical `9432160656` is 30/30 with zero submits; C4.3 `9432156081` is 8/8 with zero false success/submits; security `9432146473` reports zero vulnerabilities/secrets. Local gate: lock64, Ruff111, mypy109, pytest643 (3 platform skips), doctor shadow/live=false, Bandit medium/high0, diff-check. |
+| Operations final proof | COMPLETE | Code checkpoint `16bf1d2`; deploy requires an untracked `.env` at mode 0600 and verifies the running exact SHA/digest in shadow; successful identity is atomic and idempotent. Upgrade stops the app for a consistent backup and automatically restores both SQLite state and the previous immutable image after failed health. Qualification progress exposes duration, synchronized-event, funding, replay, unresolved order/exposure, quality, PnL, strategy, and exception blockers. The current local remediation advances SQLite to schema v14: strict stage limits and signed evidence are bound to the current release/qualification, only canonical four-leg normal paired cycles count, completion atomically freezes normal entry with the complete journal identity, promotion rechecks it, emergency reduction remains available, and legacy weak stage results are archived while runtime resets to SHADOW for sequential re-attestation. Parent exact run `32443207014` passed all five jobs; its operations artifact `9433253029` proves 42/42 manifest criteria. Current local gate: lock64, Ruff113, mypy111, pytest666, doctor shadow/live=false, diff-check; independent review P0=0/P1=0/P2=0. Fresh exact-head evidence remains required. |
+| Autonomous VPS runtime | EXACT_PASS / AWAITING_RELEASE | Exact code head `02789831ef26c61265804910a41596ad0d665c26` installs one-command Ubuntu 24.04 bootstrap, `/usr/local/sbin/ipegctl`, hardened systemd/Docker ownership, external mode-0600 onboarding, immutable OCI revision/SHA binding, and one service-owned `AutonomousOrchestrator`. Exact run `32443207014` passed all five jobs. Operations `9433253029`, replay `9433184226`, C4 critical `9433172177`, C4.3 `9433167340`, and security `9433161453` are exact-head artifacts; the operations proof covers 42/42 criteria and the C4 artifacts report zero production submits. The orchestrator may collect/finalize observation evidence only and cannot authorize canary/live. Independent final review, protected-main merge, and v1 RC release remain pending. |
 | C6 venue expansion | SOFTWARE_COMPLETE / OWNER_EVIDENCE | All four expansion adapters plus the seven-venue capability matrix, FT-02 isolation, FT-03 evidence tooling, and operations gates are exact-head verified. Real Germany/Japan measurements, account capability evidence, and a successful owner-operated canary remain external prerequisites; Wave 1 and the live-canary allowlist remain unchanged. |
 
 ## Decisions made during implementation
@@ -148,6 +149,23 @@ The repository is PUBLIC. `OWNER_ACTION.json` contains the exact separate action
 - **Fail-closed behavior:** the all-zero trust-root sentinel rejects every supplied key, Germany remains the default, no C5 deployment or live order is authorized, and no region claim is made until the complete signed evidence exists.
 
 ## Last verified command
+
+```text
+2026-08-21 autonomous VPS/risk-stage attestation checkpoint, Windows equivalent of every
+Makefile verify target: PASS
+- exact lock validation: PASS (64 packages)
+- Ruff format/check: PASS (113 files)
+- mypy --strict: PASS (111 source/test files)
+- pytest: 666 collected, all runnable tests passed (six platform skips)
+- interexchange-grid doctor: PASS; mode=shadow; live_orders_allowed=false
+- git diff --check: PASS
+
+The checkpoint binds signed completion evidence to one canonical normal four-leg paired cycle set,
+freezes normal entry atomically with journal identity, revalidates it at promotion, preserves emergency
+risk reduction, and resets legacy weak advanced stages to SHADOW for sequential re-attestation.
+Independent final dirty-snapshot review reported P0=0, P1=0, P2=0. No credentials, production
+transport, live authority, or real order were used. Commit and fresh exact-head CI remain pending.
+```
 
 ```text
 2026-08-20 Phase 4.4 local Windows equivalent of every Makefile verify target: PASS
@@ -361,7 +379,7 @@ work requires the explicit external owner actions recorded above; the product re
 ```
 
 ```text
-2026-08-21 autonomous runtime remediation: LOCAL PASS / EXACT GATE REQUIRED
+2026-08-21 autonomous runtime exact checkpoint `02789831`: PASS / RELEASE GATE REQUIRED
 - exact lock validation: PASS (64 packages)
 - Ruff format/check: PASS (113 files)
 - strict mypy: PASS (111 source/test files)
@@ -376,7 +394,23 @@ idempotently starts/resumes the exact route/release/source/config/image qualific
 blockers, finalizes only the observation collection, and never authorizes canary/live. Parquet progress
 runs in a bounded child process that is terminated on cancellation, so shutdown cannot leave an
 unowned qualification scan. Local onboarding remains interactive and writes credentials only outside
-Git; `canary-arm` fails until a separate `LIVE_CANARY_CONSENT`. The exact Ubuntu deployment/rollback,
-operations artifact, adversarial review, Ready/squash merge, protected main, and v1 RC image/release
-must still pass on the new head.
+Git; `canary-arm` fails until a separate `LIVE_CANARY_CONSENT`. Exact run `32443207014` passed all
+five jobs. Operations `9433253029`, replay `9433184226`, C4 critical `9433172177`, C4.3
+`9433167340`, and security `9433161453` are bound to the same exact head; operations covers 42/42
+acceptance criteria. Independent adversarial review, Ready/squash merge, protected main, and the v1
+RC image/release remain required.
+```
+
+```text
+2026-08-21 risk-stage attestation remediation: LOCAL / EXACT GATE REQUIRED
+
+Independent review of exact head `02789831` found that direct runtime stage limits did not enforce
+the global 5 USDT pair/50 USDT portfolio caps and `risk-stage-complete` accepted a minimal
+self-declared JSON. The local correction requires exact non-boolean integer limits, hard global caps,
+and one exact-schema Ed25519-signed stage artifact whose public key is pinned by locked policy. The
+artifact is bound to the current promotion timestamp, qualification/runtime-policy/release/source/
+config/image identity, account-wide two-snapshot quiet stable-FLAT watermark, zero active/open/
+unknown/unresolved exposure state, availability/private completeness, PnL/loss/holding gates, and
+the durable journal. The default all-zero key sentinel keeps completion impossible until owner
+onboarding installs an authorized offline public-key hash. No live authority or submit path was added.
 ```

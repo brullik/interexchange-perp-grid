@@ -42,6 +42,6 @@
   "OPS-06": ["tests/test_qualification_epoch.py::test_exact_epoch_commands_are_idempotent_and_finalize_is_immutable"],
   "OPS-07": ["tests/test_qualification_state.py::test_running_epoch_progress_reports_exact_remaining_counts_and_blockers", "tests/test_autonomous_orchestrator.py::test_orchestrator_idempotently_starts_exact_immutable_epoch", "tests/test_autonomous_orchestrator.py::test_orchestrator_finalizes_collection_but_never_authorizes_live"],
   "OPS-08": ["tests/test_c4_3_stable_flat.py::test_stable_flat_barrier_hard_times_out_hung_private_snapshot"],
-  "OPS-09": ["tests/test_risk_stages.py::test_risk_stage_promotion_is_adjacent_confirmed_and_persisted"],
+  "OPS-09": ["tests/test_risk_stages.py::test_risk_stage_promotion_is_adjacent_confirmed_and_persisted", "tests/test_risk_stages.py::test_risk_stage_limits_reject_bool_and_global_cap_bypass", "tests/test_risk_stages.py::test_stage_completion_requires_signed_exact_account_wide_evidence", "tests/test_risk_stages.py::test_stage_completion_rejects_unsigned_minimal_self_declaration"],
   "OPS-10": ["tests/test_repository_contract.py::test_no_withdrawal_or_transfer_implementation_exists"]
 }

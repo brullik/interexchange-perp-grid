@@ -5,7 +5,7 @@ import os
 import sqlite3
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -16,9 +16,11 @@ from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_journal import (
     JournalEventQuarantinedError,
+    JournalLeg,
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
+    is_completed_normal_paired_cycle,
     request_payload_hash,
 )
 from interexchange_perp_grid.private_domain import (
@@ -39,6 +41,49 @@ def test_client_order_ids_fit_every_wave1_venue_contract() -> None:
     assert len(first) <= 32
     assert first.startswith("ipeg")
     assert first != second
+
+
+def test_stage_completion_accepts_only_canonical_normal_open_and_close_cycle() -> None:
+    observed = datetime(2026, 8, 21, tzinfo=UTC)
+
+    def leg(role: str, sequence: int, side: Side) -> JournalLeg:
+        return JournalLeg(
+            venue_client_order_id("cycle-1", role, sequence),
+            Venue.BINANCE_USDM if side == Side.BUY else Venue.OKX,
+            "BTC/USDT:USDT",
+            side,
+            "a" * 64,
+            Decimal("0.001"),
+            Decimal("100"),
+            True,
+            f"order-{sequence}",
+            PrivateOrderStatus.FILLED,
+            Decimal("0.001"),
+        )
+
+    normal = LiveJournalAction(
+        "cycle-1",
+        _ROUTE,
+        "tranche-1",
+        LiveActionState.FLAT,
+        {},
+        _QUALIFICATION,
+        Decimal(0),
+        None,
+        observed,
+        observed,
+        (
+            leg("long", 0, Side.BUY),
+            leg("short", 0, Side.SELL),
+            leg("close", 1, Side.SELL),
+            leg("close", 2, Side.BUY),
+        ),
+    )
+    assert is_completed_normal_paired_cycle(normal)
+    assert not is_completed_normal_paired_cycle(
+        replace(normal, recovery_action="EMERGENCY_FLATTEN")
+    )
+    assert not is_completed_normal_paired_cycle(replace(normal, legs=normal.legs[:2]))
 
 
 def _request(venue: Venue, client_id: str, side: Side) -> VenueOrderRequest:
@@ -315,6 +360,44 @@ async def test_emergency_action_holds_same_durable_route_leases(tmp_path: Path) 
             "different-base-short",
             DirectedRouteKey("ETH", Venue.BINANCE_USDM, Venue.OKX),
         )
+
+
+@pytest.mark.asyncio
+async def test_risk_stage_completion_freeze_blocks_entry_but_not_emergency_flatten(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    journal = LiveOrderJournal(path)
+    await journal.initialise()
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "UPDATE live_entry_controls SET risk_stage_completion_frozen = 1 WHERE singleton = 1"
+        )
+    with pytest.raises(RuntimeError, match="completion freeze"):
+        await _prepare(journal)
+
+    requests = tuple(
+        replace(
+            _request(venue, f"emergency-{venue.value}", side),
+            order_type="market",
+            price=None,
+            time_in_force=None,
+        )
+        for venue, side in (
+            (Venue.BINANCE_USDM, Side.SELL),
+            (Venue.OKX, Side.BUY),
+        )
+    )
+    emergency = await journal.prepare_emergency(
+        "emergency-pair",
+        _ROUTE,
+        "emergency-tranche",
+        requests,
+        {request.client_order_id: Decimal("0.001") for request in requests},
+        {"action": "EMERGENCY_FLATTEN"},
+        _QUALIFICATION,
+    )
+    assert emergency.recovery_action == "EMERGENCY_FLATTEN"
 
 
 @pytest.mark.asyncio
@@ -678,6 +761,50 @@ async def test_every_transition_survives_restart_and_duplicate_events_are_idempo
     assert loaded is not None
     long_leg = next(leg for leg in loaded.legs if leg.client_order_id == "pair-1-long")
     assert long_leg.filled_base_quantity == Decimal("0.0005")
+
+
+@pytest.mark.asyncio
+async def test_completed_actions_since_binds_flat_filled_cycle_to_qualification(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    started_at = datetime.now(UTC) - timedelta(seconds=1)
+    await _prepare(journal)
+    await journal.mark_submit_attempted("pair-1", ("pair-1-long", "pair-1-short"))
+    for event_id, venue, client_id, side in (
+        ("event-long", Venue.BINANCE_USDM, "pair-1-long", Side.BUY),
+        ("event-short", Venue.OKX, "pair-1-short", Side.SELL),
+    ):
+        await journal.record_order_event(
+            "pair-1",
+            PrivateOrder(
+                venue=venue,
+                order_id=event_id,
+                client_order_id=client_id,
+                symbol="BTC/USDT:USDT",
+                side=side,
+                status=PrivateOrderStatus.FILLED,
+                requested_base_quantity=Decimal("0.001"),
+                filled_base_quantity=Decimal("0.001"),
+                average_price=Decimal("100"),
+                fee_usdt=Decimal("0.001"),
+                observed_at=datetime.now(UTC),
+            ),
+            event_id,
+        )
+    for state in (
+        LiveActionState.FILLED,
+        LiveActionState.HEDGED,
+        LiveActionState.CLOSING,
+        LiveActionState.FLAT,
+    ):
+        await journal.transition("pair-1", state, residual_delta=Decimal("0"))
+
+    completed = await journal.completed_actions_since(started_at, _QUALIFICATION)
+    assert tuple(action.pair_action_id for action in completed) == ("pair-1",)
+    assert all(leg.status == PrivateOrderStatus.FILLED for leg in completed[0].legs)
+    assert await journal.completed_actions_since(started_at, "b" * 64) == ()
 
 
 @pytest.mark.asyncio

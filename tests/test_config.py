@@ -94,6 +94,13 @@ def test_calibration_policy_drift_fails_startup(
             "stressed cost multiplier is below",
         ),
         ("market_data", "max_l2_age_ms", 1001, "max_l2_age_ms differs"),
+        (
+            "live",
+            "flat_barrier_quiet_period_seconds",
+            "1",
+            "flat_barrier_quiet_period_seconds differs",
+        ),
+        ("risk", "max_hold_seconds", 86_399, "risk_hard_max_hold_seconds differs"),
     ),
 )
 def test_locked_calibration_safety_cannot_be_weakened(

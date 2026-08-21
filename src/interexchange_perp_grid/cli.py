@@ -23,7 +23,11 @@ from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Venue
-from interexchange_perp_grid.live_journal import LiveOrderJournal
+from interexchange_perp_grid.live_journal import (
+    LiveOrderJournal,
+    completed_normal_actions_sha256,
+    is_completed_normal_paired_cycle,
+)
 from interexchange_perp_grid.maintenance import (
     backup_sqlite,
     prune_market_history,
@@ -73,7 +77,10 @@ from interexchange_perp_grid.region_latency import (
 )
 from interexchange_perp_grid.release_evidence import REPLAY_TEST_FILES, run_replay_proof
 from interexchange_perp_grid.release_preflight import evaluate_release_preflight
-from interexchange_perp_grid.risk_stages import load_locked_risk_stage_table
+from interexchange_perp_grid.risk_stages import (
+    load_locked_risk_stage_table,
+    verify_risk_stage_completion_evidence,
+)
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.service import run_until_signal
 from interexchange_perp_grid.shadow import ShadowRuntime
@@ -568,21 +575,37 @@ def risk_stage_complete(
         Path,
         typer.Option("--evidence", exists=True, dir_okay=False, readable=True),
     ],
+    qualification: Annotated[
+        Path,
+        typer.Option("--qualification", exists=True, dir_okay=False, readable=True),
+    ],
+    attestation_public_key: Annotated[
+        Path,
+        typer.Option("--attestation-public-key", exists=True, dir_okay=False, readable=True),
+    ],
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
-    """Bind one completed stage to stable-FLAT evidence before any next promotion."""
+    """Bind one signed, account-wide completed stage before any next promotion."""
     settings = _load(config)
-    evidence_bytes = evidence.resolve().read_bytes()
-    payload = json.loads(evidence_bytes)
-    if not isinstance(payload, dict):
-        raise typer.BadParameter("stage evidence must be one JSON object")
-    if payload.get("stage") != stage.value:
-        raise typer.BadParameter("stage evidence does not match --stage")
-    if payload.get("stable_flat_verified") is not True:
-        raise typer.BadParameter("stage evidence must prove stable_flat_verified=true")
-    if payload.get("active_action_count") != 0:
-        raise typer.BadParameter("stage evidence must prove active_action_count=0")
-    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+    policy_path = config.resolve().parent / "RUNTIME_POLICY.yaml"
+    table = load_locked_risk_stage_table(policy_path)
+    limits = next((item for item in table.stages if item.stage == stage), None)
+    if limits is None:
+        raise typer.BadParameter("shadow cannot produce a live risk-stage result")
+    attestation_policy = load_region_latency_policy(policy_path)
+    try:
+        attested = verify_risk_stage_completion_evidence(
+            evidence.resolve(),
+            attestation_public_key.resolve(),
+            attestation_policy.attestation_public_key_sha256,
+            limits,
+            required_consecutive_snapshots=table.flat_barrier_snapshots,
+            required_quiet_period_seconds=table.flat_barrier_quiet_seconds,
+            hard_maximum_holding_seconds=table.hard_maximum_holding_seconds,
+        )
+    except (ValueError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(str(error)) from error
+    qualification_evidence = load_qualification(qualification.resolve())
 
     async def complete() -> RiskStageResult:
         state_path = Path(settings.storage.sqlite_path)
@@ -590,18 +613,57 @@ def risk_stage_complete(
         current = await read_risk_stage(state_path)
         if current.stage != stage or current.qualification_hash is None:
             raise RuntimeError("stage evidence does not match the current risk stage")
+        if (
+            attested.qualification_hash != current.qualification_hash
+            or attested.qualification_hash != qualification_evidence.qualification_hash
+            or attested.runtime_policy_sha256 != table.runtime_policy_sha256
+            or attested.release_sha != qualification_evidence.code_commit_sha
+            or attested.source_sha256 != qualification_evidence.code_sha256
+            or attested.config_sha256 != qualification_evidence.config_sha256
+            or attested.container_image_digest != qualification_evidence.container_image_digest
+            or current.promoted_at is None
+            or attested.stage_started_at != current.promoted_at
+        ):
+            raise RuntimeError("stage evidence identity does not match current runtime state")
         journal = LiveOrderJournal(state_path)
         await journal.initialise()
         if await journal.active_actions():
             raise RuntimeError("risk stage completion requires zero active live actions")
+        all_completed = tuple(
+            sorted(
+                await journal.completed_actions_since(
+                    current.promoted_at,
+                    current.qualification_hash,
+                ),
+                key=lambda action: action.pair_action_id,
+            )
+        )
+        completed = tuple(
+            action for action in all_completed if is_completed_normal_paired_cycle(action)
+        )
+        completed_ids = tuple(action.pair_action_id for action in completed)
+        completed_sha256 = completed_normal_actions_sha256(all_completed)
+        all_completed_ids = tuple(action.pair_action_id for action in all_completed)
+        journal_pair_actions_sha256 = hashlib.sha256(
+            json.dumps(all_completed_ids, separators=(",", ":")).encode()
+        ).hexdigest()
+        if (
+            completed_ids != attested.completed_pair_action_ids
+            or completed_sha256 != attested.completed_pair_actions_sha256
+        ):
+            raise RuntimeError("stage evidence does not match durable completed paired cycles")
         return await record_risk_stage_result(
             state_path,
             stage,
             current.qualification_hash,
             table.runtime_policy_sha256,
-            hashlib.sha256(evidence_bytes).hexdigest(),
+            attested.evidence_sha256,
             True,
             actor,
+            await journal.event_watermark(),
+            completed_sha256,
+            journal_pair_actions_sha256,
+            all_completed_ids,
         )
 
     result = asyncio.run(complete())

@@ -1069,7 +1069,7 @@ async def run_canary_once(
     if active_actions:
         return _denied(ReasonCode.RECONCILIATION_INCOMPLETE, active_actions[0].route)
     risk_stage = await read_risk_stage(state_path)
-    if risk_stage.stage == RiskStage.SHADOW:
+    if risk_stage.stage == RiskStage.SHADOW or risk_stage.completion_frozen:
         return _denied(ReasonCode.CANARY_POLICY_VIOLATION)
     if not qualification_path.is_file():
         return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING)

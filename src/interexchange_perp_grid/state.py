@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -24,11 +25,12 @@ from interexchange_perp_grid.execution import (
     Side,
     Tranche,
 )
+from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import RiskRequest, VenueProjection
 from interexchange_perp_grid.strategy import DirectedRouteKey, SignalDecision
 
-SCHEMA_VERSION = "13"
+SCHEMA_VERSION = "14"
 STATE_TRANSITION_TERMINAL_TIMEOUT_SECONDS = 1.0
 SCHEMA_STATEMENTS = (
     """
@@ -102,7 +104,8 @@ SCHEMA_STATEMENTS = (
         qualification_hash TEXT,
         runtime_policy_sha256 TEXT,
         promoted_by TEXT NOT NULL,
-        promoted_at TEXT NOT NULL
+        promoted_at TEXT NOT NULL,
+        completion_frozen INTEGER NOT NULL DEFAULT 0 CHECK (completion_frozen IN (0, 1))
     )
     """,
     """
@@ -113,7 +116,17 @@ SCHEMA_STATEMENTS = (
         evidence_sha256 TEXT NOT NULL,
         stable_flat_verified INTEGER NOT NULL CHECK (stable_flat_verified IN (0, 1)),
         completed_by TEXT NOT NULL,
-        completed_at TEXT NOT NULL
+        completed_at TEXT NOT NULL,
+        journal_event_watermark INTEGER NOT NULL DEFAULT -1,
+        completed_actions_sha256 TEXT NOT NULL DEFAULT '',
+        journal_pair_actions_sha256 TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS live_entry_controls (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0
+            CHECK (risk_stage_completion_frozen IN (0, 1))
     )
     """,
     """
@@ -310,6 +323,7 @@ class RiskStageState:
     runtime_policy_sha256: str | None
     promoted_by: str
     promoted_at: datetime
+    completion_frozen: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +335,9 @@ class RiskStageResult:
     stable_flat_verified: bool
     completed_by: str
     completed_at: datetime
+    journal_event_watermark: int
+    completed_actions_sha256: str
+    journal_pair_actions_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -514,6 +531,7 @@ def _initialise_state_sync(path: Path) -> None:
             "10",
             "11",
             "12",
+            "13",
             SCHEMA_VERSION,
         }:
             raise RuntimeError(f"unsupported state schema version: {existing[0]}")
@@ -656,6 +674,76 @@ def _initialise_state_sync(path: Path) -> None:
                     CHECK (transient_blocked IN (0, 1))
                 """
             )
+        risk_runtime_columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(risk_stage_runtime)")
+        }
+        if "completion_frozen" not in risk_runtime_columns:
+            database.execute(
+                "ALTER TABLE risk_stage_runtime ADD COLUMN completion_frozen INTEGER "
+                "NOT NULL DEFAULT 0 CHECK (completion_frozen IN (0, 1))"
+            )
+        risk_result_columns = {
+            str(row[1]) for row in database.execute("PRAGMA table_info(risk_stage_results)")
+        }
+        legacy_risk_results = not {
+            "journal_event_watermark",
+            "completed_actions_sha256",
+            "journal_pair_actions_sha256",
+        }.issubset(risk_result_columns)
+        if legacy_risk_results:
+            database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS risk_stage_results_legacy_v13_archive (
+                    stage TEXT NOT NULL,
+                    qualification_hash TEXT NOT NULL,
+                    runtime_policy_sha256 TEXT NOT NULL,
+                    evidence_sha256 TEXT NOT NULL,
+                    stable_flat_verified INTEGER NOT NULL,
+                    completed_by TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    archived_at TEXT NOT NULL
+                )
+                """
+            )
+            database.execute(
+                """
+                INSERT INTO risk_stage_results_legacy_v13_archive(
+                    stage, qualification_hash, runtime_policy_sha256, evidence_sha256,
+                    stable_flat_verified, completed_by, completed_at, archived_at
+                )
+                SELECT stage, qualification_hash, runtime_policy_sha256, evidence_sha256,
+                       stable_flat_verified, completed_by, completed_at, ?
+                FROM risk_stage_results
+                """,
+                (datetime.now(UTC).isoformat(),),
+            )
+        if "journal_event_watermark" not in risk_result_columns:
+            database.execute(
+                "ALTER TABLE risk_stage_results ADD COLUMN journal_event_watermark "
+                "INTEGER NOT NULL DEFAULT -1"
+            )
+        if "completed_actions_sha256" not in risk_result_columns:
+            database.execute(
+                "ALTER TABLE risk_stage_results ADD COLUMN completed_actions_sha256 "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if "journal_pair_actions_sha256" not in risk_result_columns:
+            database.execute(
+                "ALTER TABLE risk_stage_results ADD COLUMN journal_pair_actions_sha256 "
+                "TEXT NOT NULL DEFAULT ''"
+            )
+        if legacy_risk_results:
+            database.execute("DELETE FROM risk_stage_results")
+            database.execute(
+                """
+                UPDATE risk_stage_runtime
+                SET stage = ?, qualification_hash = NULL, runtime_policy_sha256 = NULL,
+                    promoted_by = 'schema-v14-fail-closed-migration', promoted_at = ?,
+                    completion_frozen = 0
+                WHERE singleton = 1
+                """,
+                (RiskStage.SHADOW.value, datetime.now(UTC).isoformat()),
+            )
         for statement in _SCHEMA_INDEX_STATEMENTS:
             database.execute(statement)
         for table in _EPOCH_OBSERVATION_TABLES:
@@ -688,6 +776,10 @@ def _initialise_state_sync(path: Path) -> None:
             ) VALUES (1, ?, NULL, NULL, 'system', ?)
             """,
             (RiskStage.SHADOW.value, datetime.now(UTC).isoformat()),
+        )
+        database.execute(
+            "INSERT OR IGNORE INTO live_entry_controls("
+            "singleton, risk_stage_completion_frozen) VALUES (1, 0)"
         )
         database.commit()
 
@@ -1677,6 +1769,7 @@ def _risk_stage_from_row(row: tuple[object, ...]) -> RiskStageState:
         runtime_policy_sha256=str(row[2]) if row[2] is not None else None,
         promoted_by=str(row[3]),
         promoted_at=datetime.fromisoformat(str(row[4])),
+        completion_frozen=bool(row[5]),
     )
 
 
@@ -1684,7 +1777,8 @@ def _read_risk_stage_sync(path: Path) -> RiskStageState:
     with _connect(path) as database:
         row = database.execute(
             """
-            SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, promoted_at
+            SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, promoted_at,
+                   completion_frozen
             FROM risk_stage_runtime WHERE singleton = 1
             """
         ).fetchone()
@@ -1705,6 +1799,10 @@ def _record_risk_stage_result_sync(
     evidence_sha256: str,
     stable_flat_verified: bool,
     actor: str,
+    journal_event_watermark: int,
+    completed_actions_sha256: str,
+    journal_pair_actions_sha256: str,
+    expected_pair_action_ids: tuple[str, ...],
     now: datetime,
 ) -> RiskStageResult:
     if stage == RiskStage.SHADOW:
@@ -1715,15 +1813,24 @@ def _record_risk_stage_result_sync(
         (qualification_hash, "qualification"),
         (runtime_policy_sha256, "runtime policy"),
         (evidence_sha256, "evidence"),
+        (completed_actions_sha256, "completed actions"),
+        (journal_pair_actions_sha256, "journal pair actions"),
     ):
         if not re.fullmatch(r"[0-9a-f]{64}", value):
             raise ValueError(f"risk stage result requires an exact {label} hash")
     if not stable_flat_verified:
         raise ValueError("risk stage result requires independently verified stable FLAT")
+    if journal_event_watermark < 0:
+        raise ValueError("risk stage result requires a non-negative journal watermark")
+    if tuple(sorted(expected_pair_action_ids)) != expected_pair_action_ids or len(
+        set(expected_pair_action_ids)
+    ) != len(expected_pair_action_ids):
+        raise ValueError("risk stage result pair action IDs must be unique and sorted")
     with _connect(path) as database:
         database.execute("BEGIN IMMEDIATE")
+        database.row_factory = sqlite3.Row
         runtime = database.execute(
-            "SELECT stage, qualification_hash, runtime_policy_sha256 "
+            "SELECT stage, qualification_hash, runtime_policy_sha256, promoted_at "
             "FROM risk_stage_runtime WHERE singleton = 1"
         ).fetchone()
         if runtime is None or RiskStage(str(runtime[0])) != stage:
@@ -1732,9 +1839,39 @@ def _record_risk_stage_result_sync(
         if str(runtime[1]) != qualification_hash or str(runtime[2]) != runtime_policy_sha256:
             database.rollback()
             raise ValueError("risk stage result identity does not match current promotion")
+        active_count = int(
+            database.execute(
+                "SELECT count(*) FROM live_pair_actions WHERE state <> 'FLAT'"
+            ).fetchone()[0]
+        )
+        if active_count:
+            database.rollback()
+            raise RuntimeError("risk stage completion requires zero active live actions")
+        observed_ids, observed_completed_sha256 = LiveOrderJournal(
+            path
+        ).completed_normal_snapshot_in_transaction(
+            database,
+            datetime.fromisoformat(str(runtime[3])),
+            qualification_hash,
+        )
+        if observed_ids != expected_pair_action_ids:
+            database.rollback()
+            raise RuntimeError("live action journal changed before stage completion freeze")
+        if observed_completed_sha256 != completed_actions_sha256:
+            database.rollback()
+            raise RuntimeError(
+                "completed paired-cycle content changed before stage completion freeze"
+            )
+        observed_watermark = int(
+            database.execute("SELECT count(*) FROM live_order_events").fetchone()[0]
+        ) + int(database.execute("SELECT count(*) FROM live_journal_audit_events").fetchone()[0])
+        if observed_watermark != journal_event_watermark:
+            database.rollback()
+            raise RuntimeError("live journal watermark changed before stage completion freeze")
         existing = database.execute(
             "SELECT qualification_hash, runtime_policy_sha256, evidence_sha256, "
-            "stable_flat_verified, completed_by, completed_at "
+            "stable_flat_verified, completed_by, completed_at, journal_event_watermark, "
+            "completed_actions_sha256, journal_pair_actions_sha256 "
             "FROM risk_stage_results WHERE stage = ?",
             (stage.value,),
         ).fetchone()
@@ -1745,22 +1882,32 @@ def _record_risk_stage_result_sync(
             1,
             actor,
             now.isoformat(),
+            journal_event_watermark,
+            completed_actions_sha256,
+            journal_pair_actions_sha256,
         )
         if existing is None:
             database.execute(
                 "INSERT INTO risk_stage_results(stage, qualification_hash, "
                 "runtime_policy_sha256, evidence_sha256, stable_flat_verified, "
-                "completed_by, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "completed_by, completed_at, journal_event_watermark, "
+                "completed_actions_sha256, journal_pair_actions_sha256) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (stage.value, *values),
             )
-        elif tuple(existing[:4]) != values[:4]:
+        elif tuple(existing[:4]) != values[:4] or tuple(existing[6:9]) != values[6:9]:
             database.rollback()
             raise RuntimeError("risk stage result is immutable and already differs")
+        database.execute("UPDATE risk_stage_runtime SET completion_frozen = 1 WHERE singleton = 1")
+        database.execute(
+            "UPDATE live_entry_controls SET risk_stage_completion_frozen = 1 WHERE singleton = 1"
+        )
         database.commit()
     with _connect(path) as database:
         row = database.execute(
             "SELECT qualification_hash, runtime_policy_sha256, evidence_sha256, "
-            "stable_flat_verified, completed_by, completed_at "
+            "stable_flat_verified, completed_by, completed_at, journal_event_watermark, "
+            "completed_actions_sha256, journal_pair_actions_sha256 "
             "FROM risk_stage_results WHERE stage = ?",
             (stage.value,),
         ).fetchone()
@@ -1774,6 +1921,9 @@ def _record_risk_stage_result_sync(
         stable_flat_verified=bool(row[3]),
         completed_by=str(row[4]),
         completed_at=datetime.fromisoformat(str(row[5])),
+        journal_event_watermark=int(row[6]),
+        completed_actions_sha256=str(row[7]),
+        journal_pair_actions_sha256=str(row[8]),
     )
 
 
@@ -1785,6 +1935,10 @@ async def record_risk_stage_result(
     evidence_sha256: str,
     stable_flat_verified: bool,
     actor: str,
+    journal_event_watermark: int,
+    completed_actions_sha256: str,
+    journal_pair_actions_sha256: str,
+    expected_pair_action_ids: tuple[str, ...],
     now: datetime | None = None,
 ) -> RiskStageResult:
     return await asyncio.to_thread(
@@ -1796,6 +1950,10 @@ async def record_risk_stage_result(
         evidence_sha256,
         stable_flat_verified,
         actor,
+        journal_event_watermark,
+        completed_actions_sha256,
+        journal_pair_actions_sha256,
+        expected_pair_action_ids,
         now or datetime.now(UTC),
     )
 
@@ -1826,9 +1984,11 @@ def _promote_risk_stage_sync(
         raise ValueError("risk stage promotion must advance exactly one locked stage")
     with _connect(path) as database:
         database.execute("BEGIN IMMEDIATE")
+        database.row_factory = sqlite3.Row
         row = database.execute(
             """
-            SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, promoted_at
+            SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, promoted_at,
+                   completion_frozen
             FROM risk_stage_runtime WHERE singleton = 1
             """
         ).fetchone()
@@ -1844,25 +2004,57 @@ def _promote_risk_stage_sync(
             )
         if expected_current != RiskStage.SHADOW:
             result = database.execute(
-                "SELECT qualification_hash, runtime_policy_sha256, stable_flat_verified "
+                "SELECT qualification_hash, runtime_policy_sha256, stable_flat_verified, "
+                "journal_event_watermark, journal_pair_actions_sha256, "
+                "completed_actions_sha256 "
                 "FROM risk_stage_results WHERE stage = ?",
                 (expected_current.value,),
             ).fetchone()
             if (
                 result is None
-                or str(result[0]) != qualification_hash
+                or current.qualification_hash is None
+                or str(result[0]) != current.qualification_hash
                 or str(result[1]) != runtime_policy_sha256
                 or not bool(result[2])
+                or not current.completion_frozen
             ):
                 database.rollback()
                 raise RuntimeError(
                     "current risk stage has no matching stable-FLAT completion result"
                 )
+            active_count = int(
+                database.execute(
+                    "SELECT count(*) FROM live_pair_actions WHERE state <> 'FLAT'"
+                ).fetchone()[0]
+            )
+            observed_watermark = int(
+                database.execute("SELECT count(*) FROM live_order_events").fetchone()[0]
+            ) + int(
+                database.execute("SELECT count(*) FROM live_journal_audit_events").fetchone()[0]
+            )
+            observed_ids, observed_completed_sha256 = LiveOrderJournal(
+                path
+            ).completed_normal_snapshot_in_transaction(
+                database,
+                current.promoted_at,
+                current.qualification_hash,
+            )
+            observed_actions_sha256 = hashlib.sha256(
+                json.dumps(observed_ids, separators=(",", ":")).encode()
+            ).hexdigest()
+            if (
+                active_count
+                or observed_watermark != int(result[3])
+                or observed_actions_sha256 != str(result[4])
+                or observed_completed_sha256 != str(result[5])
+            ):
+                database.rollback()
+                raise RuntimeError("live journal changed after risk-stage completion freeze")
         database.execute(
             """
             UPDATE risk_stage_runtime
             SET stage = ?, qualification_hash = ?, runtime_policy_sha256 = ?,
-                promoted_by = ?, promoted_at = ?
+                promoted_by = ?, promoted_at = ?, completion_frozen = 0
             WHERE singleton = 1
             """,
             (
@@ -1872,6 +2064,9 @@ def _promote_risk_stage_sync(
                 actor,
                 now.isoformat(),
             ),
+        )
+        database.execute(
+            "UPDATE live_entry_controls SET risk_stage_completion_frozen = 0 WHERE singleton = 1"
         )
         database.commit()
     return _read_risk_stage_sync(path)

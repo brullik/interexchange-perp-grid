@@ -13,6 +13,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from interexchange_perp_grid.client_ids import parse_bot_client_order_id
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.private_domain import (
@@ -38,6 +39,40 @@ class LiveActionState(StrEnum):
     CLOSING = "CLOSING"
     FLAT = "FLAT"
     QUARANTINED = "QUARANTINED"
+
+
+def is_completed_normal_paired_cycle(action: LiveJournalAction) -> bool:
+    """Return true only for a canonical normal paired open-and-close cycle."""
+    if (
+        action.state != LiveActionState.FLAT
+        or action.recovery_action is not None
+        or len(action.legs) != 4
+    ):
+        return False
+    roles: list[str] = []
+    for leg in action.legs:
+        parsed = parse_bot_client_order_id(leg.client_order_id)
+        if (
+            parsed is None
+            or leg.status != PrivateOrderStatus.FILLED
+            or leg.filled_base_quantity != leg.intended_base_quantity
+            or leg.filled_base_quantity <= 0
+        ):
+            return False
+        roles.append(parsed.role_code)
+    return sorted(roles) == ["clo", "clo", "lon", "sho"]
+
+
+def completed_normal_actions_sha256(actions: tuple[LiveJournalAction, ...]) -> str:
+    eligible = tuple(action for action in actions if is_completed_normal_paired_cycle(action))
+    return hashlib.sha256(
+        json.dumps(
+            tuple(asdict(action) for action in eligible),
+            default=str,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 _TRANSITIONS: dict[LiveActionState, frozenset[LiveActionState]] = {
@@ -283,7 +318,16 @@ class LiveOrderJournal:
                     owner_process_identity TEXT NOT NULL,
                     acquired_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS live_entry_controls (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0
+                        CHECK (risk_stage_completion_frozen IN (0, 1))
+                );
                 """
+            )
+            database.execute(
+                "INSERT OR IGNORE INTO live_entry_controls("
+                "singleton, risk_stage_completion_frozen) VALUES (1, 0)"
             )
             columns = {
                 str(row[1]) for row in database.execute("PRAGMA table_info(live_order_legs)")
@@ -395,6 +439,12 @@ class LiveOrderJournal:
             raise ValueError("qualification hash must be a SHA-256 hex digest")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
+            stage_freeze = database.execute(
+                "SELECT risk_stage_completion_frozen FROM live_entry_controls WHERE singleton = 1"
+            ).fetchone()
+            if stage_freeze is not None and bool(stage_freeze["risk_stage_completion_frozen"]):
+                database.rollback()
+                raise RuntimeError("risk-stage completion freeze blocks new live entry")
             conflicting = database.execute(
                 "SELECT pair_action_id FROM live_action_leases WHERE lease_key IN (?, ?) LIMIT 1",
                 (f"base:{route.base}", f"route:{route.value}"),
@@ -1245,6 +1295,17 @@ class LiveOrderJournal:
     async def active_actions(self) -> tuple[LiveJournalAction, ...]:
         return await asyncio.to_thread(self._active_actions_sync)
 
+    async def completed_actions_since(
+        self,
+        started_at: datetime,
+        qualification_hash: str,
+    ) -> tuple[LiveJournalAction, ...]:
+        return await asyncio.to_thread(
+            self._completed_actions_since_sync,
+            started_at,
+            qualification_hash,
+        )
+
     async def acquire_account_flatten_lease(self) -> str | None:
         await self.initialise()
         return await asyncio.to_thread(self._acquire_account_flatten_lease_sync)
@@ -1362,6 +1423,51 @@ class LiveOrderJournal:
                 self._load_in_transaction(database, str(row["pair_action_id"])) for row in rows
             )
         return tuple(action for action in actions if action is not None)
+
+    def _completed_actions_since_sync(
+        self,
+        started_at: datetime,
+        qualification_hash: str,
+    ) -> tuple[LiveJournalAction, ...]:
+        if started_at.tzinfo is None or started_at.utcoffset() is None:
+            raise ValueError("completed action boundary must be timezone-aware")
+        with self._connect() as database:
+            database.execute("BEGIN")
+            rows = database.execute(
+                """
+                SELECT pair_action_id FROM live_pair_actions
+                WHERE state = ? AND created_at >= ? AND qualification_hash = ?
+                ORDER BY created_at, pair_action_id
+                """,
+                (LiveActionState.FLAT.value, started_at.isoformat(), qualification_hash),
+            ).fetchall()
+            actions = tuple(
+                self._load_in_transaction(database, str(row["pair_action_id"])) for row in rows
+            )
+        return tuple(action for action in actions if action is not None)
+
+    def completed_normal_snapshot_in_transaction(
+        self,
+        database: sqlite3.Connection,
+        started_at: datetime,
+        qualification_hash: str,
+    ) -> tuple[tuple[str, ...], str]:
+        rows = database.execute(
+            "SELECT pair_action_id FROM live_pair_actions "
+            "WHERE state = ? AND created_at >= ? AND qualification_hash = ? "
+            "ORDER BY pair_action_id",
+            (LiveActionState.FLAT.value, started_at.isoformat(), qualification_hash),
+        ).fetchall()
+        actions = tuple(
+            action
+            for row in rows
+            if (action := self._load_in_transaction(database, str(row["pair_action_id"])))
+            is not None
+        )
+        return (
+            tuple(action.pair_action_id for action in actions),
+            completed_normal_actions_sha256(actions),
+        )
 
     @staticmethod
     def _require_canonical_route_base(route: DirectedRouteKey) -> None:
