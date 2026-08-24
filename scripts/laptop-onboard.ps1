@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$OutputPath = "state/laptop-profile.clixml"
+    [string]$OutputPath = "state/laptop-profile.clixml",
+    [switch]$RuntimeSelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +19,66 @@ function Confirm-Fact([string]$Prompt) {
     if ($answer -cne "CONFIRM") {
         throw "Owner onboarding confirmation was not provided; nothing was stored"
     }
+}
+
+function Convert-PlainTextToSecureString([string]$Value) {
+    $secure = [Security.SecureString]::new()
+    for ($index = 0; $index -lt $Value.Length; $index++) {
+        $secure.AppendChar($Value[$index])
+    }
+    $secure.MakeReadOnly()
+    return $secure
+}
+
+if ($RuntimeSelfTest) {
+    $samples = @(
+        '123456789:AA_ab-CD',
+        ' !@#$%^&*()_+-=[]{};:",./<>?\|`~',
+        'пароль 漢字 😀'
+    )
+    foreach ($sample in $samples) {
+        $secure = Convert-PlainTextToSecureString -Value $sample
+        $deserializedSecure = $null
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        try {
+            $roundTrip = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+            if ($roundTrip -cne $sample) {
+                throw "SecureString runtime round-trip failed"
+            }
+
+            $serializedSample = [Management.Automation.PSSerializer]::Serialize(
+                [pscustomobject]@{ Secret = $secure }
+            )
+            $deserialized = [Management.Automation.PSSerializer]::Deserialize(
+                $serializedSample
+            )
+            $deserializedSecure = $deserialized.Secret
+            $deserializedPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR(
+                $deserializedSecure
+            )
+            try {
+                $deserializedRoundTrip = [Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+                    $deserializedPointer
+                )
+                if ($deserializedRoundTrip -cne $sample) {
+                    throw "DPAPI serializer round-trip failed"
+                }
+            } finally {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($deserializedPointer)
+                $deserializedRoundTrip = $null
+            }
+        } finally {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+            $roundTrip = $null
+            $serializedSample = $null
+            if ($null -ne $deserializedSecure) {
+                $deserializedSecure.Dispose()
+            }
+            $secure.Dispose()
+        }
+    }
+    Write-Host "SecureString and DPAPI serializer round-trip PASS"
+    return
 }
 
 function Read-SecretDialog([string]$Prompt, [bool]$Required) {
@@ -70,7 +131,7 @@ function Read-SecretDialog([string]$Prompt, [bool]$Required) {
         if ($plain.Length -eq 0) {
             return [Security.SecureString]::new()
         }
-        return ConvertTo-SecureString -String $plain -AsPlainText -Force
+        return Convert-PlainTextToSecureString -Value $plain
     } finally {
         $input.Clear()
         $plain = $null
@@ -118,12 +179,23 @@ $parent = Split-Path -Parent $resolved
 New-Item -ItemType Directory -Path $parent -Force | Out-Null
 $temporary = "$resolved.tmp"
 try {
-    $payload | Export-Clixml -LiteralPath $temporary -Force
-    Move-Item -LiteralPath $temporary -Destination $resolved -Force
+    $serialized = [Management.Automation.PSSerializer]::Serialize($payload)
+    [IO.File]::WriteAllText(
+        $temporary,
+        $serialized,
+        [Text.UTF8Encoding]::new($false)
+    )
+    if ([IO.File]::Exists($resolved)) {
+        [IO.File]::Replace($temporary, $resolved, $null)
+    } else {
+        [IO.File]::Move($temporary, $resolved)
+    }
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     & icacls.exe $resolved /inheritance:r /grant:r "${owner}:(F)" | Out-Null
 } finally {
-    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    if ([IO.File]::Exists($temporary)) {
+        [IO.File]::Delete($temporary)
+    }
 }
 
 Write-Host "Encrypted current-user DPAPI credentials stored outside Git: $resolved"
