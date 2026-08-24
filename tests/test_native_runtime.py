@@ -122,7 +122,11 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     pilot = Path("scripts/laptop-pilot.ps1").read_text(encoding="utf-8")
 
     assert "Export-Clixml" in onboarding
-    assert "Read-Host" in onboarding and "-AsSecureString" in onboarding
+    assert "UseSystemPasswordChar = $true" in onboarding
+    assert "ShortcutsEnabled = $true" in onboarding
+    assert "ConvertTo-SecureString -String $plain -AsPlainText -Force" in onboarding
+    assert "$input.Clear()" in onboarding
+    assert "Write-Host $plain" not in onboarding
     assert 'QualificationRoute = "BTC:bybit>okx"' in onboarding
     assert "LIVE_CANARY_CONSENT" not in onboarding
     assert "IPEG_LOCAL_UNLOCK_SECRET" not in onboarding

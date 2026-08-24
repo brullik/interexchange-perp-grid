@@ -10,6 +10,9 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw "laptop-onboard.ps1 requires Windows DPAPI"
 }
 
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+
 function Confirm-Fact([string]$Prompt) {
     $answer = Read-Host "$Prompt Type CONFIRM"
     if ($answer -cne "CONFIRM") {
@@ -17,12 +20,70 @@ function Confirm-Fact([string]$Prompt) {
     }
 }
 
-function Read-RequiredSecret([string]$Prompt) {
-    $value = Read-Host $Prompt -AsSecureString
-    if ($value.Length -eq 0) {
-        throw "$Prompt is required"
+function Read-SecretDialog([string]$Prompt, [bool]$Required) {
+    $form = [Windows.Forms.Form]::new()
+    $form.Text = "Interexchange Perp Grid secure input"
+    $form.ClientSize = [Drawing.Size]::new(620, 150)
+    $form.FormBorderStyle = [Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.StartPosition = [Windows.Forms.FormStartPosition]::CenterScreen
+    $form.TopMost = $true
+
+    $label = [Windows.Forms.Label]::new()
+    $label.AutoSize = $true
+    $label.Location = [Drawing.Point]::new(16, 16)
+    $label.Text = $Prompt
+
+    $input = [Windows.Forms.TextBox]::new()
+    $input.Location = [Drawing.Point]::new(16, 46)
+    $input.Size = [Drawing.Size]::new(588, 27)
+    $input.UseSystemPasswordChar = $true
+    $input.ShortcutsEnabled = $true
+
+    $ok = [Windows.Forms.Button]::new()
+    $ok.DialogResult = [Windows.Forms.DialogResult]::OK
+    $ok.Location = [Drawing.Point]::new(430, 100)
+    $ok.Size = [Drawing.Size]::new(82, 30)
+    $ok.Text = "OK"
+
+    $cancel = [Windows.Forms.Button]::new()
+    $cancel.DialogResult = [Windows.Forms.DialogResult]::Cancel
+    $cancel.Location = [Drawing.Point]::new(522, 100)
+    $cancel.Size = [Drawing.Size]::new(82, 30)
+    $cancel.Text = "Cancel"
+
+    $form.AcceptButton = $ok
+    $form.CancelButton = $cancel
+    $form.Controls.AddRange([Windows.Forms.Control[]]@($label, $input, $ok, $cancel))
+    $form.Add_Shown({ $input.Focus() })
+
+    $plain = $null
+    try {
+        if ($form.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) {
+            throw "$Prompt input was cancelled; nothing was stored"
+        }
+        $plain = $input.Text
+        if ($Required -and $plain.Length -eq 0) {
+            throw "$Prompt is required"
+        }
+        if ($plain.Length -eq 0) {
+            return [Security.SecureString]::new()
+        }
+        return ConvertTo-SecureString -String $plain -AsPlainText -Force
+    } finally {
+        $input.Clear()
+        $plain = $null
+        $form.Dispose()
     }
-    return $value
+}
+
+function Read-RequiredSecret([string]$Prompt) {
+    return Read-SecretDialog -Prompt $Prompt -Required $true
+}
+
+function Read-OptionalSecret([string]$Prompt) {
+    return Read-SecretDialog -Prompt $Prompt -Required $false
 }
 
 Confirm-Fact "Confirm Binance USD-M, Bybit and OKX use dedicated subaccounts."
@@ -42,10 +103,10 @@ $payload = [pscustomobject]@{
     TelegramBotToken = Read-RequiredSecret "Telegram bot token"
     BinanceUsdmApiKey = Read-RequiredSecret "BINANCEUSDM API key"
     BinanceUsdmApiSecret = Read-RequiredSecret "BINANCEUSDM API secret"
-    BinanceUsdmApiPassword = Read-Host "BINANCEUSDM API password (empty when unused)" -AsSecureString
+    BinanceUsdmApiPassword = Read-OptionalSecret "BINANCEUSDM API password (empty when unused)"
     BybitApiKey = Read-RequiredSecret "BYBIT API key"
     BybitApiSecret = Read-RequiredSecret "BYBIT API secret"
-    BybitApiPassword = Read-Host "BYBIT API password (empty when unused)" -AsSecureString
+    BybitApiPassword = Read-OptionalSecret "BYBIT API password (empty when unused)"
     OkxApiKey = Read-RequiredSecret "OKX API key"
     OkxApiSecret = Read-RequiredSecret "OKX API secret"
     OkxApiPassword = Read-RequiredSecret "OKX API passphrase"
