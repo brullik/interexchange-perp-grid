@@ -183,7 +183,12 @@ class CcxtProAdapter(ExchangeAdapter):
             configuration["options"] = {
                 "defaultType": "future",
                 "defaultSubType": "linear",
+                "fetchMarkets": {"types": ["linear"]},
             }
+            # The generic Binance connector otherwise loads spot, linear, and
+            # inverse markets even when ``defaultType`` is future.  Keep its
+            # proven batch BBO/unsubscribe pair, but scope discovery strictly
+            # to the USD-M linear API.
             return ccxtpro.binance(configuration)
         if venue == Venue.BYBIT:
             return SequenceQualifiedBybitExchange(configuration)

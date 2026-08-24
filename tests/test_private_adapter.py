@@ -848,3 +848,37 @@ async def test_state_change_across_account_wide_samples_never_returns_complete_f
         record.reason == "ACCOUNT_WIDE_SNAPSHOT_UNSTABLE"
         for record in snapshot.unknown_active_records
     )
+
+
+class OrderedPrivateCloseExchange:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.session = self
+        self.own_session = True
+        self.clients = {"private": self}
+        self.futures = {"orders": self}
+
+    def cancel(self) -> None:
+        self.calls.append("future")
+
+    async def close_connector(self) -> None:
+        self.calls.append("connector")
+
+    async def ws_close(self) -> None:
+        self.calls.append("websocket")
+
+    async def close(self) -> None:
+        self.calls.append("session")
+
+    async def close_proxy_sessions(self) -> None:
+        self.calls.append("proxy")
+
+
+@pytest.mark.asyncio
+async def test_private_probe_shutdown_aborts_connector_before_websocket_handshake() -> None:
+    exchange = OrderedPrivateCloseExchange()
+    adapter = CcxtPrivateAdapter(Venue.BYBIT, exchange=exchange)
+
+    await adapter.close()
+
+    assert exchange.calls == ["future", "connector", "websocket", "session", "proxy"]

@@ -65,6 +65,30 @@ def test_public_scan_rejects_non_decimal_quantity_before_network() -> None:
     assert "quantity must be a decimal number" in result.output
 
 
+def test_private_probe_reports_only_sanitized_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingPrivateAdapter:
+        def __init__(self, venue: Venue) -> None:
+            del venue
+
+        async def probe_private_capabilities(self) -> object:
+            raise RuntimeError("signed request and credential-like material")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli_module, "CcxtPrivateAdapter", FailingPrivateAdapter)
+
+    result = runner.invoke(app, ["private-probe", "--venue", "bybit"])
+
+    assert result.exit_code == 4
+    assert '"error_type": "RuntimeError"' in result.output
+    assert '"qualified": false' in result.output
+    assert "credential-like" not in result.output
+    assert "Traceback" not in result.output
+
+
 def test_public_scan_wires_every_configured_public_venue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -34,7 +34,10 @@ $manifest = Get-Content -LiteralPath $env:IPEG_NATIVE_RUNTIME_MANIFEST -Raw | Co
 $env:IPEG_RELEASE_SHA = [string]$manifest.release_sha
 $env:IPEG_CONTAINER_IMAGE_DIGEST = [string]$manifest.artifact_digest
 
-foreach ($venue in @("binanceusdm", "bybit", "okx")) {
+# The locked laptop route is Bybit -> OKX. Binance USD-M is the first
+# alternate in GOAL.md and may be geographically unavailable; it must not
+# block qualification of the required private pair.
+foreach ($venue in @("bybit", "okx")) {
     & $python -m interexchange_perp_grid.cli private-probe --venue $venue
     if ($LASTEXITCODE -ne 0) { throw "$venue private capability probe failed" }
 }

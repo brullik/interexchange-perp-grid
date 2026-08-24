@@ -144,6 +144,8 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert '$env:IPEG_RUNTIME_KIND = "native-python"' in loader
     assert "Docker" not in qualification
     assert "private-probe" in qualification
+    assert 'foreach ($venue in @("bybit", "okx"))' in qualification
+    assert 'foreach ($venue in @("binanceusdm", "bybit", "okx"))' not in qualification
     assert "SetThreadExecutionState" in qualification
     assert 'if ($consent -cne "I_ACCEPT_LIVE_CANARY_RISK")' in pilot
     assert '$env:IPEG_LIVE_ENABLED = "true"' in pilot
