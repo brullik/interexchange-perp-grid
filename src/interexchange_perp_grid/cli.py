@@ -1445,14 +1445,26 @@ def region_latency_select(
 @app.command("private-probe")
 def private_probe(
     venue: Annotated[str, typer.Option("--venue")],
+    authenticated: Annotated[bool, typer.Option("--authenticated")] = False,
 ) -> None:
-    """Read-only probe of one venue transport's declared private capabilities."""
+    """Read-only probe of declared capabilities and optional account authentication."""
     selected = Venue(venue)
 
     async def probe() -> PrivateCapabilityReport:
-        adapter = CcxtPrivateAdapter(selected)
+        credentials = PrivateCredentials.from_environment(selected) if authenticated else None
+        adapter = CcxtPrivateAdapter(selected, credentials=credentials)
         try:
-            return await adapter.probe_private_capabilities()
+            report = await adapter.probe_private_capabilities()
+            if authenticated:
+                instruments = await adapter.list_instruments()
+                instrument = next(
+                    (candidate for candidate in instruments if candidate.base == "BTC"),
+                    None,
+                )
+                if instrument is None:
+                    raise RuntimeError("BTC linear instrument is unavailable")
+                await adapter.fetch_account(instrument)
+            return report
         finally:
             await adapter.close()
 

@@ -4,12 +4,14 @@ import asyncio
 import re
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 from typer.testing import CliRunner
 
 import interexchange_perp_grid.cli as cli_module
+from interexchange_perp_grid.adapters.private import PrivateCredentials
 from interexchange_perp_grid.cli import _run_public_scan, app
 from interexchange_perp_grid.config import load_settings
 from interexchange_perp_grid.domain import Venue
@@ -69,8 +71,8 @@ def test_private_probe_reports_only_sanitized_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FailingPrivateAdapter:
-        def __init__(self, venue: Venue) -> None:
-            del venue
+        def __init__(self, venue: Venue, credentials: object | None = None) -> None:
+            del venue, credentials
 
         async def probe_private_capabilities(self) -> object:
             raise RuntimeError("signed request and credential-like material")
@@ -87,6 +89,50 @@ def test_private_probe_reports_only_sanitized_failure(
     assert '"qualified": false' in result.output
     assert "credential-like" not in result.output
     assert "Traceback" not in result.output
+
+
+def test_private_probe_authenticated_reads_account_without_exposing_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FailingAccountAdapter:
+        def __init__(self, venue: Venue, credentials: object | None = None) -> None:
+            captured["venue"] = venue
+            captured["credentials"] = credentials
+
+        async def probe_private_capabilities(self) -> object:
+            return object()
+
+        async def list_instruments(self) -> tuple[SimpleNamespace, ...]:
+            return (SimpleNamespace(base="BTC"),)
+
+        async def fetch_account(self, instrument: object) -> None:
+            captured["account_instrument"] = instrument
+            raise RuntimeError("account response must remain private")
+
+        async def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setattr(cli_module, "CcxtPrivateAdapter", FailingAccountAdapter)
+    environment = {
+        "IPEG_BYBIT_API_KEY": "fixture-key",
+        "IPEG_BYBIT_API_SECRET": "fixture-secret",
+    }
+
+    result = runner.invoke(
+        app,
+        ["private-probe", "--venue", "bybit", "--authenticated"],
+        env=environment,
+    )
+
+    assert result.exit_code == 4
+    assert '"error_type": "RuntimeError"' in result.output
+    assert "account response" not in result.output
+    assert captured["venue"] == Venue.BYBIT
+    assert isinstance(captured["credentials"], PrivateCredentials)
+    assert "account_instrument" in captured
+    assert captured["closed"] is True
 
 
 def test_public_scan_wires_every_configured_public_venue(

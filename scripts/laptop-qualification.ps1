@@ -10,6 +10,12 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 . "$PSScriptRoot/laptop-load-env.ps1" -ProfilePath $ProfilePath
 
+$laptopState = Join-Path $root "state/laptop"
+$laptopTemp = Join-Path $laptopState "tmp"
+New-Item -ItemType Directory -Path $laptopTemp -Force | Out-Null
+$env:TEMP = $laptopTemp
+$env:TMP = $laptopTemp
+
 $timeService = Get-Service W32Time
 if ($timeService.Status -ne "Running" -or $timeService.StartType -ne "Automatic") {
     throw "W32Time must be Running with Automatic startup"
@@ -38,12 +44,12 @@ $env:IPEG_CONTAINER_IMAGE_DIGEST = [string]$manifest.artifact_digest
 # alternate in GOAL.md and may be geographically unavailable; it must not
 # block qualification of the required private pair.
 foreach ($venue in @("bybit", "okx")) {
-    & $python -m interexchange_perp_grid.cli private-probe --venue $venue
+    & $python -m interexchange_perp_grid.cli private-probe `
+        --venue $venue `
+        --authenticated
     if ($LASTEXITCODE -ne 0) { throw "$venue private capability probe failed" }
 }
 
-$laptopState = Join-Path $root "state/laptop"
-New-Item -ItemType Directory -Path $laptopState -Force | Out-Null
 $replayProof = Join-Path $laptopState "replay-proof.json"
 $runtimeEvidence = Join-Path $laptopState "qualification-runtime.json"
 $qualificationEvidence = Join-Path $root "state/qualification.json"
