@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$ProfilePath = "state/laptop-profile.clixml"
+    [string]$ProfilePath = "state/laptop-profile.clixml",
+    [ValidateSet("CurrentUser", "LocalMachine")]
+    [string]$ProfileScope = "CurrentUser"
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,7 +10,11 @@ Set-StrictMode -Version Latest
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
-. "$PSScriptRoot/laptop-load-env.ps1" -ProfilePath $ProfilePath
+if ($ProfileScope -ceq "LocalMachine") {
+    . "$PSScriptRoot/laptop-load-s4u-env.ps1" -ProfilePath $ProfilePath
+} else {
+    . "$PSScriptRoot/laptop-load-env.ps1" -ProfilePath $ProfilePath
+}
 
 $laptopState = Join-Path $root "state/laptop"
 $laptopTemp = Join-Path $laptopState "tmp"
