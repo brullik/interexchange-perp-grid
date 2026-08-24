@@ -27,6 +27,7 @@ from interexchange_perp_grid.observability import (
     get_logger,
 )
 from interexchange_perp_grid.priority_scheduler import PriorityWorkScheduler
+from interexchange_perp_grid.qualification import QualificationPolicy
 from interexchange_perp_grid.shadow import ContinuousShadowEvaluator, ShadowRuntime
 from interexchange_perp_grid.state import (
     initialise_state,
@@ -124,6 +125,7 @@ class BootstrapService:
     run_shadow: bool = True
     recovery_runner: RecoveryRunner | None = None
     supervisor_poll_interval_seconds: float = 1.0
+    qualification_policy: QualificationPolicy | None = None
 
     @property
     def state_path(self) -> Path:
@@ -177,7 +179,10 @@ class BootstrapService:
         if self.settings.app.mode == "shadow":
             background_tasks.append(
                 asyncio.create_task(
-                    AutonomousOrchestrator(self.settings).run(stop_event),
+                    AutonomousOrchestrator(
+                        self.settings,
+                        qualification_policy=self.qualification_policy,
+                    ).run(stop_event),
                     name="autonomous-orchestrator",
                 )
             )

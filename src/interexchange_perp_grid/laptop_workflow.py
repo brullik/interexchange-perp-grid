@@ -14,7 +14,13 @@ from interexchange_perp_grid.live_journal import (
     completed_normal_actions_sha256,
     is_completed_normal_paired_cycle,
 )
-from interexchange_perp_grid.qualification import QualificationEvidence
+from interexchange_perp_grid.qualification import (
+    LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS,
+    QualificationEvidence,
+    QualificationPolicy,
+    laptop_owner_exception_policy,
+    qualification_policy_from_settings,
+)
 from interexchange_perp_grid.service import BootstrapService, BoundedServiceReceipt
 from interexchange_perp_grid.state import (
     QualificationEpoch,
@@ -70,14 +76,27 @@ async def run_until_qualification_finalized(
     *,
     maximum_seconds: float = 108_000,
     poll_interval_seconds: float = 5,
+    qualification_policy: QualificationPolicy | None = None,
 ) -> QualificationEpoch:
-    if not 86_400 <= maximum_seconds <= 108_000:
-        raise ValueError("native qualification deadline must be between 24 and 30 hours")
+    selected_policy = qualification_policy or qualification_policy_from_settings(settings)
+    if not selected_policy.minimum_duration_seconds <= maximum_seconds <= 108_000:
+        raise ValueError(
+            "native qualification deadline must cover its policy and stay within 30 hours"
+        )
     if not 0 < poll_interval_seconds <= 60:
         raise ValueError("native qualification polling interval is invalid")
+    service_settings = settings
+    if selected_policy == laptop_owner_exception_policy(settings):
+        service_settings = settings.model_copy(
+            update={
+                "shadow": settings.shadow.model_copy(
+                    update={"scan_interval_seconds": (LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS)}
+                )
+            }
+        )
     stop_event = asyncio.Event()
     service = asyncio.create_task(
-        BootstrapService(settings).run(stop_event),
+        BootstrapService(service_settings, qualification_policy=selected_policy).run(stop_event),
         name="native-laptop-qualification-service",
     )
     deadline = asyncio.get_running_loop().time() + maximum_seconds

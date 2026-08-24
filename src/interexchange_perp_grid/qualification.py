@@ -5,6 +5,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -14,6 +16,7 @@ from typing import Any
 
 import duckdb
 
+from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import PairActionState
 from interexchange_perp_grid.reason_codes import ReasonCode
@@ -22,6 +25,10 @@ from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _IMAGE_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+LAPTOP_OWNER_EXCEPTION_MINIMUM_DURATION_SECONDS = 43_200
+LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS = 3
+LAPTOP_OWNER_EXCEPTION_CONFIRMATION = "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION"
+LAPTOP_OWNER_EXCEPTION_ENV = "IPEG_LAPTOP_12H_OWNER_EXCEPTION"
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +169,53 @@ class QualificationPolicy:
         )
         if any(value <= 0 for value in positive) or any(value < 0 for value in non_negative):
             raise ValueError("invalid qualification policy")
+
+
+def qualification_policy_from_settings(settings: Settings) -> QualificationPolicy:
+    """Build the standard, repository-locked qualification policy."""
+    return QualificationPolicy(
+        minimum_duration_seconds=settings.shadow.qualification_min_duration_seconds,
+        minimum_synchronised_snapshots_per_venue=(
+            settings.shadow.qualification_min_synchronised_snapshots_per_venue
+        ),
+        minimum_funding_checkpoints_per_venue=(
+            settings.shadow.qualification_min_funding_checkpoints_per_venue
+        ),
+        maximum_inter_snapshot_gap_seconds=(
+            settings.shadow.qualification_max_inter_snapshot_gap_seconds
+        ),
+        maximum_sequence_gaps=settings.shadow.qualification_max_sequence_gaps,
+        maximum_stale_snapshots=settings.shadow.qualification_max_stale_snapshots,
+        maximum_sequence_unknown_snapshots=(
+            settings.shadow.qualification_max_sequence_unknown_snapshots
+        ),
+        maximum_clock_skew_snapshots=settings.shadow.qualification_max_clock_skew_snapshots,
+        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+        maximum_snapshot_age_ms=settings.market_data.max_l2_age_ms,
+    )
+
+
+def laptop_owner_exception_policy(settings: Settings) -> QualificationPolicy:
+    """Return the one allowed laptop-only policy delta; VPS/default stays at 24 hours."""
+    standard = qualification_policy_from_settings(settings)
+    if standard.minimum_duration_seconds != 86_400:
+        raise ValueError("laptop exception requires the exact standard 24-hour policy")
+    return replace(
+        standard,
+        minimum_duration_seconds=LAPTOP_OWNER_EXCEPTION_MINIMUM_DURATION_SECONDS,
+    )
+
+
+def laptop_owner_exception_authorized(
+    environ: Mapping[str, str] | None = None,
+    *,
+    platform: str | None = None,
+) -> bool:
+    """Require an explicit local Windows receipt; it is not a live-order consent."""
+    observed = environ if environ is not None else os.environ
+    return (platform or sys.platform) == "win32" and observed.get(
+        LAPTOP_OWNER_EXCEPTION_ENV, ""
+    ) == LAPTOP_OWNER_EXCEPTION_CONFIRMATION
 
 
 @dataclass(frozen=True, slots=True)
@@ -676,7 +730,7 @@ async def build_qualification_progress(
     policy: QualificationPolicy,
     now: datetime | None = None,
 ) -> QualificationProgress:
-    """Report exact persisted 24h progress without treating elapsed time as qualification."""
+    """Report exact persisted policy progress without treating elapsed time as qualification."""
     from interexchange_perp_grid.state import (
         load_tranches,
         read_qualification_epoch,
@@ -1027,6 +1081,7 @@ def qualification_is_current(
     expected_route: DirectedRouteKey | None = None,
     current_container_image_digest: str | None = None,
     current_release_code_sha: str | None = None,
+    accepted_policies: tuple[QualificationPolicy, ...] | None = None,
 ) -> tuple[bool, ReasonCode]:
     observed_at = now or datetime.now(UTC)
     release_sha = current_release_code_sha or current_code_commit_sha(repo_root)
@@ -1043,9 +1098,16 @@ def qualification_is_current(
         and evidence.qualification_hash == _qualification_hash(evidence)
     )
     route_matches = expected_route is None or evidence.route == expected_route
+    policy_matches = accepted_policies is None or evidence.policy in accepted_policies
     age_seconds = (observed_at - evidence.generated_at).total_seconds()
     fresh = 0 <= age_seconds <= max_age_seconds
-    if not evidence.accepted or not hashes_match or not route_matches or not fresh:
+    if (
+        not evidence.accepted
+        or not hashes_match
+        or not route_matches
+        or not policy_matches
+        or not fresh
+    ):
         return False, ReasonCode.QUALIFICATION_HASH_MISMATCH
     return True, ReasonCode.QUALIFICATION_PASSED
 

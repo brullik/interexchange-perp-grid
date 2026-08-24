@@ -14,6 +14,11 @@ from interexchange_perp_grid.autonomous_orchestrator import (
     load_autonomous_runtime_status,
 )
 from interexchange_perp_grid.config import load_settings
+from interexchange_perp_grid.qualification import (
+    LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
+    LAPTOP_OWNER_EXCEPTION_ENV,
+    laptop_owner_exception_policy,
+)
 from interexchange_perp_grid.state import (
     QualificationEpochStatus,
     read_active_qualification_epoch,
@@ -37,6 +42,22 @@ def _settings(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 def _confirm_onboarding(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("IPEG_OWNER_ONBOARDING_CONFIRMED", "true")
+
+
+def test_orchestrator_requires_local_receipt_for_laptop_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    policy = laptop_owner_exception_policy(settings)
+    monkeypatch.delenv(LAPTOP_OWNER_EXCEPTION_ENV, raising=False)
+
+    with pytest.raises(ValueError, match="lacks the local Windows receipt"):
+        AutonomousOrchestrator(settings, qualification_policy=policy)
+
+    monkeypatch.setenv(LAPTOP_OWNER_EXCEPTION_ENV, LAPTOP_OWNER_EXCEPTION_CONFIRMATION)
+    orchestrator = AutonomousOrchestrator(settings, qualification_policy=policy)
+    assert orchestrator.qualification_policy == policy
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,8 +43,14 @@ from interexchange_perp_grid.live_simulator import (
 from interexchange_perp_grid.market_data import DataQualityAssessment
 from interexchange_perp_grid.private_domain import PrivateCapabilityReport, VenueOrderRequest
 from interexchange_perp_grid.private_execution import translate_protected_order
+from interexchange_perp_grid.qualification import (
+    LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
+    LAPTOP_OWNER_EXCEPTION_ENV,
+    laptop_owner_exception_policy,
+)
 from interexchange_perp_grid.reason_codes import ReasonCode
-from interexchange_perp_grid.state import RuntimeControls
+from interexchange_perp_grid.risk_stages import load_locked_risk_stage_table
+from interexchange_perp_grid.state import RiskStage, RuntimeControls
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
 
@@ -504,6 +511,89 @@ async def test_shadow_risk_stage_blocks_canary_before_network_construction(
         settings,
         Path("config/defaults.yaml"),
         tmp_path / "missing-qualification.json",
+        Path("."),
+        OWNER_CONFIRMATION,
+    )
+
+    assert result.reason == ReasonCode.CANARY_POLICY_VIOLATION
+    assert result.orders_sent == 0
+    assert constructed == 0
+
+
+@pytest.mark.asyncio
+async def test_laptop_exception_allows_only_one_completed_canary_before_network(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import interexchange_perp_grid.canary_runtime as runtime_module
+
+    constructed = 0
+
+    class ForbiddenAdapter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            nonlocal constructed
+            del args, kwargs
+            constructed += 1
+            raise AssertionError("network adapter constructed after laptop canary was consumed")
+
+    settings = load_settings(
+        Path("config/defaults.yaml"),
+        {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")},
+    )
+    locked = load_locked_risk_stage_table(Path("config/RUNTIME_POLICY.yaml"))
+    route = DirectedRouteKey("BTC", Venue.BYBIT, Venue.OKX)
+    generated_at = datetime.now(UTC)
+    qualification_hash = "a" * 64
+    qualification_path = tmp_path / "qualification.json"
+    qualification_path.touch()
+    evidence = SimpleNamespace(
+        route=route,
+        strategy=object(),
+        replay_shadow=object(),
+        policy=laptop_owner_exception_policy(settings),
+        generated_at=generated_at,
+        qualification_hash=qualification_hash,
+    )
+
+    async def risk_stage(_: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            stage=RiskStage.CANARY,
+            completion_frozen=False,
+            qualification_hash=qualification_hash,
+            runtime_policy_sha256=locked.runtime_policy_sha256,
+        )
+
+    async def completed_actions_since(
+        self: LiveOrderJournal,
+        started_at: datetime,
+        observed_qualification_hash: str,
+    ) -> tuple[object, ...]:
+        del self
+        assert started_at == generated_at
+        assert observed_qualification_hash == qualification_hash
+        return (object(),)
+
+    monkeypatch.setenv(LAPTOP_OWNER_EXCEPTION_ENV, LAPTOP_OWNER_EXCEPTION_CONFIRMATION)
+    monkeypatch.setattr(runtime_module, "read_risk_stage", risk_stage)
+    monkeypatch.setattr(runtime_module, "load_qualification", lambda _: evidence)
+    monkeypatch.setattr(
+        runtime_module,
+        "resolve_runtime_artifact_digest",
+        lambda *_: "sha256:" + "b" * 64,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "qualification_is_current",
+        lambda *_args, **_kwargs: (True, ReasonCode.QUOTE_READY),
+    )
+    monkeypatch.setattr(LiveOrderJournal, "completed_actions_since", completed_actions_since)
+    monkeypatch.setattr(runtime_module, "CcxtProAdapter", ForbiddenAdapter)
+    monkeypatch.setattr(runtime_module, "CcxtPrivateAdapter", ForbiddenAdapter)
+
+    result = await run_canary_once(
+        settings,
+        Path("config/defaults.yaml"),
+        qualification_path,
         Path("."),
         OWNER_CONFIRMATION,
     )

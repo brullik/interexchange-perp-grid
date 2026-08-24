@@ -20,6 +20,9 @@ from interexchange_perp_grid.qualification import (
     build_qualification_progress,
     code_hash,
     config_hash,
+    laptop_owner_exception_authorized,
+    laptop_owner_exception_policy,
+    qualification_policy_from_settings,
 )
 from interexchange_perp_grid.state import (
     QualificationEpochStatus,
@@ -72,23 +75,7 @@ def _parse_route(raw: str) -> DirectedRouteKey:
 
 
 def _policy(settings: Settings) -> QualificationPolicy:
-    shadow = settings.shadow
-    return QualificationPolicy(
-        minimum_duration_seconds=shadow.qualification_min_duration_seconds,
-        minimum_synchronised_snapshots_per_venue=(
-            shadow.qualification_min_synchronised_snapshots_per_venue
-        ),
-        minimum_funding_checkpoints_per_venue=(
-            shadow.qualification_min_funding_checkpoints_per_venue
-        ),
-        maximum_inter_snapshot_gap_seconds=(shadow.qualification_max_inter_snapshot_gap_seconds),
-        maximum_sequence_gaps=shadow.qualification_max_sequence_gaps,
-        maximum_stale_snapshots=shadow.qualification_max_stale_snapshots,
-        maximum_sequence_unknown_snapshots=(shadow.qualification_max_sequence_unknown_snapshots),
-        maximum_clock_skew_snapshots=shadow.qualification_max_clock_skew_snapshots,
-        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
-        maximum_snapshot_age_ms=settings.market_data.max_l2_age_ms,
-    )
+    return qualification_policy_from_settings(settings)
 
 
 def _write_status_sync(path: Path, status: AutonomousRuntimeStatus) -> None:
@@ -138,8 +125,10 @@ async def _progress_from_subprocess(
     repo_root: Path,
     config_path: Path,
     epoch_id: str,
+    *,
+    laptop_owner_exception_12h: bool = False,
 ) -> _ProgressSnapshot:
-    process = await asyncio.create_subprocess_exec(
+    command = [
         sys.executable,
         "-m",
         "interexchange_perp_grid.cli",
@@ -148,6 +137,11 @@ async def _progress_from_subprocess(
         epoch_id,
         "--config",
         str(config_path.resolve()),
+    ]
+    if laptop_owner_exception_12h:
+        command.append("--laptop-owner-exception-12h")
+    process = await asyncio.create_subprocess_exec(
+        *command,
         cwd=repo_root.resolve(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -181,6 +175,22 @@ class AutonomousOrchestrator:
     poll_interval_seconds: float = 5.0
     status_path: Path | None = None
     use_progress_subprocess: bool = True
+    qualification_policy: QualificationPolicy | None = None
+
+    def __post_init__(self) -> None:
+        standard = _policy(self.settings)
+        laptop_exception = laptop_owner_exception_policy(self.settings)
+        if self.qualification_policy not in {
+            None,
+            standard,
+            laptop_exception,
+        }:
+            raise ValueError("unsupported qualification policy override")
+        if (
+            self.qualification_policy == laptop_exception
+            and not laptop_owner_exception_authorized()
+        ):
+            raise ValueError("laptop qualification exception lacks the local Windows receipt")
 
     @property
     def state_path(self) -> Path:
@@ -317,11 +327,14 @@ class AutonomousOrchestrator:
                     )
                 )
             active = await start_qualification_epoch(self.state_path, *identity)
+        selected_policy = self.qualification_policy or _policy(self.settings)
+        laptop_exception = selected_policy == laptop_owner_exception_policy(self.settings)
         if self.use_progress_subprocess:
             progress = await _progress_from_subprocess(
                 self.repo_root,
                 self.config_path,
                 active.epoch_id,
+                laptop_owner_exception_12h=laptop_exception,
             )
         else:
             observed = await asyncio.to_thread(
@@ -329,7 +342,7 @@ class AutonomousOrchestrator:
                 self.state_path,
                 Path(self.settings.storage.parquet_dir),
                 active.epoch_id,
-                _policy(self.settings),
+                selected_policy,
             )
             progress = _ProgressSnapshot(
                 observed.ready_to_finalize,
