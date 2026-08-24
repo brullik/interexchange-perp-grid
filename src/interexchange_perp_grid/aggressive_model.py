@@ -70,6 +70,7 @@ class HistoricalModelPolicy:
         Decimal("0.30"),
     )
     stop_buffer_ratio: Decimal = Decimal("0.15")
+    rearm_retreat_step_fraction: Decimal = Decimal("0.25")
 
     def __post_init__(self) -> None:
         if not (
@@ -95,6 +96,8 @@ class HistoricalModelPolicy:
             raise ValueError("exactly five tranche weights summing to one are required")
         if self.stop_buffer_ratio <= 0:
             raise ValueError("stop buffer must be positive")
+        if not 0 < self.rearm_retreat_step_fraction < 1:
+            raise ValueError("rearm retreat fraction must be within (0, 1)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +322,7 @@ def load_historical_model_policy(path: Path) -> LoadedHistoricalModelPolicy:
         level_fractions=_required_decimal_tuple(grid, "level_fractions"),
         tranche_weights=_required_decimal_tuple(grid, "tranche_weights"),
         stop_buffer_ratio=_required_decimal(grid, "stop_buffer_ratio"),
+        rearm_retreat_step_fraction=_required_decimal(grid, "rearm_retreat_step_fraction"),
     )
     return LoadedHistoricalModelPolicy(
         policy=policy,

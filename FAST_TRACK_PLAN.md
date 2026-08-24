@@ -53,14 +53,14 @@
 
 ## A3 — полноценная persistent five-level state machine
 
-- [ ] Хранить состояние каждого уровня: `ARMED`, `ENTRY_PENDING`, `OPEN`, `EXIT_PENDING`, `CLOSED_WAIT_REARM`, `DISABLED`.
-- [ ] Выбирать `first_unfilled_crossed_level`, а не всегда `entry_levels_bps[0]`.
-- [ ] Один уровень может быть заполнен ровно один раз до re-arm; шестая часть невозможна.
-- [ ] При gap через несколько уровней открывать не более одной части за decision cycle, затем заново получать свежие L2 books, economics и risk.
-- [ ] Каждой части принадлежит actual two-leg quantity/fills/fees/funding/target/stop/risk/model version.
-- [ ] Реализовать reverse-grid exit глубоких частей и normal-zone exit первой части.
-- [ ] Реализовать re-arm только после retreat минимум на 0.25 шага и повторного пересечения.
-- [ ] После restart восстановить те же level states и запретить duplicate open/close.
+- [x] Хранить состояние каждого уровня: `ARMED`, `ENTRY_PENDING`, `OPEN`, `EXIT_PENDING`, `CLOSED_WAIT_REARM`, `DISABLED`.
+- [x] Выбирать `first_unfilled_crossed_level`, а не всегда `entry_levels_bps[0]`.
+- [x] Один уровень может быть заполнен ровно один раз до re-arm; шестая часть невозможна.
+- [x] При gap через несколько уровней открывать не более одной части за decision cycle, затем заново получать свежие L2 books, economics и risk.
+- [x] Каждой части принадлежит actual two-leg quantity/fills/fees/funding/target/stop/risk/model version.
+- [x] Реализовать reverse-grid exit глубоких частей и normal-zone exit первой части.
+- [x] Реализовать re-arm только после retreat минимум на 0.25 шага и повторного пересечения.
+- [x] После restart восстановить те же level states и запретить duplicate open/close.
 
 **Выход:** deterministic replay демонстрирует уровни 1→5, частичные reverse exits, re-arm, повторную осцилляцию и полный stable-FLAT без превышения лимитов.
 
