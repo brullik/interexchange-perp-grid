@@ -66,17 +66,17 @@
 
 ## A4 — hybrid entry, aggressive economics и sizing
 
-- [ ] Один общий evaluator требует одновременно reference trigger и свежий executable L2/VWAP edge.
-- [ ] Использовать profile `config/AGGRESSIVE_SYMBIOSIS_V1.yaml` как единственный источник новых числовых параметров.
-- [ ] Установить normal cost multiplier 1.35 и minimum expected net profit 0.15 USDT; canary override 0.01 действует только в locked canary stage.
-- [ ] Учитывать 50% прогнозируемого положительного funding, 100% неблагоприятного и 2x adverse funding stress.
-- [ ] Запрещать вход, если convergence PnL без положительного funding неположителен.
-- [ ] Сохранять actual private taker fees; unknown fee/funding/depth блокирует вход.
-- [ ] Рассчитывать полный размер с весами частей так, чтобы modelled route loss <=4.50 USDT, hard projected <=5.00 USDT.
-- [ ] Для портфеля использовать normal admission <=45 USDT и hard projected <=50 USDT.
+- [x] Один общий evaluator требует одновременно reference trigger и свежий executable L2/VWAP edge.
+- [x] Использовать profile `config/AGGRESSIVE_SYMBIOSIS_V1.yaml` как единственный источник новых числовых параметров.
+- [x] Установить normal cost multiplier 1.35 и minimum expected net profit 0.15 USDT; canary override 0.01 действует только в locked canary stage.
+- [x] Учитывать 50% прогнозируемого положительного funding, 100% неблагоприятного и 2x adverse funding stress.
+- [x] Запрещать вход, если convergence PnL без положительного funding неположителен.
+- [x] Сохранять actual private taker fees; unknown fee/funding/depth блокирует вход.
+- [x] Рассчитывать полный размер с весами частей так, чтобы modelled route loss <=4.50 USDT, hard projected <=5.00 USDT.
+- [x] Для портфеля использовать normal admission <=45 USDT и hard projected <=50 USDT.
 - [ ] После lot/step rounding и каждого фактического fill пересчитывать риск; уменьшать/пропускать часть при нехватке residual budget.
 - [ ] Подключить executable stop и hard projected-loss exit в replay, shadow и live supervisor с одинаковым приоритетом.
-- [ ] Реализовать deterministic route score и tie-breakers из profile.
+- [x] Реализовать deterministic route score и tie-breakers из profile.
 
 **Выход:** property/fault tests доказывают лимиты после каждого accepted action, реальную остановку по stop и отсутствие входа только по красивому, но неисполняемому reference spread.
 
