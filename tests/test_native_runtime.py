@@ -119,6 +119,8 @@ def test_runtime_digest_resolver_requires_exact_native_manifest(
 def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> None:
     onboarding = Path("scripts/laptop-onboard.ps1").read_text(encoding="utf-8")
     loader = Path("scripts/laptop-load-env.ps1").read_text(encoding="utf-8")
+    s4u_migrator = Path("scripts/laptop-migrate-s4u-profile.ps1").read_text(encoding="utf-8")
+    s4u_loader = Path("scripts/laptop-load-s4u-env.ps1").read_text(encoding="utf-8")
     qualification = Path("scripts/laptop-qualification.ps1").read_text(encoding="utf-8")
     pilot = Path("scripts/laptop-pilot.ps1").read_text(encoding="utf-8")
 
@@ -142,7 +144,21 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert '$env:IPEG_LIVE_ENABLED = "false"' in loader
     assert '$env:IPEG_MODE = "shadow"' in loader
     assert '$env:IPEG_RUNTIME_KIND = "native-python"' in loader
+    assert "DataProtectionScope]::LocalMachine" in s4u_migrator
+    assert "DataProtectionScope]::LocalMachine" in s4u_loader
+    assert "Add-Type -AssemblyName System.Security" in s4u_migrator
+    assert "Add-Type -AssemblyName System.Security" in s4u_loader
+    assert '/inheritance:r /grant:r "${owner}:(F)"' in s4u_migrator
+    assert "[IO.File]::GetAccessControl" in s4u_loader
+    assert "Get-Acl" not in s4u_loader
+    assert "AreAccessRulesProtected" in s4u_loader
+    assert "ACL permits another identity" in s4u_loader
+    assert '$env:IPEG_LIVE_ENABLED = "false"' in s4u_loader
+    assert "Write-Host $plainJson" not in s4u_migrator
+    assert "Write-Host $plainJson" not in s4u_loader
     assert "Docker" not in qualification
+    assert '[ValidateSet("CurrentUser", "LocalMachine")]' in qualification
+    assert "laptop-load-s4u-env.ps1" in qualification
     assert "private-probe" in qualification
     assert "--authenticated" in qualification
     assert 'foreach ($venue in @("bybit", "okx"))' in qualification
@@ -158,6 +174,8 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "--service-receipt $serviceReceipt" in pilot
     assert "laptop-pilot-report" in pilot
     assert "SetThreadExecutionState" in pilot
+    assert '[ValidateSet("CurrentUser", "LocalMachine")]' in pilot
+    assert "laptop-load-s4u-env.ps1" in pilot
     assert "LIVE_CANARY_CONSENT" not in loader
     assert "risk-stage-promote" in pilot and "PROMOTE:canary" in pilot
     assert pilot.index("Start-Process") < pilot.index('$env:IPEG_LIVE_ENABLED = "true"')
@@ -203,3 +221,85 @@ def test_windows_onboarding_secure_string_runtime_round_trip() -> None:
     )
 
     assert "Secret dialog runtime round-trip PASS" in dialog_completed.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")
+def test_windows_s4u_local_machine_dpapi_profile_round_trip(tmp_path: Path) -> None:
+    fixture = tmp_path / "current-user-profile.clixml"
+    envelope = tmp_path / "s4u-profile.json"
+    migration = Path("scripts/laptop-migrate-s4u-profile.ps1").resolve()
+    loader = Path("scripts/laptop-load-s4u-env.ps1").resolve()
+    test_script = tmp_path / "round-trip.ps1"
+    test_script.write_text(
+        f"""
+$ErrorActionPreference = "Stop"
+function New-Secret([string]$Value) {{
+    $secure = [Security.SecureString]::new()
+    foreach ($character in $Value.ToCharArray()) {{ $secure.AppendChar($character) }}
+    $secure.MakeReadOnly()
+    return $secure
+}}
+$payload = [pscustomobject]@{{
+    SchemaVersion = 1
+    QualificationRoute = "BTC:bybit>okx"
+    TelegramOwnerChatId = "123456789"
+    TelegramBotToken = New-Secret "123456789:AA_ab-CD/+= token"
+    BinanceUsdmApiKey = New-Secret "binance-key"
+    BinanceUsdmApiSecret = New-Secret "binance-secret"
+    BinanceUsdmApiPassword = New-Secret ""
+    BybitApiKey = New-Secret "bybit-key"
+    BybitApiSecret = New-Secret "bybit-secret"
+    BybitApiPassword = New-Secret ""
+    OkxApiKey = New-Secret "okx-key"
+    OkxApiSecret = New-Secret "okx-secret"
+    OkxApiPassword = New-Secret "okx-passphrase"
+}}
+[IO.File]::WriteAllText(
+    '{fixture.as_posix()}',
+    [Management.Automation.PSSerializer]::Serialize($payload),
+    [Text.UTF8Encoding]::new($false)
+)
+& '{migration.as_posix()}' `
+    -InputPath '{fixture.as_posix()}' `
+    -OutputPath '{envelope.as_posix()}'
+. '{loader.as_posix()}' `
+    -ProfilePath '{envelope.as_posix()}' `
+    -StatePath '{(tmp_path / "state.sqlite3").as_posix()}' `
+    -MarketPath '{(tmp_path / "market").as_posix()}'
+if ($env:IPEG_MODE -cne "shadow" -or $env:IPEG_LIVE_ENABLED -cne "false") {{
+    throw "S4U loader widened live authority"
+}}
+if ($env:IPEG_QUALIFICATION_ROUTE -cne "BTC:bybit>okx") {{
+    throw "S4U loader changed the locked route"
+}}
+if (
+    $env:IPEG_TELEGRAM_BOT_TOKEN -cne "123456789:AA_ab-CD/+= token" -or
+    $env:IPEG_BYBIT_API_SECRET -cne "bybit-secret" -or
+    $env:IPEG_OKX_API_PASSWORD -cne "okx-passphrase"
+) {{
+    throw "S4U profile round-trip changed a credential"
+}}
+Write-Host "S4U local-machine DPAPI round-trip PASS"
+""",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(test_script),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+
+    assert "S4U local-machine DPAPI round-trip PASS" in completed.stdout
+    assert "bybit-secret" not in completed.stdout
+    assert "okx-passphrase" not in completed.stdout

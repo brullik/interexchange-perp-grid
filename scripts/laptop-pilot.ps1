@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$ProfilePath = "state/laptop-profile.clixml",
-    [string]$QualificationPath = "state/qualification.json"
+    [string]$QualificationPath = "state/qualification.json",
+    [ValidateSet("CurrentUser", "LocalMachine")]
+    [string]$ProfileScope = "CurrentUser"
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,7 +11,11 @@ Set-StrictMode -Version Latest
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
-. "$PSScriptRoot/laptop-load-env.ps1" -ProfilePath $ProfilePath
+if ($ProfileScope -ceq "LocalMachine") {
+    . "$PSScriptRoot/laptop-load-s4u-env.ps1" -ProfilePath $ProfilePath
+} else {
+    . "$PSScriptRoot/laptop-load-env.ps1" -ProfilePath $ProfilePath
+}
 
 $timeService = Get-Service W32Time
 if ($timeService.Status -ne "Running" -or $timeService.StartType -ne "Automatic") {
