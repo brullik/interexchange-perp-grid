@@ -104,11 +104,13 @@ class ParquetReferenceHistoryStore:
         return tuple(_reference_from_row(row) for row in rows)
 
     def manifest_sha256(self) -> str:
-        digest = hashlib.sha256()
-        for path in sorted(self.root.rglob("*.parquet")):
-            digest.update(path.relative_to(self.root).as_posix().encode("utf-8"))
-            digest.update(hashlib.sha256(path.read_bytes()).digest())
-        return digest.hexdigest()
+        return _tree_manifest_sha256(self.root)
+
+    def source_manifest_sha256(self) -> str:
+        return _tree_manifest_sha256(self.root / "source")
+
+    def reference_manifest_sha256(self) -> str:
+        return _tree_manifest_sha256(self.root / "reference")
 
     def _append_groups(
         self,
@@ -174,6 +176,14 @@ def _merge_rows(
     return [
         by_key[key] for key in sorted(by_key, key=lambda item: tuple(str(part) for part in item))
     ]
+
+
+def _tree_manifest_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.parquet")):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def _query(

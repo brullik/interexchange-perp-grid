@@ -19,12 +19,19 @@ import typer
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.aggressive_model import (
+    build_historical_reference_model,
+    historical_model_payload,
+    historical_model_sha256,
+    load_historical_model_policy,
+    save_historical_model,
+)
 from interexchange_perp_grid.autonomous_orchestrator import load_autonomous_runtime_status
 from interexchange_perp_grid.c4_3_proof import run_c4_3_proof
 from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
-from interexchange_perp_grid.domain import Instrument, Venue
+from interexchange_perp_grid.domain import Instrument, InstrumentKey, ProductType, Venue
 from interexchange_perp_grid.laptop_workflow import (
     LaptopQualificationIdentity,
     build_laptop_pilot_report,
@@ -517,6 +524,93 @@ def reference_history_proof(
     }
     typer.echo(json.dumps(payload, default=str, sort_keys=True))
     if not result.bars:
+        raise typer.Exit(code=3)
+
+
+@app.command("aggressive-model-proof")
+def aggressive_model_proof(
+    venue_a: Annotated[Venue, typer.Option("--venue-a")],
+    venue_b: Annotated[Venue, typer.Option("--venue-b")],
+    start: Annotated[str, typer.Option("--start")],
+    end: Annotated[str, typer.Option("--end")],
+    base: Annotated[str, typer.Option("--base")] = "BTC",
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
+    artifact: Annotated[Path, typer.Option("--artifact")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Build a deterministic non-executable historical model from local reference Parquet."""
+    _load(config)
+    if venue_a == venue_b:
+        raise typer.BadParameter("historical model requires two distinct venues")
+    try:
+        parsed_start = datetime.fromisoformat(start)
+        parsed_end = datetime.fromisoformat(end)
+    except ValueError as error:
+        raise typer.BadParameter("start and end must be ISO-8601 timestamps") from error
+    if any(
+        value.tzinfo is None or value.utcoffset() is None for value in (parsed_start, parsed_end)
+    ):
+        raise typer.BadParameter("start and end must include UTC offsets")
+    parsed_start = parsed_start.astimezone(UTC)
+    parsed_end = parsed_end.astimezone(UTC)
+    if parsed_end <= parsed_start:
+        raise typer.BadParameter("end must be later than start")
+    if not profile.is_file():
+        raise typer.BadParameter("aggressive strategy profile is missing")
+    code_sha = current_code_commit_sha(Path(".").resolve())
+    if code_sha is None:
+        raise typer.BadParameter("exact code commit SHA is unavailable")
+    canonical_a, canonical_b = sorted((venue_a, venue_b), key=lambda venue: venue.value)
+    instrument = InstrumentKey(
+        base=base.strip().upper(),
+        quote="USDT",
+        settle="USDT",
+        product_type=ProductType.LINEAR_USDT_PERPETUAL,
+    )
+    store = ParquetReferenceHistoryStore(history_root.resolve())
+    if not any((history_root.resolve() / "source").rglob("*.parquet")):
+        raise typer.BadParameter("source history manifest is missing")
+    bars = store.query_reference_bars(
+        venue_a=canonical_a,
+        venue_b=canonical_b,
+        instrument=instrument,
+        start=parsed_start,
+        end=parsed_end,
+    )
+    if not bars:
+        raise typer.BadParameter("no reference bars exist for the requested identity/window")
+    loaded_policy = load_historical_model_policy(profile)
+    model = build_historical_reference_model(
+        bars,
+        policy=loaded_policy.policy,
+        source_manifest_sha256=store.source_manifest_sha256(),
+        strategy_profile_sha256=loaded_policy.profile_sha256,
+        code_sha=code_sha,
+    )
+    model_hash = save_historical_model(artifact.resolve(), model)
+    payload = historical_model_payload(model)
+    typer.echo(
+        json.dumps(
+            {
+                "status": "PASS",
+                "model_sha256": model_hash,
+                "model": payload,
+                "artifact": str(artifact.resolve()),
+                "reference_rows": len(bars),
+                "positive_eligibility": model.positive.eligibility.value,
+                "negative_eligibility": model.negative.eligibility.value,
+                "executable": False,
+                "production_submit_calls": 0,
+            },
+            sort_keys=True,
+        )
+    )
+    if historical_model_sha256(model) != model_hash:
         raise typer.Exit(code=3)
 
 

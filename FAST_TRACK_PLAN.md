@@ -39,15 +39,15 @@
 
 ## A2 — historical reference model и агрессивная геометрия
 
-- [ ] Реализовать целевое окно 180d, live minimum 90d и shadow-only minimum 30d.
-- [ ] Рассчитать modal `S0` с точными tie-break rules и normal zone.
-- [ ] Отдельно рассчитать `H_plus`, `H_minus`, диапазоны и положительное/отрицательное направление.
-- [ ] Реализовать исторические convergence episodes, censoring, per-level convergence/adverse excursion и live gate 10 episodes + 70% within 24h.
-- [ ] Сохранить текущие 24h/7d/30d median/MAD/quantile statistics как current-regime и long-tail guard.
-- [ ] Реализовать regime-drift block и заморозку модели после первой части.
-- [ ] Рассчитать уровни 20/40/60/80/100%, веса 10/15/20/25/30%, reference stop +15% и effective stop с adaptive tail.
-- [ ] Версионировать и persist model identity: source-data hash, reference-bar hash, config hash, route identity, contract metadata version и code SHA.
-- [ ] Старые/неполные persisted calibration records мигрировать однозначно либо fail closed; не угадывать недостающие поля.
+- [x] Реализовать целевое окно 180d, live minimum 90d и shadow-only minimum 30d.
+- [x] Рассчитать modal `S0` с точными tie-break rules и normal zone.
+- [x] Отдельно рассчитать `H_plus`, `H_minus`, диапазоны и положительное/отрицательное направление.
+- [x] Реализовать исторические convergence episodes, censoring, per-level convergence/adverse excursion и live gate 10 episodes + 70% within 24h.
+- [x] Сохранить текущие 24h/7d/30d median/MAD/quantile statistics как current-regime и long-tail guard.
+- [x] Реализовать regime-drift block и заморозку модели после первой части.
+- [x] Рассчитать уровни 20/40/60/80/100%, веса 10/15/20/25/30%, reference stop +15% и effective stop с adaptive tail.
+- [x] Версионировать и persist model identity: source-data hash, reference-bar hash, config hash, route identity, contract metadata version и code SHA.
+- [x] Старые/неполные persisted calibration records мигрировать однозначно либо fail closed; не угадывать недостающие поля.
 
 **Выход:** для обеих сторон пары модель и пять уровней воспроизводимы из истории и одинаковы после restart.
 

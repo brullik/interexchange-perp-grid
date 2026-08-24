@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +16,10 @@ import interexchange_perp_grid.cli as cli_module
 from interexchange_perp_grid.adapters.private import PrivateCredentials
 from interexchange_perp_grid.cli import _run_public_scan, app
 from interexchange_perp_grid.config import load_settings
-from interexchange_perp_grid.domain import Instrument, Venue
+from interexchange_perp_grid.domain import Instrument, InstrumentKey, ProductType, Venue
 from interexchange_perp_grid.public_engine import ScanResult
-from interexchange_perp_grid.reference_history import SourceMinuteBar
+from interexchange_perp_grid.reference_history import ReferenceSpreadBar, SourceMinuteBar
+from interexchange_perp_grid.reference_store import ParquetReferenceHistoryStore
 
 runner = CliRunner()
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -198,6 +199,82 @@ def test_reference_history_proof_rejects_naive_since_before_network(
     )
     assert result.exit_code == 2
     assert "since must include a UTC offset" in result.output
+
+
+def test_aggressive_model_proof_replays_local_reference_history_without_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    history_root = tmp_path / "history"
+    artifact = tmp_path / "model.json"
+    key = InstrumentKey("BTC", "USDT", "USDT", ProductType.LINEAR_USDT_PERPETUAL)
+    bars = tuple(
+        ReferenceSpreadBar(
+            venue_a=Venue.BYBIT,
+            venue_b=Venue.OKX,
+            instrument=key,
+            interval_start=start + timedelta(minutes=minute),
+            open_bps=Decimal("0"),
+            high_bps=Decimal("10"),
+            low_bps=Decimal("-10"),
+            close_bps=Decimal("0"),
+            contract_metadata_version_a="bybit-v1",
+            contract_metadata_version_b="okx-v1",
+        )
+        for minute in range(5)
+    )
+    store = ParquetReferenceHistoryStore(history_root)
+    for venue in (Venue.BYBIT, Venue.OKX):
+        store.append_source_bars(
+            tuple(
+                SourceMinuteBar(
+                    venue=venue,
+                    instrument=key,
+                    symbol="BTC/USDT:USDT",
+                    interval_start=start + timedelta(minutes=minute),
+                    open=Decimal("100"),
+                    high=Decimal("101"),
+                    low=Decimal("99"),
+                    close=Decimal("100"),
+                    contract_metadata_version=f"{venue.value}-v1",
+                )
+                for minute in range(5)
+            )
+        )
+    store.append_reference_bars(bars)
+    monkeypatch.setattr(cli_module, "current_code_commit_sha", lambda root: "a" * 40)
+
+    result = runner.invoke(
+        app,
+        [
+            "aggressive-model-proof",
+            "--venue-a",
+            "okx",
+            "--venue-b",
+            "bybit",
+            "--start",
+            start.isoformat(),
+            "--end",
+            (start + timedelta(minutes=5)).isoformat(),
+            "--history-root",
+            str(history_root),
+            "--artifact",
+            str(artifact),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "PASS"
+    assert payload["reference_rows"] == 5
+    assert payload["model"]["identity"]["positive_route"] == "BTC:okx>bybit"
+    assert payload["model"]["identity"]["negative_route"] == "BTC:bybit>okx"
+    assert payload["positive_eligibility"] == "DISABLED"
+    assert payload["negative_eligibility"] == "DISABLED"
+    assert payload["executable"] is False
+    assert payload["production_submit_calls"] == 0
+    assert artifact.is_file()
 
 
 def test_private_probe_reports_only_sanitized_failure(
