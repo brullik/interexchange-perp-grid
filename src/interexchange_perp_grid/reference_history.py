@@ -8,6 +8,7 @@ from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from enum import StrEnum
 
 from interexchange_perp_grid.domain import Instrument, InstrumentKey, Venue
+from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _BPS_SCALE = Decimal("10000")
 _BPS_QUANTUM = Decimal("0.00000001")
@@ -109,6 +110,14 @@ class ReferenceSeriesResult:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectedReferenceRoutes:
+    venue_a: Venue
+    venue_b: Venue
+    positive: DirectedRouteKey
+    negative: DirectedRouteKey
+
+
+@dataclass(frozen=True, slots=True)
 class AggregatedReferenceBar:
     venue_a: Venue
     venue_b: Venue
@@ -145,6 +154,31 @@ def canonical_venue_pair(first: Venue, second: Venue) -> tuple[Venue, Venue]:
     if first == second:
         raise ValueError("canonical venue pair requires distinct venues")
     return tuple(sorted((first, second), key=lambda venue: venue.value))  # type: ignore[return-value]
+
+
+def directed_routes_for_reference_pair(
+    base: str,
+    first: Venue,
+    second: Venue,
+) -> DirectedReferenceRoutes:
+    venue_a, venue_b = canonical_venue_pair(first, second)
+    normalized_base = base.strip().upper()
+    if not normalized_base:
+        raise ValueError("directed reference route base must not be empty")
+    return DirectedReferenceRoutes(
+        venue_a=venue_a,
+        venue_b=venue_b,
+        positive=DirectedRouteKey(
+            base=normalized_base,
+            long_venue=venue_b,
+            short_venue=venue_a,
+        ),
+        negative=DirectedRouteKey(
+            base=normalized_base,
+            long_venue=venue_a,
+            short_venue=venue_b,
+        ),
+    )
 
 
 def build_reference_minute(
@@ -189,6 +223,8 @@ def build_reference_series(
     second_by_minute, second_conflicts = _deduplicate(second)
     conflict_minutes = first_conflicts | second_conflicts
     all_minutes = sorted(set(first_by_minute) | set(second_by_minute) | conflict_minutes)
+    first_version = _first_version(first_by_minute)
+    second_version = _first_version(second_by_minute)
     bars: list[ReferenceSpreadBar] = []
     rejections: list[ReferenceMinuteRejection] = []
     for minute in all_minutes:
@@ -202,6 +238,14 @@ def build_reference_series(
         if left is None or right is None:
             rejections.append(
                 ReferenceMinuteRejection(minute, ReferenceRejectionReason.MISSING_SOURCE)
+            )
+            continue
+        if (
+            left.contract_metadata_version != first_version
+            or right.contract_metadata_version != second_version
+        ):
+            rejections.append(
+                ReferenceMinuteRejection(minute, ReferenceRejectionReason.CONTRACT_MISMATCH)
             )
             continue
         result = build_reference_minute(left, right)
@@ -308,6 +352,31 @@ def reference_bars_sha256(bars: tuple[ReferenceSpreadBar, ...]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def source_bars_sha256(bars: tuple[SourceMinuteBar, ...]) -> str:
+    rows = [
+        {
+            "venue": bar.venue.value,
+            "symbol": bar.symbol,
+            "instrument": {
+                "base": bar.instrument.base,
+                "quote": bar.instrument.quote,
+                "settle": bar.instrument.settle,
+                "product_type": bar.instrument.product_type.value,
+            },
+            "interval_start": bar.interval_start.isoformat(),
+            "open": str(bar.open),
+            "high": str(bar.high),
+            "low": str(bar.low),
+            "close": str(bar.close),
+            "contract_metadata_version": bar.contract_metadata_version,
+            "quality": bar.quality.value,
+        }
+        for bar in sorted(bars, key=lambda item: (item.venue.value, item.interval_start))
+    ]
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def contract_metadata_version(instrument: Instrument) -> str:
     payload = {
         "venue": instrument.venue.value,
@@ -388,3 +457,7 @@ def _interval_floor(value: datetime, timeframe_minutes: int) -> datetime:
     minute_of_day = utc_value.hour * 60 + utc_value.minute
     floored = minute_of_day - (minute_of_day % timeframe_minutes)
     return utc_value.replace(hour=floored // 60, minute=floored % 60)
+
+
+def _first_version(bars: dict[datetime, SourceMinuteBar]) -> str | None:
+    return bars[min(bars)].contract_metadata_version if bars else None

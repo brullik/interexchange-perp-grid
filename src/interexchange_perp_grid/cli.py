@@ -8,8 +8,9 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
@@ -23,7 +24,7 @@ from interexchange_perp_grid.c4_3_proof import run_c4_3_proof
 from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
 from interexchange_perp_grid.config import Settings, load_settings
-from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.laptop_workflow import (
     LaptopQualificationIdentity,
     build_laptop_pilot_report,
@@ -73,6 +74,15 @@ from interexchange_perp_grid.qualification import (
     run_qualification,
     write_runtime_evidence,
 )
+from interexchange_perp_grid.reference_history import (
+    SourceMinuteBar,
+    aggregate_reference_bars,
+    build_reference_series,
+    directed_routes_for_reference_pair,
+    reference_bars_sha256,
+    source_bars_sha256,
+)
+from interexchange_perp_grid.reference_store import ParquetReferenceHistoryStore
 from interexchange_perp_grid.region_latency import (
     MAXIMUM_PROBE_DURATION_SECONDS,
     WAVE1_VENUES,
@@ -385,6 +395,128 @@ def public_scan(
     result = asyncio.run(_run_public_scan(settings, base, parsed_quantity, timeout_seconds))
     typer.echo(json.dumps(_scan_payload(result), default=str, sort_keys=True))
     if not any(quote.eligible for quote in result.quotes):
+        raise typer.Exit(code=3)
+
+
+def _one_base_instrument(instruments: tuple[Instrument, ...], base: str) -> Instrument:
+    matches = tuple(instrument for instrument in instruments if instrument.base == base.upper())
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one active {base.upper()} linear-USDT perpetual")
+    return matches[0]
+
+
+async def _fetch_reference_source_pair(
+    venue_a: Venue,
+    venue_b: Venue,
+    base: str,
+    since: datetime,
+    limit: int,
+) -> tuple[tuple[SourceMinuteBar, ...], tuple[SourceMinuteBar, ...], Instrument, Instrument]:
+    adapter_a = CcxtProAdapter(venue_a)
+    adapter_b = CcxtProAdapter(venue_b)
+    try:
+        instruments_a, instruments_b = await asyncio.gather(
+            adapter_a.discover_instruments(),
+            adapter_b.discover_instruments(),
+        )
+        instrument_a = _one_base_instrument(instruments_a, base)
+        instrument_b = _one_base_instrument(instruments_b, base)
+        bars_a, bars_b = await asyncio.gather(
+            adapter_a.fetch_closed_minute_bars(instrument_a, since, limit),
+            adapter_b.fetch_closed_minute_bars(instrument_b, since, limit),
+        )
+        return bars_a, bars_b, instrument_a, instrument_b
+    finally:
+        await asyncio.gather(adapter_a.close(), adapter_b.close(), return_exceptions=True)
+
+
+@app.command("reference-history-proof")
+def reference_history_proof(
+    venue_a: Annotated[Venue, typer.Option("--venue-a")],
+    venue_b: Annotated[Venue, typer.Option("--venue-b")],
+    since: Annotated[str, typer.Option("--since")],
+    base: Annotated[str, typer.Option("--base")] = "BTC",
+    limit: Annotated[int, typer.Option("--limit", min=1, max=1000)] = 1000,
+    output_root: Annotated[Path, typer.Option("--output-root")] = Path("data/reference-history"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Build one bounded public 1m reference-history proof; never submit an order."""
+    _load(config)
+    if venue_a == venue_b:
+        raise typer.BadParameter("reference history requires two distinct venues")
+    try:
+        raw_since = datetime.fromisoformat(since)
+    except ValueError as error:
+        raise typer.BadParameter("since must be an ISO-8601 timestamp with UTC offset") from error
+    if raw_since.tzinfo is None or raw_since.utcoffset() is None:
+        raise typer.BadParameter("since must include a UTC offset")
+    parsed_since = raw_since.astimezone(UTC)
+    if not profile.is_file():
+        raise typer.BadParameter("aggressive strategy profile is missing")
+    raw_a, raw_b, instrument_a, instrument_b = asyncio.run(
+        _fetch_reference_source_pair(venue_a, venue_b, base, parsed_since, limit)
+    )
+    bars_a = tuple(raw_a)
+    bars_b = tuple(raw_b)
+    if instrument_a.key != instrument_b.key:
+        raise typer.BadParameter("venue instruments do not share one canonical contract identity")
+    store = ParquetReferenceHistoryStore(output_root.resolve())
+    store.append_source_bars(bars_a)
+    store.append_source_bars(bars_b)
+    end = datetime.now(UTC) + timedelta(minutes=1)
+    cached_a = store.query_source_bars(
+        venue=venue_a,
+        symbol=instrument_a.symbol,
+        start=parsed_since,
+        end=end,
+    )
+    cached_b = store.query_source_bars(
+        venue=venue_b,
+        symbol=instrument_b.symbol,
+        start=parsed_since,
+        end=end,
+    )
+    result = build_reference_series(cached_a, cached_b)
+    directed_routes = directed_routes_for_reference_pair(base, venue_a, venue_b)
+    store.append_reference_bars(result.bars)
+    aggregates = {
+        str(minutes): aggregate_reference_bars(result.bars, minutes)
+        for minutes in (5, 15, 60, 240, 1440)
+    }
+    rejection_counts = Counter(rejection.reason.value for rejection in result.rejections)
+    payload = {
+        "status": "PASS" if result.bars else "FAIL",
+        "base": base.upper(),
+        "venue_a": min(venue_a.value, venue_b.value),
+        "venue_b": max(venue_a.value, venue_b.value),
+        "positive_directed_route": directed_routes.positive.value,
+        "negative_directed_route": directed_routes.negative.value,
+        "source_rows": len(cached_a) + len(cached_b),
+        "reference_rows": len(result.bars),
+        "rejected_minutes": len(result.rejections),
+        "rejection_reasons": dict(sorted(rejection_counts.items())),
+        "coverage_start": result.bars[0].interval_start if result.bars else None,
+        "coverage_end": result.bars[-1].interval_start if result.bars else None,
+        "source_sha256": source_bars_sha256((*cached_a, *cached_b)),
+        "reference_sha256": reference_bars_sha256(result.bars),
+        "store_manifest_sha256": store.manifest_sha256(),
+        "profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
+        "intervals": {
+            name: {
+                "complete": sum(bar.quality.value == "COMPLETE" for bar in bars),
+                "incomplete": sum(bar.quality.value == "INCOMPLETE" for bar in bars),
+            }
+            for name, bars in aggregates.items()
+        },
+        "synthetic_high_low_envelope": True,
+        "executable": False,
+        "production_submit_calls": 0,
+    }
+    typer.echo(json.dumps(payload, default=str, sort_keys=True))
+    if not result.bars:
         raise typer.Exit(code=3)
 
 

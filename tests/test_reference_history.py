@@ -16,6 +16,7 @@ from interexchange_perp_grid.reference_history import (
     build_reference_minute,
     build_reference_series,
     canonical_venue_pair,
+    directed_routes_for_reference_pair,
     reference_bars_sha256,
 )
 
@@ -150,7 +151,32 @@ def test_reference_minute_rejects_contract_sync_price_and_quality_faults() -> No
 
 
 def test_canonical_pair_and_source_timestamp_fail_closed() -> None:
+    routes = directed_routes_for_reference_pair("btc", Venue.OKX, Venue.BYBIT)
+    assert (routes.venue_a, routes.venue_b) == (Venue.BYBIT, Venue.OKX)
+    assert (routes.positive.long_venue, routes.positive.short_venue) == (
+        Venue.OKX,
+        Venue.BYBIT,
+    )
+    assert (routes.negative.long_venue, routes.negative.short_venue) == (
+        Venue.BYBIT,
+        Venue.OKX,
+    )
     with pytest.raises(ValueError, match="distinct venues"):
         canonical_venue_pair(Venue.OKX, Venue.OKX)
     with pytest.raises(ValueError, match="exact UTC minute"):
         replace(_source(Venue.OKX), interval_start=START + timedelta(seconds=1))
+
+
+def test_reference_series_rejects_midstream_contract_version_change() -> None:
+    left = (_source(Venue.BYBIT), _source(Venue.BYBIT, minute=1))
+    right = (
+        _source(Venue.OKX),
+        replace(_source(Venue.OKX, minute=1), contract_metadata_version="okx-v2"),
+    )
+
+    result = build_reference_series(left, right)
+
+    assert len(result.bars) == 1
+    assert tuple(item.reason for item in result.rejections) == (
+        ReferenceRejectionReason.CONTRACT_MISMATCH,
+    )

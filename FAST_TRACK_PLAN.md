@@ -19,7 +19,7 @@
 - [x] Запустить текущий `make verify`/Windows-equivalent и сохранить честный baseline результата.
 - [x] Подтвердить `mode=shadow`, `live_enabled=false`, `live_orders_allowed=false` и отсутствие production submit.
 - [x] Составить краткую карту повторного использования существующих модулей; не создавать отдельный документ — записать одну строку решения в `STATUS.md`.
-- [ ] Создать/продолжить одну ветку и один draft PR.
+- [x] Создать/продолжить одну ветку и один draft PR.
 
 **Выход:** текущая система зелёная либо каждое исходное падение явно отделено от новых изменений; live остаётся невозможным.
 
@@ -31,9 +31,9 @@
 - [x] Реализовать точные формулы `O_A/O_B`, `H_A/L_B`, `L_A/H_B`, `C_A/C_B` с детерминированной precision/rounding policy.
 - [x] Запретить forward-fill, несинхронные минуты, незакрытые бары, неоднозначные дубликаты и contract-version mismatch.
 - [x] Реализовать агрегацию 1m spread bars в 5m/15m/1h/4h/1d; прямой расчёт из старших биржевых свечей физически не использовать.
-- [ ] Реализовать resumable, idempotent, rate-limit-aware on-demand history cache в существующем Parquet/DuckDB контуре.
-- [ ] Добавить одну CLI-команду/подкоманду, которая для заданной пары строит reference bars, выводит coverage/quality/hash и ничего не торгует.
-- [ ] Добавить deterministic fixtures и property tests для формул, пропусков, дубликатов, границ интервалов и restart-resume.
+- [x] Реализовать resumable, idempotent, rate-limit-aware on-demand history cache в существующем Parquet/DuckDB контуре.
+- [x] Добавить одну CLI-команду/подкоманду, которая для заданной пары строит reference bars, выводит coverage/quality/hash и ничего не торгует.
+- [x] Добавить deterministic fixtures и property tests для формул, пропусков, дубликатов, границ интервалов и restart-resume.
 
 **Выход:** одинаковый набор source bars создаёт byte/hash-identical reference bars; неполный интервал не участвует в модели.
 

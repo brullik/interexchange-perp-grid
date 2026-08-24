@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,8 +16,9 @@ import interexchange_perp_grid.cli as cli_module
 from interexchange_perp_grid.adapters.private import PrivateCredentials
 from interexchange_perp_grid.cli import _run_public_scan, app
 from interexchange_perp_grid.config import load_settings
-from interexchange_perp_grid.domain import Venue
+from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.public_engine import ScanResult
+from interexchange_perp_grid.reference_history import SourceMinuteBar
 
 runner = CliRunner()
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -78,6 +81,123 @@ def test_public_scan_rejects_non_decimal_quantity_before_network() -> None:
     result = runner.invoke(app, ["public-scan", "--quantity", "not-a-number"])
     assert result.exit_code == 2
     assert "quantity must be a decimal number" in result.output
+
+
+def test_reference_history_proof_is_public_deterministic_and_non_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    instances: list[object] = []
+
+    class PublicHistoryAdapter:
+        def __init__(self, venue: Venue) -> None:
+            self.venue = venue
+            instances.append(self)
+
+        async def discover_instruments(self) -> tuple[Instrument, ...]:
+            return (
+                Instrument(
+                    venue=self.venue,
+                    symbol="BTC/USDT:USDT",
+                    exchange_symbol="BTCUSDT",
+                    base="BTC",
+                    quote="USDT",
+                    settle="USDT",
+                    contract_size_base=Decimal("1"),
+                    amount_step_contracts=Decimal("0.001"),
+                    price_tick=Decimal("0.1"),
+                    minimum_amount_contracts=Decimal("0.001"),
+                    minimum_notional=Decimal("5"),
+                    taker_fee_rate=None,
+                    fee_source=None,
+                ),
+            )
+
+        async def fetch_closed_minute_bars(
+            self,
+            instrument: Instrument,
+            since: datetime,
+            limit: int,
+        ) -> tuple[SourceMinuteBar, ...]:
+            assert instrument.base == "BTC"
+            assert since == start
+            assert limit == 5
+            return tuple(
+                SourceMinuteBar(
+                    venue=self.venue,
+                    instrument=instrument.key,
+                    symbol=instrument.symbol,
+                    interval_start=start.replace(minute=minute),
+                    open=Decimal("100"),
+                    high=Decimal("101"),
+                    low=Decimal("99"),
+                    close=Decimal("100"),
+                    contract_metadata_version=f"{self.venue.value}-v1",
+                )
+                for minute in range(5)
+            )
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(cli_module, "CcxtProAdapter", PublicHistoryAdapter)
+
+    result = runner.invoke(
+        app,
+        [
+            "reference-history-proof",
+            "--venue-a",
+            "bybit",
+            "--venue-b",
+            "okx",
+            "--since",
+            start.isoformat(),
+            "--limit",
+            "5",
+            "--output-root",
+            str(tmp_path / "history"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "PASS"
+    assert payload["source_rows"] == 10
+    assert payload["reference_rows"] == 5
+    assert payload["positive_directed_route"] == "BTC:okx>bybit"
+    assert payload["negative_directed_route"] == "BTC:bybit>okx"
+    assert payload["intervals"]["5"] == {"complete": 1, "incomplete": 0}
+    assert payload["synthetic_high_low_envelope"] is True
+    assert payload["executable"] is False
+    assert payload["production_submit_calls"] == 0
+    assert len(payload["source_sha256"]) == 64
+    assert len(payload["reference_sha256"]) == 64
+    assert len(instances) == 2
+
+
+def test_reference_history_proof_rejects_naive_since_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli_module,
+        "CcxtProAdapter",
+        lambda venue: pytest.fail(f"unexpected network adapter for {venue}"),
+    )
+    result = runner.invoke(
+        app,
+        [
+            "reference-history-proof",
+            "--venue-a",
+            "bybit",
+            "--venue-b",
+            "okx",
+            "--since",
+            "2026-01-01T00:00:00",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "since must include a UTC offset" in result.output
 
 
 def test_private_probe_reports_only_sanitized_failure(
