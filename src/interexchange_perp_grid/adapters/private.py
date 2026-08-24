@@ -516,7 +516,7 @@ class CcxtPrivateAdapter:
         return _decimal(_mapping(raw.get(instrument.symbol)).get("taker"))
 
     async def close(self) -> None:
-        await self._exchange.close()
+        await CcxtProAdapter(self.venue, exchange=self._exchange).close()
 
 
 def _currency_value(raw: Mapping[str, Any], group: str, currency: str) -> Decimal | None:

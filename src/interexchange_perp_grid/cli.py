@@ -1456,7 +1456,21 @@ def private_probe(
         finally:
             await adapter.close()
 
-    report = asyncio.run(probe())
+    try:
+        report = asyncio.run(probe())
+    except Exception as error:
+        typer.echo(
+            json.dumps(
+                {
+                    "venue": selected.value,
+                    "qualified": False,
+                    "error_type": type(error).__name__,
+                },
+                sort_keys=True,
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=4) from None
     typer.echo(json.dumps(asdict(report), default=str, sort_keys=True))
 
 

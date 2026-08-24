@@ -500,6 +500,13 @@ def test_pinned_wave1_broad_bbo_transport_has_matching_unsubscribe(venue: Venue)
     assert adapter._bbo_stream_kind() == "tickers"
 
 
+def test_binance_usdm_uses_futures_only_transport() -> None:
+    adapter = CcxtProAdapter(Venue.BINANCE_USDM)
+
+    assert adapter._exchange.id == "binance"
+    assert adapter._exchange.options["fetchMarkets"]["types"] == ["linear"]
+
+
 def test_pinned_kucoin_futures_bbo_transport_has_matching_unsubscribe() -> None:
     adapter = CcxtProAdapter(Venue.KUCOIN_FUTURES)
 
