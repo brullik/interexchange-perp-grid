@@ -23,6 +23,11 @@ from interexchange_perp_grid.domain import (
     OrderBookSnapshot,
     Venue,
 )
+from interexchange_perp_grid.reference_history import (
+    SourceBarQuality,
+    SourceMinuteBar,
+    contract_metadata_version,
+)
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -489,6 +494,60 @@ class CcxtProAdapter(ExchangeAdapter):
             if raw.get("timestamp") is not None
             else None,
         )
+
+    async def fetch_closed_minute_bars(
+        self,
+        instrument: Instrument,
+        since: datetime,
+        limit: int = 1000,
+    ) -> tuple[SourceMinuteBar, ...]:
+        if since.tzinfo is None or since.utcoffset() is None:
+            raise ValueError("OHLC since timestamp must be timezone-aware")
+        if limit < 1 or limit > 1000:
+            raise ValueError("OHLC limit must be between 1 and 1000")
+        if not self._has("fetchOHLCV"):
+            raise RuntimeError("closed one-minute OHLC capability is required")
+        since_utc = since.astimezone(UTC)
+        since_ms = int(since_utc.timestamp() * 1_000)
+        raw_rows = await self._exchange.fetch_ohlcv(
+            instrument.symbol,
+            "1m",
+            since_ms,
+            limit,
+        )
+        if not isinstance(raw_rows, Sequence):
+            raise TypeError("CCXT fetch_ohlcv must return a sequence")
+        closed_before_ms = int(datetime.now(UTC).timestamp() // 60 * 60_000)
+        metadata_version = contract_metadata_version(instrument)
+        bars: list[SourceMinuteBar] = []
+        for raw in raw_rows:
+            if not isinstance(raw, Sequence) or len(raw) < 6:
+                raise ValueError("CCXT OHLC row must contain timestamp/OHLC/volume")
+            timestamp = raw[0]
+            if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+                raise ValueError("CCXT OHLC timestamp must be numeric")
+            timestamp_ms = int(timestamp)
+            if timestamp_ms % 60_000 != 0:
+                raise ValueError("CCXT OHLC timestamp must be minute-aligned")
+            if timestamp_ms < since_ms or timestamp_ms >= closed_before_ms:
+                continue
+            parsed = tuple(_decimal(raw[index]) for index in range(1, 5))
+            values = tuple(value if value is not None else Decimal("NaN") for value in parsed)
+            bars.append(
+                SourceMinuteBar(
+                    venue=self.venue,
+                    instrument=instrument.key,
+                    symbol=instrument.symbol,
+                    interval_start=datetime.fromtimestamp(timestamp_ms / 1_000, tz=UTC),
+                    open=values[0],
+                    high=values[1],
+                    low=values[2],
+                    close=values[3],
+                    contract_metadata_version=metadata_version,
+                    quality=SourceBarQuality.COMPLETE,
+                )
+            )
+        return tuple(sorted(bars, key=lambda bar: bar.interval_start))
 
     async def close(self) -> None:
         close_connector = getattr(self._exchange, "close_connector", None)

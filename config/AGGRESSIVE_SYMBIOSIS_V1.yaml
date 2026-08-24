@@ -1,0 +1,133 @@
+schema_version: 1
+profile_id: aggressive_symbiosis_v1
+
+scope:
+  contracts: linear_usdt_perpetual
+  paired_only: true
+  reference_capital_usdt: '500'
+  laptop_first: true
+  vps_blocked_until_artifact: state/laptop-aggressive-acceptance.json
+
+reference_spread:
+  source_timeframe_seconds: 60
+  history_target_days: 180
+  history_minimum_live_days: 90
+  history_minimum_shadow_days: 30
+  mode_bucket_bps: '1'
+  normal_zone_minimum_half_width_bps: '2'
+  aggregate_timeframes_minutes: [5, 15, 60, 240, 1440]
+  day_boundary_utc: '00:00'
+  forward_fill_missing_minutes: false
+  incomplete_interval_is_tradeable: false
+  canonical_pair_order: lexical_venue_id
+  formula:
+    open: 10000*ln(open_a/open_b)
+    high: 10000*ln(high_a/low_b)
+    low: 10000*ln(low_a/high_b)
+    close: 10000*ln(close_a/close_b)
+
+historical_model:
+  positive_and_negative_directions_separate: true
+  extreme_source: maximum_valid_reference_bar_high_or_low
+  minimum_completed_episodes: 10
+  minimum_convergence_rate: '0.70'
+  convergence_horizon_seconds: 86400
+  current_regime_windows_hours: [24, 168, 720]
+  regime_drift_range_fraction: '0.25'
+  regime_drift_robust_sigma_multiple: '3'
+  parameter_change_limit_ratio_per_day: '0.20'
+  freeze_model_after_first_tranche: true
+
+aggressive_grid:
+  level_fractions: ['0.20', '0.40', '0.60', '0.80', '1.00']
+  tranche_weights: ['0.10', '0.15', '0.20', '0.25', '0.30']
+  stop_buffer_ratio: '0.15'
+  effective_stop_uses_farther_of_reference_and_adaptive_tail: true
+  confirmation_snapshots: 3
+  confirmation_minimum_elapsed_ms: 500
+  one_tranche_per_decision_cycle: true
+  sequential_catch_up_after_gap: true
+  require_fresh_books_between_catch_up_tranches: true
+  reverse_grid_exit: true
+  rearm_retreat_step_fraction: '0.25'
+
+entry_economics:
+  stressed_cost_multiplier: '1.35'
+  normal_minimum_expected_net_profit_usdt: '0.15'
+  canary_minimum_expected_net_profit_usdt: '0.01'
+  convergence_pnl_must_be_positive_without_positive_funding: true
+  positive_funding_credit_ratio: '0.50'
+  adverse_funding_charge_ratio: '1.00'
+  funding_stress_multiplier: '2.00'
+  use_actual_private_taker_fees_when_available: true
+  unknown_fee_or_funding_blocks_entry: true
+
+risk:
+  route_modelled_loss_limit_usdt: '4.50'
+  route_hard_projected_loss_limit_usdt: '5.00'
+  portfolio_modelled_loss_limit_usdt: '45.00'
+  portfolio_hard_projected_loss_limit_usdt: '50.00'
+  max_routes: 10
+  max_routes_per_base: 1
+  max_tranches_per_route: 5
+  local_free_margin_floor_ratio: '0.20'
+  initial_effective_leverage_cap: '3'
+  hard_max_hold_seconds: 86400
+  size_from_exchange_max_leverage: false
+
+exit_priority:
+  - emergency_or_unknown_state
+  - hard_projected_loss_or_reference_stop
+  - hard_holding_time
+  - adverse_funding
+  - tranche_reverse_grid_target
+  - next_entry_level
+
+route_selection:
+  formula: convergence_probability*expected_net_profit/(projected_stress*max(expected_holding_hours,0.25))
+  deterministic_tiebreakers:
+    - greater_executable_depth
+    - lower_total_slippage
+    - lower_data_latency
+    - lower_total_fee
+    - lower_adverse_funding
+    - lexical_route_id
+
+laptop_risk_stages:
+  canary:
+    max_routes: 1
+    max_tranches_per_route: 1
+    route_hard_loss_usdt: '1.00'
+    portfolio_hard_loss_usdt: '1.00'
+    minimum_valid_notional_only: true
+  pilot_a:
+    max_routes: 1
+    max_tranches_per_route: 5
+    route_hard_loss_usdt: '5.00'
+    portfolio_hard_loss_usdt: '5.00'
+  pilot_b:
+    max_routes: 2
+    max_tranches_per_route: 5
+    route_hard_loss_usdt: '5.00'
+    portfolio_hard_loss_usdt: '10.00'
+  wave1_prod:
+    max_routes: 3
+    max_tranches_per_route: 5
+    route_hard_loss_usdt: '5.00'
+    portfolio_hard_loss_usdt: '15.00'
+  full:
+    max_routes: 10
+    max_tranches_per_route: 5
+    route_hard_loss_usdt: '5.00'
+    portfolio_hard_loss_usdt: '50.00'
+
+laptop_acceptance:
+  native_windows_required: true
+  docker_required_on_laptop: false
+  existing_12h_owner_exception_may_be_reused_if_still_policy_valid: true
+  never_shorten_below_existing_authorized_policy: true
+  real_canary_requires_owner_credentials: true
+  real_canary_requires_explicit_owner_consent: true
+  stable_flat_required: true
+  post_flat_service_seconds: 28800
+  acceptance_artifact: state/laptop-aggressive-acceptance.json

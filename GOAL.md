@@ -1,283 +1,567 @@
-# Interexchange Perpetual Grid — fast-track product contract
+# Interexchange Perpetual Grid — Aggressive Symbiosis V1 product contract
 
 ## 1. Mission
 
-Build an autonomous, auditable system that monitors equal linear USDT perpetual futures across exchanges and trades temporary executable-price divergence through paired positions:
+Extend the current product into an aggressive but bounded interexchange convergence trader. It must combine:
 
-- long on the cheaper venue;
-- short on the more expensive venue;
-- add up to five risk-sized tranches as divergence expands;
-- close paired tranches as the executable spread converges;
-- include fees, funding, market impact, latency, partial-fill risk, and emergency-exit cost in every decision.
+1. deterministic historical reference-spread bars built from synchronized 1-minute OHLC data;
+2. long-horizon normal state and historical positive/negative extremes;
+3. a persistent five-level back-loaded grid;
+4. current robust 24h/7d/30d regime statistics;
+5. real executable L2/VWAP prices, private fees, funding schedules, slippage, and market impact;
+6. the existing protected paired execution, journal, reconciliation, recovery, Telegram, and live-safety machinery.
 
-This is convergence trading, not guaranteed or risk-free arbitrage.
+The system should use capital and recurring spread oscillations more aggressively than the current adaptive-only strategy, while retaining the hard projected-loss limits and fail-closed execution controls.
 
-## 2. Fastest delivery path
+This is statistical convergence trading. Profit and a realised maximum loss cannot be guaranteed.
 
-The first usable product is an end-to-end vertical slice, not seven incomplete connectors.
+## 2. Preserve the proven baseline
 
-### Product Ready — autonomous target without private credentials
+Do not replace the existing architecture. Preserve and regression-test:
 
-A single Docker deployment on one VPS must:
+- the typed `ExchangeAdapter` boundary and current venue transports;
+- broad BBO plus candidate/open-route L2 subscriptions;
+- protected aggressive taker IOC execution with price caps;
+- actual-fill-driven hedge logic;
+- idempotent client order IDs;
+- durable SQLite WAL action/tranche journal;
+- restart reconciliation and unknown-result handling;
+- residual-delta top-up, reduction, third-venue hedge, and emergency flatten;
+- atomic risk reservation and stable-FLAT release;
+- Telegram owner authentication and live challenge;
+- Windows native runtime manifest, DPAPI/S4U secret handling, qualification, and laptop pilot workflow;
+- exact-code/config/data/runtime evidence and branch protection checks.
 
-1. stream and normalise live public data from Binance USD-M, Bybit, and OKX;
-2. discover equivalent linear USDT perpetuals and directed venue routes;
-3. maintain fresh BBO for broad coverage and L2 depth for candidates/open routes;
-4. calculate executable VWAP spreads for actual tranche size;
-5. obtain funding and fee inputs, marking unknown values as a hard entry block;
-6. record normalised data to Parquet and transactional state to SQLite WAL;
-7. calibrate an adaptive grid from replay/live observations;
-8. run the complete paired execution state machine against a deterministic simulator and in real-time shadow mode;
-9. expose status, opportunities, simulated fills, PnL, risk, pause, and kill controls through Telegram;
-10. recover after restart through persisted state and reconciliation logic;
-11. emit explicit reason codes for every accepted or rejected signal.
+Change those components only where a new acceptance test proves that the aggressive strategy cannot be connected without a narrow extension.
 
-### Live Canary Ready — code target before owner credentials
-
-The same product must include private-data, order, cancel, position, balance, fee, and reconciliation paths for Bybit and OKX, with Binance USD-M as the first alternate. These paths must be testable through mocks, deterministic replay, and an exchange test environment where safely available.
-
-Actual live activation is an owner action performed only after all automated gates pass.
-
-### Expansion target
-
-After a successful canary architecture exists, add:
-
-1. Bitget and KuCoin Futures;
-2. MEXC and BingX;
-3. venue-specific native transport only where measured data proves CCXT Pro is insufficient.
-
-A failed or unavailable venue is quarantined and must not block the rest of the product.
-
-## 3. Fixed owner parameters
+## 3. Fixed owner limits
 
 | Parameter | Requirement |
 |---|---|
 | Reference total capital | 500 USDT |
-| Projected stressed loss per route | <= 5 USDT |
-| Projected stressed portfolio loss | <= 50 USDT |
-| Concurrent normal routes | <= 10 and may dynamically be lower or zero |
-| Normal routes per base asset | 1 |
-| Tranches per route | <= 5 |
+| Modelled route loss used for normal sizing | <= 4.50 USDT |
+| Hard projected route loss | <= 5.00 USDT |
+| Modelled portfolio loss used for normal admission | <= 45.00 USDT |
+| Hard projected portfolio loss | <= 50.00 USDT |
+| Normal routes | <= 10 |
+| Routes per base asset | 1 |
+| Tranches per route | 5 |
 | Contracts | Linear USDT-settled perpetuals only |
 | Position construction | Paired long/short only |
-| Margin mode | Cross in a bot-dedicated account/subaccount |
-| Local free-margin floor | >= 20% after stress |
-| Initial live effective leverage | <= 3x per venue |
-| Configured exchange leverage | May be high, but never determines size |
-| Holding period | Dynamic, hard cap 24 hours in first live stage |
-| Cost multiplier | Configurable, default 2.0x stressed total cost |
-| Automatic withdrawals/transfers | Forbidden in MVP |
-| Emergency hedge | Allowed on a pre-qualified third venue |
-| Interface | Telegram |
-| Deployment | One VPS; Germany or Japan chosen by measured p95/p99 |
-| HFT competition | Out of scope |
+| Margin mode | Cross in bot-dedicated accounts/subaccounts |
+| Local free margin after venue stress | >= 20% |
+| Initial effective leverage | <= 3x per venue |
+| Maximum holding time | 24 hours from the first still-open tranche |
+| Automatic withdrawals/transfers | Forbidden |
+| Emergency third-venue hedge | Allowed only on a pre-qualified venue |
+| First runtime | Native Windows laptop |
+| VPS use | Forbidden until laptop acceptance artifact is accepted |
 
-## 4. Minimal architecture
+The 0.50 USDT route difference and 5.00 USDT portfolio difference are execution reserves, not additional normal trading capacity.
 
-Use a Python 3.12 asynchronous modular monolith:
+## 4. Canonical instrument and pair identity
+
+A contract is eligible only when both venues expose the same economically normalized:
+
+- base asset;
+- linear perpetual product type;
+- USDT settlement and margin;
+- contract multiplier and base-quantity interpretation;
+- active, non-delisting status.
+
+Normalize aliases such as `PEPE` versus `1000PEPE` before comparison. Ambiguous mapping blocks the pair.
+
+For reference bars, a venue pair has a canonical order `(A, B)` determined by lexical normalized venue ID. The order never changes with price. Directed executable routes are derived from the sign of the reference divergence:
+
+- positive divergence: short A and long B;
+- negative divergence: long A and short B.
+
+The canonical reference pair and the directed live route must be explicitly linked in persisted state.
+
+## 5. One-minute source bars
+
+### 5.1 Input
+
+Use only closed 1-minute OHLC bars from both exchanges. Each source bar must contain:
+
+- UTC interval start;
+- open, high, low, close;
+- source venue and normalized instrument identity;
+- completeness/data-quality status;
+- contract metadata version.
+
+A minute is `[t, t + 60 seconds)`. Pair only bars with exactly the same UTC interval start.
+
+Reject a minute when either side is missing, incomplete, non-positive, non-finite, duplicated without an identical payload, tied to a different contract specification, or affected by a known discontinuity. Never forward-fill or substitute the previous price.
+
+### 5.2 Canonical reference-spread bar
+
+For the fixed canonical pair `(A, B)`, express spread in basis points:
 
 ```text
-CCXT Pro / venue override
-        ↓
-market + private adapter boundary
-        ↓
-in-memory normalised books and account state
-        ↓
-route evaluator → strategy → risk reservation
-        ↓
-paired execution coordinator / simulator
-        ↓
-SQLite WAL state + Parquet history + DuckDB replay
-        ↓
-Telegram control and structured metrics/logs
+open  = 10000 × ln(open_A  / open_B)
+high  = 10000 × ln(high_A  / low_B)
+low   = 10000 × ln(low_A   / high_B)
+close = 10000 × ln(close_A / close_B)
 ```
 
-### Required architectural choices
+Use `Decimal` or a deterministic fixed-point equivalent with an explicitly tested precision/rounding policy.
 
-- `ccxt`/CCXT Pro is the initial transport accelerator and must be pinned in the resolved dependency lock.
-- The domain layer must not import exchange-specific response objects.
-- Every venue exposes the same explicit capability report. Unsupported or unknown capability means disabled functionality, not an optimistic fallback.
-- Monetary values, quantities, prices, funding, and fees use `Decimal` or integer fixed-point representations. Floating point is not allowed in risk/PnL decisions.
-- Exchange timestamps are UTC; freshness uses local monotonic time. Clock skew is measured and surfaced.
-- Hot-path decisions remain in memory. Storage writes are batched/asynchronous and may never block risk reduction.
-- SQLite is sufficient for the MVP on one VPS. Migrate only after measured contention or scale justifies it.
-- No web UI, distributed queue, service mesh, or orchestration platform in the MVP.
+`high_A / low_B` and `low_A / high_B` are deterministic synthetic minute envelopes. The two extremes may have occurred at different instants. Therefore these bars are valid for historical geometry, charts, stress, and trigger arming, but they are never evidence that the spread was executable. Entry and exit remain gated by synchronized L2/VWAP.
 
-## 5. Executable spread and PnL
+### 5.3 Higher intervals
 
-A directed route is `(instrument, long_venue, short_venue)`.
-
-For normalised base quantity `q`:
+Build every intraday and daily reference-spread bar only from completed 1-minute reference-spread bars:
 
 ```text
-entry_long_price  = VWAP ask on long venue for q
-entry_short_price = VWAP bid on short venue for q
-entry_spread      = entry_short_price - entry_long_price
-
-exit_long_price   = VWAP bid on long venue for q
-exit_short_price  = VWAP ask on short venue for q
-exit_spread       = exit_short_price - exit_long_price
-
-gross_convergence_pnl = normalised_contract_value(q) × (entry_spread - exit_spread)
+open_T  = open of the first 1m spread bar
+high_T  = maximum high of all 1m spread bars
+low_T   = minimum low of all 1m spread bars
+close_T = close of the last 1m spread bar
 ```
 
-The implementation must correctly normalise contract multipliers, lot steps, price steps, minimum notional, and position units before comparing venues.
+Required intervals are 5m, 15m, 1h, 4h, and 1d. A day is `00:00:00–23:59:59 UTC`.
+
+If any required minute is missing, the higher bar is `INCOMPLETE` and cannot enter the trading model. It may be displayed only with its incomplete status. Direct calculation from exchange 5m/15m/1h/4h/1d bars is forbidden.
+
+### 5.4 Acquisition and storage
+
+Add the smallest public-history capability to the current adapter boundary. Prefer the current common transport; add a native override only for a measured capability defect.
+
+History download must be:
+
+- on-demand for eligible candidates and open routes;
+- resumable and idempotent;
+- rate-limit aware;
+- bounded in concurrency;
+- cached by venue, instrument, contract version, and minute;
+- stored in Parquet with a DuckDB query/replay path;
+- integrity checked before becoming trade-eligible.
+
+Do not block the first vertical slice on downloading every symbol from every venue.
+
+## 6. Historical reference model
+
+### 6.1 Windows
+
+Target 180 complete days. Live eligibility requires at least 90 complete days. A 30-day minimum may be used only for shadow experimentation and never for live entry.
+
+Calculate positive and negative directions separately.
+
+### 6.2 Normal state
+
+Round valid 1-minute closes to 1 basis-point buckets. The normal state `S0` is the modal bucket.
+
+Deterministic tie-breaks:
+
+1. bucket nearest the exact median;
+2. smaller absolute value;
+3. smaller numeric value.
+
+Define:
+
+```text
+d_t = abs(close_t - S0)
+normal_half_width = max(2 bps, q10(d_t))
+normal_low  = S0 - normal_half_width
+normal_high = S0 + normal_half_width
+```
+
+### 6.3 Historical extremes
+
+After data-quality rejection only:
+
+```text
+H_plus  = maximum valid 1m reference-spread high
+H_minus = minimum valid 1m reference-spread low
+R_plus  = H_plus - S0
+R_minus = S0 - H_minus
+```
+
+Do not silently delete a valid statistical outlier. Data errors must be rejected through explicit quality evidence and a reason code.
+
+Disable a direction when its range is non-positive or its required historical evidence is absent.
+
+### 6.4 Convergence episodes
+
+An episode begins after the reference spread was in the normal zone and then reaches the first grid level. It ends at the first of:
+
+- return to the normal zone;
+- the hard 24-hour horizon;
+- unavailable/incomplete data.
+
+A direction is eligible for normal live trading only with at least ten completed historical episodes and a convergence rate of at least 70% within 24 hours. A canary still requires positive executable economics and may use only a route that passes the current qualification policy.
+
+Persist per-level convergence time, adverse excursion, censoring, and episode count.
+
+### 6.5 Current-regime guard
+
+Keep the current robust 24h, 7d, and 30d median/MAD/quantile model as a regime and long-tail guard, not as the sole grid definition.
+
+For each direction, reject new entry when the current 7-day median has drifted from `S0` by more than both:
+
+```text
+0.25 × the direction's historical range
+and
+3 × current robust sigma
+```
+
+Also retain existing data-quality, depth, funding, and bounded parameter-change gates. A model update may not change live parameters by more than 20% per day.
+
+Freeze `S0`, normal zone, extremes, levels, weights, stop, economics version, and route identity when the first tranche opens. Do not move the stop farther during an active route.
+
+## 7. Aggressive five-level grid
+
+For positive divergence:
+
+```text
+E_plus[i] = S0 + (i / 5) × R_plus, i = 1..5
+```
+
+For negative divergence:
+
+```text
+E_minus[i] = S0 - (i / 5) × R_minus, i = 1..5
+```
+
+Use the fixed tranche weights:
+
+```text
+level 1: 10%
+level 2: 15%
+level 3: 20%
+level 4: 25%
+level 5: 30%
+```
+
+These weights deliberately back-load size into deeper divergence and replace equal 20% sizing for this profile.
+
+Reference stops:
+
+```text
+reference_stop_plus  = S0 + 1.15 × R_plus
+reference_stop_minus = S0 - 1.15 × R_minus
+```
+
+The effective stop is the farther risk-reducing boundary of the reference stop and the current adaptive long-tail stop:
+
+- positive route: maximum of the two positive stop values;
+- negative route: minimum of the two negative stop values.
+
+If no valid adaptive stop exists, use the reference stop. A farther stop reduces permitted size; it never expands the 5 USDT risk limit.
+
+## 8. Persistent grid state machine
+
+Persist each level independently with at least:
+
+```text
+ARMED
+ENTRY_PENDING
+OPEN
+EXIT_PENDING
+CLOSED_WAIT_REARM
+DISABLED
+```
+
+Each level owns:
+
+- model/version/hash;
+- route direction;
+- reference trigger;
+- actual two-leg fills and normalized base quantity;
+- allocated weight and reserved stress;
+- executable entry spread;
+- reverse-grid target;
+- stop and maximum holding deadline;
+- fees, funding, slippage, realised/unrealised PnL;
+- rearm boundary and state.
+
+Rules:
+
+1. A level may open once before rearm.
+2. The next entry is the first unfilled crossed level, never always level 1.
+3. At most one tranche is submitted in one decision cycle.
+4. If the market gaps through several levels, process them sequentially only after the previous tranche is `HEDGED`, fresh L2 is obtained, and economics/risk are recalculated.
+5. Earlier levels are not enlarged to compensate for a rejected later level.
+6. No sixth tranche is permitted.
+7. State survives restart exactly; incompatible legacy state blocks entry rather than being reinterpreted.
+
+## 9. Hybrid entry gate
+
+A reference level only arms an entry. A tranche opens only when every gate passes in this order:
+
+1. current state/reconciliation is known and healthy;
+2. reference level is crossed in the correct direction;
+3. the crossing is present in three fresh synchronized L2 decisions spanning at least 500 ms;
+4. the level is eligible and not already filled;
+5. both books contain sufficient protected executable depth for the normalized base quantity;
+6. actual account fees and all required funding schedules are known;
+7. current-regime and historical-convergence gates pass;
+8. expected economics pass;
+9. route, portfolio, local-margin, liquidation-distance, and effective-leverage risk pass;
+10. atomic risk reservation succeeds;
+11. the existing durable paired execution coordinator accepts the action.
+
+Use actual L2 VWAP bid/ask for the full proposed tranche. Never use the reference OHLC high/low as an order price.
+
+## 10. Aggressive economics
+
+For each tranche calculate:
 
 ```text
 stressed_total_cost =
-    four-leg fees
+    four-leg actual/private taker fees
   + entry and exit market impact
-  + expected and stressed funding over the holding horizon
+  + entry and exit slippage
   + latency reserve
-  + partial-fill / emergency-hedge reserve
-  + reconciliation and forced-exit reserve
-
-expected_net_pnl = gross_convergence_pnl - stressed_total_cost
+  + partial-fill and unmatched-leg reserve
+  + emergency-hedge reserve
+  + reconciliation/forced-exit reserve
+  + funding contribution and funding stress
+  + liquidation-distance reserve
 ```
 
-A tranche may open only when both are true:
+Funding treatment:
+
+- charge 100% of expected adverse net funding;
+- credit only 50% of expected favorable net funding;
+- stress adverse funding at 2.0x;
+- calculate each venue's events from its own next timestamp and interval;
+- unknown or stale fee/funding information blocks entry.
+
+The convergence component excluding favorable funding must remain positive.
+
+Normal entry requires both:
 
 ```text
-expected_gross_pnl >= cost_multiplier × stressed_total_cost
-expected_net_pnl   >= calibrated_minimum_profit_usdt
+expected_gross_convergence_pnl >= 1.35 × stressed_total_cost
+expected_net_pnl                >= 0.15 USDT
 ```
 
-Unknown fees, funding schedule, contract metadata, depth, or data freshness blocks the entry.
+The minimum-notional canary may use `0.01 USDT` expected net profit solely to validate the live execution path. It does not qualify the normal strategy economics.
 
-## 6. Adaptive grid
+## 11. Risk sizing
 
-Use one method but separate parameters per directed route and size bucket. Do not use one grid step for all instruments.
-
-The calibrator must use robust statistics from rolling windows and long-tail stress history, including:
-
-- median and MAD;
-- empirical entry/exit quantiles;
-- time-to-convergence by spread bucket;
-- adverse excursion after entry;
-- depth and slippage by size;
-- funding over realistic holding horizons;
-- regime-change and data-quality flags.
-
-A practical initial rule may be:
+For a proposed full route nominal `N`, calculate the loss of each weighted tranche from its actual/planned entry to the frozen effective stop, then add all closing and recovery costs:
 
 ```text
-grid_step = max(cost_floor, liquidity_floor, robust_volatility_multiple)
+projected_route_loss(N) =
+    weighted spread loss to stop
+  + remaining close fees
+  + stressed exit impact/slippage
+  + stressed funding
+  + unmatched-leg/emergency-hedge reserve
+  + reconciliation/forced-exit reserve
+  + liquidation-distance reserve
 ```
 
-subject to tick/lot rounding, minimum profit, maximum risk, and a stability limit on parameter changes.
-
-Each tranche owns its actual two-leg fills, quantity, costs, target close level, stop assumptions, and state. Closing is paired and tranche-aware.
-
-## 7. Risk model
-
-Before reserving a new tranche, calculate the projected route loss at the defined emergency exit:
+Choose the maximum rounded common base quantity such that:
 
 ```text
-open-tranche loss at route stop
-+ all remaining closing fees
-+ funding stress
-+ exit slippage and market impact stress
-+ unmatched-leg / emergency-hedge reserve
-+ liquidation-distance reserve
-<= 5 USDT
+projected_route_loss <= 4.50 USDT
+projected_portfolio_loss <= 45.00 USDT
 ```
 
-Also enforce:
+After each actual fill and every quantity/price rounding, recalculate from actual state. New risk is rejected or reduced if the modelled limits would be exceeded.
 
-- aggregate projected portfolio stress <= 50 USDT;
-- maximum 10 normal routes;
-- one normal route per base asset;
-- maximum five tranches per route;
-- venue effective leverage <= 3x during first live stage;
-- at least 20% local free margin after venue-specific stress;
-- enough depth to close both sides under stress;
-- no new route while an unresolved unmatched leg or unknown order state exists;
-- no reliance on profit held at another venue to prevent local liquidation.
-
-Risk must be reserved atomically before order submission and released/reconciled from actual fills.
-
-## 8. Execution contract
-
-Normal execution intent is `PROTECTED_AGGRESSIVE_TAKER`:
-
-1. calculate executable VWAP and a worst acceptable price;
-2. submit both legs concurrently using marketable limit IOC or the safest venue-equivalent primitive;
-3. reconcile actual fills, never requested quantity;
-4. immediately cancel stale remainders;
-5. hedge only the actual residual delta;
-6. use idempotent client order IDs;
-7. query private stream, order endpoint, and positions before retrying an unknown result.
-
-Unbounded market orders are allowed only for `EMERGENCY_HEDGE`, `EMERGENCY_CLOSE`, or `LIQUIDATION_PREVENTION` when remaining directional exposure is assessed as more dangerous than slippage.
-
-Minimum paired-action states:
+Immediate risk reduction starts when either hard boundary is reached:
 
 ```text
-CREATED → PRECHECKED → RISK_RESERVED → ORDERS_SENT
-→ PARTIALLY_HEDGED → HEDGED → CLOSING → CLOSED
+projected route loss >= 5.00 USDT
+projected portfolio loss >= 50.00 USDT
 ```
 
-Error/recovery states must include unknown order status, one-leg fill, stale data, venue outage, emergency third-venue hedge, and manual quarantine.
+The live execution may realise more than the calculated limit during a gap, outage, or failed fill. The system must report this honestly and use the existing emergency paths.
 
-## 9. Data quality and overload behavior
+Leverage only determines margin consumption. It never determines position size.
 
-Entries are fail-closed when any relevant feed is stale, unsynchronised, sequence-broken, reconnecting, clock-skewed beyond policy, or missing sufficient depth.
+## 12. Reverse-grid exit and rearm
 
-At overload:
+Exit priority is fixed:
 
-1. open positions, close/hedge actions, private streams, and reconciliation have highest priority;
-2. candidate L2 subscriptions are reduced;
-3. broad BBO coverage may be reduced;
-4. new entries are disabled before risk management is degraded.
+1. emergency, unknown, unreconciled, or liquidation-danger state;
+2. effective reference stop or hard projected-loss boundary;
+3. hard holding deadline;
+4. adverse funding that destroys remaining expected profit;
+5. tranche reverse-grid target;
+6. consideration of another entry level.
 
-## 10. Live activation gates
+For a positive route, define the tranche target:
 
-Live orders must be physically impossible unless all gates are true:
-
-- runtime mode is `live`;
-- `live_enabled` is true;
-- CI/test/simulation flags are false;
-- a local, non-repository unlock secret is present;
-- Telegram owner confirmation matches a short-lived challenge;
-- the route and venues are on the canary allowlist;
-- capability, account-mode, margin, fee, funding, clock, data-quality, reconciliation, and risk preflights pass;
-- shadow qualification has passed under the current code/config hashes;
-- no kill switch, pause, stale state, unresolved owner action, or unknown order exists.
-
-Changing configuration alone must not be sufficient to activate live trading.
-
-API credentials must have trading permissions only, IP allowlisting where supported, and no withdrawal permission.
-
-## 11. Definition of done
-
-### Product Ready
-
-All `PR-*` criteria in `ACCEPTANCE.md` pass. A clean machine can run:
-
-```bash
-cp .env.example .env
-# add optional Telegram values; no exchange secrets required
-
-docker compose up --build
+```text
+target_plus[i] = max(
+    normal_high,
+    actual_entry_spread - max(grid_step, stressed_cost_move + minimum_profit_move)
+)
 ```
 
-and receive a working shadow product for Wave 1 rather than a stub or documentation-only result.
+For a negative route:
 
-### Live Canary Ready
+```text
+target_minus[i] = min(
+    normal_low,
+    actual_entry_spread + max(grid_step, stressed_cost_move + minimum_profit_move)
+)
+```
 
-All `CR-*` criteria pass using mocks/replay and available test environments. Production credentials remain absent from Git. The only remaining owner work is to supply restricted credentials, deploy on the selected VPS, run qualification, and explicitly unlock one minimal canary route.
+Close the tranche only from executable L2 exit prices and only through the existing paired close/reconciliation path.
 
-### Full target
+After a tranche is fully closed and stable-FLAT for that allocation, it enters `CLOSED_WAIT_REARM`. It becomes `ARMED` only after the reference spread has retreated inward by at least `0.25 × grid_step`; it may reopen only after a fresh outward recross of its own level and complete re-evaluation.
 
-All seven venues are supported only after the canary architecture is proven. No venue expansion may weaken Wave 1 behavior.
+The hard route holding deadline is 24 hours from the first still-open tranche. Per-level historical convergence p90 may impose an earlier deadline.
 
-## 12. Explicit non-goals for the fast track
+## 13. Route selection
 
-- guaranteed profit or guaranteed maximum realised loss;
-- high-frequency or colocated trading;
-- automatic inter-venue withdrawals or transfers;
-- web/mobile UI;
-- portfolio margin, inverse, coin-margined, USDC, options, or spot products;
-- machine-learning prediction before a deterministic baseline works;
-- seven native adapters before the first canary-ready vertical slice;
-- long qualification waits hard-coded into development. Qualification is sample/quality based and runs independently on the VPS.
+Evaluate all eligible directed routes for one base asset and admit only one. Use:
+
+```text
+score =
+    convergence_probability × expected_net_profit
+    ------------------------------------------------
+    projected_stress × max(expected_holding_hours, 0.25)
+```
+
+Deterministic tie-breaks:
+
+1. greater executable depth;
+2. lower total slippage;
+3. lower decision/data latency;
+4. lower total fee;
+5. lower adverse funding;
+6. lexical route ID.
+
+A route with non-positive expected net profit, insufficient history, or any unknown critical input is ineligible regardless of score.
+
+## 14. Replay, shadow, and live parity
+
+The same immutable decision input and strategy evaluator must drive:
+
+- deterministic replay;
+- simulator;
+- real-time shadow;
+- laptop live canary/pilot;
+- later VPS live.
+
+Adapters may differ; strategy semantics may not. Replay must model conservative ordering when multiple levels, target, and stop are touched inside one minute. For ambiguous OHLC-only ordering, choose the worse result for the strategy unless finer event data proves the sequence.
+
+Every decision emits a stable reason code and a complete numerical breakdown for reference level, executable spread, target, stop, cost, funding, risk, route score, and state transition.
+
+## 15. Laptop-first implementation and verification
+
+### Stage A — software/replay
+
+On the current Windows laptop:
+
+- bind an exact CPython 3.12 environment and dependency lock;
+- run all existing verification and security checks;
+- build deterministic 1m reference-spread fixtures;
+- prove five-level open, catch-up, reverse close, rearm, stop, funding exit, restart, and recovery in replay/simulator;
+- prove no production submit occurs.
+
+Do not wait for long qualification while coding; use short synthetic profiles for implementation tests.
+
+### Stage B — live public shadow
+
+Use the existing Windows-native service/S4U workflow to:
+
+- download/resume the required 1m history for a narrow Wave 1 candidate set;
+- build the exact reference model;
+- run the hybrid strategy on live public BBO/L2/funding data;
+- persist qualification bound to code, config, history manifest, route, and runtime hashes.
+
+The existing owner-authorized 12-hour laptop exception may be reused only if its current policy and one-time evidence rules still accept the new exact head. Never shorten below the already authorized policy. Otherwise use the standard 24-hour policy.
+
+### Stage C — minimum live canary
+
+After all independent work is complete, request one owner action for restricted credentials and explicit live consent. The canary remains:
+
+- one base;
+- one directed route;
+- one tranche;
+- minimum valid notional;
+- at most 1 USDT hard projected route/portfolio loss;
+- exact qualification and all current live gates;
+- stable-FLAT and eight hours of post-trade service evidence.
+
+### Stage D — laptop pilot
+
+Risk-stage promotion remains owner-confirmed. The laptop must support the fixed progression:
+
+| Stage | Routes | Tranches per route | Pair hard loss | Portfolio hard loss |
+|---|---:|---:|---:|---:|
+| canary | 1 | 1 | 1 USDT | 1 USDT |
+| pilot_a | 1 | 5 | 5 USDT | 5 USDT |
+| pilot_b | 2 | 5 | 5 USDT | 10 USDT |
+| wave1_prod | 3 | 5 | 5 USDT | 15 USDT |
+| full | 10 | 5 | 5 USDT | 50 USDT |
+
+A stage may advance only after exact evidence, stable-FLAT, no unresolved action, and explicit owner promotion. No automatic risk escalation from canary to full is permitted.
+
+### Stage E — laptop acceptance and VPS block
+
+Create `state/laptop-aggressive-acceptance.json` only when:
+
+- exact software/replay/shadow evidence passes;
+- at least one owner-authorized real paired canary completed and stable-FLAT was proven;
+- no critical unresolved defect remains;
+- the artifact binds exact code, config, strategy profile, history manifest, qualification, Windows runtime manifest, and canary report hashes.
+
+Until that artifact has `accepted=true`, every VPS deploy/bootstrap command and runtime promotion must fail closed with an explicit reason. The current goal may prepare a later handoff but must not deploy to VPS.
+
+## 16. Minimal user interface
+
+Extend the existing CLI/Telegram output only as needed to show:
+
+- strategy profile/version;
+- normal state and normal zone;
+- positive/negative historical extremes;
+- five levels, weights, state, and actual fills;
+- effective stop and remaining route/portfolio risk;
+- expected/realised fees, funding, slippage, and PnL;
+- current qualification and laptop acceptance status;
+- exact rejection reason.
+
+Do not add a web UI.
+
+Provide one Windows wrapper, `scripts/laptop-aggressive.ps1`, with modes:
+
+```text
+verify
+shadow
+qualify
+canary
+pilot
+status
+stop
+```
+
+It must orchestrate the existing scripts/services rather than duplicate their implementations. Modes that require secrets or live consent must fail with one exact owner action when absent.
+
+## 17. Definition of done
+
+### Software Ready
+
+- all existing baseline `B-*`, `PR-*`, and `CR-*` acceptance remains green;
+- all new `AS-*` criteria pass;
+- `make verify` and required branch checks are green on the exact head;
+- deterministic replay proves the full five-level lifecycle and all risk/recovery invariants;
+- Windows native `verify`, `shadow`, and qualification workflows work without Docker;
+- live remains physically impossible without the existing independent unlock gates;
+- no VPS action has occurred.
+
+### Laptop Live Accepted
+
+- one exact owner-authorized minimum-notional paired canary has completed;
+- actual four-leg fills, fees, funding, stable-FLAT, restart/recovery behavior, and post-FLAT service evidence are honest and accepted;
+- `state/laptop-aggressive-acceptance.json` has `accepted=true` and exact hashes;
+- all identified defects have been fixed and reverified on the exact final head;
+- VPS remains untouched and is the subject of a later, separate goal.
+
+## 18. Permitted stop conditions for Codex
+
+Codex may stop only when:
+
+1. the complete software-only goal is accepted and the only remaining work requires owner credentials or explicit live-money consent; or
+2. laptop live acceptance is complete.
+
+Before an owner action, finish every independent code, test, review, documentation update, and local non-secret verification. Do not stop for ordinary design choices, temporary venue failure, or a long-running qualification that can be launched through the existing durable laptop workflow.
