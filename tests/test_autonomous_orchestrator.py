@@ -56,6 +56,11 @@ def test_orchestrator_requires_local_receipt_for_laptop_exception(
         AutonomousOrchestrator(settings, qualification_policy=policy)
 
     monkeypatch.setenv(LAPTOP_OWNER_EXCEPTION_ENV, LAPTOP_OWNER_EXCEPTION_CONFIRMATION)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "laptop_owner_exception_authorized",
+        lambda: True,
+    )
     orchestrator = AutonomousOrchestrator(settings, qualification_policy=policy)
     assert orchestrator.qualification_policy == policy
 
