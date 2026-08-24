@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -121,10 +122,15 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     qualification = Path("scripts/laptop-qualification.ps1").read_text(encoding="utf-8")
     pilot = Path("scripts/laptop-pilot.ps1").read_text(encoding="utf-8")
 
-    assert "Export-Clixml" in onboarding
+    assert "Export-Clixml" not in onboarding
+    assert "Import-Clixml" not in loader
+    assert "[Management.Automation.PSSerializer]::Serialize($payload)" in onboarding
+    assert "[Management.Automation.PSSerializer]::Deserialize($serialized)" in loader
     assert "UseSystemPasswordChar = $true" in onboarding
     assert "ShortcutsEnabled = $true" in onboarding
-    assert "ConvertTo-SecureString -String $plain -AsPlainText -Force" in onboarding
+    assert "ConvertTo-SecureString" not in onboarding
+    assert "$secure.AppendChar($Value[$index])" in onboarding
+    assert "$secure.MakeReadOnly()" in onboarding
     assert "$input.Clear()" in onboarding
     assert "Write-Host $plain" not in onboarding
     assert 'QualificationRoute = "BTC:bybit>okx"' in onboarding
@@ -148,3 +154,24 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "risk-stage-promote" in pilot and "PROMOTE:canary" in pilot
     assert pilot.index("Start-Process") < pilot.index('$env:IPEG_LIVE_ENABLED = "true"')
     assert pilot.index('$env:IPEG_LIVE_ENABLED = "false"') < pilot.index("Start-Process")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")
+def test_windows_onboarding_secure_string_runtime_round_trip() -> None:
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(Path("scripts/laptop-onboard.ps1").resolve()),
+            "-RuntimeSelfTest",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert "SecureString and DPAPI serializer round-trip PASS" in completed.stdout

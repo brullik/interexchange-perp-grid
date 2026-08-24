@@ -26,7 +26,8 @@ $resolved = [System.IO.Path]::GetFullPath((Join-Path $root $ProfilePath))
 if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
     throw "Encrypted laptop onboarding file is missing: $resolved"
 }
-$profile = Import-Clixml -LiteralPath $resolved
+$serialized = [IO.File]::ReadAllText($resolved, [Text.Encoding]::UTF8)
+$profile = [Management.Automation.PSSerializer]::Deserialize($serialized)
 if ($profile.SchemaVersion -ne 1 -or $profile.QualificationRoute -cne "BTC:bybit>okx") {
     throw "Encrypted laptop onboarding identity is invalid"
 }
