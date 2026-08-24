@@ -166,7 +166,14 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "$env:TEMP = $laptopTemp" in qualification
     assert "$env:TMP = $laptopTemp" in qualification
     assert "SetThreadExecutionState" in qualification
+    assert "OwnerException12h" in qualification
+    assert '"IPEG_LAPTOP_12H_OWNER_EXCEPTION"' in qualification
+    assert "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION" in qualification
+    assert "--laptop-owner-exception-12h" in qualification
+    assert "--maximum-hours 18" in qualification
     assert 'if ($consent -cne "I_ACCEPT_LIVE_CANARY_RISK")' in pilot
+    assert "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION" in pilot
+    assert "--laptop-owner-exception-12h" in pilot
     assert '$env:IPEG_LIVE_ENABLED = "true"' in pilot
     assert '$env:IPEG_LIVE_ENABLED = "false"' in pilot
     assert '"--duration-seconds", "33000"' in pilot

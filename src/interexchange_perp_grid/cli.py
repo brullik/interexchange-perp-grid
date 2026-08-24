@@ -54,6 +54,8 @@ from interexchange_perp_grid.private_transition_smoke import (
 )
 from interexchange_perp_grid.public_engine import PublicMarketEngine, ScanResult
 from interexchange_perp_grid.qualification import (
+    LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
+    LAPTOP_OWNER_EXCEPTION_ENV,
     QualificationPolicy,
     QualificationProgress,
     QualificationRuntimeEvidence,
@@ -62,9 +64,12 @@ from interexchange_perp_grid.qualification import (
     code_hash,
     config_hash,
     current_code_commit_sha,
+    laptop_owner_exception_authorized,
+    laptop_owner_exception_policy,
     load_qualification,
     load_runtime_evidence,
     qualification_is_current,
+    qualification_policy_from_settings,
     run_qualification,
     write_runtime_evidence,
 )
@@ -150,26 +155,22 @@ def _load(config: Path) -> Settings:
 
 
 def _qualification_policy(settings: Settings) -> QualificationPolicy:
-    return QualificationPolicy(
-        minimum_duration_seconds=settings.shadow.qualification_min_duration_seconds,
-        minimum_synchronised_snapshots_per_venue=(
-            settings.shadow.qualification_min_synchronised_snapshots_per_venue
-        ),
-        minimum_funding_checkpoints_per_venue=(
-            settings.shadow.qualification_min_funding_checkpoints_per_venue
-        ),
-        maximum_inter_snapshot_gap_seconds=(
-            settings.shadow.qualification_max_inter_snapshot_gap_seconds
-        ),
-        maximum_sequence_gaps=settings.shadow.qualification_max_sequence_gaps,
-        maximum_stale_snapshots=settings.shadow.qualification_max_stale_snapshots,
-        maximum_sequence_unknown_snapshots=(
-            settings.shadow.qualification_max_sequence_unknown_snapshots
-        ),
-        maximum_clock_skew_snapshots=settings.shadow.qualification_max_clock_skew_snapshots,
-        maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
-        maximum_snapshot_age_ms=settings.market_data.max_l2_age_ms,
-    )
+    return qualification_policy_from_settings(settings)
+
+
+def _selected_qualification_policy(
+    settings: Settings,
+    laptop_owner_exception_12h: bool,
+) -> QualificationPolicy:
+    standard = _qualification_policy(settings)
+    if not laptop_owner_exception_12h:
+        return standard
+    if not laptop_owner_exception_authorized():
+        raise typer.BadParameter(
+            f"Windows laptop exception requires {LAPTOP_OWNER_EXCEPTION_ENV}="
+            f"{LAPTOP_OWNER_EXCEPTION_CONFIRMATION}"
+        )
+    return laptop_owner_exception_policy(settings)
 
 
 def _current_region_evidence_identity(repo_root: Path, config: Path) -> tuple[str, str]:
@@ -436,12 +437,16 @@ def run_service_for(
 def laptop_qualification_run(
     maximum_hours: Annotated[
         float,
-        typer.Option("--maximum-hours", min=24, max=30),
+        typer.Option("--maximum-hours", min=12, max=30),
     ] = 30,
+    laptop_owner_exception_12h: Annotated[
+        bool,
+        typer.Option("--laptop-owner-exception-12h"),
+    ] = False,
     repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
-    """Run native shadow until the exact 24-hour qualification finalizes."""
+    """Run native shadow until the selected exact laptop qualification finalizes."""
     settings = _load(config)
     if settings.app.mode != "shadow" or settings.live.enabled:
         raise typer.BadParameter("laptop qualification requires shadow mode and live disabled")
@@ -452,11 +457,15 @@ def laptop_qualification_run(
     route = _parse_route(os.environ.get("IPEG_QUALIFICATION_ROUTE", ""))
     if route.value != "BTC:bybit>okx":
         raise typer.BadParameter("laptop qualification route must be BTC:bybit>okx")
+    policy = _selected_qualification_policy(settings, laptop_owner_exception_12h)
+    if not laptop_owner_exception_12h and maximum_hours < 24:
+        raise typer.BadParameter("standard laptop qualification requires at least 24 hours")
     epoch = asyncio.run(
         run_until_qualification_finalized(
             settings,
             LaptopQualificationIdentity(route, release_sha, runtime_digest),
             maximum_seconds=maximum_hours * 3600,
+            qualification_policy=policy,
         )
     )
     typer.echo(json.dumps(asdict(epoch), default=str, sort_keys=True))
@@ -525,10 +534,14 @@ def qualify(
             readable=True,
         ),
     ] = Path("state/qualification-runtime.json"),
+    laptop_owner_exception_12h: Annotated[
+        bool,
+        typer.Option("--laptop-owner-exception-12h"),
+    ] = False,
 ) -> None:
     """Write exact-route, release/image/data-bound qualification evidence."""
     settings = _load(config)
-    policy = _qualification_policy(settings)
+    policy = _selected_qualification_policy(settings, laptop_owner_exception_12h)
     result = run_qualification(
         repo_root.resolve(),
         config.resolve(),
@@ -577,10 +590,15 @@ def qualification_epoch_start(
 @app.command("qualification-epoch-status")
 def qualification_epoch_status(
     epoch_id: Annotated[str | None, typer.Option("--epoch-id")] = None,
+    laptop_owner_exception_12h: Annotated[
+        bool,
+        typer.Option("--laptop-owner-exception-12h"),
+    ] = False,
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
-    """Print exact 24h progress, remaining work, and fail-closed blockers as JSON."""
+    """Print exact selected-policy progress and fail-closed blockers as JSON."""
     settings = _load(config)
+    policy = _selected_qualification_policy(settings, laptop_owner_exception_12h)
 
     async def status() -> QualificationProgress:
         state_path = Path(settings.storage.sqlite_path)
@@ -589,7 +607,7 @@ def qualification_epoch_status(
             state_path,
             Path(settings.storage.parquet_dir),
             epoch_id,
-            _qualification_policy(settings),
+            policy,
         )
 
     try:
@@ -684,11 +702,17 @@ def risk_stage_promote(
         typer.Option("--container-image-digest", envvar="IPEG_CONTAINER_IMAGE_DIGEST"),
     ],
     repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    laptop_owner_exception_12h: Annotated[
+        bool,
+        typer.Option("--laptop-owner-exception-12h"),
+    ] = False,
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
     """Persist one adjacent owner-confirmed promotion after exact qualification validation."""
     settings = _load(config)
     evidence = load_qualification(qualification.resolve())
+    standard_policy = _qualification_policy(settings)
+    selected_policy = _selected_qualification_policy(settings, laptop_owner_exception_12h)
     current, reason = qualification_is_current(
         evidence,
         repo_root.resolve(),
@@ -696,6 +720,9 @@ def risk_stage_promote(
         Path(settings.storage.parquet_dir).resolve(),
         settings.live.qualification_max_age_seconds,
         current_container_image_digest=container_image_digest.lower(),
+        accepted_policies=(selected_policy,)
+        if selected_policy != standard_policy
+        else (standard_policy,),
     )
     if not current:
         raise typer.BadParameter(f"qualification is not current: {reason.value}")

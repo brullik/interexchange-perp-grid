@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,8 +17,16 @@ from interexchange_perp_grid.laptop_workflow import (
     build_laptop_pilot_report,
     run_until_qualification_finalized,
 )
-from interexchange_perp_grid.qualification import QualificationEvidence
-from interexchange_perp_grid.service import BoundedServiceReceipt
+from interexchange_perp_grid.qualification import (
+    LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
+    LAPTOP_OWNER_EXCEPTION_ENV,
+    LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS,
+    QualificationEvidence,
+    laptop_owner_exception_authorized,
+    laptop_owner_exception_policy,
+    qualification_policy_from_settings,
+)
+from interexchange_perp_grid.service import BootstrapService, BoundedServiceReceipt
 from interexchange_perp_grid.state import QualificationEpoch, QualificationEpochStatus
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
@@ -47,8 +56,9 @@ async def test_native_qualification_stops_only_after_exact_epoch_finalizes(
         QualificationEpochStatus.FINALIZED,
     )
 
-    async def fake_service(self: object, stop_event: asyncio.Event) -> None:
-        del self
+    async def fake_service(self: BootstrapService, stop_event: asyncio.Event) -> None:
+        assert self.qualification_policy == qualification_policy_from_settings(settings)
+        assert self.settings.shadow.scan_interval_seconds == 5
         await stop_event.wait()
         stopped.set()
 
@@ -71,6 +81,73 @@ async def test_native_qualification_stops_only_after_exact_epoch_finalizes(
 
     assert result == epoch
     assert stopped.is_set()
+
+
+def test_laptop_owner_exception_changes_only_duration_and_requires_windows_receipt(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
+    standard = qualification_policy_from_settings(settings)
+    laptop = laptop_owner_exception_policy(settings)
+
+    assert standard.minimum_duration_seconds == 86_400
+    assert laptop.minimum_duration_seconds == 43_200
+    assert replace(laptop, minimum_duration_seconds=86_400) == standard
+    receipt = {LAPTOP_OWNER_EXCEPTION_ENV: LAPTOP_OWNER_EXCEPTION_CONFIRMATION}
+    assert laptop_owner_exception_authorized(receipt, platform="win32")
+    assert not laptop_owner_exception_authorized(receipt, platform="linux")
+    assert not laptop_owner_exception_authorized({}, platform="win32")
+
+
+@pytest.mark.asyncio
+async def test_native_laptop_exception_accepts_exact_twelve_hour_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
+    policy = laptop_owner_exception_policy(settings)
+    monkeypatch.setenv(LAPTOP_OWNER_EXCEPTION_ENV, LAPTOP_OWNER_EXCEPTION_CONFIRMATION)
+    stopped = asyncio.Event()
+    observed_at = datetime(2026, 8, 21, tzinfo=UTC)
+    epoch = QualificationEpoch(
+        "epoch-12h",
+        ROUTE,
+        RELEASE,
+        "c" * 64,
+        "d" * 64,
+        DIGEST,
+        observed_at - timedelta(hours=12),
+        observed_at,
+        QualificationEpochStatus.FINALIZED,
+    )
+
+    async def fake_service(self: BootstrapService, stop_event: asyncio.Event) -> None:
+        assert self.qualification_policy == policy
+        assert self.settings.shadow.scan_interval_seconds == 3
+        await stop_event.wait()
+        stopped.set()
+
+    async def finalized(path: object) -> QualificationEpoch:
+        del path
+        return epoch
+
+    monkeypatch.setattr(
+        "interexchange_perp_grid.laptop_workflow.BootstrapService.run",
+        fake_service,
+    )
+    monkeypatch.setattr(workflow_module, "read_qualification_epoch", finalized)
+
+    result = await run_until_qualification_finalized(
+        settings,
+        LaptopQualificationIdentity(ROUTE, RELEASE, DIGEST),
+        maximum_seconds=43_200,
+        poll_interval_seconds=0.01,
+        qualification_policy=policy,
+    )
+
+    assert result == epoch
+    assert stopped.is_set()
+    assert LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS * 10_000 < 43_200
 
 
 @pytest.mark.asyncio

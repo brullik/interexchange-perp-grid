@@ -78,8 +78,11 @@ from interexchange_perp_grid.private_execution import (
     translate_protected_order,
 )
 from interexchange_perp_grid.qualification import (
+    laptop_owner_exception_authorized,
+    laptop_owner_exception_policy,
     load_qualification,
     qualification_is_current,
+    qualification_policy_from_settings,
 )
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import RiskDecision
@@ -1101,6 +1104,12 @@ async def run_canary_once(
         image_digest = resolve_runtime_artifact_digest(repo_root, config_path)
     except (OSError, ValueError, subprocess.SubprocessError):
         return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING, route)
+    standard_policy = qualification_policy_from_settings(settings)
+    accepted_policies = (
+        (standard_policy, laptop_owner_exception_policy(settings))
+        if laptop_owner_exception_authorized()
+        else (standard_policy,)
+    )
     qualification_valid, _ = qualification_is_current(
         evidence,
         repo_root,
@@ -1109,9 +1118,17 @@ async def run_canary_once(
         settings.live.qualification_max_age_seconds,
         expected_route=route,
         current_container_image_digest=image_digest,
+        accepted_policies=accepted_policies,
     )
     if not qualification_valid:
         return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING, route)
+    if evidence.policy == laptop_owner_exception_policy(settings):
+        completed_exception_canaries = await journal.completed_actions_since(
+            evidence.generated_at,
+            evidence.qualification_hash,
+        )
+        if completed_exception_canaries:
+            return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route)
 
     required_venues = {route.long_venue, route.short_venue, emergency_venue}
     public_adapters = {venue: CcxtProAdapter(venue) for venue in required_venues}

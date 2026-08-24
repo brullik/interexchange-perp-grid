@@ -30,6 +30,19 @@ def test_cli_and_public_scan_help_render() -> None:
     assert "--quantity" in ANSI_ESCAPE.sub("", public_help.output)
 
 
+def test_laptop_twelve_hour_profile_requires_explicit_local_receipt(
+    tmp_path: Path,
+) -> None:
+    result = runner.invoke(
+        app,
+        ["qualification-epoch-status", "--laptop-owner-exception-12h"],
+        env={"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")},
+    )
+
+    assert result.exit_code == 2
+    assert "IPEG_LAPTOP_12H_OWNER_EXCEPTION" in result.output
+
+
 def test_deployment_upgrade_gate_cli_persists_and_releases_freeze(tmp_path: Path) -> None:
     environment = {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")}
 

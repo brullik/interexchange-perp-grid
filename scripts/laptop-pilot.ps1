@@ -30,6 +30,22 @@ $qualification = [System.IO.Path]::GetFullPath((Join-Path $root $QualificationPa
 if (-not (Test-Path -LiteralPath $qualification -PathType Leaf)) {
     throw "Final accepted laptop qualification is missing: $qualification"
 }
+$qualificationPayload = Get-Content -LiteralPath $qualification -Raw | ConvertFrom-Json
+$qualificationDuration = [int]$qualificationPayload.policy.minimum_duration_seconds
+$ownerException12h = $qualificationDuration -eq 43200
+if ($qualificationDuration -notin @(43200, 86400)) {
+    throw "Laptop qualification policy is neither the standard nor approved exception"
+}
+$ownerExceptionConfirmation = $null
+if ($ownerException12h) {
+    $ownerExceptionConfirmation = Read-Host (
+        "For this one-time laptop-only 12-hour qualification, type " +
+        "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION"
+    )
+    if ($ownerExceptionConfirmation -cne "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION") {
+        throw "The laptop-only 12-hour qualification exception was not confirmed"
+    }
+}
 
 & $python -m interexchange_perp_grid.cli native-runtime-manifest `
     --output $env:IPEG_NATIVE_RUNTIME_MANIFEST `
@@ -74,6 +90,9 @@ if ($armed -eq 0) { throw "Windows sleep prevention could not be armed" }
 $serviceProcess = $null
 $entryAttempted = $false
 try {
+    if ($ownerException12h) {
+        $env:IPEG_LAPTOP_12H_OWNER_EXCEPTION = $ownerExceptionConfirmation
+    }
     $riskOutput = @(
         & $python -m interexchange_perp_grid.cli risk-stage-status `
             --config "$root/config/defaults.yaml"
@@ -85,15 +104,28 @@ try {
     if (-not $riskJson) { throw "risk stage status is not machine-readable" }
     $risk = $riskJson | ConvertFrom-Json
     if ([string]$risk.state.stage -eq "shadow") {
-        & $python -m interexchange_perp_grid.cli risk-stage-promote `
-            --expected-current shadow `
-            --target canary `
-            --actor laptop-owner `
-            --confirmation PROMOTE:canary `
-            --qualification $qualification `
-            --container-image-digest $env:IPEG_CONTAINER_IMAGE_DIGEST `
-            --repo-root $root `
-            --config "$root/config/defaults.yaml"
+        if ($ownerException12h) {
+            & $python -m interexchange_perp_grid.cli risk-stage-promote `
+                --expected-current shadow `
+                --target canary `
+                --actor laptop-owner `
+                --confirmation PROMOTE:canary `
+                --qualification $qualification `
+                --container-image-digest $env:IPEG_CONTAINER_IMAGE_DIGEST `
+                --laptop-owner-exception-12h `
+                --repo-root $root `
+                --config "$root/config/defaults.yaml"
+        } else {
+            & $python -m interexchange_perp_grid.cli risk-stage-promote `
+                --expected-current shadow `
+                --target canary `
+                --actor laptop-owner `
+                --confirmation PROMOTE:canary `
+                --qualification $qualification `
+                --container-image-digest $env:IPEG_CONTAINER_IMAGE_DIGEST `
+                --repo-root $root `
+                --config "$root/config/defaults.yaml"
+        }
         if ($LASTEXITCODE -ne 0) { throw "risk stage promotion to canary failed" }
     } elseif ([string]$risk.state.stage -ne "canary") {
         throw "first laptop pilot requires the locked canary risk stage"
@@ -165,6 +197,7 @@ try {
     $env:IPEG_MODE = "shadow"
     $env:IPEG_LIVE_ENABLED = "false"
     Remove-Item Env:IPEG_LOCAL_UNLOCK_SECRET -ErrorAction SilentlyContinue
+    Remove-Item Env:IPEG_LAPTOP_12H_OWNER_EXCEPTION -ErrorAction SilentlyContinue
     Write-Host "Canary is queued. The sole safety supervisor owns submission and recovery."
     Write-Host "The command will finish only after the bounded service interval and evidence audit."
     $serviceProcess.WaitForExit()
@@ -192,6 +225,7 @@ try {
     $env:IPEG_MODE = "shadow"
     $env:IPEG_LIVE_ENABLED = "false"
     Remove-Item Env:IPEG_LOCAL_UNLOCK_SECRET -ErrorAction SilentlyContinue
+    Remove-Item Env:IPEG_LAPTOP_12H_OWNER_EXCEPTION -ErrorAction SilentlyContinue
     if (
         $serviceProcess -and
         -not $serviceProcess.HasExited -and

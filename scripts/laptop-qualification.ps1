@@ -2,7 +2,8 @@
 param(
     [string]$ProfilePath = "state/laptop-profile.clixml",
     [ValidateSet("CurrentUser", "LocalMachine")]
-    [string]$ProfileScope = "CurrentUser"
+    [string]$ProfileScope = "CurrentUser",
+    [switch]$OwnerException12h
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,6 +47,23 @@ $manifest = Get-Content -LiteralPath $env:IPEG_NATIVE_RUNTIME_MANIFEST -Raw | Co
 $env:IPEG_RELEASE_SHA = [string]$manifest.release_sha
 $env:IPEG_CONTAINER_IMAGE_DIGEST = [string]$manifest.artifact_digest
 
+$ownerExceptionConfirmation = $null
+if ($OwnerException12h) {
+    $ownerExceptionConfirmation = [Environment]::GetEnvironmentVariable(
+        "IPEG_LAPTOP_12H_OWNER_EXCEPTION",
+        "Process"
+    )
+    if ([string]::IsNullOrWhiteSpace($ownerExceptionConfirmation)) {
+        $ownerExceptionConfirmation = Read-Host (
+            "For the one-time laptop-only 12-hour qualification, type " +
+            "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION"
+        )
+    }
+    if ($ownerExceptionConfirmation -cne "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION") {
+        throw "The laptop-only 12-hour qualification exception was not confirmed"
+    }
+}
+
 # The locked laptop route is Bybit -> OKX. Binance USD-M is the first
 # alternate in GOAL.md and may be geographically unavailable; it must not
 # block qualification of the required private pair.
@@ -83,14 +101,28 @@ $armed = [LaptopSleepGuard]::SetThreadExecutionState(
 )
 if ($armed -eq 0) { throw "Windows sleep prevention could not be armed" }
 
-Write-Host "Starting exact native 24-hour shadow qualification."
+if ($OwnerException12h) {
+    Write-Host "Starting exact one-time native 12-hour laptop shadow qualification."
+    Write-Host "The standard and future VPS qualification policy remains 24 hours."
+} else {
+    Write-Host "Starting exact native 24-hour shadow qualification."
+}
 Write-Host "Keep AC power and network connected. Closing this terminal interrupts qualification."
 Write-Host "Live remains disabled; no real order can be submitted in this phase."
 try {
-    & $python -m interexchange_perp_grid.cli laptop-qualification-run `
-        --maximum-hours 30 `
-        --repo-root $root `
-        --config "$root/config/defaults.yaml"
+    if ($OwnerException12h) {
+        $env:IPEG_LAPTOP_12H_OWNER_EXCEPTION = $ownerExceptionConfirmation
+        & $python -m interexchange_perp_grid.cli laptop-qualification-run `
+            --maximum-hours 18 `
+            --laptop-owner-exception-12h `
+            --repo-root $root `
+            --config "$root/config/defaults.yaml"
+    } else {
+        & $python -m interexchange_perp_grid.cli laptop-qualification-run `
+            --maximum-hours 30 `
+            --repo-root $root `
+            --config "$root/config/defaults.yaml"
+    }
     if ($LASTEXITCODE -ne 0) { throw "native qualification service failed" }
 
     $statusOutput = @(
@@ -117,13 +149,23 @@ try {
         --config "$root/config/defaults.yaml"
     if ($LASTEXITCODE -ne 0) { throw "qualification runtime evidence failed" }
 
-    & $python -m interexchange_perp_grid.cli qualify `
-        --evidence $qualificationEvidence `
-        --runtime-evidence $runtimeEvidence `
-        --repo-root $root `
-        --config "$root/config/defaults.yaml"
+    if ($OwnerException12h) {
+        & $python -m interexchange_perp_grid.cli qualify `
+            --evidence $qualificationEvidence `
+            --runtime-evidence $runtimeEvidence `
+            --laptop-owner-exception-12h `
+            --repo-root $root `
+            --config "$root/config/defaults.yaml"
+    } else {
+        & $python -m interexchange_perp_grid.cli qualify `
+            --evidence $qualificationEvidence `
+            --runtime-evidence $runtimeEvidence `
+            --repo-root $root `
+            --config "$root/config/defaults.yaml"
+    }
     if ($LASTEXITCODE -ne 0) { throw "final laptop qualification failed closed" }
     Write-Host "Native laptop qualification accepted: $qualificationEvidence"
 } finally {
+    Remove-Item Env:IPEG_LAPTOP_12H_OWNER_EXCEPTION -ErrorAction SilentlyContinue
     [void][LaptopSleepGuard]::SetThreadExecutionState($continuous)
 }

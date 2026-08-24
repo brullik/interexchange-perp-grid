@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -211,6 +212,31 @@ async def test_route_qualification_binds_complete_release_evidence(
         expected_route=_ROUTE,
         current_container_image_digest=_IMAGE,
         current_release_code_sha=_SHA,
+    ) == (True, ReasonCode.QUALIFICATION_PASSED)
+    mismatched_policy = replace(evidence.policy, minimum_duration_seconds=43_200)
+    assert qualification_is_current(
+        evidence,
+        repo,
+        config,
+        data,
+        3600,
+        now=observed + timedelta(minutes=1),
+        expected_route=_ROUTE,
+        current_container_image_digest=_IMAGE,
+        current_release_code_sha=_SHA,
+        accepted_policies=(mismatched_policy,),
+    ) == (False, ReasonCode.QUALIFICATION_HASH_MISMATCH)
+    assert qualification_is_current(
+        evidence,
+        repo,
+        config,
+        data,
+        3600,
+        now=observed + timedelta(minutes=1),
+        expected_route=_ROUTE,
+        current_container_image_digest=_IMAGE,
+        current_release_code_sha=_SHA,
+        accepted_policies=(evidence.policy,),
     ) == (True, ReasonCode.QUALIFICATION_PASSED)
 
     await _record_route(data, observed + timedelta(seconds=10))
