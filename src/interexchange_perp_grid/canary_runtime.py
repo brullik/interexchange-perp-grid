@@ -7,7 +7,7 @@ import subprocess
 import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -15,11 +15,26 @@ from uuid import uuid4
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.aggressive_evaluator import (
+    AggressiveDecisionPolicy,
+    AggressiveEntryStage,
+    AggressiveExitInput,
+    AggressiveExitReason,
+    HybridEntryInput,
+    VenueFundingProjection,
+    canonical_executable_spread_bps,
+    load_aggressive_decision_policy,
+    revalidate_hybrid_entry_once,
+    select_aggressive_exit_reason,
+)
 from interexchange_perp_grid.aggressive_live import (
     AggressiveLaptopLiveStage,
     AggressiveLiveIntentEnvelope,
+    aggressive_intent_from_mapping,
+    aggressive_intent_sha256,
     prepare_aggressive_live_plan,
 )
+from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
 from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.config import Settings
@@ -66,9 +81,12 @@ from interexchange_perp_grid.live_reconciliation import (
     ReconciliationReport,
     VenuePrivateState,
     collect_private_states,
+    combined_event_watermark,
     evaluate_canary_risk_from_private_state,
     reconcile_private_states,
+    reconciliation_position_signature_sha256,
     shutdown_private_requests,
+    wait_for_stable_flat,
 )
 from interexchange_perp_grid.market_data import BookRegistry, DataQualityAssessment
 from interexchange_perp_grid.native_runtime import resolve_runtime_artifact_digest
@@ -117,6 +135,64 @@ from interexchange_perp_grid.venue_capabilities import (
 OWNER_CONFIRMATION = "I_ACCEPT_LIVE_CANARY_RISK"
 PILOT_A_OWNER_CONFIRMATION = "I_ACCEPT_AGGRESSIVE_PILOT_A_RISK"
 _OPENING_GATE_TASKS: set[asyncio.Task[object]] = set()
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoritativeFlatEvidence:
+    stable_flat: bool
+    private_event_watermark: int
+    reconciliation_sha256: str
+
+
+async def collect_authoritative_live_flat_evidence(
+    settings: Settings,
+    base: str,
+) -> AuthoritativeFlatEvidence:
+    """Take a fresh account-wide private stable-FLAT barrier without submit authority."""
+    state_path = Path(settings.storage.sqlite_path)
+    await initialise_state(state_path)
+    journal = LiveOrderJournal(state_path)
+    await journal.initialise()
+    venues = {Venue(value) for value in settings.venues.wave1_public}
+    public = {venue: CcxtProAdapter(venue) for venue in venues}
+    private: dict[Venue, CcxtPrivateAdapter] = {}
+    try:
+        instruments, _ = await _discover_instruments(base, public)
+        private = {
+            venue: CcxtPrivateAdapter(venue, PrivateCredentials.from_environment(venue))
+            for venue in venues
+        }
+
+        async def report_factory() -> ReconciliationReport:
+            states = await collect_private_states(
+                private,
+                instruments,
+                reconciliation_trigger="LAPTOP_ACCEPTANCE_FINAL_FLAT",
+            )
+            return reconcile_private_states(
+                (),
+                states,
+                await journal.known_client_order_ids(),
+                venues,
+            )
+
+        barrier = await wait_for_stable_flat(
+            report_factory,
+            lambda: combined_event_watermark(private, journal.event_watermark),
+            _flat_barrier_policy(settings),
+        )
+        return AuthoritativeFlatEvidence(
+            stable_flat=barrier.verified,
+            private_event_watermark=barrier.event_watermark,
+            reconciliation_sha256=reconciliation_position_signature_sha256(barrier.report),
+        )
+    finally:
+        await shutdown_private_requests(private)
+        await asyncio.gather(
+            *(adapter.close() for adapter in public.values()),
+            *(adapter.close() for adapter in private.values()),
+            return_exceptions=True,
+        )
 
 
 def _consume_opening_gate_task(task: asyncio.Task[object]) -> None:
@@ -287,6 +363,16 @@ class RuntimeCanaryMonitor(CanaryMonitor):
         instruments: dict[Venue, Instrument],
         initial_funding: dict[Venue, FundingSnapshot],
         state_path: Path,
+        *,
+        pair_action_id: str | None = None,
+        direction: DivergenceDirection | None = None,
+        effective_stop_bps: Decimal | None = None,
+        projected_route_loss_usdt: Decimal = Decimal(0),
+        projected_portfolio_loss_usdt: Decimal = Decimal(0),
+        route_hard_loss_usdt: Decimal = Decimal("Infinity"),
+        portfolio_hard_loss_usdt: Decimal = Decimal("Infinity"),
+        holding_deadline: datetime | None = None,
+        aggressive_policy: AggressiveDecisionPolicy | None = None,
     ) -> None:
         self._settings = settings
         self._route = route
@@ -297,6 +383,15 @@ class RuntimeCanaryMonitor(CanaryMonitor):
         self._instruments = instruments
         self._initial_funding = initial_funding
         self._state_path = state_path
+        self._pair_action_id = pair_action_id
+        self._direction = direction
+        self._effective_stop_bps = effective_stop_bps
+        self._projected_route_loss_usdt = projected_route_loss_usdt
+        self._projected_portfolio_loss_usdt = projected_portfolio_loss_usdt
+        self._route_hard_loss_usdt = route_hard_loss_usdt
+        self._portfolio_hard_loss_usdt = portfolio_hard_loss_usdt
+        self._holding_deadline = holding_deadline
+        self._aggressive_policy = aggressive_policy
         self._registry = BookRegistry()
 
     async def wait_for_close(self, timeout_seconds: int) -> CloseReason:
@@ -307,6 +402,11 @@ class RuntimeCanaryMonitor(CanaryMonitor):
                 return CloseReason.EMERGENCY
             if controls.paused:
                 return CloseReason.OPERATOR_CLOSE
+            if self._aggressive_policy is not None:
+                try:
+                    await self._refresh_durable_aggressive_risk()
+                except Exception:
+                    return CloseReason.EMERGENCY
             try:
                 books = await asyncio.gather(
                     *(
@@ -327,13 +427,43 @@ class RuntimeCanaryMonitor(CanaryMonitor):
                     collect_private_states(self._private, self._instruments),
                     self._funding(),
                 )
+                journal = LiveOrderJournal(self._state_path)
+                active_actions, known_client_ids = await asyncio.gather(
+                    journal.active_actions(),
+                    journal.known_client_order_ids(),
+                )
+                reconciliation = reconcile_private_states(
+                    active_actions,
+                    states,
+                    known_client_ids,
+                    set(self._private),
+                )
             except Exception:
                 return CloseReason.STALE_DATA
+            executable_spread = self._executable_spread(book_by_venue)
+            data_stale = not all(item.accepted for item in quality)
+            risk_deteriorated = (
+                _private_risk_deteriorated(self._settings, states) or not reconciliation.consistent
+            )
+            funding_deteriorated = self._funding_deteriorated(funding)
+            aggressive_reason = self._aggressive_close_reason(
+                executable_spread,
+                funding_deteriorated,
+            )
             signals = CanaryCloseSignals(
-                target_converged=self._target_converged(book_by_venue),
-                risk_deteriorated=_private_risk_deteriorated(self._settings, states),
-                funding_deteriorated=self._funding_deteriorated(funding),
-                public_or_private_data_stale=not all(item.accepted for item in quality),
+                emergency_active=(aggressive_reason == AggressiveExitReason.EMERGENCY_OR_UNKNOWN),
+                target_converged=aggressive_reason == AggressiveExitReason.REVERSE_GRID_TARGET,
+                hard_stop_or_loss=(
+                    aggressive_reason == AggressiveExitReason.HARD_PROJECTED_LOSS_OR_REFERENCE_STOP
+                ),
+                hard_holding_time=aggressive_reason == AggressiveExitReason.HARD_HOLDING_TIME,
+                risk_deteriorated=risk_deteriorated,
+                funding_deteriorated=(
+                    funding_deteriorated
+                    if self._aggressive_policy is None
+                    else aggressive_reason == AggressiveExitReason.ADVERSE_FUNDING
+                ),
+                public_or_private_data_stale=data_stale,
             )
             reason = first_close_reason(signals)
             if reason is not None:
@@ -343,6 +473,51 @@ class RuntimeCanaryMonitor(CanaryMonitor):
             )
         return CloseReason.CANARY_TIMEOUT
 
+    async def _refresh_durable_aggressive_risk(self) -> None:
+        """Refresh aggregate limits and the route deadline from the durable owner set."""
+        if self._pair_action_id is None:
+            raise RuntimeError("aggressive monitor has no durable action identity")
+        journal = LiveOrderJournal(self._state_path)
+        active = await journal.active_actions()
+        current = next(
+            (item for item in active if item.pair_action_id == self._pair_action_id),
+            None,
+        )
+        if current is None or current.route != self._route:
+            raise RuntimeError("aggressive monitor lost its durable action")
+        aggressive = tuple(
+            item
+            for item in active
+            if item.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1"
+        )
+        if not aggressive:
+            raise RuntimeError("aggressive monitor has no durable portfolio")
+        self._projected_route_loss_usdt = sum(
+            (
+                _effective_reserved_stress(item.risk_reservation)
+                for item in aggressive
+                if item.route == self._route
+            ),
+            Decimal(0),
+        )
+        self._projected_portfolio_loss_usdt = sum(
+            (_effective_reserved_stress(item.risk_reservation) for item in aggressive),
+            Decimal(0),
+        )
+        try:
+            deadlines = tuple(
+                datetime.fromisoformat(str(item.risk_reservation["hard_holding_deadline"]))
+                for item in aggressive
+                if item.route == self._route
+            )
+        except (KeyError, ValueError) as error:
+            raise RuntimeError("aggressive route deadline is incomplete") from error
+        if not deadlines or any(
+            deadline.tzinfo is None or deadline.utcoffset() is None for deadline in deadlines
+        ):
+            raise RuntimeError("aggressive route deadline is invalid")
+        self._holding_deadline = min(deadlines)
+
     async def _funding(self) -> dict[Venue, FundingSnapshot]:
         venues = (self._route.long_venue, self._route.short_venue)
         values = await asyncio.gather(
@@ -350,7 +525,10 @@ class RuntimeCanaryMonitor(CanaryMonitor):
         )
         return {snapshot.venue: snapshot for snapshot in values}
 
-    def _target_converged(self, books: dict[Venue, OrderBookSnapshot]) -> bool:
+    def _executable_spread(
+        self,
+        books: dict[Venue, OrderBookSnapshot],
+    ) -> Decimal | None:
         long_exit = executable_vwap(
             books[self._route.long_venue].bids,
             self._quantity,
@@ -360,11 +538,91 @@ class RuntimeCanaryMonitor(CanaryMonitor):
             self._quantity,
         )
         if long_exit is None or short_exit is None:
+            return None
+        if self._direction is None:
+            return (short_exit.price - long_exit.price) / long_exit.price * Decimal(10_000)
+        return canonical_executable_spread_bps(
+            self._direction,
+            long_exit.price,
+            short_exit.price,
+        )
+
+    def _target_converged(self, spread_bps: Decimal | None) -> bool:
+        if spread_bps is None:
             return False
-        spread_bps = (short_exit.price - long_exit.price) / long_exit.price * Decimal(10_000)
+        if self._direction == DivergenceDirection.NEGATIVE:
+            return spread_bps >= self._target_exit_spread_bps
         return spread_bps <= self._target_exit_spread_bps
 
+    def _aggressive_close_reason(
+        self,
+        spread_bps: Decimal | None,
+        adverse_funding_destroys_profit: bool,
+    ) -> AggressiveExitReason:
+        if self._aggressive_policy is None:
+            return (
+                AggressiveExitReason.REVERSE_GRID_TARGET
+                if self._target_converged(spread_bps)
+                else AggressiveExitReason.NONE
+            )
+        if (
+            spread_bps is None
+            or self._direction is None
+            or self._effective_stop_bps is None
+            or self._holding_deadline is None
+        ):
+            return AggressiveExitReason.EMERGENCY_OR_UNKNOWN
+        if (
+            self._projected_route_loss_usdt >= self._route_hard_loss_usdt
+            or self._projected_portfolio_loss_usdt >= self._portfolio_hard_loss_usdt
+        ):
+            return AggressiveExitReason.HARD_PROJECTED_LOSS_OR_REFERENCE_STOP
+        return select_aggressive_exit_reason(
+            AggressiveExitInput(
+                direction=self._direction,
+                executable_spread_bps=spread_bps,
+                effective_stop_bps=self._effective_stop_bps,
+                reverse_target_bps=self._target_exit_spread_bps,
+                projected_route_loss_usdt=self._projected_route_loss_usdt,
+                projected_portfolio_loss_usdt=self._projected_portfolio_loss_usdt,
+                holding_deadline=self._holding_deadline,
+                now=datetime.now(UTC),
+                emergency_or_unknown=False,
+                adverse_funding_destroys_profit=adverse_funding_destroys_profit,
+            ),
+            self._aggressive_policy,
+        )
+
     def _funding_deteriorated(self, current: dict[Venue, FundingSnapshot]) -> bool:
+        now = datetime.now(UTC)
+        now_ms = int(now.timestamp() * 1000)
+        # The laptop live program does not claim exchange funding-ledger evidence.
+        # Close before the first stored funding event so accepted stage PnL never
+        # depends on an unobserved credit/debit.
+        for venue in (self._route.long_venue, self._route.short_venue):
+            next_timestamp = self._initial_funding[venue].next_funding_timestamp_ms
+            if next_timestamp is None or now_ms >= next_timestamp - 60_000:
+                return True
+        maximum_hold_seconds = (
+            self._aggressive_policy.hard_max_hold_seconds
+            if self._aggressive_policy is not None
+            else self._settings.live.canary_timeout_seconds
+        )
+        venues = (self._route.long_venue, self._route.short_venue)
+        if any(venue not in current for venue in venues) or any(
+            _gate_funding_projection(
+                current[venue],
+                venue,
+                self._instruments[venue].symbol,
+                now,
+                maximum_hold_seconds,
+                self._settings.strategy.calibration_funding_refresh_seconds * 1000,
+                self._settings.market_data.max_clock_skew_ms,
+            )
+            is None
+            for venue in venues
+        ):
+            return True
         initial_long = self._initial_funding[self._route.long_venue].rate
         initial_short = self._initial_funding[self._route.short_venue].rate
         current_long = current[self._route.long_venue].rate
@@ -405,12 +663,226 @@ def _private_risk_deteriorated(
     return False
 
 
+def _effective_reserved_stress(risk_reservation: object) -> Decimal:
+    """Return the conservative per-action stress after durable fill repricing."""
+    if not isinstance(risk_reservation, dict):
+        raise ValueError("live risk reservation is invalid")
+    try:
+        planned = Decimal(str(risk_reservation["projected_stress_usdt"]))
+        actual = risk_reservation.get("actual_fill_risk")
+        repriced = (
+            Decimal(str(actual["incremental_stress_usdt"]))
+            if isinstance(actual, dict) and "incremental_stress_usdt" in actual
+            else planned
+        )
+    except (ArithmeticError, KeyError, ValueError) as error:
+        raise ValueError("live risk reservation is invalid") from error
+    if not planned.is_finite() or not repriced.is_finite() or min(planned, repriced) <= 0:
+        raise ValueError("live risk reservation is invalid")
+    return max(planned, repriced)
+
+
+def _gate_funding_projection(
+    snapshot: FundingSnapshot,
+    venue: Venue,
+    symbol: str,
+    now: datetime,
+    maximum_hold_seconds: int,
+    maximum_age_ms: int,
+    maximum_future_skew_ms: int,
+) -> VenueFundingProjection | None:
+    if (
+        snapshot.venue != venue
+        or snapshot.symbol != symbol
+        or snapshot.rate is None
+        or snapshot.mark_price is None
+        or snapshot.next_funding_timestamp_ms is None
+        or snapshot.interval is None
+        or snapshot.exchange_timestamp_ms is None
+    ):
+        return None
+    now_ms = int(now.timestamp() * 1000)
+    age_ms = now_ms - snapshot.exchange_timestamp_ms
+    if age_ms < -maximum_future_skew_ms or age_ms > maximum_age_ms:
+        return None
+    raw_interval = snapshot.interval.strip().lower()
+    if (
+        len(raw_interval) < 2
+        or raw_interval[-1] not in {"h", "m"}
+        or not raw_interval[:-1].isdigit()
+    ):
+        return None
+    interval_seconds = int(raw_interval[:-1]) * (3600 if raw_interval[-1] == "h" else 60)
+    remaining_ms = snapshot.next_funding_timestamp_ms - int(now.timestamp() * 1000)
+    if interval_seconds <= 0 or remaining_ms < 0:
+        return None
+    horizon_ms = maximum_hold_seconds * 1000
+    event_count = (
+        0
+        if remaining_ms > horizon_ms
+        else 1 + (horizon_ms - remaining_ms) // (interval_seconds * 1000)
+    )
+    try:
+        return VenueFundingProjection(
+            venue=venue,
+            rate=snapshot.rate,
+            mark_price=snapshot.mark_price,
+            event_count=event_count,
+            next_funding_timestamp_ms=snapshot.next_funding_timestamp_ms,
+            interval_seconds=interval_seconds,
+        )
+    except ValueError:
+        return None
+
+
 class ImmediateRecoveryCloseMonitor(CanaryMonitor):
     """A restarted action is reduced immediately instead of reopening its holding window."""
 
     async def wait_for_close(self, timeout_seconds: int) -> CloseReason:
         del timeout_seconds
         return CloseReason.EMERGENCY
+
+
+class PortfolioInterruptMonitor(CanaryMonitor):
+    """Wake a tranche monitor immediately when the shared route watcher fires."""
+
+    def __init__(self, delegate: CanaryMonitor, route_close_event: asyncio.Event) -> None:
+        self._delegate = delegate
+        self._route_close_event = route_close_event
+
+    async def wait_for_close(self, timeout_seconds: int) -> CloseReason:
+        delegate = asyncio.create_task(self._delegate.wait_for_close(timeout_seconds))
+        interrupt = asyncio.create_task(self._route_close_event.wait())
+        done, pending = await asyncio.wait(
+            (delegate, interrupt),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if interrupt in done and interrupt.result():
+            return CloseReason.HARD_STOP_OR_LOSS
+        return delegate.result()
+
+
+async def _watch_aggressive_route_safety(
+    settings: Settings,
+    journal: LiveOrderJournal,
+    route: DirectedRouteKey,
+    close_event: asyncio.Event,
+    stop_event: asyncio.Event,
+) -> None:
+    """Continuously observe route-wide stop/deadline/risk between tranche cycles."""
+    public = {venue: CcxtProAdapter(venue) for venue in (route.long_venue, route.short_venue)}
+    registry = BookRegistry()
+    try:
+        instruments, _ = await _discover_instruments(route.base, public)
+        while not stop_event.is_set() and not close_event.is_set():
+            active = tuple(
+                item
+                for item in await journal.active_actions()
+                if item.route == route
+                and item.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1"
+            )
+            if not active:
+                return
+            parameters = tuple(_aggressive_monitor_parameters(item) for item in active)
+            if any(item is None for item in parameters):
+                raise RuntimeError("route watcher found an incompatible durable action")
+            typed = tuple(item for item in parameters if item is not None)
+            directions = {item[0] for item in typed}
+            stops = {item[1] for item in typed}
+            route_limits = {item[4] for item in typed}
+            portfolio_limits = {item[5] for item in typed}
+            if any(
+                len(values) != 1 for values in (directions, stops, route_limits, portfolio_limits)
+            ):
+                raise RuntimeError("route watcher found mutable route safety geometry")
+            direction = next(iter(directions))
+            effective_stop = next(iter(stops))
+            route_limit = next(iter(route_limits))
+            portfolio_limit = next(iter(portfolio_limits))
+            deadlines = tuple(item[6] for item in typed)
+            route_risk = sum(
+                (_effective_reserved_stress(item.risk_reservation) for item in active),
+                Decimal(0),
+            )
+            portfolio_risk = sum(
+                (
+                    _effective_reserved_stress(item.risk_reservation)
+                    for item in await journal.active_actions()
+                    if item.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1"
+                ),
+                Decimal(0),
+            )
+            if (
+                route_risk >= route_limit
+                or portfolio_risk >= portfolio_limit
+                or datetime.now(UTC) >= min(deadlines)
+            ):
+                close_event.set()
+                return
+            quantity = sum(
+                (
+                    sum(
+                        (
+                            leg.filled_base_quantity
+                            if leg.venue == route.long_venue and leg.side == Side.BUY
+                            else -leg.filled_base_quantity
+                            if leg.venue == route.long_venue and leg.side == Side.SELL
+                            else Decimal(0)
+                            for leg in item.legs
+                        ),
+                        Decimal(0),
+                    )
+                    for item in active
+                ),
+                Decimal(0),
+            )
+            if quantity <= 0:
+                raise RuntimeError("route watcher lost positive long ownership")
+            books = await asyncio.gather(
+                *(
+                    public[venue].watch_order_book(instruments[venue])
+                    for venue in (route.long_venue, route.short_venue)
+                )
+            )
+            if not all(
+                registry.accept(
+                    book,
+                    max_age_ms=settings.market_data.max_l2_age_ms,
+                    max_clock_skew_ms=settings.market_data.max_clock_skew_ms,
+                ).accepted
+                for book in books
+            ):
+                close_event.set()
+                return
+            by_venue = {book.venue: book for book in books}
+            long_exit = executable_vwap(by_venue[route.long_venue].bids, quantity)
+            short_exit = executable_vwap(by_venue[route.short_venue].asks, quantity)
+            if long_exit is None or short_exit is None:
+                close_event.set()
+                return
+            spread = canonical_executable_spread_bps(
+                direction,
+                long_exit.price,
+                short_exit.price,
+            )
+            if (direction == DivergenceDirection.POSITIVE and spread >= effective_stop) or (
+                direction == DivergenceDirection.NEGATIVE and spread <= effective_stop
+            ):
+                close_event.set()
+                return
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=0.01)
+    except Exception:
+        close_event.set()
+        raise
+    finally:
+        await asyncio.gather(
+            *(adapter.close() for adapter in public.values()),
+            return_exceptions=True,
+        )
 
 
 class OnDemandLiveControlPlane:
@@ -565,6 +1037,51 @@ def _rebuild_active_plan(
     )
 
 
+def _aggressive_monitor_parameters(
+    action: LiveJournalAction,
+) -> tuple[DivergenceDirection, Decimal, Decimal, Decimal, Decimal, Decimal, datetime] | None:
+    if action.risk_reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1":
+        return None
+    try:
+        actual = action.risk_reservation.get("actual_fill_risk")
+        route_total = (
+            actual.get("route_total_usdt")
+            if isinstance(actual, dict)
+            else action.risk_reservation["projected_route_total_usdt"]
+        )
+        portfolio_total = (
+            actual.get("portfolio_total_usdt")
+            if isinstance(actual, dict)
+            else action.risk_reservation["projected_portfolio_total_usdt"]
+        )
+        if route_total is None or portfolio_total is None:
+            raise KeyError("actual fill risk totals are incomplete")
+        values = (
+            DivergenceDirection(str(action.risk_reservation["direction"])),
+            Decimal(str(action.risk_reservation["effective_stop_bps"])),
+            Decimal(str(route_total)),
+            Decimal(str(portfolio_total)),
+            Decimal(str(action.risk_reservation["route_hard_loss_usdt"])),
+            Decimal(str(action.risk_reservation["portfolio_hard_loss_usdt"])),
+            datetime.fromisoformat(str(action.risk_reservation["hard_holding_deadline"])),
+        )
+    except (KeyError, ValueError, ArithmeticError) as error:
+        raise ValueError("aggressive monitor reservation is incomplete") from error
+    _, stop, route_loss, portfolio_loss, route_limit, portfolio_limit, deadline = values
+    if (
+        any(
+            not value.is_finite()
+            for value in (stop, route_loss, portfolio_loss, route_limit, portfolio_limit)
+        )
+        or min(route_loss, portfolio_loss) < 0
+        or min(route_limit, portfolio_limit) <= 0
+        or deadline.tzinfo is None
+        or deadline.utcoffset() is None
+    ):
+        raise ValueError("aggressive monitor reservation is invalid")
+    return values
+
+
 async def _coordinate_live_action(
     settings: Settings,
     journal: LiveOrderJournal,
@@ -575,6 +1092,9 @@ async def _coordinate_live_action(
     plan: CanaryExecutionPlan,
     monitor: CanaryMonitor,
     emergency_venue: Venue,
+    *,
+    portfolio_mode: bool = False,
+    aggressive_policy: AggressiveDecisionPolicy | None = None,
 ) -> CanaryCycleResult:
     protection = PublicProtectionProvider(settings, public_adapters, instruments)
 
@@ -652,6 +1172,23 @@ async def _coordinate_live_action(
         public_reports = {report.venue: report for report in snapshot.public_reports}
         private_reports = {report.venue: report for report in snapshot.private_reports}
         funding = {item.venue: item for item in snapshot.funding}
+        gate_now = datetime.now(UTC)
+        funding_projections = {
+            venue: _gate_funding_projection(
+                funding[venue],
+                venue,
+                instruments[venue].symbol,
+                gate_now,
+                (
+                    aggressive_policy.hard_max_hold_seconds
+                    if aggressive_policy is not None
+                    else settings.live.canary_timeout_seconds
+                ),
+                settings.strategy.calibration_funding_refresh_seconds * 1000,
+                settings.market_data.max_clock_skew_ms,
+            )
+            for venue in capability_venues
+        }
         if not any(
             action.pair_action_id == current_plan.pair_action_id for action in snapshot.actions
         ):
@@ -663,17 +1200,35 @@ async def _coordinate_live_action(
             set(adapters),
         )
         try:
-            projected_stress = Decimal(str(current_plan.risk_reservation["projected_stress_usdt"]))
-        except (ArithmeticError, KeyError, ValueError):
+            projected_stress = _effective_reserved_stress(current_plan.risk_reservation)
+            route_stress = sum(
+                (
+                    _effective_reserved_stress(action.risk_reservation)
+                    for action in snapshot.actions
+                    if action.route == current_plan.route
+                ),
+                Decimal(0),
+            )
+            portfolio_stress = sum(
+                (
+                    _effective_reserved_stress(action.risk_reservation)
+                    for action in snapshot.actions
+                ),
+                Decimal(0),
+            )
+        except ValueError:
             return False
         aggressive_stage = current_plan.risk_reservation.get("stage")
         is_pilot_a = aggressive_stage == AggressiveLaptopLiveStage.PILOT_A.value
-        risk_limit = (
-            Decimal(5) if is_pilot_a else settings.live.canary_pair_stressed_loss_limit_usdt
+        route_admission_limit = (
+            Decimal("4.5") if is_pilot_a else settings.live.canary_pair_stressed_loss_limit_usdt
         )
+        portfolio_admission_limit = Decimal("5") if is_pilot_a else route_admission_limit
         risk_current = (
             projected_stress.is_finite()
-            and Decimal(0) <= projected_stress <= risk_limit
+            and Decimal(0) < projected_stress <= route_admission_limit
+            and route_stress <= route_admission_limit
+            and portfolio_stress <= portfolio_admission_limit
             and not _private_risk_deteriorated(settings, snapshot.private_states)
         )
         preflight_items: list[PrivatePreflightReport] = []
@@ -688,12 +1243,7 @@ async def _coordinate_live_action(
                         account=state.account,
                         instrument=instruments[venue],
                         fee_rate=state.taker_fee_rate,
-                        funding_known=(
-                            funding[venue].rate is not None
-                            and funding[venue].next_funding_timestamp_ms is not None
-                            and funding[venue].interval is not None
-                            and funding[venue].exchange_timestamp_ms is not None
-                        ),
+                        funding_known=funding_projections[venue] is not None,
                         clock_skew_ms=public_reports[venue].clock_skew_ms,
                         maximum_clock_skew_ms=settings.market_data.max_clock_skew_ms,
                         symbol_available=True,
@@ -748,6 +1298,87 @@ async def _coordinate_live_action(
             instruments[current_plan.short_request.venue].price_tick,
             settings.live.canary_entry_slippage_cap_bps,
         )
+        aggressive_revalidated = True
+        if current_plan.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1":
+            aggressive_revalidated = False
+            try:
+                if aggressive_policy is None:
+                    raise ValueError("aggressive policy is unavailable")
+                intent = aggressive_intent_from_mapping(
+                    current_plan.risk_reservation["aggressive_intent"]
+                )
+                stored_hash = str(current_plan.risk_reservation["aggressive_intent_sha256"])
+                now = datetime.now(UTC)
+                last_closed_minute = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+                outer_stage = AggressiveLaptopLiveStage(str(current_plan.risk_reservation["stage"]))
+                expected_stage = (
+                    AggressiveEntryStage.LOCKED_CANARY
+                    if outer_stage == AggressiveLaptopLiveStage.CANARY
+                    else AggressiveEntryStage.NORMAL
+                )
+                long_venue = Venue(intent.long_venue)
+                short_venue = Venue(intent.short_venue)
+                binding_hash = str(current_plan.risk_reservation["aggressive_binding_sha256"])
+                if (
+                    aggressive_intent_sha256(intent) != stored_hash
+                    or intent.intent_id != current_plan.pair_action_id
+                    or intent.quantity != current_plan.quantity
+                    or intent.entry_stage != expected_stage
+                    or aggressive_stage != outer_stage.value
+                    or intent.reference_interval_start != last_closed_minute
+                    or current_plan.route.value != intent.route_identity
+                    or current_plan.long_request.venue != long_venue
+                    or current_plan.short_request.venue != short_venue
+                    or current_plan.long_request.symbol != intent.long_symbol
+                    or current_plan.short_request.symbol != intent.short_symbol
+                    or len(current_plan.qualification_hash) != 64
+                    or len(binding_hash) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in current_plan.qualification_hash + binding_hash
+                    )
+                    or current_plan.risk_reservation.get("strategy_profile_sha256")
+                    != intent.strategy_profile_sha256
+                ):
+                    raise ValueError("aggressive final-gate identity is stale or inconsistent")
+                long_state = snapshot.private_states[long_venue]
+                short_state = snapshot.private_states[short_venue]
+                current_entry = HybridEntryInput(
+                    route_identity=intent.route_identity,
+                    direction=intent.direction,
+                    level_index=intent.level_index,
+                    reference_spread_bps=intent.reference_spread_bps,
+                    reference_trigger_bps=intent.reference_trigger_bps,
+                    grid_step_bps=intent.grid_step_bps,
+                    stressed_cost_move_bps=intent.stressed_cost_move_bps,
+                    minimum_profit_move_bps=intent.minimum_profit_move_bps,
+                    normal_low_bps=intent.normal_low_bps,
+                    normal_high_bps=intent.normal_high_bps,
+                    quantity=intent.quantity,
+                    long_venue=long_venue,
+                    short_venue=short_venue,
+                    long_book=snapshot.books[long_venue],
+                    short_book=snapshot.books[short_venue],
+                    long_private_taker_fee_rate=long_state.taker_fee_rate,
+                    short_private_taker_fee_rate=short_state.taker_fee_rate,
+                    long_funding=funding_projections[long_venue],
+                    short_funding=funding_projections[short_venue],
+                    reserves=intent.reserves,
+                    observed_monotonic_ns=time.monotonic_ns(),
+                    maximum_book_age_ms=settings.market_data.max_l2_age_ms,
+                    now=now,
+                    reference_interval_start=intent.reference_interval_start,
+                    stage=expected_stage,
+                    state_reconciled=reconciliation.consistent,
+                    historical_model_eligible=True,
+                    regime_ready=True,
+                )
+                aggressive_revalidated = revalidate_hybrid_entry_once(
+                    current_entry,
+                    policy=aggressive_policy,
+                ).accepted
+            except (KeyError, TypeError, ValueError, ArithmeticError):
+                aggressive_revalidated = False
         return (
             not snapshot.controls.paused
             and not snapshot.controls.killed
@@ -765,6 +1396,7 @@ async def _coordinate_live_action(
                 current_short,
                 short_sell.marginal_price,
             )
+            and aggressive_revalidated
         )
 
     return await LiveCanaryCoordinator(
@@ -776,7 +1408,11 @@ async def _coordinate_live_action(
         emergency_venue,
         flat_barrier_policy=_flat_barrier_policy(settings),
         opening_gate=opening_gate,
-        final_opening_gate=lambda: _final_opening_controls_allow(settings),
+        # Re-run the complete bounded gate after durable submit-attempt ownership.
+        # No transport submit has happened yet, so any TOCTOU drift still fails closed.
+        final_opening_gate=lambda: opening_gate(plan),
+        portfolio_mode=portfolio_mode,
+        aggressive_policy=aggressive_policy,
     ).run(plan)
 
 
@@ -845,7 +1481,19 @@ async def _resume_active_canary(
     settings: Settings,
     journal: LiveOrderJournal,
     active: LiveJournalAction,
+    *,
+    portfolio_mode: bool = False,
+    portfolio_close_event: asyncio.Event | None = None,
 ) -> CanaryRunEvidence:
+    if active.state == LiveActionState.PREPARED and not _fresh_supervisor_handoff(active):
+        # Only a very recent, pristine supervisor handoff may reach the complete
+        # opening gates below. Unknown/stale PREPARED state has no exchange
+        # exposure and is quarantined without constructing a transport.
+        return await _quarantine_prepared_before_submit(
+            journal,
+            active,
+            "PREPARED_RESTART_REQUIRES_FRESH_ENTRY_EPOCH",
+        )
     try:
         emergency_venue = _wave1_emergency_venue(settings, active.route)
     except ValueError as error:
@@ -872,20 +1520,7 @@ async def _resume_active_canary(
     private_stop: asyncio.Event | None = None
     private_task: asyncio.Task[None] | None = None
     try:
-        if active.state == LiveActionState.PREPARED:
-            try:
-                instruments, _ = await _await_owned_opening_operation(
-                    _discover_instruments(active.route.base, public_adapters),
-                    name=f"prepared-discovery-{active.pair_action_id}",
-                )
-            except TimeoutError:
-                return await _quarantine_prepared_before_submit(
-                    journal,
-                    active,
-                    "PRE_SUBMIT_DISCOVERY_DEADLINE",
-                )
-        else:
-            instruments, _ = await _discover_instruments(active.route.base, public_adapters)
+        instruments, _ = await _discover_instruments(active.route.base, public_adapters)
         for venue in venues:
             private_adapters[venue] = CcxtPrivateAdapter(
                 venue,
@@ -910,8 +1545,20 @@ async def _resume_active_canary(
             plan = _rebuild_active_plan(
                 active,
                 instruments,
-                settings.live.canary_timeout_seconds,
+                1 if portfolio_mode else settings.live.canary_timeout_seconds,
             )
+            monitor_parameters = _aggressive_monitor_parameters(active)
+            aggressive_policy: AggressiveDecisionPolicy | None = None
+            if monitor_parameters is not None:
+                loaded_policy = load_aggressive_decision_policy(
+                    Path(__file__).resolve().parents[2] / "config" / "AGGRESSIVE_SYMBIOSIS_V1.yaml"
+                )
+                if (
+                    active.risk_reservation.get("strategy_profile_sha256")
+                    != loaded_policy.profile_sha256
+                ):
+                    raise ValueError("aggressive monitor strategy profile identity changed")
+                aggressive_policy = loaded_policy.policy
         except ValueError as error:
             return CanaryRunEvidence(
                 submitted=False,
@@ -934,7 +1581,7 @@ async def _resume_active_canary(
             )
         monitor: CanaryMonitor = ImmediateRecoveryCloseMonitor()
         if (
-            active.state == LiveActionState.PREPARED
+            active.state in {LiveActionState.PREPARED, LiveActionState.HEDGED}
             and active.risk_reservation.get("supervisor_intent") == "LIVE_CANARY"
             and active.risk_reservation.get("supervisor_queued") is True
         ):
@@ -955,23 +1602,82 @@ async def _resume_active_canary(
                     name=f"prepared-initial-funding-{active.pair_action_id}",
                 )
             except TimeoutError:
-                return await _quarantine_prepared_before_submit(
-                    journal,
-                    active,
-                    "PRE_SUBMIT_FUNDING_DEADLINE",
-                )
-            initial_funding = {snapshot.venue: snapshot for snapshot in funding_values}
-            monitor = RuntimeCanaryMonitor(
-                settings,
-                active.route,
-                plan.quantity,
-                Decimal(str(active.risk_reservation["target_exit_spread_bps"])),
-                public_adapters,
-                typed_adapters,
-                instruments,
-                initial_funding,
-                Path(settings.storage.sqlite_path),
+                funding_values = None
+            initial_funding = (
+                {}
+                if funding_values is None
+                else {snapshot.venue: snapshot for snapshot in funding_values}
             )
+            funding_monitor_valid = funding_values is not None
+            if funding_monitor_valid:
+                stored_rates = active.risk_reservation.get("initial_funding_rates")
+                stored_next_timestamps = active.risk_reservation.get(
+                    "initial_funding_next_timestamp_ms"
+                )
+                if not isinstance(stored_rates, dict) or not isinstance(
+                    stored_next_timestamps, dict
+                ):
+                    funding_monitor_valid = False
+                else:
+                    try:
+                        initial_funding = {
+                            venue: replace(
+                                snapshot,
+                                rate=Decimal(str(stored_rates[venue.value])),
+                                next_funding_timestamp_ms=int(
+                                    str(stored_next_timestamps[venue.value])
+                                ),
+                            )
+                            for venue, snapshot in initial_funding.items()
+                        }
+                    except (KeyError, ValueError, ArithmeticError):
+                        funding_monitor_valid = False
+            if funding_monitor_valid:
+                try:
+                    target_exit_spread_bps = Decimal(
+                        str(active.risk_reservation["target_exit_spread_bps"])
+                    )
+                except (KeyError, ValueError, ArithmeticError):
+                    target_exit_spread_bps = Decimal("NaN")
+                if not target_exit_spread_bps.is_finite():
+                    funding_monitor_valid = False
+            if funding_monitor_valid:
+                monitor = (
+                    RuntimeCanaryMonitor(
+                        settings,
+                        active.route,
+                        plan.quantity,
+                        target_exit_spread_bps,
+                        public_adapters,
+                        typed_adapters,
+                        instruments,
+                        initial_funding,
+                        Path(settings.storage.sqlite_path),
+                    )
+                    if monitor_parameters is None
+                    else RuntimeCanaryMonitor(
+                        settings,
+                        active.route,
+                        plan.quantity,
+                        target_exit_spread_bps,
+                        public_adapters,
+                        typed_adapters,
+                        instruments,
+                        initial_funding,
+                        Path(settings.storage.sqlite_path),
+                        pair_action_id=active.pair_action_id,
+                        direction=monitor_parameters[0],
+                        effective_stop_bps=monitor_parameters[1],
+                        projected_route_loss_usdt=monitor_parameters[2],
+                        projected_portfolio_loss_usdt=monitor_parameters[3],
+                        route_hard_loss_usdt=monitor_parameters[4],
+                        portfolio_hard_loss_usdt=monitor_parameters[5],
+                        holding_deadline=monitor_parameters[6],
+                        aggressive_policy=aggressive_policy,
+                    )
+                )
+        if portfolio_close_event is not None:
+            monitor = PortfolioInterruptMonitor(monitor, portfolio_close_event)
         result = await _coordinate_live_action(
             settings,
             journal,
@@ -982,6 +1688,8 @@ async def _resume_active_canary(
             plan,
             monitor,
             emergency_venue,
+            portfolio_mode=portfolio_mode,
+            aggressive_policy=aggressive_policy,
         )
         return CanaryRunEvidence(
             submitted=result.orders_sent > 0,
@@ -1035,6 +1743,28 @@ async def _resume_active_canary(
             raise RuntimeError("canary cleanup failed: " + "; ".join(cleanup_errors))
 
 
+def _fresh_supervisor_handoff(active: LiveJournalAction, *, now: datetime | None = None) -> bool:
+    observed = now or datetime.now(UTC)
+    age_seconds = (observed - active.created_at).total_seconds()
+    opening_ids = active.risk_reservation.get("opening_client_order_ids")
+    return (
+        active.risk_reservation.get("supervisor_intent") == "LIVE_CANARY"
+        and active.risk_reservation.get("supervisor_queued") is True
+        and active.risk_reservation.get("qualification_hash") == active.qualification_hash
+        and isinstance(opening_ids, dict)
+        and set(map(str, opening_ids.values())) == {leg.client_order_id for leg in active.legs}
+        and active.recovery_action is None
+        and 0 <= age_seconds <= 30
+        and all(
+            not leg.submit_attempted
+            and leg.order_id is None
+            and leg.status is None
+            and leg.filled_base_quantity == 0
+            for leg in active.legs
+        )
+    )
+
+
 async def recover_active_canary(
     settings: Settings,
     journal: LiveOrderJournal,
@@ -1057,17 +1787,129 @@ async def recover_active_actions(
     journal: LiveOrderJournal,
     active: tuple[LiveJournalAction, ...],
 ) -> object:
-    """Recover one action normally or flatten a multi-action account as one owned batch."""
+    """Recover one canary or one compatible aggressive multi-tranche portfolio."""
     if not active:
         return object()
     if len(active) == 1:
         return await recover_active_canary(settings, journal, active[0])
-    result = await OnDemandLiveControlPlane(settings).emergency_flatten()
-    if not result.success:
-        raise RuntimeError(
-            result.instruction or "multi-action account recovery did not verify stable FLAT"
+    if _compatible_aggressive_pilot_portfolio(active):
+        results: list[CanaryRunEvidence] = []
+        priorities = {
+            LiveActionState.CLOSING: 0,
+            LiveActionState.RECOVERING: 1,
+            LiveActionState.UNKNOWN: 1,
+            LiveActionState.PARTIAL: 2,
+            LiveActionState.FILLED: 3,
+            LiveActionState.HEDGED: 4,
+            LiveActionState.PREPARED: 5,
+        }
+        route_close_event = asyncio.Event()
+        route_watcher_stop = asyncio.Event()
+        route_watcher = (
+            asyncio.create_task(
+                _watch_aggressive_route_safety(
+                    settings,
+                    journal,
+                    active[0].route,
+                    route_close_event,
+                    route_watcher_stop,
+                ),
+                name="aggressive-route-safety-watcher",
+            )
+            if all(item.state == LiveActionState.HEDGED for item in active)
+            else None
         )
-    return result
+        try:
+            for snapshot in sorted(
+                active,
+                key=lambda item: (
+                    priorities.get(item.state, 99),
+                    item.created_at,
+                    item.pair_action_id,
+                ),
+            ):
+                current = await journal.load(snapshot.pair_action_id)
+                if current is None or current.state == LiveActionState.FLAT:
+                    continue
+                result = await _resume_active_canary(
+                    settings,
+                    journal,
+                    current,
+                    portfolio_mode=True,
+                    portfolio_close_event=route_close_event,
+                )
+                results.append(result)
+                if not result.success and result.terminal_state != LiveActionState.PREPARED:
+                    raise RuntimeError("aggressive portfolio recovery failed closed")
+        except Exception:
+            flattened = await OnDemandLiveControlPlane(settings).emergency_flatten()
+            if not flattened.success:
+                raise RuntimeError(
+                    flattened.instruction
+                    or "aggressive portfolio emergency flatten did not verify stable FLAT"
+                ) from None
+            return flattened
+        finally:
+            route_watcher_stop.set()
+            if route_watcher is not None:
+                try:
+                    await route_watcher
+                except Exception:
+                    if not route_close_event.is_set():
+                        raise
+        return tuple(results)
+    control_result = await OnDemandLiveControlPlane(settings).emergency_flatten()
+    if not control_result.success:
+        raise RuntimeError(
+            control_result.instruction or "multi-action account recovery did not verify stable FLAT"
+        )
+    return control_result
+
+
+def _compatible_aggressive_pilot_portfolio(
+    actions: tuple[LiveJournalAction, ...],
+) -> bool:
+    if not 2 <= len(actions) <= 5:
+        return False
+    first = actions[0]
+    expected_identity = (
+        first.route,
+        first.qualification_hash,
+        first.risk_reservation.get("aggressive_binding_sha256"),
+        first.risk_reservation.get("strategy_profile_sha256"),
+    )
+    levels: set[int] = set()
+    for action in actions:
+        reservation = action.risk_reservation
+        try:
+            level = int(str(reservation["level_index"]))
+        except (KeyError, ValueError):
+            return False
+        identity = (
+            action.route,
+            action.qualification_hash,
+            reservation.get("aggressive_binding_sha256"),
+            reservation.get("strategy_profile_sha256"),
+        )
+        if (
+            reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1"
+            or reservation.get("stage") != AggressiveLaptopLiveStage.PILOT_A.value
+            or identity != expected_identity
+            or not 1 <= level <= 5
+            or level in levels
+            or action.state
+            not in {
+                LiveActionState.PREPARED,
+                LiveActionState.PARTIAL,
+                LiveActionState.FILLED,
+                LiveActionState.HEDGED,
+                LiveActionState.CLOSING,
+                LiveActionState.RECOVERING,
+            }
+        ):
+            return False
+        levels.add(level)
+    return True
 
 
 async def run_canary_once(
@@ -1358,24 +2200,23 @@ async def run_canary_once(
         )
         if economic.signal is None:
             return _denied(economic.reason, route, quantity, economic=economic)
-        projected_stress = max(
-            economic.signal.cost.stressed_total_cost_usdt,
-            evidence.replay_shadow.maximum_adverse_excursion_usdt,
-            (
-                aggressive_intent.intent.projected_route_loss_usdt
-                if aggressive_intent is not None
-                else Decimal(0)
-            ),
+        projected_stress = (
+            max(
+                economic.signal.cost.stressed_total_cost_usdt,
+                aggressive_intent.intent.incremental_tranche_loss_usdt,
+            )
+            if aggressive_intent is not None
+            else max(
+                economic.signal.cost.stressed_total_cost_usdt,
+                evidence.replay_shadow.maximum_adverse_excursion_usdt,
+            )
         )
         try:
             existing_projected_stress = sum(
-                (
-                    Decimal(str(action.risk_reservation["projected_stress_usdt"]))
-                    for action in active_actions
-                ),
+                (_effective_reserved_stress(action.risk_reservation) for action in active_actions),
                 Decimal(0),
             )
-        except (ArithmeticError, KeyError, ValueError):
+        except ValueError:
             return _denied(ReasonCode.RISK_PREFLIGHT_FAILED, route, quantity)
         cumulative_projected_stress = existing_projected_stress + projected_stress
         notional = quantity * max(
@@ -1387,8 +2228,8 @@ async def run_canary_once(
             states,
             notional,
             cumulative_projected_stress,
-            pair_stress_limit_usdt=stage_limits.pair_usdt,
-            portfolio_stress_limit_usdt=stage_limits.portfolio_usdt,
+            pair_stress_limit_usdt=min(stage_limits.pair_usdt, Decimal("4.5")),
+            portfolio_stress_limit_usdt=min(stage_limits.portfolio_usdt, Decimal("45")),
             free_margin_floor_ratio=settings.live.canary_free_margin_floor_ratio,
             effective_leverage_cap=stage_limits.leverage,
             exit_depth_sufficient=emergency_assessment.passed,
@@ -1550,16 +2391,39 @@ async def run_canary_once(
                 stage=aggressive_stage,
                 timeout_seconds=settings.live.canary_timeout_seconds,
             )
+            route_opened_at = aggressive_intent.intent.decided_at.astimezone(UTC)
+            if aggressive_stage == AggressiveLaptopLiveStage.PILOT_A:
+                for existing in active_actions:
+                    if existing.route != route:
+                        continue
+                    try:
+                        existing_opened_at = datetime.fromisoformat(
+                            str(
+                                existing.risk_reservation.get(
+                                    "route_opened_at",
+                                    existing.risk_reservation["decided_at"],
+                                )
+                            )
+                        ).astimezone(UTC)
+                    except (KeyError, ValueError):
+                        return _denied(ReasonCode.RISK_PREFLIGHT_FAILED, route, quantity)
+                    route_opened_at = min(route_opened_at, existing_opened_at)
             plan = replace(
                 aggressive_plan,
                 risk_reservation={
                     **aggressive_plan.risk_reservation,
+                    "route_opened_at": route_opened_at.isoformat(),
+                    "hard_holding_deadline": (route_opened_at + timedelta(hours=24)).isoformat(),
                     "risk": risk.breakdown,
                     "qualification_hash": evidence.qualification_hash,
                     "supervisor_intent": "LIVE_CANARY",
                     "supervisor_queued": True,
                     "initial_funding_rates": {
                         venue.value: funding[venue].rate for venue in required_venues
+                    },
+                    "initial_funding_next_timestamp_ms": {
+                        venue.value: funding[venue].next_funding_timestamp_ms
+                        for venue in required_venues
                     },
                 },
             )
@@ -1605,6 +2469,10 @@ async def run_canary_once(
                     "target_exit_spread_bps": evidence.strategy.target_exit_spread_bps,
                     "initial_funding_rates": {
                         venue.value: funding[venue].rate for venue in required_venues
+                    },
+                    "initial_funding_next_timestamp_ms": {
+                        venue.value: funding[venue].next_funding_timestamp_ms
+                        for venue in required_venues
                     },
                     "opening_client_order_ids": {
                         "long": long_client_id,

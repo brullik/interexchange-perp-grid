@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import signal
@@ -54,6 +55,7 @@ class BoundedServiceReceipt:
     observed_monotonic_seconds: float
     state_path: str
     service_starts: int
+    receipt_sha256: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -68,6 +70,14 @@ class BoundedServiceReceipt:
             or not self.state_path
         ):
             raise ValueError("bounded service receipt is invalid")
+        payload = asdict(self)
+        payload["receipt_sha256"] = ""
+        expected = hashlib.sha256(
+            json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        if self.receipt_sha256 and self.receipt_sha256 != expected:
+            raise ValueError("bounded service receipt hash mismatch")
+        object.__setattr__(self, "receipt_sha256", expected)
 
 
 def write_bounded_service_receipt(path: Path, receipt: BoundedServiceReceipt) -> None:
@@ -96,6 +106,7 @@ def load_bounded_service_receipt(path: Path) -> BoundedServiceReceipt:
         observed_monotonic_seconds=float(payload["observed_monotonic_seconds"]),
         state_path=str(payload["state_path"]),
         service_starts=int(payload["service_starts"]),
+        receipt_sha256=str(payload["receipt_sha256"]),
     )
 
 
@@ -249,7 +260,8 @@ async def run_until_signal(settings: Settings) -> None:
         except (NotImplementedError, RuntimeError):
             continue
     try:
-        await BootstrapService(settings).run(stop_event)
+        with _prevent_windows_sleep():
+            await BootstrapService(settings).run(stop_event)
     finally:
         for handled_signal in installed_signals:
             loop.remove_signal_handler(handled_signal)

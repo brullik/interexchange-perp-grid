@@ -113,7 +113,7 @@
 - [x] Запустить все focused tests и полный `make verify`/Windows-equivalent.
 - [x] Подтвердить обязательные checks: `verify`, `security`, `c4-critical-proof`, `c4-3-proof`, `docker-smoke` либо их актуальные protected-main successors.
 - [x] Сформировать exact-head replay/fault/restart/laptop-shadow artifacts без production submit.
-- [ ] Получить независимый review, исправить P0/P1/P2 и разрешить все material threads.
+- [x] Получить независимый review, исправить P0/P1/P2 и разрешить все material threads.
 - [x] Обновить верхний блок `STATUS.md`, не удаляя историю.
 - [ ] Mark Ready и squash-merge единственный PR автоматически, только если head SHA неизменен и branch protection полностью зелёная.
 

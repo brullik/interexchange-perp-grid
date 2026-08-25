@@ -10,6 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
+from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.live_journal import (
     LiveOrderJournal,
     completed_normal_actions_sha256,
@@ -32,8 +33,13 @@ class AggressiveLaptopStageEvidence:
     completed_level_indices: tuple[int, ...]
     completed_actions_sha256: str
     production_filled_order_count: int
+    actual_fees_usdt: Decimal
+    realized_funding_usdt: Decimal
+    realized_pnl_usdt: Decimal
     active_action_count: int
     maximum_projected_route_loss_usdt: Decimal
+    final_private_event_watermark: int
+    reconciliation_evidence_sha256: str
     stable_flat: bool
     post_flat_service_seconds: int
     accepted: bool
@@ -58,6 +64,7 @@ class AggressiveLaptopStageEvidence:
             for value in (
                 self.aggressive_binding_sha256,
                 self.completed_actions_sha256,
+                self.reconciliation_evidence_sha256,
                 self.evidence_sha256,
             )
         ):
@@ -65,9 +72,14 @@ class AggressiveLaptopStageEvidence:
         if (
             self.production_filled_order_count < 0
             or self.active_action_count < 0
+            or self.final_private_event_watermark < 0
             or self.post_flat_service_seconds < 0
             or not self.maximum_projected_route_loss_usdt.is_finite()
             or self.maximum_projected_route_loss_usdt < 0
+            or not self.actual_fees_usdt.is_finite()
+            or self.actual_fees_usdt < 0
+            or not self.realized_funding_usdt.is_finite()
+            or not self.realized_pnl_usdt.is_finite()
         ):
             raise ValueError("aggressive laptop stage counters are invalid")
 
@@ -202,8 +214,13 @@ def build_aggressive_laptop_stage_evidence(
     completed_level_indices: tuple[int, ...],
     completed_actions_sha256: str,
     production_filled_order_count: int,
+    actual_fees_usdt: Decimal,
+    realized_funding_usdt: Decimal,
+    realized_pnl_usdt: Decimal,
     active_action_count: int,
     maximum_projected_route_loss_usdt: Decimal,
+    final_private_event_watermark: int,
+    reconciliation_evidence_sha256: str,
     stable_flat: bool,
     post_flat_service_seconds: int,
     blockers: tuple[str, ...] = (),
@@ -218,8 +235,13 @@ def build_aggressive_laptop_stage_evidence(
         completed_level_indices=completed_level_indices,
         completed_actions_sha256=completed_actions_sha256,
         production_filled_order_count=production_filled_order_count,
+        actual_fees_usdt=actual_fees_usdt,
+        realized_funding_usdt=realized_funding_usdt,
+        realized_pnl_usdt=realized_pnl_usdt,
         active_action_count=active_action_count,
         maximum_projected_route_loss_usdt=maximum_projected_route_loss_usdt,
+        final_private_event_watermark=final_private_event_watermark,
+        reconciliation_evidence_sha256=reconciliation_evidence_sha256,
         stable_flat=stable_flat,
         post_flat_service_seconds=post_flat_service_seconds,
         accepted=not blockers,
@@ -237,11 +259,17 @@ async def build_aggressive_laptop_stage_evidence_from_journal(
     started_at: datetime,
     ended_at: datetime,
     post_flat_service_seconds: int,
+    authoritative_stable_flat: bool = False,
+    authoritative_private_event_watermark: int | None = None,
+    authoritative_reconciliation_sha256: str | None = None,
 ) -> AggressiveLaptopStageEvidence:
     journal = LiveOrderJournal(state_path)
     await journal.initialise()
     active = await journal.active_actions()
-    completed = await journal.completed_actions_since(started_at, binding.qualification_hash)
+    all_completed = await journal.completed_actions_since(started_at, binding.qualification_hash)
+    # Later stages share the same qualification hash and journal. Rebuilding an
+    # earlier immutable stage must inspect only its recorded closed interval.
+    completed = tuple(action for action in all_completed if action.updated_at <= ended_at)
     matching = tuple(
         action
         for action in completed
@@ -252,18 +280,37 @@ async def build_aggressive_laptop_stage_evidence_from_journal(
     blockers: list[str] = []
     if active:
         blockers.append("ACTIVE_LIVE_ACTION_REMAINS")
+    if (
+        not authoritative_stable_flat
+        or authoritative_private_event_watermark is None
+        or authoritative_private_event_watermark < 0
+        or authoritative_reconciliation_sha256 is None
+        or _SHA256.fullmatch(authoritative_reconciliation_sha256) is None
+    ):
+        blockers.append("AUTHORITATIVE_PRIVATE_STABLE_FLAT_REQUIRED")
     if len(matching) != len(completed):
         blockers.append("NON_AGGRESSIVE_OR_WRONG_BINDING_ACTION_PRESENT")
     if any(not is_completed_normal_paired_cycle(action) for action in matching):
         blockers.append("INCOMPLETE_PAIRED_ACTION_PRESENT")
+    if any(
+        action.created_at < started_at
+        or action.updated_at > ended_at
+        or action.updated_at < action.created_at
+        for action in matching
+    ):
+        blockers.append("ACTION_OUTSIDE_STAGE_WINDOW")
     levels: list[int] = []
     losses: list[Decimal] = []
+    filled_order_count = 0
+    actual_fees = Decimal(0)
+    realized_cashflow = Decimal(0)
+    realized_funding = Decimal(0)
     routes = {action.route.value for action in matching}
     for action in matching:
         try:
             level = int(str(action.risk_reservation["level_index"]))
-            loss = Decimal(str(action.risk_reservation["projected_stress_usdt"]))
-        except (KeyError, ValueError):
+            loss = _effective_action_risk(action.risk_reservation)
+        except (KeyError, TypeError, ValueError, ArithmeticError):
             blockers.append("AGGRESSIVE_ACTION_IDENTITY_INVALID")
             continue
         if not 1 <= level <= 5 or not loss.is_finite() or loss < 0:
@@ -271,15 +318,50 @@ async def build_aggressive_laptop_stage_evidence_from_journal(
             continue
         levels.append(level)
         losses.append(loss)
+        orders = await journal.latest_order_events(action.pair_action_id)
+        by_client = {order.client_order_id: order for order in orders}
+        if set(by_client) != {leg.client_order_id for leg in action.legs}:
+            blockers.append("PRIVATE_FILL_EVIDENCE_INCOMPLETE")
+        for order in orders:
+            if (
+                order.status.value != "FILLED"
+                or order.filled_base_quantity <= 0
+                or order.average_price is None
+                or order.fee_usdt is None
+            ):
+                blockers.append("PRIVATE_FILL_OR_FEE_EVIDENCE_INCOMPLETE")
+                continue
+            filled_order_count += 1
+            actual_fees += order.fee_usdt
+            signed_cashflow = order.filled_base_quantity * order.average_price
+            realized_cashflow += signed_cashflow if order.side == Side.SELL else -signed_cashflow
+        next_funding = action.risk_reservation.get("initial_funding_next_timestamp_ms")
+        close_ms = int(action.updated_at.timestamp() * 1000)
+        if isinstance(next_funding, dict) and all(
+            value is not None and int(str(value)) > close_ms for value in next_funding.values()
+        ):
+            action_funding = Decimal(0)
+        else:
+            try:
+                action_funding = Decimal(str(action.risk_reservation["realized_funding_usdt"]))
+            except (KeyError, ValueError, ArithmeticError):
+                blockers.append("REALIZED_FUNDING_EVIDENCE_MISSING")
+                action_funding = Decimal(0)
+        if not action_funding.is_finite():
+            blockers.append("REALIZED_FUNDING_EVIDENCE_INVALID")
+        else:
+            realized_funding += action_funding
     expected = (1,) if stage == "canary" else (1, 2, 3, 4, 5)
     if tuple(sorted(levels)) != expected or len(routes) != 1:
         blockers.append("AGGRESSIVE_STAGE_LEVEL_OR_ROUTE_SET_INVALID")
-    maximum = max(losses, default=Decimal(0))
+    maximum = sum(losses, Decimal(0))
     limit = Decimal(1) if stage == "canary" else Decimal(5)
     if maximum > limit:
         blockers.append("AGGRESSIVE_STAGE_RISK_LIMIT_EXCEEDED")
     if stage == "pilot_a" and post_flat_service_seconds < 28_800:
         blockers.append("EIGHT_HOUR_POST_FLAT_SERVICE_REQUIRED")
+    final_watermark = authoritative_private_event_watermark or 0
+    reconciliation_sha256 = authoritative_reconciliation_sha256 or "0" * 64
     return build_aggressive_laptop_stage_evidence(
         stage=stage,
         started_at=started_at,
@@ -288,10 +370,15 @@ async def build_aggressive_laptop_stage_evidence_from_journal(
         aggressive_binding_sha256=binding.binding_sha256,
         completed_level_indices=tuple(sorted(levels)),
         completed_actions_sha256=completed_normal_actions_sha256(matching),
-        production_filled_order_count=sum(len(action.legs) for action in matching),
+        production_filled_order_count=filled_order_count,
+        actual_fees_usdt=actual_fees,
+        realized_funding_usdt=realized_funding,
+        realized_pnl_usdt=realized_cashflow - actual_fees + realized_funding,
         active_action_count=len(active),
         maximum_projected_route_loss_usdt=maximum,
-        stable_flat=not active,
+        final_private_event_watermark=final_watermark,
+        reconciliation_evidence_sha256=reconciliation_sha256,
+        stable_flat=not active and authoritative_stable_flat,
         post_flat_service_seconds=post_flat_service_seconds,
         blockers=tuple(dict.fromkeys(blockers)),
     )
@@ -319,10 +406,15 @@ def load_aggressive_laptop_stage_evidence(path: Path) -> AggressiveLaptopStageEv
         ),
         completed_actions_sha256=str(payload["completed_actions_sha256"]),
         production_filled_order_count=int(str(payload["production_filled_order_count"])),
+        actual_fees_usdt=Decimal(str(payload["actual_fees_usdt"])),
+        realized_funding_usdt=Decimal(str(payload["realized_funding_usdt"])),
+        realized_pnl_usdt=Decimal(str(payload["realized_pnl_usdt"])),
         active_action_count=int(str(payload["active_action_count"])),
         maximum_projected_route_loss_usdt=Decimal(
             str(payload["maximum_projected_route_loss_usdt"])
         ),
+        final_private_event_watermark=int(str(payload["final_private_event_watermark"])),
+        reconciliation_evidence_sha256=str(payload["reconciliation_evidence_sha256"]),
         stable_flat=_bool_value(payload, "stable_flat"),
         post_flat_service_seconds=int(str(payload["post_flat_service_seconds"])),
         accepted=_bool_value(payload, "accepted"),
@@ -388,6 +480,21 @@ def _verify_stage_evidence(evidence: AggressiveLaptopStageEvidence) -> None:
         raise ValueError("aggressive laptop stage evidence hash mismatch")
     if evidence.accepted != (not evidence.blockers):
         raise ValueError("aggressive laptop stage acceptance contradicts its blockers")
+
+
+def _effective_action_risk(reservation: object) -> Decimal:
+    if not isinstance(reservation, dict):
+        raise ValueError("aggressive action risk reservation is invalid")
+    planned = Decimal(str(reservation["projected_stress_usdt"]))
+    actual = reservation.get("actual_fill_risk")
+    repriced = (
+        Decimal(str(actual["incremental_stress_usdt"]))
+        if isinstance(actual, dict) and "incremental_stress_usdt" in actual
+        else planned
+    )
+    if not planned.is_finite() or not repriced.is_finite() or min(planned, repriced) <= 0:
+        raise ValueError("aggressive action risk reservation is invalid")
+    return max(planned, repriced)
 
 
 def _artifact_sha256(

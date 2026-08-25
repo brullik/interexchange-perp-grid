@@ -13,6 +13,7 @@ from interexchange_perp_grid.aggressive_model import (
     DivergenceDirection,
     EpisodeCloseReason,
     HistoricalModelPolicy,
+    HistoricalReferenceModel,
     ModelEligibility,
     build_historical_reference_model,
     decimal_quantile,
@@ -133,6 +134,46 @@ def test_locked_profile_is_the_only_policy_source(tmp_path: Path) -> None:
         load_historical_model_policy(drifted)
 
 
+@pytest.mark.parametrize(
+    ("original", "replacement", "message"),
+    (
+        (
+            "['0.20', '0.40', '0.60', '0.80', '1.00']",
+            "['0.10', '0.40', '0.60', '0.80', '1.00']",
+            "level fractions",
+        ),
+        (
+            "['0.10', '0.15', '0.20', '0.25', '0.30']",
+            "['0.05', '0.15', '0.20', '0.25', '0.35']",
+            "tranche weights",
+        ),
+        ("stop_buffer_ratio: '0.15'", "stop_buffer_ratio: '0.16'", "stop buffer"),
+        (
+            "rearm_retreat_step_fraction: '0.25'",
+            "rearm_retreat_step_fraction: '0.20'",
+            "rearm retreat fraction",
+        ),
+    ),
+)
+def test_locked_profile_rejects_fixed_geometry_mutation(
+    tmp_path: Path,
+    original: str,
+    replacement: str,
+    message: str,
+) -> None:
+    profile = Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml").read_text(encoding="utf-8")
+    assert original in profile
+    mutated = tmp_path / "mutated.yaml"
+    mutated.write_text(profile.replace(original, replacement), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_historical_model_policy(mutated)
+
+
+def test_historical_policy_rejects_nonfinite_values() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        HistoricalModelPolicy(history_target_days=Decimal("NaN"))
+
+
 def test_effective_stop_uses_farther_outward_boundary() -> None:
     assert effective_stop_bps(DivergenceDirection.POSITIVE, Decimal("11.5"), None) == Decimal(
         "11.5"
@@ -188,6 +229,43 @@ def test_model_builds_separate_geometry_episodes_and_live_gate() -> None:
     assert not model.execution_authorized
 
 
+def test_live_coverage_uses_longest_uninterrupted_minute_run() -> None:
+    first_run = tuple(_bar(minute) for minute in range(7 * 1440))
+    scattered = tuple(
+        _bar((100 + day * 2) * 1440 + minute) for day in range(14) for minute in range(720)
+    )
+    model = build_historical_reference_model(
+        (*first_run, *scattered),
+        policy=_policy(
+            history_target_days=Decimal("14"),
+            history_minimum_live_days=Decimal("12"),
+            history_minimum_shadow_days=Decimal("6"),
+        ),
+        source_manifest_sha256="source-hash",
+        strategy_profile_sha256="profile-hash",
+        code_sha="code-sha",
+    )
+
+    assert model.coverage_days == Decimal(7)
+    assert not model.target_coverage_met
+    assert model.positive.eligibility != ModelEligibility.LIVE_ELIGIBLE
+
+
+def test_noon_to_noon_minutes_do_not_count_as_a_complete_utc_day() -> None:
+    bars = tuple(
+        replace(_bar(minute), interval_start=_START + timedelta(hours=12, minutes=minute))
+        for minute in range(1440)
+    )
+    model = build_historical_reference_model(
+        bars,
+        source_manifest_sha256="source-hash",
+        strategy_profile_sha256="profile-hash",
+        code_sha="code-sha",
+    )
+
+    assert model.coverage_days == 0
+
+
 def test_episode_requires_normal_reset_and_gap_censors_every_reached_level() -> None:
     bars = (_bar(0), _bar(1, "10", high="10", low="0"), _bar(3))
     rejection = ReferenceMinuteRejection(
@@ -214,7 +292,7 @@ def test_episode_requires_normal_reset_and_gap_censors_every_reached_level() -> 
     assert episode.close_reason == EpisodeCloseReason.DATA_UNAVAILABLE
     assert tuple(sample.level_index for sample in episode.level_samples) == (1, 2, 3, 4, 5)
     assert all(sample.censored for sample in episode.level_samples)
-    assert model.positive.eligibility == ModelEligibility.SHADOW_ONLY
+    assert model.positive.eligibility == ModelEligibility.DISABLED
 
 
 def test_horizon_censors_and_records_adverse_excursion() -> None:
@@ -244,13 +322,13 @@ def test_horizon_censors_and_records_adverse_excursion() -> None:
 
 
 def test_direction_can_be_independently_disabled() -> None:
-    bars = tuple(_bar(minute, "0", high="10", low="0") for minute in range(3))
+    bars = tuple(_bar(minute, "0", high="10", low="0") for minute in range(1440))
     model = build_historical_reference_model(
         bars,
         policy=_policy(
-            history_target_days=Decimal("0.002"),
-            history_minimum_live_days=Decimal("0.0015"),
-            history_minimum_shadow_days=Decimal("0.001"),
+            history_target_days=Decimal("2"),
+            history_minimum_live_days=Decimal("1.5"),
+            history_minimum_shadow_days=Decimal("1"),
             minimum_completed_episodes=1,
         ),
         source_manifest_sha256="source-hash",
@@ -330,6 +408,15 @@ def test_model_persistence_is_atomic_strict_and_restart_identical(tmp_path: Path
     with pytest.raises(ValueError, match="missing or unknown fields"):
         load_historical_model(path)
 
+    save_historical_model(path, model)
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    envelope["model"]["positive"]["levels_bps"][0] = "123.456"
+    payload = json.dumps(envelope["model"], sort_keys=True, separators=(",", ":"))
+    envelope["model_sha256"] = hashlib.sha256(payload.encode()).hexdigest()
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    with pytest.raises(ValueError, match="locked directional geometry"):
+        load_historical_model(path)
+
 
 def test_active_model_is_frozen_and_flat_updates_are_bounded() -> None:
     current = build_historical_reference_model(
@@ -339,20 +426,25 @@ def test_active_model_is_frozen_and_flat_updates_are_bounded() -> None:
         strategy_profile_sha256="profile-hash",
         code_sha="code-sha",
     )
-    ten_percent = replace(
-        current,
-        positive=replace(
-            current.positive,
-            levels_bps=tuple(value * Decimal("1.10") for value in current.positive.levels_bps),
-        ),
-    )
-    thirty_percent = replace(
-        current,
-        positive=replace(
-            current.positive,
-            levels_bps=tuple(value * Decimal("1.30") for value in current.positive.levels_bps),
-        ),
-    )
+
+    def scaled_positive(factor: Decimal) -> HistoricalReferenceModel:
+        spread_range = current.positive.range_bps * factor
+        return replace(
+            current,
+            positive=replace(
+                current.positive,
+                extreme_bps=current.s0_bps + spread_range,
+                range_bps=spread_range,
+                levels_bps=tuple(
+                    current.s0_bps + spread_range * fraction
+                    for fraction in _policy().level_fractions
+                ),
+                reference_stop_bps=current.s0_bps + spread_range * Decimal("1.15"),
+            ),
+        )
+
+    ten_percent = scaled_positive(Decimal("1.10"))
+    thirty_percent = scaled_positive(Decimal("1.30"))
     policy = _policy()
     assert route_model_update_allowed(current, ten_percent, elapsed_seconds=86_400, policy=policy)
     assert not route_model_update_allowed(
@@ -415,3 +507,29 @@ def test_direction_enum_is_explicit_in_persisted_evidence() -> None:
     assert payload["positive"]["direction"] == DivergenceDirection.POSITIVE.value  # type: ignore[index]
     assert payload["negative"]["direction"] == DivergenceDirection.NEGATIVE.value  # type: ignore[index]
     assert payload["execution_authorized"] is False
+
+    with pytest.raises(ValueError, match="directional identity"):
+        replace(
+            model,
+            positive=replace(model.positive, direction=DivergenceDirection.NEGATIVE),
+        )
+    with pytest.raises(ValueError, match="directional identity"):
+        replace(
+            model,
+            positive=replace(
+                model.positive,
+                range_bps=Decimal("-1"),
+                extreme_bps=model.s0_bps - Decimal(1),
+                levels_bps=tuple(
+                    model.s0_bps - fraction
+                    for fraction in (
+                        Decimal("0.2"),
+                        Decimal("0.4"),
+                        Decimal("0.6"),
+                        Decimal("0.8"),
+                        Decimal(1),
+                    )
+                ),
+                reference_stop_bps=model.s0_bps - Decimal("1.15"),
+            ),
+        )

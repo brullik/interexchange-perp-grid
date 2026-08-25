@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import yaml
 
+from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.reference_history import (
     ReferenceMinuteRejection,
     ReferenceSpreadBar,
@@ -23,6 +24,20 @@ from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _ONE = Decimal("1")
 _ROBUST_SIGMA_FACTOR = Decimal("1.4826")
+_LOCKED_LEVEL_FRACTIONS = (
+    Decimal("0.20"),
+    Decimal("0.40"),
+    Decimal("0.60"),
+    Decimal("0.80"),
+    Decimal("1.00"),
+)
+_LOCKED_TRANCHE_WEIGHTS = (
+    Decimal("0.10"),
+    Decimal("0.15"),
+    Decimal("0.20"),
+    Decimal("0.25"),
+    Decimal("0.30"),
+)
 
 
 class DivergenceDirection(StrEnum):
@@ -55,24 +70,29 @@ class HistoricalModelPolicy:
     regime_drift_range_fraction: Decimal = Decimal("0.25")
     regime_drift_robust_sigma_multiple: Decimal = Decimal("3")
     parameter_change_limit_ratio_per_day: Decimal = Decimal("0.20")
-    level_fractions: tuple[Decimal, ...] = (
-        Decimal("0.20"),
-        Decimal("0.40"),
-        Decimal("0.60"),
-        Decimal("0.80"),
-        Decimal("1.00"),
-    )
-    tranche_weights: tuple[Decimal, ...] = (
-        Decimal("0.10"),
-        Decimal("0.15"),
-        Decimal("0.20"),
-        Decimal("0.25"),
-        Decimal("0.30"),
-    )
+    level_fractions: tuple[Decimal, ...] = _LOCKED_LEVEL_FRACTIONS
+    tranche_weights: tuple[Decimal, ...] = _LOCKED_TRANCHE_WEIGHTS
     stop_buffer_ratio: Decimal = Decimal("0.15")
     rearm_retreat_step_fraction: Decimal = Decimal("0.25")
 
     def __post_init__(self) -> None:
+        decimal_values = (
+            self.history_target_days,
+            self.history_minimum_live_days,
+            self.history_minimum_shadow_days,
+            self.mode_bucket_bps,
+            self.normal_zone_minimum_half_width_bps,
+            self.minimum_convergence_rate,
+            self.regime_drift_range_fraction,
+            self.regime_drift_robust_sigma_multiple,
+            self.parameter_change_limit_ratio_per_day,
+            *self.level_fractions,
+            *self.tranche_weights,
+            self.stop_buffer_ratio,
+            self.rearm_retreat_step_fraction,
+        )
+        if any(not value.is_finite() for value in decimal_values):
+            raise ValueError("historical model policy values must be finite")
         if not (
             self.history_target_days
             >= self.history_minimum_live_days
@@ -88,16 +108,14 @@ class HistoricalModelPolicy:
             raise ValueError("minimum convergence rate must be within [0, 1]")
         if self.convergence_horizon_seconds <= 0:
             raise ValueError("convergence horizon must be positive")
-        if self.level_fractions != tuple(sorted(self.level_fractions)):
-            raise ValueError("level fractions must be ordered")
-        if len(self.level_fractions) != 5 or self.level_fractions[-1] != 1:
-            raise ValueError("exactly five levels ending at 100% are required")
-        if len(self.tranche_weights) != 5 or sum(self.tranche_weights) != 1:
-            raise ValueError("exactly five tranche weights summing to one are required")
-        if self.stop_buffer_ratio <= 0:
-            raise ValueError("stop buffer must be positive")
-        if not 0 < self.rearm_retreat_step_fraction < 1:
-            raise ValueError("rearm retreat fraction must be within (0, 1)")
+        if self.level_fractions != _LOCKED_LEVEL_FRACTIONS:
+            raise ValueError("level fractions must remain locked at 20/40/60/80/100 percent")
+        if self.tranche_weights != _LOCKED_TRANCHE_WEIGHTS:
+            raise ValueError("tranche weights must remain locked at 10/15/20/25/30 percent")
+        if self.stop_buffer_ratio != Decimal("0.15"):
+            raise ValueError("stop buffer must remain locked at 0.15")
+        if self.rearm_retreat_step_fraction != Decimal("0.25"):
+            raise ValueError("rearm retreat fraction must remain locked at 0.25")
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +210,7 @@ class HistoricalReferenceModel:
             raise ValueError("historical model identity is incomplete")
         if self.execution_authorized:
             raise ValueError("historical reference model is never executable")
+        validate_historical_model(self)
 
 
 def build_historical_reference_model(
@@ -203,12 +222,29 @@ def build_historical_reference_model(
     strategy_profile_sha256: str,
     code_sha: str,
     algorithm_version: str = "aggressive-symbiosis-historical-v1",
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    reference_dataset_sha256: str | None = None,
 ) -> HistoricalReferenceModel:
     policy = policy or HistoricalModelPolicy()
     ordered = tuple(sorted(bars, key=lambda bar: bar.interval_start))
     if not ordered:
         raise ValueError("historical model requires reference bars")
     _require_single_identity(ordered)
+    effective_start = window_start or ordered[0].interval_start
+    effective_end = window_end or ordered[-1].interval_start + timedelta(minutes=1)
+    if effective_end <= effective_start or any(
+        not effective_start <= bar.interval_start < effective_end for bar in ordered
+    ):
+        raise ValueError("historical model exact window is invalid")
+    if window_start is not None or window_end is not None:
+        if window_start is None or window_end is None:
+            raise ValueError("historical model exact window requires both bounds")
+        outcomes = {bar.interval_start for bar in ordered} | {
+            rejection.interval_start for rejection in rejections
+        }
+        if len(outcomes) != int((effective_end - effective_start).total_seconds() // 60):
+            raise ValueError("historical model ledger does not cover the exact window")
     closes = tuple(bar.close_bps for bar in ordered)
     s0 = modal_bucket(closes, policy.mode_bucket_bps)
     distances = tuple(abs(close - s0) for close in closes)
@@ -218,11 +254,11 @@ def build_historical_reference_model(
     )
     normal_low = s0 - half_width
     normal_high = s0 + half_width
-    coverage_days = Decimal(len(ordered)) / Decimal(1440)
+    coverage_days = Decimal(_complete_utc_day_count(ordered))
     windows = (
-        robust_window(ordered, 1440),
-        robust_window(ordered, 7 * 1440),
-        robust_window(ordered, 30 * 1440),
+        robust_window(ordered, 1440, window_end=effective_end),
+        robust_window(ordered, 7 * 1440, window_end=effective_end),
+        robust_window(ordered, 30 * 1440, window_end=effective_end),
     )
     positive = _build_direction(
         DivergenceDirection.POSITIVE,
@@ -255,8 +291,8 @@ def build_historical_reference_model(
     return HistoricalReferenceModel(
         schema_version=1,
         algorithm_version=algorithm_version,
-        window_start=first.interval_start,
-        window_end=ordered[-1].interval_start + timedelta(minutes=1),
+        window_start=effective_start,
+        window_end=effective_end,
         coverage_days=coverage_days,
         target_coverage_met=coverage_days >= policy.history_target_days,
         s0_bps=s0,
@@ -269,7 +305,7 @@ def build_historical_reference_model(
         window_7d=windows[1],
         window_30d=windows[2],
         source_manifest_sha256=source_manifest_sha256,
-        reference_manifest_sha256=reference_bars_sha256(ordered),
+        reference_manifest_sha256=reference_dataset_sha256 or reference_bars_sha256(ordered),
         strategy_profile_sha256=strategy_profile_sha256,
         code_sha=code_sha,
         venue_a=first.venue_a.value,
@@ -370,11 +406,27 @@ def decimal_quantile(values: tuple[Decimal, ...], quantile: Decimal) -> Decimal:
     return ordered[lower_index] + (ordered[upper_index] - ordered[lower_index]) * fraction
 
 
-def robust_window(bars: tuple[ReferenceSpreadBar, ...], minutes: int) -> RobustWindow:
+def robust_window(
+    bars: tuple[ReferenceSpreadBar, ...],
+    minutes: int,
+    *,
+    window_end: datetime | None = None,
+) -> RobustWindow:
     if minutes <= 0:
         raise ValueError("robust window minutes must be positive")
     ordered = tuple(sorted(bars, key=lambda bar: bar.interval_start))
-    selected = ordered[-minutes:]
+    effective_end = window_end or (
+        ordered[-1].interval_start + timedelta(minutes=1) if ordered else None
+    )
+    selected = (
+        tuple(
+            bar
+            for bar in ordered
+            if effective_end - timedelta(minutes=minutes) <= bar.interval_start < effective_end
+        )
+        if effective_end is not None
+        else ()
+    )
     values = tuple(bar.close_bps for bar in selected)
     if not values:
         return RobustWindow(minutes, 0, False, None, None, None, None, None)
@@ -390,6 +442,91 @@ def robust_window(bars: tuple[ReferenceSpreadBar, ...], minutes: int) -> RobustW
         q90_bps=decimal_quantile(values, Decimal("0.90")),
         q999_abs_bps=decimal_quantile(tuple(abs(value) for value in values), Decimal("0.999")),
     )
+
+
+def validate_historical_model(model: HistoricalReferenceModel) -> None:
+    """Recompute every locked internal geometry invariant from persisted primitives."""
+    decimals = (
+        model.coverage_days,
+        model.s0_bps,
+        model.normal_half_width_bps,
+        model.normal_low_bps,
+        model.normal_high_bps,
+        model.positive.extreme_bps,
+        model.positive.range_bps,
+        model.positive.reference_stop_bps,
+        model.negative.extreme_bps,
+        model.negative.range_bps,
+        model.negative.reference_stop_bps,
+        *model.positive.levels_bps,
+        *model.negative.levels_bps,
+        *model.positive.tranche_weights,
+        *model.negative.tranche_weights,
+    )
+    if any(not value.is_finite() for value in decimals):
+        raise ValueError("historical model geometry contains a non-finite value")
+    if (
+        model.window_end <= model.window_start
+        or model.coverage_days < 0
+        or model.normal_half_width_bps < Decimal(2)
+        or model.normal_low_bps != model.s0_bps - model.normal_half_width_bps
+        or model.normal_high_bps != model.s0_bps + model.normal_half_width_bps
+    ):
+        raise ValueError("historical model normal geometry is inconsistent")
+    if (
+        model.positive.direction != DivergenceDirection.POSITIVE
+        or model.negative.direction != DivergenceDirection.NEGATIVE
+        or min(model.positive.range_bps, model.negative.range_bps) < 0
+        or (
+            model.positive.range_bps == 0
+            and model.positive.eligibility != ModelEligibility.DISABLED
+        )
+        or (
+            model.negative.range_bps == 0
+            and model.negative.eligibility != ModelEligibility.DISABLED
+        )
+    ):
+        raise ValueError("historical model directional identity or range is invalid")
+    routes = directed_routes_for_reference_pair(
+        model.base,
+        Venue(model.venue_a),
+        Venue(model.venue_b),
+    )
+    if (
+        model.venue_a >= model.venue_b
+        or model.positive_route != _route_identity(routes.positive)
+        or model.negative_route != _route_identity(routes.negative)
+    ):
+        raise ValueError("historical model canonical routes are inconsistent")
+    expected = (
+        (
+            model.positive,
+            model.positive.extreme_bps - model.s0_bps,
+            tuple(
+                model.s0_bps + (model.positive.extreme_bps - model.s0_bps) * fraction
+                for fraction in _LOCKED_LEVEL_FRACTIONS
+            ),
+            model.s0_bps + (model.positive.extreme_bps - model.s0_bps) * Decimal("1.15"),
+        ),
+        (
+            model.negative,
+            model.s0_bps - model.negative.extreme_bps,
+            tuple(
+                model.s0_bps - (model.s0_bps - model.negative.extreme_bps) * fraction
+                for fraction in _LOCKED_LEVEL_FRACTIONS
+            ),
+            model.s0_bps - (model.s0_bps - model.negative.extreme_bps) * Decimal("1.15"),
+        ),
+    )
+    for direction, expected_range, levels, stop in expected:
+        if (
+            direction.range_bps != expected_range
+            or direction.levels_bps != levels
+            or direction.tranche_weights != _LOCKED_TRANCHE_WEIGHTS
+            or direction.reference_stop_bps != stop
+            or len(direction.per_level_samples) != 5
+        ):
+            raise ValueError("historical model locked directional geometry is inconsistent")
 
 
 def historical_model_sha256(model: HistoricalReferenceModel) -> str:
@@ -792,6 +929,18 @@ def _consecutive(bars: tuple[ReferenceSpreadBar, ...]) -> bool:
     return all(
         right.interval_start == left.interval_start + timedelta(minutes=1)
         for left, right in pairwise(bars)
+    )
+
+
+def _complete_utc_day_count(bars: tuple[ReferenceSpreadBar, ...]) -> int:
+    """Count only UTC calendar days containing every exact minute."""
+    by_day: dict[datetime, set[datetime]] = {}
+    for bar in bars:
+        start = bar.interval_start.replace(hour=0, minute=0)
+        by_day.setdefault(start, set()).add(bar.interval_start)
+    return sum(
+        starts == {day_start + timedelta(minutes=offset) for offset in range(1440)}
+        for day_start, starts in by_day.items()
     )
 
 

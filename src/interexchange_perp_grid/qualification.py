@@ -1082,6 +1082,7 @@ def qualification_is_current(
     current_container_image_digest: str | None = None,
     current_release_code_sha: str | None = None,
     accepted_policies: tuple[QualificationPolicy, ...] | None = None,
+    enforce_age: bool = True,
 ) -> tuple[bool, ReasonCode]:
     observed_at = now or datetime.now(UTC)
     release_sha = current_release_code_sha or current_code_commit_sha(repo_root)
@@ -1100,7 +1101,7 @@ def qualification_is_current(
     route_matches = expected_route is None or evidence.route == expected_route
     policy_matches = accepted_policies is None or evidence.policy in accepted_policies
     age_seconds = (observed_at - evidence.generated_at).total_seconds()
-    fresh = 0 <= age_seconds <= max_age_seconds
+    fresh = not enforce_age or 0 <= age_seconds <= max_age_seconds
     if (
         not evidence.accepted
         or not hashes_match

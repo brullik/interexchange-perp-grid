@@ -28,13 +28,26 @@ _ARTIFACT = re.compile(r"^sha256:[0-9a-f]{64}$")
 class AggressiveDirectionBinding:
     route_identity: str
     levels_bps: tuple[Decimal, ...]
+    reverse_targets_bps: tuple[Decimal, ...]
     tranche_weights: tuple[Decimal, ...]
     reference_stop_bps: Decimal
 
     def __post_init__(self) -> None:
-        if not self.route_identity or len(self.levels_bps) != 5 or len(self.tranche_weights) != 5:
+        if (
+            not self.route_identity
+            or len(self.levels_bps) != 5
+            or len(self.reverse_targets_bps) != 5
+            or len(self.tranche_weights) != 5
+        ):
             raise ValueError("aggressive direction binding must contain exact five-level geometry")
-        if any(not value.is_finite() for value in (*self.levels_bps, *self.tranche_weights)):
+        if any(
+            not value.is_finite()
+            for value in (
+                *self.levels_bps,
+                *self.reverse_targets_bps,
+                *self.tranche_weights,
+            )
+        ):
             raise ValueError("aggressive direction geometry must be finite")
         if sum(self.tranche_weights) != 1 or not self.reference_stop_bps.is_finite():
             raise ValueError("aggressive direction weights or stop are invalid")
@@ -139,8 +152,16 @@ def build_aggressive_qualification_binding(
         reference_manifest_sha256=model.reference_manifest_sha256,
         profile_sha256=profile_sha256,
         qualification_route=route,
-        positive=_direction_binding(model.positive_route, model.positive),
-        negative=_direction_binding(model.negative_route, model.negative),
+        positive=_direction_binding(
+            model.positive_route,
+            model.positive,
+            model.normal_high_bps,
+        ),
+        negative=_direction_binding(
+            model.negative_route,
+            model.negative,
+            model.normal_low_bps,
+        ),
         accepted=True,
         binding_sha256="0" * 64,
     )
@@ -218,10 +239,12 @@ def verify_aggressive_qualification_binding(
 def _direction_binding(
     route_identity: str,
     direction: DirectionHistoricalModel,
+    normal_zone_target_bps: Decimal,
 ) -> AggressiveDirectionBinding:
     return AggressiveDirectionBinding(
         route_identity,
         direction.levels_bps,
+        (normal_zone_target_bps, *direction.levels_bps[:-1]),
         direction.tranche_weights,
         direction.reference_stop_bps,
     )
@@ -231,12 +254,18 @@ def _load_direction(value: object) -> AggressiveDirectionBinding:
     if not isinstance(value, dict):
         raise ValueError("aggressive direction binding must be an object")
     levels = value.get("levels_bps")
+    targets = value.get("reverse_targets_bps")
     weights = value.get("tranche_weights")
-    if not isinstance(levels, list) or not isinstance(weights, list):
+    if (
+        not isinstance(levels, list)
+        or not isinstance(targets, list)
+        or not isinstance(weights, list)
+    ):
         raise ValueError("aggressive direction arrays are invalid")
     return AggressiveDirectionBinding(
         route_identity=str(value["route_identity"]),
         levels_bps=tuple(Decimal(str(item)) for item in levels),
+        reverse_targets_bps=tuple(Decimal(str(item)) for item in targets),
         tranche_weights=tuple(Decimal(str(item)) for item in weights),
         reference_stop_bps=Decimal(str(value["reference_stop_bps"])),
     )

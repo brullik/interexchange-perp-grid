@@ -15,7 +15,11 @@ from interexchange_perp_grid.aggressive_evaluator import (
     VenueFundingProjection,
     load_aggressive_decision_policy,
 )
-from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, GridLevelState
+from interexchange_perp_grid.aggressive_grid import (
+    AggressiveGridStore,
+    FrozenGridSizingPlan,
+    GridLevelState,
+)
 from interexchange_perp_grid.aggressive_live import (
     AggressiveLaptopLiveStage,
     AggressiveLiveIntentEnvelope,
@@ -275,6 +279,7 @@ def _live_binding(intent_model_sha256: str) -> AggressiveQualificationBinding:
     geometry = AggressiveDirectionBinding(
         "BTC:okx>bybit",
         tuple(Decimal(index) for index in range(1, 6)),
+        tuple(Decimal(index) for index in range(5)),
         (Decimal("0.10"), Decimal("0.15"), Decimal("0.20"), Decimal("0.25"), Decimal("0.30")),
         Decimal(6),
     )
@@ -398,6 +403,49 @@ def test_shared_core_reserves_exactly_one_persisted_level(tmp_path: Path) -> Non
     assert sum(level.state == GridLevelState.ENTRY_PENDING for level in levels) == 1
     with pytest.raises(RuntimeError, match="changed after decision"):
         AggressiveDecisionCore.reserve(store, decision)
+
+
+def test_later_level_uses_first_level_frozen_route_allocation() -> None:
+    first = _accepted(AggressiveRuntimeMode.LIVE)
+    assert first.intent is not None
+    frozen = FrozenGridSizingPlan(
+        first.intent.route_identity,
+        first.intent.model_sha256,
+        first.sizing.full_route_base_quantity,
+        first.sizing.tranche_base_quantities,
+        first.sizing.tranche_projected_losses_usdt,
+        first.sizing.projected_margin_usdt,
+        first.intent.decided_at,
+    )
+    core = AggressiveDecisionCore(
+        load_aggressive_decision_policy(Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")).policy
+    )
+    second = None
+    model = _model()
+    for offset in (0, 250_000_000, 500_000_000):
+        request = _request(AggressiveRuntimeMode.LIVE, offset)
+        request = replace(
+            request,
+            proposal=replace(
+                request.proposal,
+                level_index=2,
+                reference_trigger_bps=model.positive.levels_bps[1],
+                reference_spread_bps=model.positive.levels_bps[-1] + Decimal(1),
+            ),
+            sizing=replace(
+                request.sizing,
+                existing_route_loss_usdt=first.sizing.tranche_projected_losses_usdt[0],
+                existing_portfolio_loss_usdt=first.sizing.tranche_projected_losses_usdt[0],
+                frozen_route_sizing=frozen,
+            ),
+            decision_cycle=2,
+        )
+        second = core.evaluate(request)
+
+    assert second is not None and second.accepted
+    assert second.intent is not None
+    assert second.intent.quantity == first.sizing.tranche_base_quantities[1]
+    assert second.sizing.tranche_base_quantities == first.sizing.tranche_base_quantities
 
 
 def test_model_or_runtime_identity_mismatch_fails_closed() -> None:

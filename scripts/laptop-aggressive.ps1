@@ -64,6 +64,24 @@ function Invoke-Verify {
     if ($LASTEXITCODE -ne 0) { throw "native runtime manifest failed" }
 }
 
+function Ensure-HistoricalModel {
+    Require-Python
+    # Use closed UTC days only.  One extra day protects the 180-day target
+    # against the currently open day without weakening the 90-day live floor.
+    $historyEnd = [DateTime]::UtcNow.Date
+    $historyStart = $historyEnd.AddDays(-181)
+    & $python -m interexchange_perp_grid.cli reference-history-proof `
+        --venue-a bybit --venue-b okx --base BTC `
+        --since $historyStart.ToString("o") --end $historyEnd.ToString("o") --limit 1000 `
+        --output-root $history --profile $profile --config $config
+    if ($LASTEXITCODE -ne 0) { throw "exact paginated historical acquisition failed closed" }
+    & $python -m interexchange_perp_grid.cli aggressive-model-proof `
+        --venue-a bybit --venue-b okx --base BTC `
+        --start $historyStart.ToString("o") --end $historyEnd.ToString("o") `
+        --history-root $history --artifact $model --profile $profile --config $config
+    if ($LASTEXITCODE -ne 0) { throw "exact historical model build failed closed" }
+}
+
 function Invoke-ShadowCycle {
     $since = [DateTime]::UtcNow.AddMinutes(-4).ToString("o")
     & $python -m interexchange_perp_grid.cli reference-history-proof `
@@ -88,7 +106,7 @@ switch ($Mode) {
         Require-Python
         Load-LaptopEnvironment
         if (-not (Test-Path -LiteralPath $model -PathType Leaf)) {
-            throw "Historical model is missing: $model"
+            Ensure-HistoricalModel
         }
         if ($ShadowMinutes -lt 0) { throw "ShadowMinutes cannot be negative" }
         [Environment]::ProcessId | Set-Content -LiteralPath $pidFile -Encoding ascii
@@ -105,6 +123,7 @@ switch ($Mode) {
         }
     }
     "qualify" {
+        Ensure-HistoricalModel
         & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
             -ProfileScope $ProfileScope -OwnerException12h:$OwnerException12h
         if ($LASTEXITCODE -ne 0) { throw "base laptop qualification failed closed" }

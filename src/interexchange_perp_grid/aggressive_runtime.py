@@ -2,22 +2,28 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field, replace
-from datetime import datetime
-from decimal import Decimal, localcontext
+from datetime import datetime, timedelta
+from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 
 from interexchange_perp_grid.aggressive_evaluator import (
     AggressiveDecisionPolicy,
     AggressiveEconomicDecision,
     AggressiveEntryReason,
+    AggressiveEntryStage,
     CostReserves,
     CrossingConfirmationTracker,
     GridSizingResult,
     HybridEntryInput,
+    canonical_executable_spread_bps,
     evaluate_hybrid_entry,
     size_aggressive_grid,
 )
-from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, GridLevelState
+from interexchange_perp_grid.aggressive_grid import (
+    AggressiveGridStore,
+    FrozenGridSizingPlan,
+    GridLevelState,
+)
 from interexchange_perp_grid.aggressive_model import (
     DirectionHistoricalModel,
     DivergenceDirection,
@@ -68,6 +74,7 @@ class AggressiveSizingInput:
     existing_route_loss_usdt: Decimal
     existing_portfolio_loss_usdt: Decimal
     free_margin_usdt: Decimal
+    frozen_route_sizing: FrozenGridSizingPlan | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,8 +109,18 @@ class AggressiveTrancheIntent:
     short_venue: str
     long_symbol: str
     short_symbol: str
+    reference_interval_start: datetime
     reference_trigger_bps: Decimal
     reference_spread_bps: Decimal
+    grid_step_bps: Decimal
+    stressed_cost_move_bps: Decimal
+    minimum_profit_move_bps: Decimal
+    normal_low_bps: Decimal
+    normal_high_bps: Decimal
+    reserves: CostReserves
+    entry_stage: AggressiveEntryStage
+    adverse_funding_reserve_usdt: Decimal
+    remaining_close_fees_usdt: Decimal
     executable_entry_spread_bps: Decimal
     reverse_target_bps: Decimal
     effective_stop_bps: Decimal
@@ -111,6 +128,7 @@ class AggressiveTrancheIntent:
     short_entry_vwap: Decimal
     projected_route_loss_usdt: Decimal
     projected_portfolio_loss_usdt: Decimal
+    incremental_tranche_loss_usdt: Decimal
     expected_net_pnl_usdt: Decimal
     model_sha256: str
     strategy_profile_sha256: str
@@ -123,7 +141,14 @@ class AggressiveTrancheIntent:
     execution_authorized: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
-        if self.decided_at.tzinfo is None or self.decided_at.utcoffset() is None:
+        if (
+            self.decided_at.tzinfo is None
+            or self.decided_at.utcoffset() is None
+            or self.reference_interval_start.tzinfo is None
+            or self.reference_interval_start.utcoffset() is None
+            or self.reference_interval_start.second != 0
+            or self.reference_interval_start.microsecond != 0
+        ):
             raise ValueError("aggressive intent timestamp must be timezone-aware")
         if not 1 <= self.level_index <= 5 or self.quantity <= 0:
             raise ValueError("aggressive intent level or quantity is invalid")
@@ -148,6 +173,13 @@ class AggressiveTrancheIntent:
             self.quantity,
             self.reference_trigger_bps,
             self.reference_spread_bps,
+            self.grid_step_bps,
+            self.stressed_cost_move_bps,
+            self.minimum_profit_move_bps,
+            self.normal_low_bps,
+            self.normal_high_bps,
+            self.adverse_funding_reserve_usdt,
+            self.remaining_close_fees_usdt,
             self.executable_entry_spread_bps,
             self.reverse_target_bps,
             self.effective_stop_bps,
@@ -155,10 +187,12 @@ class AggressiveTrancheIntent:
             self.short_entry_vwap,
             self.projected_route_loss_usdt,
             self.projected_portfolio_loss_usdt,
+            self.incremental_tranche_loss_usdt,
             self.expected_net_pnl_usdt,
         )
         if any(not value.is_finite() for value in numbers):
             raise ValueError("aggressive intent contains a non-finite value")
+        self.reserves.total()
         if self.execution_authorized:
             raise ValueError("strategy intent never authorizes exchange execution")
 
@@ -238,22 +272,73 @@ class AggressiveDecisionCore:
             reference_price = (
                 request.proposal.long_book.asks[0].price + request.proposal.short_book.bids[0].price
             ) / Decimal(2)
-        sizing = size_aggressive_grid(
-            direction_levels_bps=direction_model.levels_bps,
-            tranche_weights=direction_model.tranche_weights,
-            effective_stop_bps=request.effective_stop_bps,
-            reference_price=reference_price,
-            quantity_step=request.sizing.quantity_step,
-            minimum_base_quantity=request.sizing.minimum_base_quantity,
-            minimum_notional_usdt=request.sizing.minimum_notional_usdt,
-            per_full_base_reserve_usdt=request.sizing.per_full_base_reserve_usdt,
-            existing_route_loss_usdt=request.sizing.existing_route_loss_usdt,
-            existing_portfolio_loss_usdt=request.sizing.existing_portfolio_loss_usdt,
-            free_margin_usdt=request.sizing.free_margin_usdt,
-            policy=self.policy,
+        frozen = request.sizing.frozen_route_sizing
+        if frozen is None:
+            sizing = size_aggressive_grid(
+                direction_levels_bps=direction_model.levels_bps,
+                tranche_weights=direction_model.tranche_weights,
+                effective_stop_bps=request.effective_stop_bps,
+                reference_price=reference_price,
+                quantity_step=request.sizing.quantity_step,
+                minimum_base_quantity=request.sizing.minimum_base_quantity,
+                minimum_notional_usdt=request.sizing.minimum_notional_usdt,
+                per_full_base_reserve_usdt=request.sizing.per_full_base_reserve_usdt,
+                existing_route_loss_usdt=request.sizing.existing_route_loss_usdt,
+                existing_portfolio_loss_usdt=request.sizing.existing_portfolio_loss_usdt,
+                free_margin_usdt=request.sizing.free_margin_usdt,
+                policy=self.policy,
+            )
+        else:
+            if (
+                frozen.route_identity != expected_route
+                or frozen.model_sha256 != historical_model_sha256(request.model)
+            ):
+                raise ValueError("frozen route sizing identity changed")
+            remaining_loss = sum(
+                frozen.tranche_projected_losses_usdt[level_index - 1 :],
+                Decimal(0),
+            )
+            projected_route = request.sizing.existing_route_loss_usdt + remaining_loss
+            projected_portfolio = request.sizing.existing_portfolio_loss_usdt + remaining_loss
+            next_quantity = frozen.tranche_base_quantities[level_index - 1]
+            next_margin = (
+                next_quantity * reference_price / self.policy.initial_effective_leverage_cap
+            )
+            frozen_accepted = (
+                next_quantity > 0
+                and projected_route <= self.policy.route_modelled_loss_limit_usdt
+                and projected_route < self.policy.route_hard_projected_loss_limit_usdt
+                and projected_portfolio <= self.policy.portfolio_modelled_loss_limit_usdt
+                and projected_portfolio < self.policy.portfolio_hard_projected_loss_limit_usdt
+                and next_margin
+                <= request.sizing.free_margin_usdt
+                * (Decimal(1) - self.policy.local_free_margin_floor_ratio)
+            )
+            sizing = GridSizingResult(
+                accepted=frozen_accepted,
+                reason=(
+                    AggressiveEntryReason.ACCEPTED
+                    if frozen_accepted
+                    else AggressiveEntryReason.RISK_REJECTED
+                ),
+                full_route_base_quantity=frozen.full_route_base_quantity,
+                tranche_base_quantities=frozen.tranche_base_quantities,
+                tranche_projected_losses_usdt=frozen.tranche_projected_losses_usdt,
+                projected_route_loss_usdt=projected_route,
+                projected_portfolio_loss_usdt=projected_portfolio,
+                projected_margin_usdt=frozen.projected_margin_usdt,
+            )
+        canary_minimum = max(
+            request.sizing.minimum_base_quantity,
+            request.sizing.minimum_notional_usdt / reference_price,
         )
         quantity = (
-            sizing.tranche_base_quantities[level_index - 1]
+            (canary_minimum / request.sizing.quantity_step).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+            * request.sizing.quantity_step
+            if request.proposal.stage == AggressiveEntryStage.LOCKED_CANARY
+            else sizing.tranche_base_quantities[level_index - 1]
             if sizing.accepted and 1 <= level_index <= len(sizing.tranche_base_quantities)
             else request.proposal.quantity
         )
@@ -292,6 +377,55 @@ class AggressiveDecisionCore:
                 AggressiveEntryReason.RISK_REJECTED if not sizing.accepted else economics.reason
             )
             return AggressiveStrategyDecision(False, reason, economics, sizing, None)
+        incremental_tranche_loss = quantity * (
+            reference_price
+            * abs(request.effective_stop_bps - direction_model.levels_bps[level_index - 1])
+            / _BPS
+            + request.sizing.per_full_base_reserve_usdt
+        )
+        projected_route_loss = (
+            request.sizing.existing_route_loss_usdt + incremental_tranche_loss
+            if request.proposal.stage == AggressiveEntryStage.LOCKED_CANARY
+            else request.sizing.existing_route_loss_usdt
+            + incremental_tranche_loss
+            + sum(frozen.tranche_projected_losses_usdt[level_index:], Decimal(0))
+            if frozen is not None
+            else sizing.projected_route_loss_usdt
+        )
+        projected_portfolio_loss = (
+            request.sizing.existing_portfolio_loss_usdt + incremental_tranche_loss
+            if request.proposal.stage == AggressiveEntryStage.LOCKED_CANARY
+            else request.sizing.existing_portfolio_loss_usdt
+            + incremental_tranche_loss
+            + sum(frozen.tranche_projected_losses_usdt[level_index:], Decimal(0))
+            if frozen is not None
+            else sizing.projected_portfolio_loss_usdt
+        )
+        if request.proposal.stage == AggressiveEntryStage.LOCKED_CANARY and (
+            incremental_tranche_loss > Decimal(1)
+            or projected_route_loss > Decimal(1)
+            or projected_portfolio_loss > Decimal(1)
+        ):
+            return AggressiveStrategyDecision(
+                False,
+                AggressiveEntryReason.RISK_REJECTED,
+                economics,
+                sizing,
+                None,
+            )
+        if request.proposal.stage == AggressiveEntryStage.NORMAL and (
+            projected_route_loss > self.policy.route_modelled_loss_limit_usdt
+            or projected_route_loss >= self.policy.route_hard_projected_loss_limit_usdt
+            or projected_portfolio_loss > self.policy.portfolio_modelled_loss_limit_usdt
+            or projected_portfolio_loss >= self.policy.portfolio_hard_projected_loss_limit_usdt
+        ):
+            return AggressiveStrategyDecision(
+                False,
+                AggressiveEntryReason.RISK_REJECTED,
+                economics,
+                sizing,
+                None,
+            )
         assert economics.executable_entry_spread_bps is not None
         assert economics.reverse_target_bps is not None
         assert economics.long_entry_vwap is not None
@@ -307,15 +441,36 @@ class AggressiveDecisionCore:
             short_venue=proposal.short_venue.value,
             long_symbol=proposal.long_book.symbol,
             short_symbol=proposal.short_book.symbol,
+            reference_interval_start=(
+                proposal.reference_interval_start
+                if proposal.reference_interval_start is not None
+                else proposal.now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+            ),
             reference_trigger_bps=proposal.reference_trigger_bps,
             reference_spread_bps=proposal.reference_spread_bps,
+            grid_step_bps=proposal.grid_step_bps,
+            stressed_cost_move_bps=proposal.stressed_cost_move_bps,
+            minimum_profit_move_bps=proposal.minimum_profit_move_bps,
+            normal_low_bps=proposal.normal_low_bps,
+            normal_high_bps=proposal.normal_high_bps,
+            reserves=proposal.reserves,
+            entry_stage=proposal.stage,
+            adverse_funding_reserve_usdt=max(
+                Decimal(0),
+                economics.stressed_total_cost_usdt
+                - economics.four_leg_fees_usdt
+                - economics.measured_book_impact_usdt
+                - proposal.reserves.total(),
+            ),
+            remaining_close_fees_usdt=economics.remaining_close_fees_usdt,
             executable_entry_spread_bps=economics.executable_entry_spread_bps,
             reverse_target_bps=economics.reverse_target_bps,
             effective_stop_bps=request.effective_stop_bps,
             long_entry_vwap=economics.long_entry_vwap,
             short_entry_vwap=economics.short_entry_vwap,
-            projected_route_loss_usdt=sizing.projected_route_loss_usdt,
-            projected_portfolio_loss_usdt=sizing.projected_portfolio_loss_usdt,
+            projected_route_loss_usdt=projected_route_loss,
+            projected_portfolio_loss_usdt=projected_portfolio_loss,
+            incremental_tranche_loss_usdt=incremental_tranche_loss,
             expected_net_pnl_usdt=economics.expected_net_pnl_usdt,
             model_sha256=historical_model_sha256(request.model),
             strategy_profile_sha256=request.model.strategy_profile_sha256,
@@ -335,6 +490,21 @@ class AggressiveDecisionCore:
         if not decision.accepted or decision.intent is None:
             raise RuntimeError("only an accepted aggressive intent may reserve grid ownership")
         intent = decision.intent
+        frozen = store.frozen_sizing_plan(intent.route_identity)
+        if frozen is None:
+            if intent.level_index != 1:
+                raise RuntimeError("first route sizing reservation must be level one")
+            store.freeze_sizing_plan(
+                FrozenGridSizingPlan(
+                    route_identity=intent.route_identity,
+                    model_sha256=intent.model_sha256,
+                    full_route_base_quantity=decision.sizing.full_route_base_quantity,
+                    tranche_base_quantities=decision.sizing.tranche_base_quantities,
+                    tranche_projected_losses_usdt=decision.sizing.tranche_projected_losses_usdt,
+                    projected_margin_usdt=decision.sizing.projected_margin_usdt,
+                    created_at=intent.decided_at,
+                )
+            )
         selected = store.first_unfilled_crossed_level(
             intent.route_identity,
             intent.reference_spread_bps,
@@ -345,7 +515,7 @@ class AggressiveDecisionCore:
             intent.route_identity,
             reference_spread_bps=intent.reference_spread_bps,
             decision_cycle=intent.decision_cycle,
-            reserved_stress_usdt=intent.projected_route_loss_usdt,
+            reserved_stress_usdt=intent.incremental_tranche_loss_usdt,
             now=intent.decided_at,
         )
         if pending.state != GridLevelState.ENTRY_PENDING:
@@ -376,9 +546,11 @@ def recompute_actual_fill_risk(
         or min(fill.actual_fees_usdt, fill.adverse_funding_usdt, fill.other_reserves_usdt) < 0
     ):
         raise ValueError("actual-fill risk contains an invalid amount")
-    with localcontext() as context:
-        context.prec = 50
-        spread = (fill.short_fill_price / fill.long_fill_price).ln() * _BPS
+    spread = canonical_executable_spread_bps(
+        fill.direction,
+        fill.long_fill_price,
+        fill.short_fill_price,
+    )
     average_price = (fill.long_fill_price + fill.short_fill_price) / Decimal(2)
     market_loss = fill.base_quantity * average_price * abs(fill.effective_stop_bps - spread) / _BPS
     incremental = (

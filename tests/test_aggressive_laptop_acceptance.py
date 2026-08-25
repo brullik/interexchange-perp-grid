@@ -23,6 +23,7 @@ from interexchange_perp_grid.aggressive_qualification import (
     AggressiveDirectionBinding,
     AggressiveQualificationBinding,
 )
+from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.native_runtime import NativeRuntimeManifest
 
 _NOW = datetime(2026, 8, 25, tzinfo=UTC)
@@ -49,6 +50,7 @@ def _binding() -> AggressiveQualificationBinding:
     direction = AggressiveDirectionBinding(
         "BTC:bybit>okx",
         tuple(Decimal(index) for index in range(1, 6)),
+        tuple(Decimal(index) for index in range(5)),
         (Decimal(".10"), Decimal(".15"), Decimal(".20"), Decimal(".25"), Decimal(".30")),
         Decimal(6),
     )
@@ -91,11 +93,16 @@ def _stage(
         completed_level_indices=levels or ((1,) if is_canary else (1, 2, 3, 4, 5)),
         completed_actions_sha256=("1" if is_canary else "2") * 64,
         production_filled_order_count=4 if is_canary else 20,
+        actual_fees_usdt=Decimal("0.04" if is_canary else "0.20"),
+        realized_funding_usdt=Decimal(0),
+        realized_pnl_usdt=Decimal("0.10" if is_canary else "0.50"),
         active_action_count=0,
         maximum_projected_route_loss_usdt=(
             maximum_loss if maximum_loss is not None else Decimal(1 if is_canary else 5)
         ),
         stable_flat=True,
+        final_private_event_watermark=4 if is_canary else 20,
+        reconciliation_evidence_sha256=("3" if is_canary else "4") * 64,
         post_flat_service_seconds=(
             post_flat_seconds if post_flat_seconds is not None else (28_800 if not is_canary else 0)
         ),
@@ -170,15 +177,24 @@ async def test_pilot_stage_report_reads_exact_five_aggressive_journal_actions(
     binding = _binding()
     actions = tuple(
         SimpleNamespace(
+            pair_action_id=f"action-{level}",
             route=SimpleNamespace(value="BTC:bybit>okx"),
+            created_at=_NOW + timedelta(minutes=level),
+            updated_at=_NOW + timedelta(minutes=level + 1),
             risk_reservation={
                 "strategy": "AGGRESSIVE_SYMBIOSIS_V1",
                 "stage": "pilot_a",
                 "aggressive_binding_sha256": binding.binding_sha256,
                 "level_index": level,
-                "projected_stress_usdt": Decimal(level),
+                "projected_stress_usdt": Decimal("0.8"),
+                "initial_funding_next_timestamp_ms": {
+                    "bybit": int((_NOW + timedelta(hours=8)).timestamp() * 1000),
+                    "okx": int((_NOW + timedelta(hours=8)).timestamp() * 1000),
+                },
             },
-            legs=(object(), object(), object(), object()),
+            legs=tuple(
+                SimpleNamespace(client_order_id=f"action-{level}-leg-{index}") for index in range(4)
+            ),
         )
         for level in range(1, 6)
     )
@@ -202,6 +218,22 @@ async def test_pilot_stage_report_reads_exact_five_aggressive_journal_actions(
             assert qualification == binding.qualification_hash
             return actions
 
+        async def latest_order_events(self, pair_action_id: str) -> tuple[object, ...]:
+            return tuple(
+                SimpleNamespace(
+                    client_order_id=f"{pair_action_id}-leg-{index}",
+                    status=SimpleNamespace(value="FILLED"),
+                    filled_base_quantity=Decimal("0.01"),
+                    average_price=Decimal("100"),
+                    fee_usdt=Decimal("0.001"),
+                    side=Side.BUY if index % 2 == 0 else Side.SELL,
+                )
+                for index in range(4)
+            )
+
+        async def event_watermark(self) -> int:
+            return 20
+
     monkeypatch.setattr(acceptance_module, "LiveOrderJournal", FakeJournal)
     monkeypatch.setattr(acceptance_module, "is_completed_normal_paired_cycle", lambda _: True)
     monkeypatch.setattr(
@@ -216,8 +248,134 @@ async def test_pilot_stage_report_reads_exact_five_aggressive_journal_actions(
         started_at=_NOW,
         ended_at=_NOW + timedelta(hours=9),
         post_flat_service_seconds=28_800,
+        authoritative_stable_flat=True,
+        authoritative_private_event_watermark=20,
+        authoritative_reconciliation_sha256="5" * 64,
     )
     assert evidence.accepted
     assert evidence.completed_level_indices == (1, 2, 3, 4, 5)
     assert evidence.production_filled_order_count == 20
     assert evidence.stable_flat
+
+
+@pytest.mark.asyncio
+async def test_stage_report_never_inferrs_flat_from_an_empty_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class EmptyJournal:
+        def __init__(self, path: Path) -> None:
+            del path
+
+        async def initialise(self) -> None:
+            return None
+
+        async def active_actions(self) -> tuple[object, ...]:
+            return ()
+
+        async def completed_actions_since(
+            self, started: datetime, qualification: str
+        ) -> tuple[object, ...]:
+            del started, qualification
+            return ()
+
+        async def event_watermark(self) -> int:
+            return 0
+
+    monkeypatch.setattr(acceptance_module, "LiveOrderJournal", EmptyJournal)
+    evidence = await build_aggressive_laptop_stage_evidence_from_journal(
+        tmp_path / "state.sqlite3",
+        _binding(),
+        stage="canary",
+        started_at=_NOW,
+        ended_at=_NOW + timedelta(minutes=1),
+        post_flat_service_seconds=0,
+    )
+
+    assert not evidence.accepted
+    assert not evidence.stable_flat
+    assert "AUTHORITATIVE_PRIVATE_STABLE_FLAT_REQUIRED" in evidence.blockers
+
+
+@pytest.mark.asyncio
+async def test_canary_rebuild_excludes_later_pilot_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+
+    def action(stage: str, level: int, minute: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            pair_action_id=f"{stage}-{level}",
+            route=SimpleNamespace(value="BTC:bybit>okx"),
+            created_at=_NOW + timedelta(minutes=minute),
+            updated_at=_NOW + timedelta(minutes=minute + 1),
+            risk_reservation={
+                "strategy": "AGGRESSIVE_SYMBIOSIS_V1",
+                "stage": stage,
+                "aggressive_binding_sha256": binding.binding_sha256,
+                "level_index": level,
+                "projected_stress_usdt": Decimal("0.8"),
+                "initial_funding_next_timestamp_ms": {
+                    "bybit": int((_NOW + timedelta(hours=8)).timestamp() * 1000),
+                    "okx": int((_NOW + timedelta(hours=8)).timestamp() * 1000),
+                },
+            },
+            legs=tuple(
+                SimpleNamespace(client_order_id=f"{stage}-{level}-leg-{index}")
+                for index in range(4)
+            ),
+        )
+
+    canary_action = action("canary", 1, 1)
+    later_pilot = action("pilot_a", 1, 20)
+
+    class FakeJournal:
+        def __init__(self, path: Path) -> None:
+            del path
+
+        async def initialise(self) -> None:
+            return None
+
+        async def active_actions(self) -> tuple[object, ...]:
+            return ()
+
+        async def completed_actions_since(
+            self, started: datetime, qualification: str
+        ) -> tuple[object, ...]:
+            del started, qualification
+            return (canary_action, later_pilot)
+
+        async def latest_order_events(self, pair_action_id: str) -> tuple[object, ...]:
+            return tuple(
+                SimpleNamespace(
+                    client_order_id=f"{pair_action_id}-leg-{index}",
+                    status=SimpleNamespace(value="FILLED"),
+                    filled_base_quantity=Decimal("0.01"),
+                    average_price=Decimal("100"),
+                    fee_usdt=Decimal("0.001"),
+                    side=Side.BUY if index % 2 == 0 else Side.SELL,
+                )
+                for index in range(4)
+            )
+
+        async def event_watermark(self) -> int:
+            return 8
+
+    monkeypatch.setattr(acceptance_module, "LiveOrderJournal", FakeJournal)
+    monkeypatch.setattr(acceptance_module, "is_completed_normal_paired_cycle", lambda _: True)
+    monkeypatch.setattr(acceptance_module, "completed_normal_actions_sha256", lambda _: "6" * 64)
+    evidence = await build_aggressive_laptop_stage_evidence_from_journal(
+        tmp_path / "state.sqlite3",
+        binding,
+        stage="canary",
+        started_at=_NOW,
+        ended_at=_NOW + timedelta(minutes=10),
+        post_flat_service_seconds=0,
+        authoritative_stable_flat=True,
+        authoritative_private_event_watermark=8,
+        authoritative_reconciliation_sha256="7" * 64,
+    )
+
+    assert evidence.accepted
+    assert evidence.completed_level_indices == (1,)

@@ -9,7 +9,7 @@ import re
 import subprocess
 import sys
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -25,7 +25,13 @@ from interexchange_perp_grid.aggressive_evaluator import (
     CostReserves,
     load_aggressive_decision_policy,
 )
-from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, GridLevelState
+from interexchange_perp_grid.aggressive_grid import (
+    AggressiveGridStore,
+    ExternalGridLevelProjection,
+    GridLegFill,
+    GridLevelState,
+    GridTrancheOwnership,
+)
 from interexchange_perp_grid.aggressive_laptop_acceptance import (
     build_aggressive_laptop_acceptance,
     build_aggressive_laptop_stage_evidence_from_journal,
@@ -53,6 +59,7 @@ from interexchange_perp_grid.aggressive_model import (
     save_historical_model,
 )
 from interexchange_perp_grid.aggressive_qualification import (
+    AggressiveQualificationBinding,
     build_aggressive_qualification_binding,
     load_aggressive_qualification_binding,
     save_aggressive_qualification_binding,
@@ -75,11 +82,13 @@ from interexchange_perp_grid.c4_3_proof import run_c4_3_proof
 from interexchange_perp_grid.c4_proof import run_c4_proof
 from interexchange_perp_grid.canary_runtime import (
     PILOT_A_OWNER_CONFIRMATION,
+    collect_authoritative_live_flat_evidence,
     run_canary_once,
     run_emergency_flatten,
 )
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Instrument, InstrumentKey, ProductType, Venue
+from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.laptop_workflow import (
     LaptopQualificationIdentity,
     build_laptop_pilot_report,
@@ -88,6 +97,7 @@ from interexchange_perp_grid.laptop_workflow import (
 )
 from interexchange_perp_grid.live_journal import (
     DeploymentUpgradeGate,
+    LiveActionState,
     LiveOrderJournal,
     completed_normal_actions_sha256,
     is_completed_normal_paired_cycle,
@@ -132,6 +142,7 @@ from interexchange_perp_grid.qualification import (
     write_runtime_evidence,
 )
 from interexchange_perp_grid.reference_history import (
+    SourceBarQuality,
     SourceMinuteBar,
     aggregate_reference_bars,
     build_reference_series,
@@ -308,6 +319,20 @@ def aggressive_laptop_acceptance(
     runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
     canary_evidence: Annotated[Path, typer.Option("--canary-evidence")],
     pilot_evidence: Annotated[Path, typer.Option("--pilot-evidence")],
+    qualification: Annotated[Path, typer.Option("--qualification")] = Path(
+        "state/qualification.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-grid.sqlite3"),
+    live_grid: Annotated[Path, typer.Option("--live-grid")] = Path(
+        "state/aggressive-live-grid.sqlite3"
+    ),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
     output: Annotated[Path, typer.Option("--output")] = Path(
         "state/laptop-aggressive-acceptance.json"
     ),
@@ -315,19 +340,123 @@ def aggressive_laptop_acceptance(
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
     """Create accepted laptop evidence only after exact canary, pilot and stable FLAT."""
-    for required in (binding, runtime_manifest, canary_evidence, pilot_evidence):
+    for required in (
+        binding,
+        runtime_manifest,
+        canary_evidence,
+        pilot_evidence,
+        qualification,
+        model,
+        grid,
+        live_grid,
+        profile,
+    ):
         if not required.is_file():
             raise typer.BadParameter(f"required laptop acceptance input is missing: {required}")
+    settings = _load(config)
     runtime = verify_native_runtime_manifest(
         runtime_manifest.resolve(),
         repo_root.resolve(),
         config.resolve(),
     )
-    acceptance = build_aggressive_laptop_acceptance(
-        load_aggressive_qualification_binding(binding.resolve()),
+    loaded_binding = load_aggressive_qualification_binding(binding.resolve())
+    loaded_qualification = load_qualification(qualification.resolve())
+    qualification_current, _ = qualification_is_current(
+        loaded_qualification,
+        repo_root.resolve(),
+        config.resolve(),
+        Path(settings.storage.parquet_dir),
+        settings.live.qualification_max_age_seconds,
+        expected_route=_parse_route(loaded_binding.qualification_route),
+        current_container_image_digest=runtime.artifact_digest,
+        accepted_policies=(
+            qualification_policy_from_settings(settings),
+            laptop_owner_exception_policy(settings),
+        ),
+        enforce_age=False,
+    )
+    if not qualification_current:
+        raise typer.BadParameter("aggressive laptop qualification is no longer current")
+    loaded_model = load_historical_model(model.resolve())
+    _verify_aggressive_model_window(history_root.resolve(), loaded_model)
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    verify_aggressive_qualification_binding(
+        loaded_binding,
+        loaded_qualification,
+        loaded_model,
         runtime,
-        load_aggressive_laptop_stage_evidence(canary_evidence.resolve()),
-        load_aggressive_laptop_stage_evidence(pilot_evidence.resolve()),
+        grid_store,
+        profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
+    )
+    live_grid_store = AggressiveGridStore(live_grid.resolve())
+    live_grid_store.initialise()
+    _require_aggressive_live_grid_flat(live_grid_store, loaded_binding)
+    canary = load_aggressive_laptop_stage_evidence(canary_evidence.resolve())
+    pilot = load_aggressive_laptop_stage_evidence(pilot_evidence.resolve())
+    journal = LiveOrderJournal(Path(settings.storage.sqlite_path))
+    post_pilot_tail = asyncio.run(
+        journal.actions_updated_after(
+            pilot.ended_at,
+            loaded_binding.qualification_hash,
+        )
+    )
+    if post_pilot_tail:
+        raise typer.BadParameter("JOURNAL_CHANGED_AFTER_ACCEPTED_PILOT")
+    fresh_flat = asyncio.run(
+        collect_authoritative_live_flat_evidence(
+            settings,
+            loaded_binding.qualification_route.partition(":")[0],
+        )
+    )
+    live_grid_store.initialise()
+    _require_aggressive_live_grid_flat(live_grid_store, loaded_binding)
+    post_private_tail = asyncio.run(
+        journal.actions_updated_after(
+            pilot.ended_at,
+            loaded_binding.qualification_hash,
+        )
+    )
+    if post_private_tail:
+        raise typer.BadParameter("JOURNAL_CHANGED_AFTER_ACCEPTED_PILOT")
+    if not fresh_flat.stable_flat or any(
+        evidence.reconciliation_evidence_sha256 != fresh_flat.reconciliation_sha256
+        for evidence in (canary, pilot)
+    ):
+        raise typer.BadParameter("fresh private stable-FLAT evidence is required")
+    rebuilt_canary = asyncio.run(
+        build_aggressive_laptop_stage_evidence_from_journal(
+            Path(settings.storage.sqlite_path),
+            loaded_binding,
+            stage="canary",
+            started_at=canary.started_at,
+            ended_at=canary.ended_at,
+            post_flat_service_seconds=canary.post_flat_service_seconds,
+            authoritative_stable_flat=True,
+            authoritative_private_event_watermark=canary.final_private_event_watermark,
+            authoritative_reconciliation_sha256=canary.reconciliation_evidence_sha256,
+        )
+    )
+    rebuilt_pilot = asyncio.run(
+        build_aggressive_laptop_stage_evidence_from_journal(
+            Path(settings.storage.sqlite_path),
+            loaded_binding,
+            stage="pilot_a",
+            started_at=pilot.started_at,
+            ended_at=pilot.ended_at,
+            post_flat_service_seconds=pilot.post_flat_service_seconds,
+            authoritative_stable_flat=True,
+            authoritative_private_event_watermark=pilot.final_private_event_watermark,
+            authoritative_reconciliation_sha256=pilot.reconciliation_evidence_sha256,
+        )
+    )
+    if rebuilt_canary != canary or rebuilt_pilot != pilot:
+        raise typer.BadParameter("laptop stage evidence is no longer current")
+    acceptance = build_aggressive_laptop_acceptance(
+        loaded_binding,
+        runtime,
+        canary,
+        pilot,
     )
     save_aggressive_laptop_acceptance(output.resolve(), acceptance)
     typer.echo(json.dumps(asdict(acceptance), default=str, sort_keys=True))
@@ -367,6 +496,7 @@ def aggressive_laptop_stage_report(
         if (
             Path(bounded_service.state_path).resolve()
             != Path(settings.storage.sqlite_path).resolve()
+            or bounded_service.started_at < ended
             or bounded_service.requested_seconds < 28_800
             or bounded_service.observed_monotonic_seconds < 28_800
         ):
@@ -375,14 +505,24 @@ def aggressive_laptop_stage_report(
             int(bounded_service.requested_seconds),
             int(bounded_service.observed_monotonic_seconds),
         )
+    loaded_binding = load_aggressive_qualification_binding(binding.resolve())
+    authoritative_flat = asyncio.run(
+        collect_authoritative_live_flat_evidence(
+            settings,
+            loaded_binding.qualification_route.partition(":")[0],
+        )
+    )
     evidence = asyncio.run(
         build_aggressive_laptop_stage_evidence_from_journal(
             Path(settings.storage.sqlite_path),
-            load_aggressive_qualification_binding(binding.resolve()),
+            loaded_binding,
             stage=stage,
             started_at=started,
             ended_at=ended,
             post_flat_service_seconds=post_flat_service_seconds,
+            authoritative_stable_flat=authoritative_flat.stable_flat,
+            authoritative_private_event_watermark=(authoritative_flat.private_event_watermark),
+            authoritative_reconciliation_sha256=(authoritative_flat.reconciliation_sha256),
         )
     )
     save_aggressive_laptop_stage_evidence(output.resolve(), evidence)
@@ -419,7 +559,9 @@ def aggressive_laptop_stage_progress(
             post_flat_service_seconds=0,
         )
     )
-    typer.echo(json.dumps(asdict(evidence), default=str, sort_keys=True))
+    payload = asdict(evidence)
+    payload["stable_flat"] = evidence.active_action_count == 0
+    typer.echo(json.dumps(payload, default=str, sort_keys=True))
 
 
 @app.command("aggressive-laptop-promote-pilot-a")
@@ -443,6 +585,17 @@ def aggressive_laptop_promote_pilot_a(
     ):
         raise typer.BadParameter("accepted exact aggressive canary evidence is required")
     table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+    fresh_flat = asyncio.run(
+        collect_authoritative_live_flat_evidence(
+            settings,
+            loaded_binding.qualification_route.partition(":")[0],
+        )
+    )
+    if (
+        not fresh_flat.stable_flat
+        or fresh_flat.reconciliation_sha256 != evidence.reconciliation_evidence_sha256
+    ):
+        raise typer.BadParameter("fresh private stable-FLAT evidence is required")
 
     async def promote() -> RiskStageState:
         state_path = Path(settings.storage.sqlite_path)
@@ -462,6 +615,9 @@ def aggressive_laptop_promote_pilot_a(
             started_at=evidence.started_at,
             ended_at=evidence.ended_at,
             post_flat_service_seconds=evidence.post_flat_service_seconds,
+            authoritative_stable_flat=True,
+            authoritative_private_event_watermark=evidence.final_private_event_watermark,
+            authoritative_reconciliation_sha256=evidence.reconciliation_evidence_sha256,
         )
         if rebuilt != evidence:
             raise RuntimeError("canary evidence does not match the current durable journal")
@@ -516,18 +672,144 @@ def aggressive_laptop_promote_pilot_a(
 def aggressive_vps_handoff_check(
     acceptance: Annotated[Path, typer.Option("--acceptance")],
     runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    binding: Annotated[Path, typer.Option("--binding")],
+    qualification: Annotated[Path, typer.Option("--qualification")],
+    model: Annotated[Path, typer.Option("--model")],
+    grid: Annotated[Path, typer.Option("--grid")],
+    live_grid: Annotated[Path, typer.Option("--live-grid")],
+    canary_evidence: Annotated[Path, typer.Option("--canary-evidence")],
+    pilot_evidence: Annotated[Path, typer.Option("--pilot-evidence")],
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
     repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
     """Verify a future VPS handoff without connecting to or modifying any VPS."""
-    if not acceptance.is_file() or not runtime_manifest.is_file():
-        raise typer.BadParameter("accepted laptop artifact and exact runtime manifest are required")
+    required = (
+        acceptance,
+        runtime_manifest,
+        binding,
+        qualification,
+        model,
+        grid,
+        live_grid,
+        canary_evidence,
+        pilot_evidence,
+        profile,
+    )
+    if any(not path.is_file() for path in required):
+        raise typer.BadParameter("the complete exact laptop artifact set is required")
+    settings = _load(config)
     loaded = load_aggressive_laptop_acceptance(acceptance.resolve())
     runtime = verify_native_runtime_manifest(
         runtime_manifest.resolve(),
         repo_root.resolve(),
         config.resolve(),
     )
+    loaded_binding = load_aggressive_qualification_binding(binding.resolve())
+    loaded_qualification = load_qualification(qualification.resolve())
+    qualification_current, _ = qualification_is_current(
+        loaded_qualification,
+        repo_root.resolve(),
+        config.resolve(),
+        Path(settings.storage.parquet_dir),
+        settings.live.qualification_max_age_seconds,
+        expected_route=_parse_route(loaded_binding.qualification_route),
+        current_container_image_digest=runtime.artifact_digest,
+        accepted_policies=(
+            qualification_policy_from_settings(settings),
+            laptop_owner_exception_policy(settings),
+        ),
+        enforce_age=False,
+    )
+    if not qualification_current:
+        raise typer.BadParameter("aggressive laptop qualification is no longer current")
+    loaded_model = load_historical_model(model.resolve())
+    _verify_aggressive_model_window(history_root.resolve(), loaded_model)
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    verify_aggressive_qualification_binding(
+        loaded_binding,
+        loaded_qualification,
+        loaded_model,
+        runtime,
+        grid_store,
+        profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
+    )
+    live_grid_store = AggressiveGridStore(live_grid.resolve())
+    live_grid_store.initialise()
+    _require_aggressive_live_grid_flat(live_grid_store, loaded_binding)
+    canary = load_aggressive_laptop_stage_evidence(canary_evidence.resolve())
+    pilot = load_aggressive_laptop_stage_evidence(pilot_evidence.resolve())
+    journal = LiveOrderJournal(Path(settings.storage.sqlite_path))
+    post_pilot_tail = asyncio.run(
+        journal.actions_updated_after(
+            pilot.ended_at,
+            loaded_binding.qualification_hash,
+        )
+    )
+    if post_pilot_tail:
+        raise typer.BadParameter("JOURNAL_CHANGED_AFTER_ACCEPTED_PILOT")
+    fresh_flat = asyncio.run(
+        collect_authoritative_live_flat_evidence(
+            settings,
+            loaded_binding.qualification_route.partition(":")[0],
+        )
+    )
+    live_grid_store.initialise()
+    _require_aggressive_live_grid_flat(live_grid_store, loaded_binding)
+    post_private_tail = asyncio.run(
+        journal.actions_updated_after(
+            pilot.ended_at,
+            loaded_binding.qualification_hash,
+        )
+    )
+    if post_private_tail:
+        raise typer.BadParameter("JOURNAL_CHANGED_AFTER_ACCEPTED_PILOT")
+    if not fresh_flat.stable_flat or any(
+        evidence.reconciliation_evidence_sha256 != fresh_flat.reconciliation_sha256
+        for evidence in (canary, pilot)
+    ):
+        raise typer.BadParameter("fresh private stable-FLAT evidence is required for handoff")
+    rebuilt_canary = asyncio.run(
+        build_aggressive_laptop_stage_evidence_from_journal(
+            Path(settings.storage.sqlite_path),
+            loaded_binding,
+            stage="canary",
+            started_at=canary.started_at,
+            ended_at=canary.ended_at,
+            post_flat_service_seconds=canary.post_flat_service_seconds,
+            authoritative_stable_flat=True,
+            authoritative_private_event_watermark=canary.final_private_event_watermark,
+            authoritative_reconciliation_sha256=canary.reconciliation_evidence_sha256,
+        )
+    )
+    rebuilt_pilot = asyncio.run(
+        build_aggressive_laptop_stage_evidence_from_journal(
+            Path(settings.storage.sqlite_path),
+            loaded_binding,
+            stage="pilot_a",
+            started_at=pilot.started_at,
+            ended_at=pilot.ended_at,
+            post_flat_service_seconds=pilot.post_flat_service_seconds,
+            authoritative_stable_flat=True,
+            authoritative_private_event_watermark=pilot.final_private_event_watermark,
+            authoritative_reconciliation_sha256=pilot.reconciliation_evidence_sha256,
+        )
+    )
+    if rebuilt_canary != canary or rebuilt_pilot != pilot:
+        raise typer.BadParameter("laptop stage evidence is no longer current for handoff")
+    rebuilt = build_aggressive_laptop_acceptance(
+        loaded_binding,
+        runtime,
+        canary,
+        pilot,
+        now=loaded.accepted_at,
+    )
+    if rebuilt != loaded:
+        raise typer.BadParameter("aggressive laptop acceptance artifact set changed")
     verify_aggressive_laptop_handoff(loaded, runtime)
     typer.echo(
         json.dumps(
@@ -542,6 +824,43 @@ def aggressive_vps_handoff_check(
             sort_keys=True,
         )
     )
+
+
+def _require_aggressive_live_grid_flat(
+    grid_store: AggressiveGridStore,
+    binding: AggressiveQualificationBinding,
+) -> None:
+    active = {
+        GridLevelState.ENTRY_PENDING,
+        GridLevelState.OPEN,
+        GridLevelState.EXIT_PENDING,
+    }
+    for direction in (binding.positive, binding.negative):
+        levels = grid_store.levels(str(direction.route_identity))
+        if len(levels) != 5 or any(level.state in active for level in levels):
+            raise typer.BadParameter("aggressive live grid is not durably flat")
+
+
+def _journal_action_effective_stress(risk_reservation: object) -> Decimal:
+    if not isinstance(risk_reservation, dict):
+        raise RuntimeError("live journal stress reservation is invalid")
+    try:
+        planned = Decimal(str(risk_reservation["projected_stress_usdt"]))
+        actual = risk_reservation.get("actual_fill_risk")
+        repriced = (
+            Decimal(str(actual["incremental_stress_usdt"])) if isinstance(actual, dict) else planned
+        )
+    except (KeyError, ValueError, ArithmeticError) as error:
+        raise RuntimeError("live journal stress reservation is incomplete") from error
+    if not planned.is_finite() or not repriced.is_finite() or min(planned, repriced) <= 0:
+        raise RuntimeError("live journal stress reservation is invalid")
+    return max(planned, repriced)
+
+
+def _required_order_decimal(value: Decimal | None) -> Decimal:
+    if value is None or not value.is_finite():
+        raise ValueError("live journal fill value is missing")
+    return value
 
 
 @app.command()
@@ -729,11 +1048,111 @@ async def _fetch_reference_source_pair(
         await asyncio.gather(adapter_a.close(), adapter_b.close(), return_exceptions=True)
 
 
+async def _fetch_reference_source_pair_window(
+    venue_a: Venue,
+    venue_b: Venue,
+    base: str,
+    start: datetime,
+    end: datetime,
+    batch_limit: int,
+    store: ParquetReferenceHistoryStore,
+) -> tuple[tuple[SourceMinuteBar, ...], tuple[SourceMinuteBar, ...], Instrument, Instrument]:
+    """Fetch an exact closed-minute window in bounded, resumable API pages."""
+    adapter_a = CcxtProAdapter(venue_a)
+    adapter_b = CcxtProAdapter(venue_b)
+    try:
+        instruments_a, instruments_b = await asyncio.gather(
+            adapter_a.discover_instruments(),
+            adapter_b.discover_instruments(),
+        )
+        instrument_a = _one_base_instrument(instruments_a, base)
+        instrument_b = _one_base_instrument(instruments_b, base)
+        rows_a: list[SourceMinuteBar] = []
+        rows_b: list[SourceMinuteBar] = []
+        cursor = start
+        while cursor < end:
+            remaining = int((end - cursor).total_seconds() // 60)
+            page_size = min(batch_limit, remaining)
+            page_end = cursor + timedelta(minutes=page_size)
+            cached_a = store.query_source_bars(
+                venue=venue_a,
+                symbol=instrument_a.symbol,
+                start=cursor,
+                end=page_end,
+            )
+            cached_b = store.query_source_bars(
+                venue=venue_b,
+                symbol=instrument_b.symbol,
+                start=cursor,
+                end=page_end,
+            )
+            expected_minutes = {cursor + timedelta(minutes=index) for index in range(page_size)}
+            cached_complete = {bar.interval_start for bar in cached_a} == expected_minutes and {
+                bar.interval_start for bar in cached_b
+            } == expected_minutes
+            if cached_complete:
+                page_a, page_b = cached_a, cached_b
+            else:
+                fetched_a, fetched_b = await asyncio.gather(
+                    adapter_a.fetch_closed_minute_bars(instrument_a, cursor, page_size),
+                    adapter_b.fetch_closed_minute_bars(instrument_b, cursor, page_size),
+                )
+                page_a = _normalize_source_page_duplicates(
+                    tuple(bar for bar in fetched_a if cursor <= bar.interval_start < page_end)
+                )
+                page_b = _normalize_source_page_duplicates(
+                    tuple(bar for bar in fetched_b if cursor <= bar.interval_start < page_end)
+                )
+                store.append_source_bars(page_a)
+                store.append_source_bars(page_b)
+            rows_a.extend(page_a)
+            rows_b.extend(page_b)
+            # Exchanges may silently cap OHLC responses below the requested
+            # limit. Advance only through the prefix both venues had a chance
+            # to return; the longer page is idempotently re-read on the next
+            # iteration instead of creating a permanent hole.
+            last_a = max(
+                (bar.interval_start for bar in page_a), default=page_end - timedelta(minutes=1)
+            )
+            last_b = max(
+                (bar.interval_start for bar in page_b), default=page_end - timedelta(minutes=1)
+            )
+            cursor = min(last_a, last_b) + timedelta(minutes=1)
+        return (
+            tuple(sorted(rows_a, key=lambda bar: bar.interval_start)),
+            tuple(sorted(rows_b, key=lambda bar: bar.interval_start)),
+            instrument_a,
+            instrument_b,
+        )
+    finally:
+        await asyncio.gather(adapter_a.close(), adapter_b.close(), return_exceptions=True)
+
+
+def _normalize_source_page_duplicates(
+    bars: tuple[SourceMinuteBar, ...],
+) -> tuple[SourceMinuteBar, ...]:
+    """Persist one explicit ambiguity marker instead of last-write-wins OHLC."""
+    grouped: dict[datetime, list[SourceMinuteBar]] = {}
+    for bar in bars:
+        grouped.setdefault(bar.interval_start, []).append(bar)
+    normalized: list[SourceMinuteBar] = []
+    for interval_start in sorted(grouped):
+        candidates = grouped[interval_start]
+        first = candidates[0]
+        normalized.append(
+            first
+            if all(candidate == first for candidate in candidates[1:])
+            else replace(first, quality=SourceBarQuality.AMBIGUOUS_DUPLICATE)
+        )
+    return tuple(normalized)
+
+
 @app.command("reference-history-proof")
 def reference_history_proof(
     venue_a: Annotated[Venue, typer.Option("--venue-a")],
     venue_b: Annotated[Venue, typer.Option("--venue-b")],
     since: Annotated[str, typer.Option("--since")],
+    end: Annotated[str | None, typer.Option("--end")] = None,
     base: Annotated[str, typer.Option("--base")] = "BTC",
     limit: Annotated[int, typer.Option("--limit", min=1, max=1000)] = 1000,
     output_root: Annotated[Path, typer.Option("--output-root")] = Path("data/reference-history"),
@@ -753,36 +1172,77 @@ def reference_history_proof(
     if raw_since.tzinfo is None or raw_since.utcoffset() is None:
         raise typer.BadParameter("since must include a UTC offset")
     parsed_since = raw_since.astimezone(UTC)
+    if parsed_since.second != 0 or parsed_since.microsecond != 0:
+        raise typer.BadParameter("since must be aligned to an exact UTC minute")
     if not profile.is_file():
         raise typer.BadParameter("aggressive strategy profile is missing")
+    latest_closed = datetime.now(UTC).replace(second=0, microsecond=0)
+    if end is None:
+        requested_end = parsed_since + timedelta(minutes=limit)
+    else:
+        try:
+            raw_end = datetime.fromisoformat(end)
+        except ValueError as error:
+            raise typer.BadParameter("end must be an ISO-8601 timestamp with UTC offset") from error
+        if raw_end.tzinfo is None or raw_end.utcoffset() is None:
+            raise typer.BadParameter("end must include a UTC offset")
+        requested_end = raw_end.astimezone(UTC)
+        if requested_end.second != 0 or requested_end.microsecond != 0:
+            raise typer.BadParameter("end must be aligned to an exact UTC minute")
+    bounded_end = min(latest_closed, requested_end)
+    if bounded_end <= parsed_since:
+        raise typer.BadParameter("since must precede the latest closed UTC minute")
+    store = ParquetReferenceHistoryStore(output_root.resolve())
     raw_a, raw_b, instrument_a, instrument_b = asyncio.run(
-        _fetch_reference_source_pair(venue_a, venue_b, base, parsed_since, limit)
+        _fetch_reference_source_pair_window(
+            venue_a,
+            venue_b,
+            base,
+            parsed_since,
+            bounded_end,
+            limit,
+            store,
+        )
     )
     bars_a = tuple(raw_a)
     bars_b = tuple(raw_b)
     if instrument_a.key != instrument_b.key:
         raise typer.BadParameter("venue instruments do not share one canonical contract identity")
-    store = ParquetReferenceHistoryStore(output_root.resolve())
     store.append_source_bars(bars_a)
     store.append_source_bars(bars_b)
-    end = datetime.now(UTC) + timedelta(minutes=1)
+    window_end = bounded_end
     cached_a = store.query_source_bars(
         venue=venue_a,
         symbol=instrument_a.symbol,
         start=parsed_since,
-        end=end,
+        end=window_end,
     )
     cached_b = store.query_source_bars(
         venue=venue_b,
         symbol=instrument_b.symbol,
         start=parsed_since,
-        end=end,
+        end=window_end,
     )
-    result = build_reference_series(cached_a, cached_b)
+    result = build_reference_series(
+        cached_a,
+        cached_b,
+        window_start=parsed_since,
+        window_end=window_end,
+    )
     directed_routes = directed_routes_for_reference_pair(base, venue_a, venue_b)
     store.append_reference_bars(result.bars)
+    window_manifest = store.write_window_manifest(result, cached_a, cached_b)
+    store.verify_window_manifest(window_manifest)
     aggregates = {
-        str(minutes): aggregate_reference_bars(result.bars, minutes)
+        str(minutes): aggregate_reference_bars(
+            result.bars,
+            minutes,
+            window_start=parsed_since,
+            window_end=window_end,
+            venue_a=result.venue_a,
+            venue_b=result.venue_b,
+            instrument=result.instrument,
+        )
         for minutes in (5, 15, 60, 240, 1440)
     }
     rejection_counts = Counter(rejection.reason.value for rejection in result.rejections)
@@ -801,6 +1261,11 @@ def reference_history_proof(
         "coverage_end": result.bars[-1].interval_start if result.bars else None,
         "source_sha256": source_bars_sha256((*cached_a, *cached_b)),
         "reference_sha256": reference_bars_sha256(result.bars),
+        "reference_dataset_sha256": result.dataset_sha256,
+        "reference_window_manifest_sha256": window_manifest.manifest_sha256,
+        "reference_window_manifest": str(
+            output_root.resolve() / "windows" / f"{result.dataset_sha256}.json"
+        ),
         "store_manifest_sha256": store.manifest_sha256(),
         "profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest(),
         "intervals": {
@@ -870,7 +1335,7 @@ def aggressive_live_intent_once(
             rearm_retreat_step_fraction=Decimal("0.25"),
         )
 
-    async def synchronize_live_levels() -> None:
+    async def synchronize_live_levels() -> bool:
         state_path = Path(settings.storage.sqlite_path)
         await initialise_state(state_path)
         current = await read_risk_stage(state_path)
@@ -885,15 +1350,12 @@ def aggressive_live_intent_once(
             raise RuntimeError("aggressive laptop live stage is not current")
         journal = LiveOrderJournal(state_path)
         await journal.initialise()
-        actions = (
-            *(
-                await journal.completed_actions_since(
-                    current.promoted_at,
-                    loaded_binding.qualification_hash,
-                )
-            ),
-            *(await journal.active_actions()),
+        completed = await journal.completed_actions_since(
+            current.promoted_at,
+            loaded_binding.qualification_hash,
         )
+        active = await journal.active_actions()
+        actions = (*completed, *active)
         stage_actions = tuple(
             action
             for action in actions
@@ -905,6 +1367,8 @@ def aggressive_live_intent_once(
         if len(stage_actions) != len(actions):
             raise RuntimeError("live stage journal contains an incompatible action")
         levels: set[int] = set()
+        projections: list[ExternalGridLevelProjection] = []
+        transitional = False
         for action in stage_actions:
             level = int(str(action.risk_reservation.get("level_index", 0)))
             if not 1 <= level <= (1 if stage == AggressiveLaptopLiveStage.CANARY else 5):
@@ -912,13 +1376,105 @@ def aggressive_live_intent_once(
             if level in levels:
                 raise RuntimeError("live stage journal contains a duplicate level")
             levels.add(level)
-        grid_store.synchronize_externally_owned_levels(
+            stress = _journal_action_effective_stress(action.risk_reservation)
+            if action in completed:
+                projections.append(
+                    ExternalGridLevelProjection(
+                        level,
+                        GridLevelState.CLOSED_WAIT_REARM,
+                        Decimal(0),
+                    )
+                )
+            elif action.state == LiveActionState.HEDGED:
+                orders = await journal.latest_order_events(action.pair_action_id)
+                opening_ids = action.risk_reservation.get("opening_client_order_ids")
+                if not isinstance(opening_ids, dict):
+                    raise RuntimeError("live journal opening identity is incomplete")
+                by_id = {order.client_order_id: order for order in orders}
+                try:
+                    long_order = by_id[str(opening_ids["long"])]
+                    short_order = by_id[str(opening_ids["short"])]
+                    actual = action.risk_reservation["actual_fill_risk"]
+                    if not isinstance(actual, dict):
+                        raise ValueError("actual fill risk is absent")
+                    ownership = GridTrancheOwnership(
+                        tranche_id=action.tranche_id,
+                        normalized_base_quantity=long_order.filled_base_quantity,
+                        legs=(
+                            GridLegFill(
+                                action.route.long_venue,
+                                long_order.symbol,
+                                Side.BUY,
+                                long_order.filled_base_quantity,
+                                _required_order_decimal(long_order.average_price),
+                                _required_order_decimal(long_order.fee_usdt),
+                                Decimal(0),
+                            ),
+                            GridLegFill(
+                                action.route.short_venue,
+                                short_order.symbol,
+                                Side.SELL,
+                                short_order.filled_base_quantity,
+                                _required_order_decimal(short_order.average_price),
+                                _required_order_decimal(short_order.fee_usdt),
+                                Decimal(0),
+                            ),
+                        ),
+                        executable_entry_spread_bps=Decimal(str(actual["actual_entry_spread_bps"])),
+                        reverse_target_bps=Decimal(
+                            str(action.risk_reservation["target_exit_spread_bps"])
+                        ),
+                        effective_stop_bps=Decimal(
+                            str(action.risk_reservation["effective_stop_bps"])
+                        ),
+                        maximum_holding_deadline=datetime.fromisoformat(
+                            str(action.risk_reservation["hard_holding_deadline"])
+                        ),
+                        reserved_stress_usdt=stress,
+                        entry_slippage_usdt=Decimal(0),
+                        realised_pnl_usdt=Decimal(0),
+                        unrealised_pnl_usdt=Decimal(0),
+                        opened_at=datetime.fromisoformat(
+                            str(action.risk_reservation["route_opened_at"])
+                        ),
+                    )
+                except (KeyError, ValueError, ArithmeticError) as error:
+                    raise RuntimeError("live journal hedge ownership is incomplete") from error
+                projections.append(
+                    ExternalGridLevelProjection(
+                        level,
+                        GridLevelState.OPEN,
+                        stress,
+                        ownership=ownership,
+                    )
+                )
+            elif action.state in {
+                LiveActionState.PREPARED,
+                LiveActionState.PARTIAL,
+                LiveActionState.FILLED,
+                LiveActionState.RECOVERING,
+            }:
+                transitional = True
+                projections.append(
+                    ExternalGridLevelProjection(
+                        level,
+                        GridLevelState.ENTRY_PENDING,
+                        stress,
+                        decision_cycle=int(str(action.risk_reservation["decision_cycle"])),
+                    )
+                )
+            else:
+                transitional = True
+        grid_store.synchronize_journal_levels(
             loaded_binding.qualification_route,
-            frozenset(levels),
+            tuple(projections),
             now=datetime.now(UTC),
         )
+        return transitional
 
-    asyncio.run(synchronize_live_levels())
+    if asyncio.run(synchronize_live_levels()):
+        typer.echo(json.dumps({"status": "WAITING_FOR_DURABLE_LIVE_TRANSITION"}, sort_keys=True))
+        raise typer.Exit(code=3)
     intents: list[AggressiveTrancheIntent] = []
     result = asyncio.run(
         _run_aggressive_shadow_once(
@@ -1019,22 +1575,33 @@ def aggressive_model_proof(
     store = ParquetReferenceHistoryStore(history_root.resolve())
     if not any((history_root.resolve() / "source").rglob("*.parquet")):
         raise typer.BadParameter("source history manifest is missing")
-    bars = store.query_reference_bars(
-        venue_a=canonical_a,
-        venue_b=canonical_b,
-        instrument=instrument,
-        start=parsed_start,
-        end=parsed_end,
-    )
+    try:
+        window_manifest = store.find_window_manifest(
+            venue_a=canonical_a,
+            venue_b=canonical_b,
+            instrument=instrument,
+            start=parsed_start,
+            end=parsed_end,
+        )
+        series = store.verify_window_manifest(window_manifest)
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(
+            "an exact verified reference window manifest is required"
+        ) from error
+    bars = series.bars
     if not bars:
         raise typer.BadParameter("no reference bars exist for the requested identity/window")
     loaded_policy = load_historical_model_policy(profile)
     model = build_historical_reference_model(
         bars,
+        rejections=series.rejections,
         policy=loaded_policy.policy,
-        source_manifest_sha256=store.source_manifest_sha256(),
+        source_manifest_sha256=window_manifest.manifest_sha256,
         strategy_profile_sha256=loaded_policy.profile_sha256,
         code_sha=code_sha,
+        window_start=window_manifest.window_start,
+        window_end=window_manifest.window_end,
+        reference_dataset_sha256=window_manifest.dataset_sha256,
     )
     model_hash = save_historical_model(artifact.resolve(), model)
     payload = historical_model_payload(model)
@@ -1046,6 +1613,8 @@ def aggressive_model_proof(
                 "model": payload,
                 "artifact": str(artifact.resolve()),
                 "reference_rows": len(bars),
+                "reference_window_manifest_sha256": window_manifest.manifest_sha256,
+                "reference_dataset_sha256": window_manifest.dataset_sha256,
                 "positive_eligibility": model.positive.eligibility.value,
                 "negative_eligibility": model.negative.eligibility.value,
                 "executable": False,
@@ -1069,6 +1638,7 @@ def aggressive_qualification_bind(
     profile: Annotated[Path, typer.Option("--profile")] = Path(
         "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
     ),
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
     output: Annotated[Path, typer.Option("--output")] = Path("state/aggressive-qualification.json"),
 ) -> None:
     """Bind accepted qualification to exact aggressive geometry; never authorize execution."""
@@ -1076,6 +1646,7 @@ def aggressive_qualification_bind(
         if not required.is_file():
             raise typer.BadParameter(f"required aggressive binding input is missing: {required}")
     loaded_model = load_historical_model(model.resolve())
+    _verify_aggressive_model_window(history_root.resolve(), loaded_model)
     grid_store = AggressiveGridStore(grid.resolve())
     grid_store.initialise()
     binding = build_aggressive_qualification_binding(
@@ -1101,18 +1672,21 @@ def aggressive_qualification_check(
     profile: Annotated[Path, typer.Option("--profile")] = Path(
         "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
     ),
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
 ) -> None:
     """Fail closed unless every accepted aggressive qualification identity still matches."""
     for required in (binding, qualification, runtime_manifest, model, grid, profile):
         if not required.is_file():
             raise typer.BadParameter(f"required aggressive binding input is missing: {required}")
     loaded = load_aggressive_qualification_binding(binding.resolve())
+    loaded_model = load_historical_model(model.resolve())
+    _verify_aggressive_model_window(history_root.resolve(), loaded_model)
     grid_store = AggressiveGridStore(grid.resolve())
     grid_store.initialise()
     verify_aggressive_qualification_binding(
         loaded,
         load_qualification(qualification.resolve()),
-        load_historical_model(model.resolve()),
+        loaded_model,
         load_native_runtime_manifest(runtime_manifest.resolve()),
         grid_store,
         profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
@@ -1145,6 +1719,25 @@ def _aggressive_reserves_per_base(settings: Settings, price: Decimal) -> CostRes
         ),
         liquidation_distance_usdt=Decimal(0),
     )
+
+
+def _verify_aggressive_model_window(
+    history_root: Path,
+    model: HistoricalReferenceModel,
+) -> None:
+    store = ParquetReferenceHistoryStore(history_root)
+    try:
+        manifest = store.load_window_manifest(model.reference_manifest_sha256)
+        series = store.verify_window_manifest(manifest)
+    except (OSError, ValueError) as error:
+        raise ValueError("aggressive model reference window is unavailable or changed") from error
+    if (
+        manifest.manifest_sha256 != model.source_manifest_sha256
+        or series.dataset_sha256 != model.reference_manifest_sha256
+        or manifest.window_start != model.window_start
+        or manifest.window_end != model.window_end
+    ):
+        raise ValueError("aggressive model reference window identity changed")
 
 
 def _aggressive_effective_stop(
@@ -1188,6 +1781,7 @@ async def _run_aggressive_shadow_once(
         raise RuntimeError("aggressive model/profile identity mismatch")
     now = datetime.now(UTC)
     store = ParquetReferenceHistoryStore(history_root)
+    _verify_aggressive_model_window(history_root, model)
     bars = store.query_reference_bars(
         venue_a=Venue(model.venue_a),
         venue_b=Venue(model.venue_b),

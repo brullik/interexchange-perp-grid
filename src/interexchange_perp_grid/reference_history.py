@@ -18,6 +18,7 @@ class SourceBarQuality(StrEnum):
     COMPLETE = "COMPLETE"
     INCOMPLETE = "INCOMPLETE"
     DISCONTINUITY = "DISCONTINUITY"
+    AMBIGUOUS_DUPLICATE = "AMBIGUOUS_DUPLICATE"
 
 
 class ReferenceBarQuality(StrEnum):
@@ -107,6 +108,33 @@ class ReferenceMinuteResult:
 class ReferenceSeriesResult:
     bars: tuple[ReferenceSpreadBar, ...]
     rejections: tuple[ReferenceMinuteRejection, ...]
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    venue_a: Venue | None = None
+    venue_b: Venue | None = None
+    instrument: InstrumentKey | None = None
+    symbol_a: str = ""
+    symbol_b: str = ""
+    source_a_sha256: str = ""
+    source_b_sha256: str = ""
+    dataset_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        _validate_requested_window(self.window_start, self.window_end)
+        if (self.window_start is None) != (self.window_end is None):
+            raise ValueError("reference series window must include both bounds")
+        if (self.venue_a is None) != (self.venue_b is None):
+            raise ValueError("reference series identity must include both venues")
+        if (
+            self.venue_a is not None
+            and self.venue_b is not None
+            and canonical_venue_pair(self.venue_a, self.venue_b) != (self.venue_a, self.venue_b)
+        ):
+            raise ValueError("reference series identity is not canonical")
+        expected = reference_series_sha256(self)
+        if self.dataset_sha256 and self.dataset_sha256 != expected:
+            raise ValueError("reference series dataset hash mismatch")
+        object.__setattr__(self, "dataset_sha256", expected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,11 +246,26 @@ def build_reference_minute(
 def build_reference_series(
     first: tuple[SourceMinuteBar, ...],
     second: tuple[SourceMinuteBar, ...],
+    *,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> ReferenceSeriesResult:
+    _validate_requested_window(window_start, window_end)
+    identity_sources = (*first, *second)
+    if window_start is not None and window_end is not None:
+        first = tuple(bar for bar in first if window_start <= bar.interval_start < window_end)
+        second = tuple(bar for bar in second if window_start <= bar.interval_start < window_end)
     first_by_minute, first_conflicts = _deduplicate(first)
     second_by_minute, second_conflicts = _deduplicate(second)
     conflict_minutes = first_conflicts | second_conflicts
-    all_minutes = sorted(set(first_by_minute) | set(second_by_minute) | conflict_minutes)
+    if window_start is not None and window_end is not None:
+        all_minutes = []
+        minute = window_start
+        while minute < window_end:
+            all_minutes.append(minute)
+            minute += timedelta(minutes=1)
+    else:
+        all_minutes = sorted(set(first_by_minute) | set(second_by_minute) | conflict_minutes)
     first_version = _first_version(first_by_minute)
     second_version = _first_version(second_by_minute)
     bars: list[ReferenceSpreadBar] = []
@@ -254,27 +297,86 @@ def build_reference_series(
         else:
             assert result.rejection is not None
             rejections.append(result.rejection)
-    return ReferenceSeriesResult(tuple(bars), tuple(rejections))
+    identity_venues = tuple(
+        sorted({bar.venue for bar in identity_sources}, key=lambda item: item.value)
+    )
+    identity_instruments = {bar.instrument for bar in identity_sources}
+    venue_a = identity_venues[0] if len(identity_venues) == 2 else None
+    venue_b = identity_venues[1] if len(identity_venues) == 2 else None
+    instrument = next(iter(identity_instruments)) if len(identity_instruments) == 1 else None
+    canonical_a = (
+        tuple(bar for bar in (*first, *second) if bar.venue == venue_a)
+        if venue_a is not None
+        else ()
+    )
+    canonical_b = (
+        tuple(bar for bar in (*first, *second) if bar.venue == venue_b)
+        if venue_b is not None
+        else ()
+    )
+    symbols_a = {bar.symbol for bar in canonical_a}
+    symbols_b = {bar.symbol for bar in canonical_b}
+    return ReferenceSeriesResult(
+        tuple(bars),
+        tuple(rejections),
+        window_start,
+        window_end,
+        venue_a,
+        venue_b,
+        instrument,
+        next(iter(symbols_a)) if len(symbols_a) == 1 else "",
+        next(iter(symbols_b)) if len(symbols_b) == 1 else "",
+        source_bars_sha256(canonical_a),
+        source_bars_sha256(canonical_b),
+    )
 
 
 def aggregate_reference_bars(
     bars: tuple[ReferenceSpreadBar, ...],
     timeframe_minutes: int,
+    *,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+    venue_a: Venue | None = None,
+    venue_b: Venue | None = None,
+    instrument: InstrumentKey | None = None,
 ) -> tuple[AggregatedReferenceBar, ...]:
     if timeframe_minutes not in (5, 15, 60, 240, 1440):
         raise ValueError("unsupported reference aggregation timeframe")
-    if not bars:
+    _validate_requested_window(window_start, window_end)
+    if not bars and (
+        window_start is None
+        or window_end is None
+        or venue_a is None
+        or venue_b is None
+        or instrument is None
+    ):
         return ()
     ordered = tuple(sorted(bars, key=lambda bar: bar.interval_start))
     groups: dict[datetime, list[ReferenceSpreadBar]] = {}
     for bar in ordered:
+        if (
+            window_start is not None
+            and window_end is not None
+            and not (window_start <= bar.interval_start < window_end)
+        ):
+            continue
         groups.setdefault(_interval_floor(bar.interval_start, timeframe_minutes), []).append(bar)
+    if window_start is not None and window_end is not None:
+        interval_start = _interval_floor(window_start, timeframe_minutes)
+        while interval_start < window_end:
+            groups.setdefault(interval_start, [])
+            interval_start += timedelta(minutes=timeframe_minutes)
     aggregates: list[AggregatedReferenceBar] = []
     for interval_start, group in sorted(groups.items()):
-        first = group[0]
+        first = group[0] if group else ordered[0] if ordered else None
+        identity_a = first.venue_a if first is not None else venue_a
+        identity_b = first.venue_b if first is not None else venue_b
+        identity_instrument = first.instrument if first is not None else instrument
+        assert identity_a is not None and identity_b is not None and identity_instrument is not None
         identity_matches = all(
             (bar.venue_a, bar.venue_b, bar.instrument)
-            == (first.venue_a, first.venue_b, first.instrument)
+            == (identity_a, identity_b, identity_instrument)
             for bar in group
         )
         expected_starts = {
@@ -290,9 +392,9 @@ def aggregate_reference_bars(
         if complete:
             aggregates.append(
                 AggregatedReferenceBar(
-                    venue_a=first.venue_a,
-                    venue_b=first.venue_b,
-                    instrument=first.instrument,
+                    venue_a=identity_a,
+                    venue_b=identity_b,
+                    instrument=identity_instrument,
                     interval_start=interval_start,
                     timeframe_minutes=timeframe_minutes,
                     quality=ReferenceBarQuality.COMPLETE,
@@ -307,9 +409,9 @@ def aggregate_reference_bars(
         else:
             aggregates.append(
                 AggregatedReferenceBar(
-                    venue_a=first.venue_a,
-                    venue_b=first.venue_b,
-                    instrument=first.instrument,
+                    venue_a=identity_a,
+                    venue_b=identity_b,
+                    instrument=identity_instrument,
                     interval_start=interval_start,
                     timeframe_minutes=timeframe_minutes,
                     quality=ReferenceBarQuality.INCOMPLETE,
@@ -322,6 +424,20 @@ def aggregate_reference_bars(
                 )
             )
     return tuple(aggregates)
+
+
+def _validate_requested_window(
+    window_start: datetime | None,
+    window_end: datetime | None,
+) -> None:
+    if (window_start is None) != (window_end is None):
+        raise ValueError("reference history window requires both start and end")
+    if window_start is None or window_end is None:
+        return
+    _require_utc_minute(window_start)
+    _require_utc_minute(window_end)
+    if window_end <= window_start:
+        raise ValueError("reference history window end must follow start")
 
 
 def reference_bars_sha256(bars: tuple[ReferenceSpreadBar, ...]) -> str:
@@ -350,6 +466,50 @@ def reference_bars_sha256(bars: tuple[ReferenceSpreadBar, ...]) -> str:
     ]
     payload = json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def reference_series_sha256(series: ReferenceSeriesResult) -> str:
+    instrument = series.instrument
+    outcomes: list[dict[str, object]] = [
+        {
+            "interval_start": bar.interval_start.isoformat(),
+            "kind": "BAR",
+            "bar_sha256": reference_bars_sha256((bar,)),
+        }
+        for bar in series.bars
+    ]
+    outcomes.extend(
+        {
+            "interval_start": rejection.interval_start.isoformat(),
+            "kind": "REJECTION",
+            "reason": rejection.reason.value,
+        }
+        for rejection in series.rejections
+    )
+    outcomes.sort(key=lambda item: str(item["interval_start"]))
+    payload = {
+        "window_start": series.window_start.isoformat() if series.window_start else None,
+        "window_end": series.window_end.isoformat() if series.window_end else None,
+        "venue_a": series.venue_a.value if series.venue_a else None,
+        "venue_b": series.venue_b.value if series.venue_b else None,
+        "instrument": (
+            {
+                "base": instrument.base,
+                "quote": instrument.quote,
+                "settle": instrument.settle,
+                "product_type": instrument.product_type.value,
+            }
+            if instrument is not None
+            else None
+        ),
+        "symbol_a": series.symbol_a,
+        "symbol_b": series.symbol_b,
+        "source_a_sha256": series.source_a_sha256,
+        "source_b_sha256": series.source_b_sha256,
+        "outcomes": outcomes,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def source_bars_sha256(bars: tuple[SourceMinuteBar, ...]) -> str:
@@ -401,6 +561,8 @@ def _source_rejection_reason(source: SourceMinuteBar) -> ReferenceRejectionReaso
         return ReferenceRejectionReason.SOURCE_INCOMPLETE
     if source.quality == SourceBarQuality.DISCONTINUITY:
         return ReferenceRejectionReason.SOURCE_DISCONTINUITY
+    if source.quality == SourceBarQuality.AMBIGUOUS_DUPLICATE:
+        return ReferenceRejectionReason.DUPLICATE_CONFLICT
     values = (source.open, source.high, source.low, source.close)
     if any(not value.is_finite() for value in values):
         return ReferenceRejectionReason.SOURCE_NON_FINITE

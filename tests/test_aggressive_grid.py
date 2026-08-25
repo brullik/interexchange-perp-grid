@@ -12,6 +12,8 @@ import pytest
 
 from interexchange_perp_grid.aggressive_grid import (
     AggressiveGridStore,
+    ExternalGridLevelProjection,
+    FrozenGridSizingPlan,
     GridLegFill,
     GridLevelState,
     GridTrancheOwnership,
@@ -47,13 +49,13 @@ def _bar(minute: int, close: Decimal, high: Decimal, low: Decimal) -> ReferenceS
 
 
 def _model() -> HistoricalReferenceModel:
-    bars = tuple(_bar(minute, Decimal(0), Decimal(10), Decimal(-10)) for minute in range(20))
+    bars = tuple(_bar(minute, Decimal(0), Decimal(10), Decimal(-10)) for minute in range(1440))
     return build_historical_reference_model(
         bars,
         policy=HistoricalModelPolicy(
-            history_target_days=Decimal("0.02"),
-            history_minimum_live_days=Decimal("0.015"),
-            history_minimum_shadow_days=Decimal("0.01"),
+            history_target_days=Decimal("2"),
+            history_minimum_live_days=Decimal("1.5"),
+            history_minimum_shadow_days=Decimal("1"),
         ),
         source_manifest_sha256="source",
         strategy_profile_sha256="profile",
@@ -567,3 +569,77 @@ def test_live_journal_projection_fences_consumed_levels_across_restart(tmp_path:
         frozenset({1, 3}),
         now=_NOW + timedelta(seconds=1),
     ) == restarted.levels(route)
+
+
+def test_journal_projection_preserves_active_risk_and_closes_idempotently(tmp_path: Path) -> None:
+    model = _model()
+    route = model.positive_route
+    store = AggressiveGridStore(tmp_path / "grid.sqlite3")
+    store.initialise()
+    store.initialise_route(
+        model,
+        DivergenceDirection.POSITIVE,
+        now=_NOW,
+        rearm_retreat_step_fraction=Decimal("0.25"),
+    )
+    store.synchronize_journal_levels(
+        route,
+        (
+            ExternalGridLevelProjection(
+                1,
+                GridLevelState.ENTRY_PENDING,
+                Decimal("0.5"),
+                decision_cycle=0,
+            ),
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+    opened = store.synchronize_journal_levels(
+        route,
+        (
+            ExternalGridLevelProjection(
+                1,
+                GridLevelState.OPEN,
+                Decimal("0.8"),
+                ownership=replace(_ownership(1), reserved_stress_usdt=Decimal("0.8")),
+            ),
+        ),
+        now=_NOW + timedelta(seconds=2),
+    )[0]
+    assert opened.state == GridLevelState.OPEN
+    assert opened.reserved_stress_usdt == Decimal("0.8")
+
+    closed = store.synchronize_journal_levels(
+        route,
+        (ExternalGridLevelProjection(1, GridLevelState.CLOSED_WAIT_REARM, Decimal(0)),),
+        now=_NOW + timedelta(seconds=3),
+    )[0]
+    assert closed.state == GridLevelState.CLOSED_WAIT_REARM
+    assert closed.reserved_stress_usdt == 0
+
+
+def test_route_sizing_plan_is_frozen_and_restart_durable(tmp_path: Path) -> None:
+    model = _model()
+    route = model.positive_route
+    store = AggressiveGridStore(tmp_path / "grid.sqlite3")
+    store.initialise()
+    store.initialise_route(
+        model,
+        DivergenceDirection.POSITIVE,
+        now=_NOW,
+        rearm_retreat_step_fraction=Decimal("0.25"),
+    )
+    plan = FrozenGridSizingPlan(
+        route,
+        store.levels(route)[0].model_sha256,
+        Decimal("1"),
+        (Decimal(".1"), Decimal(".15"), Decimal(".2"), Decimal(".25"), Decimal(".3")),
+        tuple(Decimal(".5") for _ in range(5)),
+        Decimal("10"),
+        _NOW,
+    )
+    store.freeze_sizing_plan(plan)
+
+    assert AggressiveGridStore(store.path).frozen_sizing_plan(route) == plan
+    with pytest.raises(RuntimeError, match="cannot change"):
+        store.freeze_sizing_plan(replace(plan, projected_margin_usdt=Decimal("11")))

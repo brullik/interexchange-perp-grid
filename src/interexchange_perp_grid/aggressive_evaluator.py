@@ -178,6 +178,7 @@ class HybridEntryInput:
     observed_monotonic_ns: int
     maximum_book_age_ms: int
     now: datetime
+    reference_interval_start: datetime | None = None
     stage: AggressiveEntryStage = AggressiveEntryStage.NORMAL
     state_reconciled: bool = True
     historical_model_eligible: bool = True
@@ -195,6 +196,7 @@ class AggressiveEconomicDecision:
     long_entry_vwap: Decimal | None
     short_entry_vwap: Decimal | None
     four_leg_fees_usdt: Decimal
+    remaining_close_fees_usdt: Decimal
     measured_book_impact_usdt: Decimal
     stressed_total_cost_usdt: Decimal
     favorable_funding_credit_usdt: Decimal
@@ -209,6 +211,7 @@ class GridSizingResult:
     reason: AggressiveEntryReason
     full_route_base_quantity: Decimal
     tranche_base_quantities: tuple[Decimal, ...]
+    tranche_projected_losses_usdt: tuple[Decimal, ...]
     projected_route_loss_usdt: Decimal
     projected_portfolio_loss_usdt: Decimal
     projected_margin_usdt: Decimal
@@ -323,6 +326,26 @@ def evaluate_hybrid_entry(
     )
     if not confirmed:
         return _rejected(proposal, AggressiveEntryReason.CONFIRMATION_INSUFFICIENT)
+    return _evaluate_confirmed_hybrid_entry(proposal, policy)
+
+
+def revalidate_hybrid_entry_once(
+    proposal: HybridEntryInput,
+    *,
+    policy: AggressiveDecisionPolicy,
+) -> AggressiveEconomicDecision:
+    """Repeat the shared mutable entry checks once immediately before submit."""
+    return evaluate_hybrid_entry(
+        proposal,
+        policy=policy,
+        confirmations=CrossingConfirmationTracker(1, 0),
+    )
+
+
+def _evaluate_confirmed_hybrid_entry(
+    proposal: HybridEntryInput,
+    policy: AggressiveDecisionPolicy,
+) -> AggressiveEconomicDecision:
     if (
         proposal.long_private_taker_fee_rate is None
         or proposal.short_private_taker_fee_rate is None
@@ -341,9 +364,11 @@ def evaluate_hybrid_entry(
     short_exit = executable_vwap(proposal.short_book.asks, proposal.quantity)
     if long_fill is None or short_fill is None or long_exit is None or short_exit is None:
         return _rejected(proposal, AggressiveEntryReason.DEPTH_INSUFFICIENT)
-    with localcontext() as context:
-        context.prec = 50
-        executable_spread = (short_fill.price / long_fill.price).ln() * _BPS
+    executable_spread = canonical_executable_spread_bps(
+        proposal.direction,
+        long_fill.price,
+        short_fill.price,
+    )
     average_price = (long_fill.price + short_fill.price) / Decimal(2)
     reverse_target = reverse_grid_target_bps(
         proposal.direction,
@@ -360,6 +385,9 @@ def evaluate_hybrid_entry(
     four_leg_fees = proposal.quantity * (
         (long_fill.price + long_exit.price) * fees[0]
         + (short_fill.price + short_exit.price) * fees[1]
+    )
+    remaining_close_fees = proposal.quantity * (
+        long_exit.price * fees[0] + short_exit.price * fees[1]
     )
     measured_impact = proposal.quantity * (
         max(Decimal(0), long_fill.price - proposal.long_book.asks[0].price)
@@ -405,6 +433,7 @@ def evaluate_hybrid_entry(
         long_entry_vwap=long_fill.price,
         short_entry_vwap=short_fill.price,
         four_leg_fees_usdt=four_leg_fees,
+        remaining_close_fees_usdt=remaining_close_fees,
         measured_book_impact_usdt=measured_impact,
         stressed_total_cost_usdt=stressed_cost,
         favorable_funding_credit_usdt=favorable_credit,
@@ -474,10 +503,18 @@ def size_aggressive_grid(
         quantity if quantity >= minimum else Decimal(0) for quantity in tranche_quantities
     )
     effective_full_quantity = sum(tranche_quantities, Decimal(0))
-    projected_route = existing_route_loss_usdt + effective_full_quantity * loss_per_full_base
-    projected_portfolio = (
-        existing_portfolio_loss_usdt + effective_full_quantity * loss_per_full_base
+    tranche_losses = tuple(
+        quantity
+        * (reference_price * abs(effective_stop_bps - level) / _BPS + per_full_base_reserve_usdt)
+        for quantity, level in zip(
+            tranche_quantities,
+            direction_levels_bps,
+            strict=True,
+        )
     )
+    incremental_route_loss = sum(tranche_losses, Decimal(0))
+    projected_route = existing_route_loss_usdt + incremental_route_loss
+    projected_portfolio = existing_portfolio_loss_usdt + incremental_route_loss
     projected_margin = (
         effective_full_quantity * reference_price / policy.initial_effective_leverage_cap
     )
@@ -494,6 +531,7 @@ def size_aggressive_grid(
         reason=AggressiveEntryReason.ACCEPTED if accepted else AggressiveEntryReason.RISK_REJECTED,
         full_route_base_quantity=effective_full_quantity,
         tranche_base_quantities=tranche_quantities,
+        tranche_projected_losses_usdt=tranche_losses,
         projected_route_loss_usdt=projected_route,
         projected_portfolio_loss_usdt=projected_portfolio,
         projected_margin_usdt=projected_margin,
@@ -514,6 +552,25 @@ def projected_net_funding_usdt(
         base_quantity * short_funding.mark_price * short_funding.rate * short_funding.event_count
     )
     return long_payment + short_payment
+
+
+def canonical_executable_spread_bps(
+    direction: DivergenceDirection,
+    long_price: Decimal,
+    short_price: Decimal,
+) -> Decimal:
+    """Return the canonical signed A/B spread for a directed long/short route.
+
+    Positive divergence is traded long B / short A, so the directed short/long ratio already
+    has the canonical sign. Negative divergence is traded long A / short B and must be negated
+    before comparing with the signed historical levels, targets, and stops.
+    """
+    if any(not value.is_finite() or value <= 0 for value in (long_price, short_price)):
+        raise ValueError("executable spread prices must be positive and finite")
+    with localcontext() as context:
+        context.prec = 50
+        directed = (short_price / long_price).ln() * _BPS
+    return directed if direction == DivergenceDirection.POSITIVE else -directed
 
 
 def route_score(
@@ -691,6 +748,7 @@ def _rejected(
         long_entry_vwap=None,
         short_entry_vwap=None,
         four_leg_fees_usdt=Decimal(0),
+        remaining_close_fees_usdt=Decimal(0),
         measured_book_impact_usdt=Decimal(0),
         stressed_total_cost_usdt=Decimal(0),
         favorable_funding_credit_usdt=Decimal(0),
@@ -705,6 +763,7 @@ def _risk_rejected(route_loss: Decimal, portfolio_loss: Decimal) -> GridSizingRe
         reason=AggressiveEntryReason.RISK_REJECTED,
         full_route_base_quantity=Decimal(0),
         tranche_base_quantities=(Decimal(0),) * 5,
+        tranche_projected_losses_usdt=(Decimal(0),) * 5,
         projected_route_loss_usdt=route_loss,
         projected_portfolio_loss_usdt=portfolio_loss,
         projected_margin_usdt=Decimal(0),

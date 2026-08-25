@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from decimal import Decimal, localcontext
+from decimal import Decimal
 
 from interexchange_perp_grid.aggressive_evaluator import (
     AggressiveDecisionPolicy,
@@ -13,6 +13,7 @@ from interexchange_perp_grid.aggressive_evaluator import (
     CostReserves,
     HybridEntryInput,
     VenueFundingProjection,
+    canonical_executable_spread_bps,
     select_aggressive_exit_reason,
 )
 from interexchange_perp_grid.aggressive_grid import (
@@ -179,6 +180,7 @@ class AggressiveShadowDecisionBridge:
             observed_monotonic_ns=inputs.market.observed_monotonic_ns,
             maximum_book_age_ms=inputs.maximum_book_age_ms,
             now=inputs.now,
+            reference_interval_start=inputs.reference_bar.interval_start,
             stage=inputs.stage,
             state_reconciled=(
                 inputs.state_reconciled
@@ -215,6 +217,7 @@ class AggressiveShadowDecisionBridge:
                 existing_route_loss_usdt=inputs.existing_route_loss_usdt,
                 existing_portfolio_loss_usdt=inputs.existing_portfolio_loss_usdt,
                 free_margin_usdt=inputs.free_margin_usdt,
+                frozen_route_sizing=self._grid.frozen_sizing_plan(inputs.market.route.value),
             ),
             reserves_per_base=inputs.reserves,
             effective_stop_bps=inputs.effective_stop_bps,
@@ -277,7 +280,7 @@ class AggressiveShadowPortfolio:
             effective_stop_bps=intent.effective_stop_bps,
             maximum_holding_deadline=intent.decided_at
             + timedelta(seconds=self._policy.hard_max_hold_seconds),
-            reserved_stress_usdt=intent.projected_route_loss_usdt,
+            reserved_stress_usdt=intent.incremental_tranche_loss_usdt,
             entry_slippage_usdt=Decimal(0),
             realised_pnl_usdt=Decimal(0),
             unrealised_pnl_usdt=Decimal(0),
@@ -321,9 +324,11 @@ class AggressiveShadowPortfolio:
             )
             if long_exit is None or short_exit is None:
                 continue
-            with localcontext() as context:
-                context.prec = 50
-                executable_spread = (short_exit.price / long_exit.price).ln() * _BPS
+            executable_spread = canonical_executable_spread_bps(
+                level.direction,
+                long_exit.price,
+                short_exit.price,
+            )
             reference_stop_crossed = (
                 reference_bar.high_bps >= ownership.effective_stop_bps
                 if level.direction == DivergenceDirection.POSITIVE

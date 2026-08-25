@@ -88,6 +88,7 @@ class PriorityWorkScheduler:
         self._admissions: dict[str, tuple[WorkPriority, asyncio.Future[object]]] = {}
         self._reserved_active_keys: dict[WorkPriority, str] = {}
         self._running: dict[str, WorkPriority] = {}
+        self._operations: dict[str, asyncio.Future[object]] = {}
         self._workers: set[asyncio.Task[None]] = set()
         self._waiting_critical = 0
         self._sequence = 0
@@ -129,6 +130,30 @@ class PriorityWorkScheduler:
 
     def critical_work_count(self) -> int:
         return self.snapshot().critical_work_count
+
+    async def cancel_and_wait(self, key: str, *, timeout_seconds: float) -> bool:
+        """Cancel one owned operation and prove it stopped before returning true."""
+        if not key:
+            raise ValueError("scheduler work key cannot be empty")
+        if timeout_seconds <= 0:
+            raise ValueError("scheduler cancellation timeout must be positive")
+        async with self._condition:
+            item = self._by_key.get(key)
+            if item is None:
+                return True
+            operation = self._operations.get(key)
+            if operation is None:
+                if item in self._queue:
+                    self._queue.remove(item)
+                    self._by_key.pop(key, None)
+                    if not item.future.done():
+                        item.future.cancel()
+                    self._condition.notify_all()
+                    return True
+                return False
+            operation.cancel()
+        _done, pending = await asyncio.wait({operation}, timeout=timeout_seconds)
+        return not pending
 
     async def run(
         self,
@@ -277,7 +302,10 @@ class PriorityWorkScheduler:
                 self._running[item.key] = item.priority
                 self._condition.notify_all()
             try:
-                result = await item.operation()
+                operation: asyncio.Future[object] = asyncio.ensure_future(item.operation())
+                async with self._condition:
+                    self._operations[item.key] = operation
+                result = await operation
             except asyncio.CancelledError:
                 if not item.future.done():
                     item.future.cancel()
@@ -292,6 +320,7 @@ class PriorityWorkScheduler:
                     item.future.set_result(result)
             finally:
                 async with self._condition:
+                    self._operations.pop(item.key, None)
                     self._running.pop(item.key, None)
                     self._by_key.pop(item.key, None)
                     if self._reserved_active_keys.get(item.priority) == item.key:

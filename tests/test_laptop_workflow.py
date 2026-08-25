@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,7 +27,12 @@ from interexchange_perp_grid.qualification import (
     laptop_owner_exception_policy,
     qualification_policy_from_settings,
 )
-from interexchange_perp_grid.service import BootstrapService, BoundedServiceReceipt
+from interexchange_perp_grid.service import (
+    BootstrapService,
+    BoundedServiceReceipt,
+    load_bounded_service_receipt,
+    write_bounded_service_receipt,
+)
 from interexchange_perp_grid.state import QualificationEpoch, QualificationEpochStatus
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
@@ -283,3 +289,25 @@ async def test_pilot_report_fails_when_post_trade_interval_is_short(
     assert report.status == "FAIL"
     assert "EXACTLY_ONE_COMPLETED_PAIRED_CANARY_REQUIRED" in report.blockers
     assert "EIGHT_HOUR_POST_TRADE_OBSERVATION_REQUIRED" in report.blockers
+
+
+def test_bounded_service_receipt_rejects_edited_duration(tmp_path: Path) -> None:
+    started_at = datetime(2026, 8, 25, tzinfo=UTC)
+    receipt = BoundedServiceReceipt(
+        1,
+        "PASS",
+        started_at,
+        started_at + timedelta(hours=8),
+        28_800,
+        28_800,
+        "state.sqlite3",
+        1,
+    )
+    path = tmp_path / "receipt.json"
+    write_bounded_service_receipt(path, receipt)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["observed_monotonic_seconds"] = 99_999
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        load_bounded_service_receipt(path)

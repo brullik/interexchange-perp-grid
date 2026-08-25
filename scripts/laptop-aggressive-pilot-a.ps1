@@ -63,36 +63,40 @@ $outputDirectory = Join-Path $root "artifacts/runtime/aggressive-pilot-a/$runId"
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 $intentPath = Join-Path $outputDirectory "live-intent.json"
 $liveGrid = Join-Path $outputDirectory "live-grid.sqlite3"
-$serviceStdout = Join-Path $outputDirectory "service.stdout.log"
-$serviceStderr = Join-Path $outputDirectory "service.stderr.log"
 $postFlatReceipt = Join-Path $outputDirectory "post-flat-service.json"
 $pilotEvidence = Join-Path $root "state/aggressive-pilot-a-stage.json"
+$acceptanceEvidence = Join-Path $root "state/laptop-aggressive-acceptance.json"
 $failurePath = Join-Path $outputDirectory "failure.json"
 $serviceProcess = $null
 $entryAttempted = $false
 $pilotStartedAt = [DateTime]::UtcNow
 $pilotDeadline = $pilotStartedAt.AddHours(24)
 
-try {
-    $serviceProcess = Start-Process -FilePath $python -ArgumentList @(
+function Start-PilotSafetySupervisor {
+    $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+    $process = Start-Process -FilePath $python -ArgumentList @(
         "-m", "interexchange_perp_grid.cli", "run", "--config", $config
     ) -PassThru -WindowStyle Hidden `
-        -RedirectStandardOutput $serviceStdout -RedirectStandardError $serviceStderr
+        -RedirectStandardOutput (Join-Path $outputDirectory "service-$stamp.stdout.log") `
+        -RedirectStandardError (Join-Path $outputDirectory "service-$stamp.stderr.log")
     $healthy = $false
     for ($attempt = 0; $attempt -lt 60; $attempt++) {
-        if ($serviceProcess.HasExited) { throw "pilot safety supervisor stopped during startup" }
+        if ($process.HasExited) { throw "pilot safety supervisor stopped during startup" }
         & $python -m interexchange_perp_grid.cli health --config $config *> $null
         if ($LASTEXITCODE -eq 0) { $healthy = $true; break }
         Start-Sleep -Seconds 1
     }
     if (-not $healthy) { throw "pilot safety supervisor did not become healthy" }
+    return $process
+}
 
-    Write-Host "In Telegram send /challenge, then /confirm_live <returned-token>."
-    $telegramReady = Read-Host "After the bot confirms live_confirmed_until, type CONFIRMED"
-    if ($telegramReady -cne "CONFIRMED") { throw "Telegram live challenge was not confirmed" }
-
+try {
+    $serviceProcess = Start-PilotSafetySupervisor
     $env:IPEG_LOCAL_UNLOCK_SECRET = Convert-Secret $unlock
     while ([DateTime]::UtcNow -lt $pilotDeadline) {
+        if (-not $serviceProcess -or $serviceProcess.HasExited) {
+            $serviceProcess = Start-PilotSafetySupervisor
+        }
         $since = [DateTime]::UtcNow.AddMinutes(-4).ToString("o")
         & $python -m interexchange_perp_grid.cli reference-history-proof `
             --venue-a bybit --venue-b okx --base BTC --since $since --limit 4 `
@@ -109,6 +113,11 @@ try {
         $intentExit = $LASTEXITCODE
         $intentOutput | Add-Content -LiteralPath (Join-Path $outputDirectory "intent.log")
         if ($intentExit -eq 0) {
+            Write-Host "In Telegram send /challenge, then /confirm_live <returned-token>."
+            $telegramReady = Read-Host "After the bot confirms this level, type CONFIRMED"
+            if ($telegramReady -cne "CONFIRMED") {
+                throw "Fresh Telegram live challenge was not confirmed for this level"
+            }
             $entryAttempted = $true
             $env:IPEG_MODE = "live"
             $env:IPEG_LIVE_ENABLED = "true"
@@ -161,6 +170,10 @@ try {
     if ([DateTime]::UtcNow -ge $pilotDeadline) {
         throw "pilot_a did not complete all five levels within the hard 24-hour holding window"
     }
+    # The trading stage ends at the first durable stable-FLAT observation.  The
+    # following service soak is post-stage evidence and must not expand the
+    # action/economic evidence window by eight hours.
+    $pilotFlatAt = [DateTime]::UtcNow
 
     if ($serviceProcess -and -not $serviceProcess.HasExited) {
         Stop-Process -Id $serviceProcess.Id
@@ -175,14 +188,21 @@ try {
         -RedirectStandardError (Join-Path $outputDirectory "post-flat.stderr.log")
     $serviceProcess.WaitForExit()
     if ($serviceProcess.ExitCode -ne 0) { throw "eight-hour post-FLAT service failed" }
-    $pilotEndedAt = [DateTime]::UtcNow
     & $python -m interexchange_perp_grid.cli aggressive-laptop-stage-report `
         --stage pilot_a --started-at $pilotStartedAt.ToString("o") `
-        --ended-at $pilotEndedAt.ToString("o") --post-flat-service-seconds 28800 `
+        --ended-at $pilotFlatAt.ToString("o") --post-flat-service-seconds 28800 `
         --binding $binding --service-receipt $postFlatReceipt `
         --output $pilotEvidence --config $config
     if ($LASTEXITCODE -ne 0) { throw "aggressive pilot_a evidence failed closed" }
+    & $python -m interexchange_perp_grid.cli aggressive-laptop-acceptance `
+        --binding $binding --runtime-manifest $runtimeManifest `
+        --canary-evidence $canaryEvidence --pilot-evidence $pilotEvidence `
+        --qualification $qualification --model $model --grid $qualificationGrid `
+        --live-grid $liveGrid --profile $strategyProfile --history-root $history `
+        --output $acceptanceEvidence --repo-root $root --config $config
+    if ($LASTEXITCODE -ne 0) { throw "aggressive laptop acceptance failed closed" }
     Write-Host "Aggressive pilot_a evidence: $pilotEvidence"
+    Write-Host "Aggressive laptop acceptance: $acceptanceEvidence"
 } catch {
     [ordered]@{
         schema_version = 1
@@ -190,6 +210,13 @@ try {
         observed_at = [DateTime]::UtcNow.ToString("o")
         failure = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
     } | ConvertTo-Json | Set-Content -LiteralPath $failurePath
+    if ($entryAttempted -and (-not $serviceProcess -or $serviceProcess.HasExited)) {
+        try {
+            $serviceProcess = Start-PilotSafetySupervisor
+        } catch {
+            Write-Error "CRITICAL: replacement safety supervisor could not be started: $_"
+        }
+    }
     throw
 } finally {
     $env:IPEG_MODE = "shadow"

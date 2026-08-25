@@ -88,6 +88,99 @@ def test_reference_series_rejects_missing_conflicting_and_incomplete_minutes() -
     )
 
 
+def test_requested_window_accounts_for_minutes_missing_from_both_venues() -> None:
+    bybit = (_source(Venue.BYBIT, minute=0), _source(Venue.BYBIT, minute=120))
+    okx = (_source(Venue.OKX, minute=0), _source(Venue.OKX, minute=120))
+
+    result = build_reference_series(
+        bybit,
+        okx,
+        window_start=START,
+        window_end=START + timedelta(hours=3),
+    )
+    hourly = aggregate_reference_bars(
+        result.bars,
+        60,
+        window_start=START,
+        window_end=START + timedelta(hours=3),
+    )
+
+    assert len(result.bars) + len(result.rejections) == 180
+    assert len(result.rejections) == 178
+    assert all(
+        rejection.reason == ReferenceRejectionReason.MISSING_SOURCE
+        for rejection in result.rejections
+    )
+    assert len(hourly) == 3
+    assert tuple(bar.quality for bar in hourly) == (
+        ReferenceBarQuality.INCOMPLETE,
+        ReferenceBarQuality.INCOMPLETE,
+        ReferenceBarQuality.INCOMPLETE,
+    )
+    assert hourly[1].observed_minutes == 0
+
+
+def test_exact_window_hash_binds_bounds_and_every_rejection_reason() -> None:
+    missing = build_reference_series(
+        (_source(Venue.BYBIT),),
+        (),
+        window_start=START,
+        window_end=START + timedelta(minutes=2),
+    )
+    incomplete = build_reference_series(
+        (_source(Venue.BYBIT, quality=SourceBarQuality.INCOMPLETE),),
+        (_source(Venue.OKX),),
+        window_start=START,
+        window_end=START + timedelta(minutes=2),
+    )
+    longer = build_reference_series(
+        (_source(Venue.BYBIT),),
+        (),
+        window_start=START,
+        window_end=START + timedelta(minutes=3),
+    )
+
+    assert len({missing.dataset_sha256, incomplete.dataset_sha256, longer.dataset_sha256}) == 3
+    assert len(missing.dataset_sha256) == 64
+
+
+def test_out_of_window_contract_version_never_poison_exact_window() -> None:
+    left = (
+        replace(_source(Venue.BYBIT, minute=-1), contract_metadata_version="bybit-old"),
+        _source(Venue.BYBIT),
+    )
+    right = (
+        replace(_source(Venue.OKX, minute=-1), contract_metadata_version="okx-old"),
+        _source(Venue.OKX),
+    )
+
+    result = build_reference_series(
+        left,
+        right,
+        window_start=START,
+        window_end=START + timedelta(minutes=1),
+    )
+
+    assert len(result.bars) == 1
+    assert result.rejections == ()
+
+
+def test_all_empty_requested_window_emits_incomplete_aggregate_ledger() -> None:
+    hourly = aggregate_reference_bars(
+        (),
+        60,
+        window_start=START,
+        window_end=START + timedelta(hours=2),
+        venue_a=Venue.BYBIT,
+        venue_b=Venue.OKX,
+        instrument=KEY,
+    )
+
+    assert len(hourly) == 2
+    assert all(item.quality == ReferenceBarQuality.INCOMPLETE for item in hourly)
+    assert all(item.observed_minutes == 0 for item in hourly)
+
+
 def test_identical_duplicate_is_idempotent_and_hash_is_order_independent() -> None:
     bybit = tuple(_source(Venue.BYBIT, minute=minute) for minute in range(5))
     okx = tuple(_source(Venue.OKX, minute=minute) for minute in range(5))

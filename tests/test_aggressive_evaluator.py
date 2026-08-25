@@ -12,6 +12,7 @@ from interexchange_perp_grid.aggressive_evaluator import (
     AggressiveDecisionPolicy,
     AggressiveEconomicDecision,
     AggressiveEntryReason,
+    AggressiveEntryStage,
     AggressiveExitInput,
     AggressiveExitReason,
     CostReserves,
@@ -19,8 +20,10 @@ from interexchange_perp_grid.aggressive_evaluator import (
     HybridEntryInput,
     RouteScoreCandidate,
     VenueFundingProjection,
+    canonical_executable_spread_bps,
     evaluate_hybrid_entry,
     load_aggressive_decision_policy,
+    revalidate_hybrid_entry_once,
     route_score,
     select_aggressive_exit_reason,
     select_route_candidate,
@@ -109,6 +112,21 @@ def test_locked_policy_loads_all_economic_and_risk_constants() -> None:
     assert len(loaded.profile_sha256) == 64
 
 
+def test_executable_spread_is_canonical_and_signed_for_both_directed_routes() -> None:
+    positive = canonical_executable_spread_bps(
+        DivergenceDirection.POSITIVE,
+        Decimal("100"),
+        Decimal("101"),
+    )
+    negative = canonical_executable_spread_bps(
+        DivergenceDirection.NEGATIVE,
+        Decimal("100"),
+        Decimal("101"),
+    )
+    assert positive > 0
+    assert negative == -positive
+
+
 def test_hybrid_entry_requires_three_fresh_l2_decisions_spanning_500ms() -> None:
     policy = _policy()
     tracker = CrossingConfirmationTracker(
@@ -134,6 +152,80 @@ def test_hybrid_entry_requires_three_fresh_l2_decisions_spanning_500ms() -> None
     assert accepted.expected_gross_convergence_pnl_usdt > 0
     assert accepted.expected_net_pnl_usdt >= Decimal("0.15")
     assert not accepted.execution_authorized
+
+
+def test_final_revalidation_preserves_canary_only_profit_floor_and_vetoes_lost_edge() -> None:
+    policy = _policy()
+    marginal = _proposal(short_book=_book(Venue.BYBIT, "100.2", "100.3"))
+
+    canary = revalidate_hybrid_entry_once(
+        replace(marginal, stage=AggressiveEntryStage.LOCKED_CANARY),
+        policy=policy,
+    )
+    normal = revalidate_hybrid_entry_once(
+        replace(marginal, stage=AggressiveEntryStage.NORMAL),
+        policy=policy,
+    )
+    lost_edge = revalidate_hybrid_entry_once(
+        replace(
+            marginal,
+            stage=AggressiveEntryStage.LOCKED_CANARY,
+            short_book=_book(Venue.BYBIT, "100.05", "100.15"),
+        ),
+        policy=policy,
+    )
+
+    assert canary.accepted and Decimal("0.01") <= canary.expected_net_pnl_usdt < Decimal("0.15")
+    assert not normal.accepted and normal.reason == AggressiveEntryReason.ECONOMICS_INSUFFICIENT
+    assert (
+        not lost_edge.accepted and lost_edge.reason == AggressiveEntryReason.ECONOMICS_INSUFFICIENT
+    )
+
+
+def test_negative_hybrid_entry_uses_signed_canonical_target_without_immediate_exit() -> None:
+    policy = _policy()
+    tracker = CrossingConfirmationTracker(3, 500)
+    proposal = _proposal(
+        route_identity="BTC:bybit>okx",
+        direction=DivergenceDirection.NEGATIVE,
+        reference_spread_bps=Decimal("-2.1"),
+        reference_trigger_bps=Decimal("-2"),
+        long_venue=Venue.BYBIT,
+        short_venue=Venue.OKX,
+        long_book=_book(Venue.BYBIT, "99.9", "100"),
+        short_book=_book(Venue.OKX, "101", "101.1"),
+        long_funding=_funding(Venue.BYBIT),
+        short_funding=_funding(Venue.OKX),
+    )
+    result = None
+    for offset in (0, 250_000_000, 500_000_000):
+        result = evaluate_hybrid_entry(
+            replace(proposal, observed_monotonic_ns=1_000_000_000 + offset),
+            policy=policy,
+            confirmations=tracker,
+        )
+    assert result is not None and result.accepted
+    assert result.executable_entry_spread_bps is not None
+    assert result.reverse_target_bps is not None
+    assert result.executable_entry_spread_bps < result.reverse_target_bps < 0
+    assert (
+        select_aggressive_exit_reason(
+            AggressiveExitInput(
+                direction=DivergenceDirection.NEGATIVE,
+                executable_spread_bps=result.executable_entry_spread_bps,
+                effective_stop_bps=Decimal("-120"),
+                reverse_target_bps=result.reverse_target_bps,
+                projected_route_loss_usdt=Decimal(0),
+                projected_portfolio_loss_usdt=Decimal(0),
+                holding_deadline=_NOW + timedelta(hours=24),
+                now=_NOW,
+                emergency_or_unknown=False,
+                adverse_funding_destroys_profit=False,
+            ),
+            policy,
+        )
+        == AggressiveExitReason.NONE
+    )
 
 
 def test_reference_high_alone_never_opens_without_executable_books() -> None:

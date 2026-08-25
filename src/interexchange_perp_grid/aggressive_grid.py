@@ -137,6 +137,71 @@ class GridLevelRecord:
             raise ValueError("grid state never authorizes execution")
 
 
+@dataclass(frozen=True, slots=True)
+class ExternalGridLevelProjection:
+    level_index: int
+    state: GridLevelState
+    reserved_stress_usdt: Decimal
+    decision_cycle: int | None = None
+    ownership: GridTrancheOwnership | None = None
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.level_index <= _LEVEL_COUNT:
+            raise ValueError("external grid level index is invalid")
+        if self.state not in {
+            GridLevelState.ENTRY_PENDING,
+            GridLevelState.OPEN,
+            GridLevelState.CLOSED_WAIT_REARM,
+        }:
+            raise ValueError("external grid projection state is invalid")
+        if not self.reserved_stress_usdt.is_finite() or self.reserved_stress_usdt < 0:
+            raise ValueError("external grid projection stress is invalid")
+        if self.state == GridLevelState.ENTRY_PENDING and (
+            self.decision_cycle is None or self.ownership is not None
+        ):
+            raise ValueError("external pending grid projection is invalid")
+        if self.state == GridLevelState.OPEN and (
+            self.ownership is None or self.decision_cycle is not None
+        ):
+            raise ValueError("external open grid projection is invalid")
+        if self.state == GridLevelState.CLOSED_WAIT_REARM and (
+            self.ownership is not None
+            or self.decision_cycle is not None
+            or self.reserved_stress_usdt != 0
+        ):
+            raise ValueError("external closed grid projection is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenGridSizingPlan:
+    route_identity: str
+    model_sha256: str
+    full_route_base_quantity: Decimal
+    tranche_base_quantities: tuple[Decimal, ...]
+    tranche_projected_losses_usdt: tuple[Decimal, ...]
+    projected_margin_usdt: Decimal
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        values = (
+            self.full_route_base_quantity,
+            *self.tranche_base_quantities,
+            *self.tranche_projected_losses_usdt,
+            self.projected_margin_usdt,
+        )
+        if (
+            not self.route_identity
+            or not self.model_sha256
+            or len(self.tranche_base_quantities) != _LEVEL_COUNT
+            or len(self.tranche_projected_losses_usdt) != _LEVEL_COUNT
+            or self.created_at.tzinfo is None
+            or self.created_at.utcoffset() is None
+            or any(not value.is_finite() or value < 0 for value in values)
+            or self.full_route_base_quantity != sum(self.tranche_base_quantities, Decimal(0))
+        ):
+            raise ValueError("frozen grid sizing plan is invalid")
+
+
 class AggressiveGridStore:
     """Transactional five-level ownership state; it never performs exchange actions."""
 
@@ -165,6 +230,12 @@ class AggressiveGridStore:
                     level_index INTEGER NOT NULL CHECK (level_index BETWEEN 1 AND 5),
                     payload_json TEXT NOT NULL,
                     PRIMARY KEY (route_identity, level_index),
+                    FOREIGN KEY (route_identity) REFERENCES aggressive_grid_routes(route_identity)
+                );
+                CREATE TABLE IF NOT EXISTS aggressive_grid_sizing_plans (
+                    route_identity TEXT PRIMARY KEY,
+                    model_sha256 TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
                     FOREIGN KEY (route_identity) REFERENCES aggressive_grid_routes(route_identity)
                 );
                 """
@@ -277,6 +348,60 @@ class AggressiveGridStore:
         if row is None:
             raise RuntimeError("grid route is not initialised")
         return int(row[0]) + 1
+
+    def frozen_sizing_plan(self, route_identity: str) -> FrozenGridSizingPlan | None:
+        with self._connect() as database:
+            row = database.execute(
+                "SELECT payload_json FROM aggressive_grid_sizing_plans WHERE route_identity = ?",
+                (route_identity,),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(str(row[0]))
+        return FrozenGridSizingPlan(
+            route_identity=str(payload["route_identity"]),
+            model_sha256=str(payload["model_sha256"]),
+            full_route_base_quantity=Decimal(str(payload["full_route_base_quantity"])),
+            tranche_base_quantities=tuple(
+                Decimal(str(value)) for value in payload["tranche_base_quantities"]
+            ),
+            tranche_projected_losses_usdt=tuple(
+                Decimal(str(value)) for value in payload["tranche_projected_losses_usdt"]
+            ),
+            projected_margin_usdt=Decimal(str(payload["projected_margin_usdt"])),
+            created_at=datetime.fromisoformat(str(payload["created_at"])),
+        )
+
+    def freeze_sizing_plan(self, plan: FrozenGridSizingPlan) -> FrozenGridSizingPlan:
+        encoded = json.dumps(asdict(plan), default=str, sort_keys=True, separators=(",", ":"))
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            route = database.execute(
+                "SELECT model_sha256 FROM aggressive_grid_routes WHERE route_identity = ?",
+                (plan.route_identity,),
+            ).fetchone()
+            if route is None or str(route[0]) != plan.model_sha256:
+                database.rollback()
+                raise RuntimeError("frozen sizing route model identity mismatch")
+            existing = database.execute(
+                "SELECT payload_json FROM aggressive_grid_sizing_plans WHERE route_identity = ?",
+                (plan.route_identity,),
+            ).fetchone()
+            if existing is not None:
+                observed = self.frozen_sizing_plan(plan.route_identity)
+                if observed != plan:
+                    database.rollback()
+                    raise RuntimeError("frozen sizing plan cannot change while route is active")
+                database.commit()
+                return plan
+            database.execute(
+                "INSERT INTO aggressive_grid_sizing_plans("
+                "route_identity, model_sha256, payload_json) "
+                "VALUES(?, ?, ?)",
+                (plan.route_identity, plan.model_sha256, encoded),
+            )
+            database.commit()
+        return plan
 
     def first_unfilled_crossed_level(
         self,
@@ -398,6 +523,70 @@ class AggressiveGridStore:
                 elif record.state != GridLevelState.CLOSED_WAIT_REARM:
                     database.rollback()
                     raise RuntimeError("external live level conflicts with local grid ownership")
+                updated.append(record)
+            database.commit()
+        return tuple(updated)
+
+    def synchronize_journal_levels(
+        self,
+        route_identity: str,
+        projections: tuple[ExternalGridLevelProjection, ...],
+        *,
+        now: datetime,
+    ) -> tuple[GridLevelRecord, ...]:
+        """Project exact durable journal lifecycle into the strategy ownership grid."""
+        self._require_aware(now)
+        by_level = {item.level_index: item for item in projections}
+        if len(by_level) != len(projections):
+            raise RuntimeError("journal grid projection contains duplicate levels")
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            records = self._levels_locked(database, route_identity)
+            if len(records) != _LEVEL_COUNT:
+                database.rollback()
+                raise RuntimeError("aggressive live grid route is incomplete")
+            updated: list[GridLevelRecord] = []
+            for record in records:
+                projection = by_level.get(record.level_index)
+                if projection is None:
+                    updated.append(record)
+                    continue
+                allowed = {
+                    GridLevelState.ARMED: {
+                        GridLevelState.ENTRY_PENDING,
+                        GridLevelState.OPEN,
+                        GridLevelState.CLOSED_WAIT_REARM,
+                    },
+                    GridLevelState.ENTRY_PENDING: {
+                        GridLevelState.ENTRY_PENDING,
+                        GridLevelState.OPEN,
+                        GridLevelState.CLOSED_WAIT_REARM,
+                    },
+                    GridLevelState.OPEN: {
+                        GridLevelState.OPEN,
+                        GridLevelState.CLOSED_WAIT_REARM,
+                    },
+                    GridLevelState.EXIT_PENDING: {GridLevelState.CLOSED_WAIT_REARM},
+                    GridLevelState.CLOSED_WAIT_REARM: {GridLevelState.CLOSED_WAIT_REARM},
+                    GridLevelState.DISABLED: set(),
+                }
+                if projection.state not in allowed[record.state]:
+                    database.rollback()
+                    raise RuntimeError("journal grid projection conflicts with local ownership")
+                if projection.ownership is not None and not _ownership_matches_route(
+                    route_identity, projection.ownership
+                ):
+                    database.rollback()
+                    raise RuntimeError("journal grid ownership does not match route")
+                record = _replace_level(
+                    record,
+                    state=projection.state,
+                    ownership=projection.ownership,
+                    reserved_stress_usdt=projection.reserved_stress_usdt,
+                    pending_decision_cycle=projection.decision_cycle,
+                    now=now,
+                )
+                self._write_level_locked(database, record)
                 updated.append(record)
             database.commit()
         return tuple(updated)
