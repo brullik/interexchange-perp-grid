@@ -96,7 +96,10 @@ async def run_until_qualification_finalized(
                 )
             }
         )
-    elif selected_policy == laptop_smoke_policy(settings):
+    elif selected_policy in (
+        laptop_smoke_policy(settings, 5),
+        laptop_smoke_policy(settings, 30),
+    ):
         service_settings = settings.model_copy(
             update={
                 "shadow": settings.shadow.model_copy(

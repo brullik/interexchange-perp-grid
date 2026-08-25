@@ -197,8 +197,8 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert pilot.index("Start-Process") < pilot.index('$env:IPEG_LIVE_ENABLED = "true"')
     assert pilot.index('$env:IPEG_LIVE_ENABLED = "false"') < pilot.index("Start-Process")
     assert (
-        'ValidateSet("verify", "shadow", "smoke30", "qualify", "canary", "pilot", "status", "stop")'
-        in aggressive
+        'ValidateSet("verify", "shadow", "smoke5", "smoke30", "qualify", '
+        '"canary", "pilot", "status", "stop")' in aggressive
     )
     assert "reference-history-proof" in aggressive
     assert "aggressive-shadow-once" in aggressive
@@ -208,7 +208,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "laptop-pilot.ps1" in aggressive and "-Aggressive" in aggressive
     assert "laptop-aggressive-pilot-a.ps1" in aggressive
     assert '"smoke30"' in aggressive
+    assert '"smoke5"' in aggressive
     assert "-Smoke30m" in aggressive
+    assert "-Smoke5m" in aggressive
     assert '[Guid]::NewGuid().ToString("N")' in qualification
     assert "IPEG_LAPTOP_SMOKE_RUN_ID" in qualification
     assert "Docker" not in aggressive

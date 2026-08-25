@@ -22,7 +22,10 @@ from interexchange_perp_grid.qualification import (
     LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
     LAPTOP_OWNER_EXCEPTION_ENV,
     LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS,
+    LAPTOP_SMOKE_FAST_MINIMUM_DURATION_SECONDS,
+    LAPTOP_SMOKE_FAST_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE,
     LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS,
+    LAPTOP_SMOKE_MINIMUM_FUNDING_CHECKPOINTS_PER_VENUE,
     LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE,
     LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS,
     QualificationEvidence,
@@ -115,6 +118,7 @@ def test_laptop_smoke_policy_is_short_isolated_and_not_an_accepted_policy(
     settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
     standard = qualification_policy_from_settings(settings)
     smoke = laptop_smoke_policy(settings)
+    fast_smoke = laptop_smoke_policy(settings, 5)
 
     assert smoke.minimum_duration_seconds == LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS
     assert (
@@ -123,6 +127,21 @@ def test_laptop_smoke_policy_is_short_isolated_and_not_an_accepted_policy(
     )
     assert smoke != standard
     assert smoke != laptop_owner_exception_policy(settings)
+    assert fast_smoke.minimum_duration_seconds == LAPTOP_SMOKE_FAST_MINIMUM_DURATION_SECONDS
+    assert (
+        fast_smoke.minimum_synchronised_snapshots_per_venue
+        == LAPTOP_SMOKE_FAST_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+    )
+    assert fast_smoke != smoke
+    assert (
+        fast_smoke.minimum_funding_checkpoints_per_venue
+        == LAPTOP_SMOKE_MINIMUM_FUNDING_CHECKPOINTS_PER_VENUE
+        == 1
+    )
+    assert smoke.minimum_funding_checkpoints_per_venue == 1
+    assert standard.minimum_funding_checkpoints_per_venue == 3
+    with pytest.raises(ValueError, match="exactly 5 or 30"):
+        laptop_smoke_policy(settings, 10)
     assert LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS * 500 < 1_800
 
 

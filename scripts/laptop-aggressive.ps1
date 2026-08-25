@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("verify", "shadow", "smoke30", "qualify", "canary", "pilot", "status", "stop")]
+    [ValidateSet("verify", "shadow", "smoke5", "smoke30", "qualify", "canary", "pilot", "status", "stop")]
     [string]$Mode,
     [string]$ProfilePath = "state/laptop-profile.clixml",
     [ValidateSet("CurrentUser", "LocalMachine")]
@@ -139,6 +139,12 @@ switch ($Mode) {
         & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
             -ProfileScope $ProfileScope -Smoke30m
         if ($LASTEXITCODE -ne 0) { throw "30-minute qualification rehearsal failed closed" }
+    }
+    "smoke5" {
+        Ensure-HistoricalModel
+        & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
+            -ProfileScope $ProfileScope -Smoke5m
+        if ($LASTEXITCODE -ne 0) { throw "5-minute qualification rehearsal failed closed" }
     }
     "canary" {
         Write-Host "Canary requires a separate, explicit live-money authorization at execution time."

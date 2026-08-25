@@ -173,6 +173,9 @@ class QualificationPolicy:
 
 LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS = 1_800
 LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE = 500
+LAPTOP_SMOKE_FAST_MINIMUM_DURATION_SECONDS = 300
+LAPTOP_SMOKE_FAST_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE = 100
+LAPTOP_SMOKE_MINIMUM_FUNDING_CHECKPOINTS_PER_VENUE = 1
 LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS = 2
 
 
@@ -211,17 +214,24 @@ def laptop_owner_exception_policy(settings: Settings) -> QualificationPolicy:
     )
 
 
-def laptop_smoke_policy(settings: Settings) -> QualificationPolicy:
-    """Return a non-accepting 30-minute operational rehearsal policy."""
+def laptop_smoke_policy(settings: Settings, duration_minutes: int = 30) -> QualificationPolicy:
+    """Return a non-accepting 5- or 30-minute operational rehearsal policy."""
     standard = qualification_policy_from_settings(settings)
     if standard.minimum_duration_seconds != 86_400:
         raise ValueError("laptop smoke requires the exact standard 24-hour policy")
+    if duration_minutes == 5:
+        duration_seconds = LAPTOP_SMOKE_FAST_MINIMUM_DURATION_SECONDS
+        minimum_snapshots = LAPTOP_SMOKE_FAST_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+    elif duration_minutes == 30:
+        duration_seconds = LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS
+        minimum_snapshots = LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+    else:
+        raise ValueError("laptop smoke duration must be exactly 5 or 30 minutes")
     return replace(
         standard,
-        minimum_duration_seconds=LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS,
-        minimum_synchronised_snapshots_per_venue=(
-            LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
-        ),
+        minimum_duration_seconds=duration_seconds,
+        minimum_synchronised_snapshots_per_venue=minimum_snapshots,
+        minimum_funding_checkpoints_per_venue=(LAPTOP_SMOKE_MINIMUM_FUNDING_CHECKPOINTS_PER_VENUE),
     )
 
 

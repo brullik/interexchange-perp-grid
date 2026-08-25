@@ -2099,6 +2099,7 @@ def laptop_qualification_run(
 
 @app.command("laptop-qualification-smoke-run")
 def laptop_qualification_smoke_run(
+    minutes: Annotated[int, typer.Option("--minutes")] = 30,
     repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
@@ -2109,6 +2110,8 @@ def laptop_qualification_smoke_run(
         raise typer.BadParameter(
             "laptop qualification smoke requires shadow mode and live disabled"
         )
+    if minutes not in (5, 30):
+        raise typer.BadParameter("laptop qualification smoke must be exactly 5 or 30 minutes")
     smoke_run_id = os.environ.get("IPEG_LAPTOP_SMOKE_RUN_ID", "")
     if re.fullmatch(r"[0-9a-f]{32}", smoke_run_id) is None:
         raise typer.BadParameter("laptop qualification smoke requires a unique run id")
@@ -2125,12 +2128,12 @@ def laptop_qualification_smoke_run(
     route = _parse_route(os.environ.get("IPEG_QUALIFICATION_ROUTE", ""))
     if route.value != "BTC:bybit>okx":
         raise typer.BadParameter("laptop qualification smoke route must be BTC:bybit>okx")
-    policy = laptop_smoke_policy(settings)
+    policy = laptop_smoke_policy(settings, minutes)
     epoch = asyncio.run(
         run_until_qualification_finalized(
             settings,
             LaptopQualificationIdentity(route, release_sha, runtime_digest),
-            maximum_seconds=2_100,
+            maximum_seconds=(minutes + 5) * 60,
             poll_interval_seconds=2,
             qualification_policy=policy,
         )
@@ -2142,8 +2145,9 @@ def laptop_qualification_smoke_run(
                 "epoch": asdict(epoch),
                 "live_authorized": False,
                 "policy": asdict(policy),
-                "purpose": "NON_QUALIFYING_30_MINUTE_REHEARSAL",
+                "purpose": f"NON_QUALIFYING_{minutes}_MINUTE_REHEARSAL",
                 "run_id": smoke_run_id,
+                "scheduled_minutes": minutes,
                 "schema_version": 1,
                 "status": "PASS",
             },

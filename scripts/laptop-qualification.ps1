@@ -4,6 +4,7 @@ param(
     [ValidateSet("CurrentUser", "LocalMachine")]
     [string]$ProfileScope = "CurrentUser",
     [switch]$OwnerException12h,
+    [switch]$Smoke5m,
     [switch]$Smoke30m
 )
 
@@ -24,7 +25,10 @@ if ($ProfileScope -ceq "LocalMachine") {
 # intact while removing Telegram from this process before any Python command.
 . "$PSScriptRoot/laptop-disable-shadow-telegram.ps1"
 
-if ($Smoke30m) {
+if ($Smoke5m -and $Smoke30m) { throw "Choose exactly one smoke duration" }
+$smokeMinutes = if ($Smoke5m) { 5 } elseif ($Smoke30m) { 30 } else { 0 }
+
+if ($smokeMinutes -gt 0) {
     $env:IPEG_LAPTOP_SMOKE_RUN_ID = [Guid]::NewGuid().ToString("N")
     $env:IPEG_STATE_PATH = [IO.Path]::GetFullPath(
         (Join-Path $root "state/laptop/smoke/$env:IPEG_LAPTOP_SMOKE_RUN_ID/ipeg.sqlite3")
@@ -65,8 +69,8 @@ $env:IPEG_RELEASE_SHA = [string]$manifest.release_sha
 $env:IPEG_CONTAINER_IMAGE_DIGEST = [string]$manifest.artifact_digest
 
 $ownerExceptionConfirmation = $null
-if ($Smoke30m) {
-    Write-Host "Preparing isolated non-qualifying 30-minute laptop rehearsal."
+if ($smokeMinutes -gt 0) {
+    Write-Host "Preparing isolated non-qualifying $smokeMinutes-minute laptop rehearsal."
 } elseif ($OwnerException12h) {
     $ownerExceptionConfirmation = [Environment]::GetEnvironmentVariable(
         "IPEG_LAPTOP_12H_OWNER_EXCEPTION",
@@ -129,13 +133,14 @@ if ($OwnerException12h) {
 Write-Host "Keep AC power and network connected. Closing this terminal interrupts qualification."
 Write-Host "Live remains disabled; no real order can be submitted in this phase."
 try {
-    if ($Smoke30m) {
-        Write-Host "Starting isolated non-qualifying 30-minute laptop rehearsal."
+    if ($smokeMinutes -gt 0) {
+        Write-Host "Starting isolated non-qualifying $smokeMinutes-minute laptop rehearsal."
         & $python -m interexchange_perp_grid.cli laptop-qualification-smoke-run `
+            --minutes $smokeMinutes `
             --repo-root $root `
             --config "$root/config/defaults.yaml"
-        if ($LASTEXITCODE -ne 0) { throw "30-minute qualification rehearsal failed" }
-        Write-Host "30-minute rehearsal passed; it cannot authorize canary or live."
+        if ($LASTEXITCODE -ne 0) { throw "$smokeMinutes-minute qualification rehearsal failed" }
+        Write-Host "$smokeMinutes-minute rehearsal passed; it cannot authorize canary or live."
         return
     } elseif ($OwnerException12h) {
         $env:IPEG_LAPTOP_12H_OWNER_EXCEPTION = $ownerExceptionConfirmation
