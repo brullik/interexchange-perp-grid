@@ -135,13 +135,11 @@ switch ($Mode) {
         if ($LASTEXITCODE -ne 0) { throw "aggressive qualification binding failed closed" }
     }
     "smoke30" {
-        Ensure-HistoricalModel
         & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
             -ProfileScope $ProfileScope -SmokeMinutes 30
         if ($LASTEXITCODE -ne 0) { throw "30-minute qualification rehearsal failed closed" }
     }
     "smoke5" {
-        Ensure-HistoricalModel
         & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
             -ProfileScope $ProfileScope -SmokeMinutes 5
         if ($LASTEXITCODE -ne 0) { throw "5-minute qualification rehearsal failed closed" }

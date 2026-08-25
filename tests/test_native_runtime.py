@@ -215,7 +215,10 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "-SmokeMinutes 5" in aggressive
     assert "Start-Process" in detached_smoke
     assert "laptop_smoke_runner.py" in detached_smoke
-    assert "subprocess" not in Path("scripts/laptop_smoke_runner.py").read_text(encoding="utf-8")
+    runner = Path("scripts/laptop_smoke_runner.py").read_text(encoding="utf-8")
+    assert "subprocess" not in runner
+    assert "reference_history_proof" in runner
+    assert "aggressive_model_proof" in runner
     assert "ValidateSet(5, 30)" in detached_smoke
     assert "[IO.FileMode]::CreateNew" in detached_smoke
     assert "qualification-smoke.lock" in detached_smoke
