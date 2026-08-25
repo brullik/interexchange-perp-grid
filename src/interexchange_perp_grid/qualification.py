@@ -695,7 +695,13 @@ def _venue_book_statistics(
         for previous, current in pairwise(synchronised)
     )
     sequence_gaps: list[int] = []
-    for previous, current in pairwise(synchronised):
+    for previous, current in pairwise(snapshot_events):
+        # Persisted snapshots are periodic materialisations, not every exchange
+        # delta. A jump between two adapter-confirmed synchronised snapshots is
+        # therefore expected; only a snapshot explicitly rejected by the venue
+        # sequence tracker can represent a sequence break here.
+        if current.synchronised:
+            continue
         if previous.sequence_end is None or current.sequence_start is None:
             continue
         gap = current.sequence_start - previous.sequence_end - 1

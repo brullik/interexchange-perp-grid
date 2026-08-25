@@ -204,6 +204,58 @@ async def test_native_laptop_exception_accepts_exact_twelve_hour_deadline(
 
 
 @pytest.mark.asyncio
+async def test_native_smoke_uses_exact_fast_runtime_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
+    policy = laptop_smoke_policy(settings, 5)
+    stopped = asyncio.Event()
+    observed_at = datetime(2026, 8, 21, tzinfo=UTC)
+    epoch = QualificationEpoch(
+        "epoch-smoke",
+        ROUTE,
+        RELEASE,
+        "c" * 64,
+        "d" * 64,
+        DIGEST,
+        observed_at - timedelta(minutes=5),
+        observed_at,
+        QualificationEpochStatus.FINALIZED,
+    )
+
+    async def fake_service(self: BootstrapService, stop_event: asyncio.Event) -> None:
+        assert self.qualification_policy == policy
+        assert self.settings.shadow.scan_interval_seconds == 2
+        assert self.settings.shadow.qualification_min_duration_seconds == 300
+        assert self.settings.shadow.qualification_min_synchronised_snapshots_per_venue == 100
+        assert self.settings.shadow.qualification_min_funding_checkpoints_per_venue == 1
+        await stop_event.wait()
+        stopped.set()
+
+    async def finalized(path: object) -> QualificationEpoch:
+        assert isinstance(path, Path)
+        return epoch
+
+    monkeypatch.setattr(
+        "interexchange_perp_grid.laptop_workflow.BootstrapService.run",
+        fake_service,
+    )
+    monkeypatch.setattr(workflow_module, "read_qualification_epoch", finalized)
+
+    result = await run_until_qualification_finalized(
+        settings,
+        LaptopQualificationIdentity(ROUTE, RELEASE, DIGEST),
+        maximum_seconds=600,
+        poll_interval_seconds=0.01,
+        qualification_policy=policy,
+    )
+
+    assert result == epoch
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
 async def test_pilot_report_requires_real_paired_cycle_and_eight_hours(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -20,6 +20,7 @@ from interexchange_perp_grid.canary_runtime import (
     recover_active_actions,
 )
 from interexchange_perp_grid.config import Settings
+from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.live_journal import LiveJournalAction, LiveOrderJournal
 from interexchange_perp_grid.observability import (
     SERVICE_HEARTBEATS,
@@ -28,6 +29,7 @@ from interexchange_perp_grid.observability import (
     get_logger,
 )
 from interexchange_perp_grid.priority_scheduler import PriorityWorkScheduler
+from interexchange_perp_grid.public_engine import PublicMarketEngine
 from interexchange_perp_grid.qualification import QualificationPolicy
 from interexchange_perp_grid.shadow import ContinuousShadowEvaluator, ShadowRuntime
 from interexchange_perp_grid.state import (
@@ -200,10 +202,19 @@ class BootstrapService:
         if self.run_shadow and self.settings.app.mode == "shadow":
             runtime = ShadowRuntime(self.settings)
             await runtime.start()
+            qualification_engine = None
+            if self.qualification_policy is not None:
+                qualification_engine = PublicMarketEngine(
+                    self.settings,
+                    public_venues=tuple(
+                        Venue(value) for value in self.settings.venues.wave1_public
+                    ),
+                )
             background_tasks.append(
                 asyncio.create_task(
                     ContinuousShadowEvaluator(
                         self.settings,
+                        engine=qualification_engine,
                         runtime=runtime,
                         critical_work_count=priority_scheduler.critical_work_count,
                     ).run(stop_event),

@@ -111,6 +111,25 @@ def _build_progress_sync(
     return asyncio.run(build_qualification_progress(state_path, data_root, epoch_id, policy))
 
 
+def _ready_to_finalize_for_policy(
+    settings: Settings,
+    policy: QualificationPolicy,
+    progress: QualificationProgress,
+) -> bool:
+    if policy not in {
+        laptop_smoke_policy(settings, 5),
+        laptop_smoke_policy(settings, 30),
+    }:
+        return progress.ready_to_finalize
+    nonaccepting_rehearsal_only = {
+        "REPLAY_NOT_COMPLETED",
+        "SIGNAL_STATISTICS_MISSING",
+        "SIMULATED_NET_PNL_NOT_POSITIVE",
+        "STRATEGY_PARAMETERS_MISSING",
+    }
+    return all(blocker in nonaccepting_rehearsal_only for blocker in progress.blockers)
+
+
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -354,7 +373,7 @@ class AutonomousOrchestrator:
                 selected_policy,
             )
             progress = _ProgressSnapshot(
-                observed.ready_to_finalize,
+                _ready_to_finalize_for_policy(self.settings, selected_policy, observed),
                 observed.completion_ratio,
                 observed.blockers,
             )

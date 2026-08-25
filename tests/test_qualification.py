@@ -15,6 +15,7 @@ from interexchange_perp_grid.qualification import (
     QualificationRuntimeEvidence,
     QualifiedStrategyParameters,
     ReplayShadowStatistics,
+    _venue_book_statistics,
     code_hash,
     config_hash,
     qualification_is_current,
@@ -122,6 +123,47 @@ async def _record_route(data: Path, start: datetime, levels: int = 1) -> None:
                 for venue in (Venue.BINANCE_USDM, Venue.OKX)
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_synchronised_periodic_snapshots_do_not_invent_sequence_gaps(
+    tmp_path: Path,
+) -> None:
+    start = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
+    recorder = ParquetMarketRecorder(tmp_path)
+    for index, sequence in enumerate((1, 100, 250)):
+        observed = start + timedelta(seconds=index)
+        await recorder.append_books(
+            (
+                OrderBookSnapshot(
+                    Venue.OKX,
+                    "BTC/USDT:USDT",
+                    (BookLevel(Decimal("100"), Decimal("1")),),
+                    (BookLevel(Decimal("101"), Decimal("1")),),
+                    int(observed.timestamp() * 1000),
+                    observed,
+                    sequence,
+                    sequence,
+                    sequence,
+                    True,
+                    True,
+                    0,
+                ),
+            )
+        )
+
+    statistics = _venue_book_statistics(
+        tmp_path,
+        Venue.OKX,
+        "BTC",
+        _policy(),
+        start,
+        start + timedelta(seconds=2),
+    )
+
+    assert statistics.synchronised_snapshots == 3
+    assert statistics.sequence_gap_count == 0
+    assert statistics.unsynchronised_snapshot_count == 0
 
 
 @pytest.mark.asyncio

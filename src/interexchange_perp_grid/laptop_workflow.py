@@ -93,7 +93,18 @@ async def run_until_qualification_finalized(
         service_settings = settings.model_copy(
             update={
                 "shadow": settings.shadow.model_copy(
-                    update={"scan_interval_seconds": (LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS)}
+                    update={
+                        "scan_interval_seconds": LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS,
+                        "qualification_min_duration_seconds": (
+                            selected_policy.minimum_duration_seconds
+                        ),
+                        "qualification_min_synchronised_snapshots_per_venue": (
+                            selected_policy.minimum_synchronised_snapshots_per_venue
+                        ),
+                        "qualification_min_funding_checkpoints_per_venue": (
+                            selected_policy.minimum_funding_checkpoints_per_venue
+                        ),
+                    }
                 )
             }
         )
@@ -104,7 +115,18 @@ async def run_until_qualification_finalized(
         service_settings = settings.model_copy(
             update={
                 "shadow": settings.shadow.model_copy(
-                    update={"scan_interval_seconds": LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS}
+                    update={
+                        "scan_interval_seconds": LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS,
+                        "qualification_min_duration_seconds": (
+                            selected_policy.minimum_duration_seconds
+                        ),
+                        "qualification_min_synchronised_snapshots_per_venue": (
+                            selected_policy.minimum_synchronised_snapshots_per_venue
+                        ),
+                        "qualification_min_funding_checkpoints_per_venue": (
+                            selected_policy.minimum_funding_checkpoints_per_venue
+                        ),
+                    }
                 )
             }
         )
