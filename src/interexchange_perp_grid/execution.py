@@ -4,11 +4,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import RiskDecision
 from interexchange_perp_grid.strategy import DirectedRouteKey
+
+if TYPE_CHECKING:
+    from interexchange_perp_grid.aggressive_runtime import AggressiveTrancheIntent
 
 
 class Side(StrEnum):
@@ -261,6 +265,31 @@ def _weighted_price(fills: list[Fill], quantity: Decimal) -> Decimal:
 
 
 class PairExecutionCoordinator:
+    @staticmethod
+    def prepare_aggressive_tranche(intent: AggressiveTrancheIntent) -> Tranche:
+        """Translate an accepted strategy intent into the protected state machine.
+
+        This boundary performs no risk reservation and no exchange submission. Live callers
+        must still pass the existing journal, risk, owner, and protected-price gates.
+        """
+        route = DirectedRouteKey(
+            intent.base,
+            Venue(intent.long_venue),
+            Venue(intent.short_venue),
+        )
+        if route.value != intent.route_identity:
+            raise ValueError("aggressive intent directed route identity is inconsistent")
+        if intent.execution_authorized:
+            raise ValueError("strategy intent cannot authorize execution")
+        return Tranche(
+            tranche_id=intent.intent_id,
+            route=route,
+            requested_quantity=intent.quantity,
+            target_close_spread=intent.reverse_target_bps,
+            stop_spread=intent.effective_stop_bps,
+            projected_stress_usdt=intent.projected_route_loss_usdt,
+        )
+
     def precheck_and_reserve(self, tranche: Tranche, risk: RiskDecision) -> None:
         self._require_state(tranche, {PairActionState.CREATED})
         tranche.state = PairActionState.PRECHECKED

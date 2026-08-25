@@ -49,7 +49,7 @@ def _book(venue: Venue, bid: str, ask: str, *, age_ms: int = 0) -> OrderBookSnap
     )
 
 
-def _reserves(value: str = "0.01") -> CostReserves:
+def _reserves(value: str = "0.001") -> CostReserves:
     amount = Decimal(value)
     return CostReserves(amount, amount, amount, amount, amount, amount, amount, amount, amount)
 
@@ -72,14 +72,18 @@ def _proposal(**changes: object) -> HybridEntryInput:
         "level_index": 1,
         "reference_spread_bps": Decimal("2.1"),
         "reference_trigger_bps": Decimal("2"),
-        "reverse_target_bps": Decimal("2"),
+        "grid_step_bps": Decimal("20"),
+        "stressed_cost_move_bps": Decimal("1"),
+        "minimum_profit_move_bps": Decimal("0.5"),
+        "normal_low_bps": Decimal("-2"),
+        "normal_high_bps": Decimal("2"),
         "quantity": Decimal("1"),
         "long_venue": Venue.OKX,
         "short_venue": Venue.BYBIT,
         "long_book": _book(Venue.OKX, "99.9", "100"),
         "short_book": _book(Venue.BYBIT, "101", "101.1"),
-        "long_private_taker_fee_rate": Decimal("0.0004"),
-        "short_private_taker_fee_rate": Decimal("0.0004"),
+        "long_private_taker_fee_rate": Decimal("0.0001"),
+        "short_private_taker_fee_rate": Decimal("0.0001"),
         "long_funding": _funding(Venue.OKX),
         "short_funding": _funding(Venue.BYBIT),
         "reserves": _reserves(),
@@ -218,7 +222,10 @@ def test_funding_is_asymmetric_and_positive_credit_cannot_rescue_gross_gate() ->
     )
     nonconvergent = final(
         _proposal(
-            reverse_target_bps=Decimal("99.5033085316808409"),
+            grid_step_bps=Decimal("0.0000000000000001"),
+            stressed_cost_move_bps=Decimal("0.0000000000000001"),
+            minimum_profit_move_bps=Decimal("0"),
+            normal_high_bps=Decimal("99.5033085316808409"),
             short_funding=_funding(Venue.BYBIT, "1"),
         )
     )

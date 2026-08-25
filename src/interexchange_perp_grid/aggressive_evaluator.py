@@ -10,6 +10,7 @@ from pathlib import Path
 
 import yaml
 
+from interexchange_perp_grid.aggressive_grid import reverse_grid_target_bps
 from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.domain import OrderBookSnapshot, Venue
 from interexchange_perp_grid.routes import executable_vwap
@@ -159,7 +160,11 @@ class HybridEntryInput:
     level_index: int
     reference_spread_bps: Decimal
     reference_trigger_bps: Decimal
-    reverse_target_bps: Decimal
+    grid_step_bps: Decimal
+    stressed_cost_move_bps: Decimal
+    minimum_profit_move_bps: Decimal
+    normal_low_bps: Decimal
+    normal_high_bps: Decimal
     quantity: Decimal
     long_venue: Venue
     short_venue: Venue
@@ -186,6 +191,7 @@ class AggressiveEconomicDecision:
     route_identity: str
     level_index: int
     executable_entry_spread_bps: Decimal | None
+    reverse_target_bps: Decimal | None
     long_entry_vwap: Decimal | None
     short_entry_vwap: Decimal | None
     four_leg_fees_usdt: Decimal
@@ -336,12 +342,16 @@ def evaluate_hybrid_entry(
         context.prec = 50
         executable_spread = (short_fill.price / long_fill.price).ln() * _BPS
     average_price = (long_fill.price + short_fill.price) / Decimal(2)
-    gross = (
-        proposal.quantity
-        * average_price
-        * abs(executable_spread - proposal.reverse_target_bps)
-        / _BPS
+    reverse_target = reverse_grid_target_bps(
+        proposal.direction,
+        actual_entry_spread_bps=executable_spread,
+        grid_step_bps=proposal.grid_step_bps,
+        stressed_cost_move_bps=proposal.stressed_cost_move_bps,
+        minimum_profit_move_bps=proposal.minimum_profit_move_bps,
+        normal_low_bps=proposal.normal_low_bps,
+        normal_high_bps=proposal.normal_high_bps,
     )
+    gross = proposal.quantity * average_price * abs(executable_spread - reverse_target) / _BPS
     if gross <= 0:
         return _rejected(proposal, AggressiveEntryReason.CONVERGENCE_NON_POSITIVE)
     four_leg_fees = (
@@ -381,6 +391,7 @@ def evaluate_hybrid_entry(
         route_identity=proposal.route_identity,
         level_index=proposal.level_index,
         executable_entry_spread_bps=executable_spread,
+        reverse_target_bps=reverse_target,
         long_entry_vwap=long_fill.price,
         short_entry_vwap=short_fill.price,
         four_leg_fees_usdt=four_leg_fees,
@@ -665,6 +676,7 @@ def _rejected(
         route_identity=proposal.route_identity,
         level_index=proposal.level_index,
         executable_entry_spread_bps=None,
+        reverse_target_bps=None,
         long_entry_vwap=None,
         short_entry_vwap=None,
         four_leg_fees_usdt=Decimal(0),
