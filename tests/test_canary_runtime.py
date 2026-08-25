@@ -485,6 +485,29 @@ async def test_owner_gate_denial_performs_no_network_or_adapter_construction(
 
 
 @pytest.mark.asyncio
+async def test_aggressive_canary_requires_intent_and_binding_together_before_state(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(
+        Path("config/defaults.yaml"),
+        {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")},
+    )
+
+    result = await run_canary_once(
+        settings,
+        Path("config/defaults.yaml"),
+        tmp_path / "missing-qualification.json",
+        Path("."),
+        OWNER_CONFIRMATION,
+        aggressive_binding=object(),  # type: ignore[arg-type]
+    )
+
+    assert result.reason == ReasonCode.CANARY_POLICY_VIOLATION
+    assert result.orders_sent == 0
+    assert not (tmp_path / "state.sqlite3").exists()
+
+
+@pytest.mark.asyncio
 async def test_shadow_risk_stage_blocks_canary_before_network_construction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

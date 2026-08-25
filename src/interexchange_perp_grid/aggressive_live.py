@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
+from pathlib import Path
 
+from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
 from interexchange_perp_grid.aggressive_runtime import AggressiveTrancheIntent
 from interexchange_perp_grid.client_ids import venue_client_order_id
@@ -32,6 +37,97 @@ _LIMITS = {
     AggressiveLaptopLiveStage.CANARY: AggressiveLiveStageLimits(1, Decimal(1), Decimal(1)),
     AggressiveLaptopLiveStage.PILOT_A: AggressiveLiveStageLimits(5, Decimal(5), Decimal(5)),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class AggressiveLiveIntentEnvelope:
+    schema_version: int
+    generated_at: datetime
+    aggressive_binding_sha256: str
+    qualification_hash: str
+    intent: AggressiveTrancheIntent
+    intent_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("aggressive live intent envelope version is invalid")
+        if self.generated_at.tzinfo is None or self.generated_at.utcoffset() is None:
+            raise ValueError("aggressive live intent envelope time must be aware")
+        if self.intent.execution_authorized:
+            raise ValueError("aggressive live intent envelope cannot authorize execution")
+        for value in (
+            self.aggressive_binding_sha256,
+            self.qualification_hash,
+            self.intent_sha256,
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError("aggressive live intent envelope identity is invalid")
+        if aggressive_intent_sha256(self.intent) != self.intent_sha256:
+            raise ValueError("aggressive live intent envelope hash mismatch")
+
+
+def save_aggressive_live_intent(
+    path: Path,
+    envelope: AggressiveLiveIntentEnvelope,
+) -> None:
+    envelope.__post_init__()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(asdict(envelope), default=str, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_aggressive_live_intent(path: Path) -> AggressiveLiveIntentEnvelope:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("intent"), dict):
+        raise ValueError("aggressive live intent envelope is invalid")
+    raw = payload["intent"]
+    if not isinstance(raw, dict):
+        raise ValueError("aggressive live intent payload is invalid")
+    intent = AggressiveTrancheIntent(
+        base=str(raw["base"]),
+        route_identity=str(raw["route_identity"]),
+        direction=DivergenceDirection(str(raw["direction"])),
+        level_index=int(str(raw["level_index"])),
+        decision_cycle=int(str(raw["decision_cycle"])),
+        quantity=Decimal(str(raw["quantity"])),
+        long_venue=str(raw["long_venue"]),
+        short_venue=str(raw["short_venue"]),
+        long_symbol=str(raw["long_symbol"]),
+        short_symbol=str(raw["short_symbol"]),
+        reference_trigger_bps=Decimal(str(raw["reference_trigger_bps"])),
+        reference_spread_bps=Decimal(str(raw["reference_spread_bps"])),
+        executable_entry_spread_bps=Decimal(str(raw["executable_entry_spread_bps"])),
+        reverse_target_bps=Decimal(str(raw["reverse_target_bps"])),
+        effective_stop_bps=Decimal(str(raw["effective_stop_bps"])),
+        long_entry_vwap=Decimal(str(raw["long_entry_vwap"])),
+        short_entry_vwap=Decimal(str(raw["short_entry_vwap"])),
+        projected_route_loss_usdt=Decimal(str(raw["projected_route_loss_usdt"])),
+        projected_portfolio_loss_usdt=Decimal(str(raw["projected_portfolio_loss_usdt"])),
+        expected_net_pnl_usdt=Decimal(str(raw["expected_net_pnl_usdt"])),
+        model_sha256=str(raw["model_sha256"]),
+        strategy_profile_sha256=str(raw["strategy_profile_sha256"]),
+        source_manifest_sha256=str(raw["source_manifest_sha256"]),
+        reference_manifest_sha256=str(raw["reference_manifest_sha256"]),
+        runtime_manifest_sha256=str(raw["runtime_manifest_sha256"]),
+        contract_metadata_version_a=str(raw["contract_metadata_version_a"]),
+        contract_metadata_version_b=str(raw["contract_metadata_version_b"]),
+        decided_at=datetime.fromisoformat(str(raw["decided_at"])),
+    )
+    return AggressiveLiveIntentEnvelope(
+        schema_version=int(str(payload["schema_version"])),
+        generated_at=datetime.fromisoformat(str(payload["generated_at"])),
+        aggressive_binding_sha256=str(payload["aggressive_binding_sha256"]),
+        qualification_hash=str(payload["qualification_hash"]),
+        intent=intent,
+        intent_sha256=str(payload["intent_sha256"]),
+    )
 
 
 def aggressive_intent_sha256(intent: AggressiveTrancheIntent) -> str:

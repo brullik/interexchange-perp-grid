@@ -62,6 +62,7 @@ class AggressiveShadowDecisionInput:
     runtime_manifest_sha256: str
     maximum_book_age_ms: int
     now: datetime
+    runtime_mode: AggressiveRuntimeMode = AggressiveRuntimeMode.SHADOW
     stage: AggressiveEntryStage = AggressiveEntryStage.NORMAL
     private_long_taker_fee_rate: Decimal | None = None
     private_short_taker_fee_rate: Decimal | None = None
@@ -197,7 +198,7 @@ class AggressiveShadowDecisionBridge:
             inputs.market.short_instrument,
         )
         request = AggressiveStrategyRequest(
-            mode=AggressiveRuntimeMode.SHADOW,
+            mode=inputs.runtime_mode,
             model=inputs.model,
             proposal=proposal,
             sizing=AggressiveSizingInput(

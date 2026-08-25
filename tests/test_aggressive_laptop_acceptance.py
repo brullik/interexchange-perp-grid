@@ -5,13 +5,16 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import interexchange_perp_grid.aggressive_laptop_acceptance as acceptance_module
 from interexchange_perp_grid.aggressive_laptop_acceptance import (
     AggressiveLaptopStageEvidence,
     build_aggressive_laptop_acceptance,
     build_aggressive_laptop_stage_evidence,
+    build_aggressive_laptop_stage_evidence_from_journal,
     load_aggressive_laptop_acceptance,
     save_aggressive_laptop_acceptance,
     verify_aggressive_laptop_handoff,
@@ -157,3 +160,64 @@ def test_acceptance_fails_closed_on_any_missing_live_evidence(
             pilot,
             now=_NOW,
         )
+
+
+@pytest.mark.asyncio
+async def test_pilot_stage_report_reads_exact_five_aggressive_journal_actions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _binding()
+    actions = tuple(
+        SimpleNamespace(
+            route=SimpleNamespace(value="BTC:bybit>okx"),
+            risk_reservation={
+                "strategy": "AGGRESSIVE_SYMBIOSIS_V1",
+                "stage": "pilot_a",
+                "aggressive_binding_sha256": binding.binding_sha256,
+                "level_index": level,
+                "projected_stress_usdt": Decimal(level),
+            },
+            legs=(object(), object(), object(), object()),
+        )
+        for level in range(1, 6)
+    )
+
+    class FakeJournal:
+        def __init__(self, path: Path) -> None:
+            assert path == tmp_path / "state.sqlite3"
+
+        async def initialise(self) -> None:
+            return None
+
+        async def active_actions(self) -> tuple[object, ...]:
+            return ()
+
+        async def completed_actions_since(
+            self,
+            started: datetime,
+            qualification: str,
+        ) -> tuple[object, ...]:
+            assert started == _NOW
+            assert qualification == binding.qualification_hash
+            return actions
+
+    monkeypatch.setattr(acceptance_module, "LiveOrderJournal", FakeJournal)
+    monkeypatch.setattr(acceptance_module, "is_completed_normal_paired_cycle", lambda _: True)
+    monkeypatch.setattr(
+        acceptance_module,
+        "completed_normal_actions_sha256",
+        lambda _: "4" * 64,
+    )
+    evidence = await build_aggressive_laptop_stage_evidence_from_journal(
+        tmp_path / "state.sqlite3",
+        binding,
+        stage="pilot_a",
+        started_at=_NOW,
+        ended_at=_NOW + timedelta(hours=9),
+        post_flat_service_seconds=28_800,
+    )
+    assert evidence.accepted
+    assert evidence.completed_level_indices == (1, 2, 3, 4, 5)
+    assert evidence.production_filled_order_count == 20
+    assert evidence.stable_flat

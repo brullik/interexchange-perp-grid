@@ -18,8 +18,11 @@ from interexchange_perp_grid.aggressive_evaluator import (
 from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, GridLevelState
 from interexchange_perp_grid.aggressive_live import (
     AggressiveLaptopLiveStage,
+    AggressiveLiveIntentEnvelope,
     aggressive_intent_sha256,
+    load_aggressive_live_intent,
     prepare_aggressive_live_plan,
+    save_aggressive_live_intent,
 )
 from interexchange_perp_grid.aggressive_model import (
     DivergenceDirection,
@@ -355,6 +358,27 @@ def test_live_canary_and_pilot_consume_the_same_immutable_intent_without_submit(
         timeout_seconds=30,
     )
     assert pilot.risk_reservation["stage"] == "pilot_a"
+
+
+def test_live_intent_envelope_is_hash_protected_and_non_authorizing(tmp_path: Path) -> None:
+    decision = _accepted(AggressiveRuntimeMode.LIVE)
+    assert decision.intent is not None
+    envelope = AggressiveLiveIntentEnvelope(
+        1,
+        _NOW,
+        "a" * 64,
+        "b" * 64,
+        decision.intent,
+        aggressive_intent_sha256(decision.intent),
+    )
+    path = tmp_path / "intent.json"
+    save_aggressive_live_intent(path, envelope)
+    assert load_aggressive_live_intent(path) == envelope
+    assert not envelope.intent.execution_authorized
+    payload = path.read_text(encoding="utf-8").replace('"level_index": 1', '"level_index": 2')
+    path.write_text(payload, encoding="utf-8")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        load_aggressive_live_intent(path)
 
 
 def test_shared_core_reserves_exactly_one_persisted_level(tmp_path: Path) -> None:

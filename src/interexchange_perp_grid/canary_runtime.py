@@ -6,7 +6,7 @@ import os
 import subprocess
 import time
 from collections.abc import Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -15,6 +15,12 @@ from uuid import uuid4
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.aggressive_live import (
+    AggressiveLaptopLiveStage,
+    AggressiveLiveIntentEnvelope,
+    prepare_aggressive_live_plan,
+)
+from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
 from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import (
@@ -1061,7 +1067,11 @@ async def run_canary_once(
     qualification_path: Path,
     repo_root: Path,
     owner_confirmation: str,
+    aggressive_intent: AggressiveLiveIntentEnvelope | None = None,
+    aggressive_binding: AggressiveQualificationBinding | None = None,
 ) -> CanaryRunEvidence:
+    if (aggressive_intent is None) != (aggressive_binding is None):
+        return _denied(ReasonCode.CANARY_POLICY_VIOLATION)
     if owner_confirmation != OWNER_CONFIRMATION:
         return _denied(ReasonCode.OWNER_CONFIRMATION_MISSING)
     state_path = Path(settings.storage.sqlite_path)
@@ -1085,6 +1095,31 @@ async def run_canary_once(
     if evidence.route is None or evidence.strategy is None or evidence.replay_shadow is None:
         return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING)
     route = evidence.route
+    if aggressive_intent is not None and aggressive_binding is not None:
+        candidate = aggressive_intent.intent
+        try:
+            aggressive_route = DirectedRouteKey(
+                candidate.base,
+                Venue(candidate.long_venue),
+                Venue(candidate.short_venue),
+            )
+        except ValueError:
+            return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route)
+        intent_age = (datetime.now(UTC) - candidate.decided_at.astimezone(UTC)).total_seconds()
+        if (
+            not aggressive_binding.accepted
+            or aggressive_binding.binding_sha256 != aggressive_intent.aggressive_binding_sha256
+            or aggressive_binding.qualification_hash != evidence.qualification_hash
+            or aggressive_intent.qualification_hash != evidence.qualification_hash
+            or candidate.level_index != 1
+            or intent_age < 0
+            or intent_age > settings.live.canary_timeout_seconds
+            or aggressive_route.base != route.base
+            or {aggressive_route.long_venue, aggressive_route.short_venue}
+            != {route.long_venue, route.short_venue}
+        ):
+            return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route)
+        route = aggressive_route
     locked_stages = load_locked_risk_stage_table(
         config_path.resolve().parent / "RUNTIME_POLICY.yaml"
     )
@@ -1163,7 +1198,12 @@ async def run_canary_once(
             )
         except ValueError:
             return _denied(ReasonCode.CONTRACT_METADATA_UNKNOWN, route)
-        if quantity != evidence.strategy.size_bucket_base_quantity:
+        expected_quantity = (
+            aggressive_intent.intent.quantity
+            if aggressive_intent is not None
+            else evidence.strategy.size_bucket_base_quantity
+        )
+        if quantity != expected_quantity:
             return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route, quantity)
         quote = evaluate_directed_route(
             instruments[route.long_venue],
@@ -1271,6 +1311,11 @@ async def run_canary_once(
         projected_stress = max(
             economic.signal.cost.stressed_total_cost_usdt,
             evidence.replay_shadow.maximum_adverse_excursion_usdt,
+            (
+                aggressive_intent.intent.projected_route_loss_usdt
+                if aggressive_intent is not None
+                else Decimal(0)
+            ),
         )
         notional = quantity * max(
             cast(Decimal, quote.entry_long_vwap),
@@ -1371,7 +1416,15 @@ async def run_canary_once(
             local_unlock_present=bool(os.environ.get("IPEG_LOCAL_UNLOCK_SECRET")),
             telegram_challenge_valid=await live_confirmation_valid(state_path),
             current_qualification_valid=qualification_valid,
-            route_allowlisted=evidence.route == route,
+            route_allowlisted=(
+                evidence.route == route
+                or (
+                    aggressive_binding is not None
+                    and route.base == evidence.route.base
+                    and {route.long_venue, route.short_venue}
+                    == {evidence.route.long_venue, evidence.route.short_venue}
+                )
+            ),
             canary_policy_passed=policy_passed,
             capability_preflight_passed=all_preflights_passed,
             account_preflight_passed=all_preflights_passed,
@@ -1393,56 +1446,89 @@ async def run_canary_once(
             )
         assert economic.long_protected_price is not None
         assert economic.short_protected_price is not None
-        prefix = f"ipeg-canary-{time.time_ns()}-{uuid4().hex[:8]}"
-        long_client_id = venue_client_order_id(prefix, "long")
-        short_client_id = venue_client_order_id(prefix, "short")
-        long_intent = ExecutionIntent(
-            long_client_id,
-            route.long_venue,
-            Side.BUY,
-            OrderPurpose.NORMAL_OPEN,
-            quantity,
-            economic.long_protected_price,
-        )
-        short_intent = ExecutionIntent(
-            short_client_id,
-            route.short_venue,
-            Side.SELL,
-            OrderPurpose.NORMAL_OPEN,
-            quantity,
-            economic.short_protected_price,
-        )
-        plan = CanaryExecutionPlan(
-            pair_action_id=prefix,
-            route=route,
-            tranche_id=f"{prefix}-tranche-1",
-            quantity=quantity,
-            long_request=translate_protected_order(
-                long_intent,
+        if aggressive_intent is not None and aggressive_binding is not None:
+            final_intent_age_ms = (
+                datetime.now(UTC) - aggressive_intent.intent.decided_at.astimezone(UTC)
+            ).total_seconds() * 1000
+            if (
+                final_intent_age_ms < 0
+                or final_intent_age_ms > settings.live.canary_timeout_seconds * 1000
+            ):
+                return _denied(ReasonCode.BOOK_STALE, route, quantity)
+            aggressive_plan = prepare_aggressive_live_plan(
+                aggressive_intent.intent,
+                aggressive_binding,
                 instruments[route.long_venue],
-            ),
-            short_request=translate_protected_order(
-                short_intent,
                 instruments[route.short_venue],
-            ),
-            risk_reservation={
-                "risk": risk.breakdown,
-                "projected_stress_usdt": projected_stress,
-                "qualification_hash": evidence.qualification_hash,
-                "supervisor_intent": "LIVE_CANARY",
-                "supervisor_queued": True,
-                "target_exit_spread_bps": evidence.strategy.target_exit_spread_bps,
-                "initial_funding_rates": {
-                    venue.value: funding[venue].rate for venue in required_venues
+                long_protected_price=economic.long_protected_price,
+                short_protected_price=economic.short_protected_price,
+                stage=AggressiveLaptopLiveStage.CANARY,
+                timeout_seconds=settings.live.canary_timeout_seconds,
+            )
+            plan = replace(
+                aggressive_plan,
+                risk_reservation={
+                    **aggressive_plan.risk_reservation,
+                    "risk": risk.breakdown,
+                    "qualification_hash": evidence.qualification_hash,
+                    "supervisor_intent": "LIVE_CANARY",
+                    "supervisor_queued": True,
+                    "initial_funding_rates": {
+                        venue.value: funding[venue].rate for venue in required_venues
+                    },
                 },
-                "opening_client_order_ids": {
-                    "long": long_client_id,
-                    "short": short_client_id,
+            )
+        else:
+            prefix = f"ipeg-canary-{time.time_ns()}-{uuid4().hex[:8]}"
+            long_client_id = venue_client_order_id(prefix, "long")
+            short_client_id = venue_client_order_id(prefix, "short")
+            long_intent = ExecutionIntent(
+                long_client_id,
+                route.long_venue,
+                Side.BUY,
+                OrderPurpose.NORMAL_OPEN,
+                quantity,
+                economic.long_protected_price,
+            )
+            short_intent = ExecutionIntent(
+                short_client_id,
+                route.short_venue,
+                Side.SELL,
+                OrderPurpose.NORMAL_OPEN,
+                quantity,
+                economic.short_protected_price,
+            )
+            plan = CanaryExecutionPlan(
+                pair_action_id=prefix,
+                route=route,
+                tranche_id=f"{prefix}-tranche-1",
+                quantity=quantity,
+                long_request=translate_protected_order(
+                    long_intent,
+                    instruments[route.long_venue],
+                ),
+                short_request=translate_protected_order(
+                    short_intent,
+                    instruments[route.short_venue],
+                ),
+                risk_reservation={
+                    "risk": risk.breakdown,
+                    "projected_stress_usdt": projected_stress,
+                    "qualification_hash": evidence.qualification_hash,
+                    "supervisor_intent": "LIVE_CANARY",
+                    "supervisor_queued": True,
+                    "target_exit_spread_bps": evidence.strategy.target_exit_spread_bps,
+                    "initial_funding_rates": {
+                        venue.value: funding[venue].rate for venue in required_venues
+                    },
+                    "opening_client_order_ids": {
+                        "long": long_client_id,
+                        "short": short_client_id,
+                    },
                 },
-            },
-            qualification_hash=evidence.qualification_hash,
-            timeout_seconds=settings.live.canary_timeout_seconds,
-        )
+                qualification_hash=evidence.qualification_hash,
+                timeout_seconds=settings.live.canary_timeout_seconds,
+            )
         queued_action = await LiveCanaryCoordinator(
             journal,
             typed_adapters,

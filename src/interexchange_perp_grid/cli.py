@@ -20,6 +20,7 @@ import typer
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
 from interexchange_perp_grid.aggressive_evaluator import (
+    AggressiveEntryStage,
     AggressiveExitReason,
     CostReserves,
     load_aggressive_decision_policy,
@@ -27,10 +28,18 @@ from interexchange_perp_grid.aggressive_evaluator import (
 from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, GridLevelState
 from interexchange_perp_grid.aggressive_laptop_acceptance import (
     build_aggressive_laptop_acceptance,
+    build_aggressive_laptop_stage_evidence_from_journal,
     load_aggressive_laptop_acceptance,
     load_aggressive_laptop_stage_evidence,
     save_aggressive_laptop_acceptance,
+    save_aggressive_laptop_stage_evidence,
     verify_aggressive_laptop_handoff,
+)
+from interexchange_perp_grid.aggressive_live import (
+    AggressiveLiveIntentEnvelope,
+    aggressive_intent_sha256,
+    load_aggressive_live_intent,
+    save_aggressive_live_intent,
 )
 from interexchange_perp_grid.aggressive_model import (
     DivergenceDirection,
@@ -50,7 +59,9 @@ from interexchange_perp_grid.aggressive_qualification import (
 )
 from interexchange_perp_grid.aggressive_runtime import (
     AggressiveDecisionCore,
+    AggressiveRuntimeMode,
     AggressiveStrategyDecision,
+    AggressiveTrancheIntent,
     aggressive_runtime_manifest_sha256,
 )
 from interexchange_perp_grid.aggressive_shadow import (
@@ -315,6 +326,48 @@ def aggressive_laptop_acceptance(
     )
     save_aggressive_laptop_acceptance(output.resolve(), acceptance)
     typer.echo(json.dumps(asdict(acceptance), default=str, sort_keys=True))
+
+
+@app.command("aggressive-laptop-stage-report")
+def aggressive_laptop_stage_report(
+    stage: Annotated[str, typer.Option("--stage")],
+    started_at: Annotated[str, typer.Option("--started-at")],
+    ended_at: Annotated[str, typer.Option("--ended-at")],
+    post_flat_service_seconds: Annotated[
+        int,
+        typer.Option("--post-flat-service-seconds", min=0),
+    ],
+    binding: Annotated[Path, typer.Option("--binding")],
+    output: Annotated[Path, typer.Option("--output")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Build exact stage evidence from the durable journal without submitting an order."""
+    if stage not in {"canary", "pilot_a"}:
+        raise typer.BadParameter("stage must be canary or pilot_a")
+    try:
+        started = datetime.fromisoformat(started_at)
+        ended = datetime.fromisoformat(ended_at)
+    except ValueError as error:
+        raise typer.BadParameter("stage timestamps must be ISO-8601 with UTC offsets") from error
+    if any(value.tzinfo is None or value.utcoffset() is None for value in (started, ended)):
+        raise typer.BadParameter("stage timestamps must be ISO-8601 with UTC offsets")
+    started = started.astimezone(UTC)
+    ended = ended.astimezone(UTC)
+    settings = _load(config)
+    evidence = asyncio.run(
+        build_aggressive_laptop_stage_evidence_from_journal(
+            Path(settings.storage.sqlite_path),
+            load_aggressive_qualification_binding(binding.resolve()),
+            stage=stage,
+            started_at=started,
+            ended_at=ended,
+            post_flat_service_seconds=post_flat_service_seconds,
+        )
+    )
+    save_aggressive_laptop_stage_evidence(output.resolve(), evidence)
+    typer.echo(json.dumps(asdict(evidence), default=str, sort_keys=True))
+    if not evidence.accepted:
+        raise typer.Exit(code=3)
 
 
 @app.command("aggressive-vps-handoff-check")
@@ -624,6 +677,87 @@ def reference_history_proof(
         raise typer.Exit(code=3)
 
 
+@app.command("aggressive-live-intent-once")
+def aggressive_live_intent_once(
+    binding: Annotated[Path, typer.Option("--binding")],
+    qualification: Annotated[Path, typer.Option("--qualification")],
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    output: Annotated[Path, typer.Option("--output")],
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
+    timeout_seconds: Annotated[int, typer.Option("--timeout", min=1, max=120)] = 30,
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create one fresh shared LIVE-mode intent; never authorize or submit it."""
+    settings = _load(config)
+    if settings.app.mode != "shadow" or settings.live.enabled:
+        raise typer.BadParameter("live intent preparation requires shadow mode and live=false")
+    loaded_binding = load_aggressive_qualification_binding(binding.resolve())
+    loaded_qualification = load_qualification(qualification.resolve())
+    loaded_model = load_historical_model(model.resolve())
+    loaded_runtime = load_native_runtime_manifest(runtime_manifest.resolve())
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    verify_aggressive_qualification_binding(
+        loaded_binding,
+        loaded_qualification,
+        loaded_model,
+        loaded_runtime,
+        grid_store,
+        profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
+    )
+    intents: list[AggressiveTrancheIntent] = []
+    result = asyncio.run(
+        _run_aggressive_shadow_once(
+            settings,
+            model.resolve(),
+            history_root.resolve(),
+            grid.resolve(),
+            profile.resolve(),
+            config.resolve(),
+            timeout_seconds,
+            runtime_mode=AggressiveRuntimeMode.LIVE,
+            simulate_fills=False,
+            private_fee_rates=loaded_qualification.private_taker_fee_rates,
+            entry_stage=AggressiveEntryStage.LOCKED_CANARY,
+            intent_sink=intents,
+        )
+    )
+    selected = tuple(
+        intent for intent in intents if intent.route_identity == loaded_binding.qualification_route
+    )
+    if len(selected) != 1 or selected[0].level_index != 1:
+        typer.echo(json.dumps(result, default=str, sort_keys=True))
+        raise typer.Exit(code=3)
+    envelope = AggressiveLiveIntentEnvelope(
+        schema_version=1,
+        generated_at=datetime.now(UTC),
+        aggressive_binding_sha256=loaded_binding.binding_sha256,
+        qualification_hash=loaded_binding.qualification_hash,
+        intent=selected[0],
+        intent_sha256=aggressive_intent_sha256(selected[0]),
+    )
+    save_aggressive_live_intent(output.resolve(), envelope)
+    typer.echo(
+        json.dumps(
+            {
+                "status": "PASS",
+                "intent": asdict(envelope),
+                "execution_authorized": False,
+                "production_submit_calls": 0,
+            },
+            default=str,
+            sort_keys=True,
+        )
+    )
+
+
 @app.command("aggressive-model-proof")
 def aggressive_model_proof(
     venue_a: Annotated[Venue, typer.Option("--venue-a")],
@@ -828,6 +962,12 @@ async def _run_aggressive_shadow_once(
     profile_path: Path,
     config_path: Path,
     timeout_seconds: int,
+    *,
+    runtime_mode: AggressiveRuntimeMode = AggressiveRuntimeMode.SHADOW,
+    simulate_fills: bool = True,
+    private_fee_rates: dict[Venue, Decimal] | None = None,
+    entry_stage: AggressiveEntryStage = AggressiveEntryStage.NORMAL,
+    intent_sink: list[AggressiveTrancheIntent] | None = None,
 ) -> dict[str, object]:
     model = load_historical_model(model_path)
     profile = load_aggressive_decision_policy(profile_path)
@@ -908,23 +1048,24 @@ async def _run_aggressive_shadow_once(
                     if market.route.value == model.positive_route
                     else model.negative.direction
                 )
-                exits.extend(
-                    portfolio.close_due(
-                        model=model,
-                        reference_bar=reference_bar,
-                        market=market,
-                        now=datetime.now(UTC),
-                        projected_portfolio_loss_usdt=sum(
-                            (
-                                level.reserved_stress_usdt
-                                for route in (model.positive_route, model.negative_route)
-                                for level in grid.levels(route)
-                                if level.state == GridLevelState.OPEN
+                if simulate_fills:
+                    exits.extend(
+                        portfolio.close_due(
+                            model=model,
+                            reference_bar=reference_bar,
+                            market=market,
+                            now=datetime.now(UTC),
+                            projected_portfolio_loss_usdt=sum(
+                                (
+                                    level.reserved_stress_usdt
+                                    for route in (model.positive_route, model.negative_route)
+                                    for level in grid.levels(route)
+                                    if level.state == GridLevelState.OPEN
+                                ),
+                                Decimal(0),
                             ),
-                            Decimal(0),
-                        ),
+                        )
                     )
-                )
                 levels = grid.levels(market.route.value)
                 other_route_active = any(
                     level.state
@@ -970,10 +1111,24 @@ async def _run_aggressive_shadow_once(
                         runtime_manifest_sha256=runtime_identity,
                         maximum_book_age_ms=settings.market_data.max_l2_age_ms,
                         now=datetime.now(UTC),
+                        runtime_mode=runtime_mode,
+                        stage=entry_stage,
+                        private_long_taker_fee_rate=(
+                            private_fee_rates.get(market.long_instrument.venue)
+                            if private_fee_rates is not None
+                            else None
+                        ),
+                        private_short_taker_fee_rate=(
+                            private_fee_rates.get(market.short_instrument.venue)
+                            if private_fee_rates is not None
+                            else None
+                        ),
                     )
                 )
                 decisions.append(decision)
-                if decision.accepted:
+                if decision.accepted and decision.intent is not None and intent_sink is not None:
+                    intent_sink.append(decision.intent)
+                if decision.accepted and simulate_fills:
                     portfolio.open(decision)
             if confirmation + 1 < profile.policy.confirmation_snapshots:
                 await asyncio.sleep(
@@ -981,19 +1136,20 @@ async def _run_aggressive_shadow_once(
                     / 1000
                     / (profile.policy.confirmation_snapshots - 1)
                 )
-        for route, direction in (
-            (model.positive_route, model.positive.direction),
-            (model.negative_route, model.negative.direction),
-        ):
-            rearmed[route] = portfolio.rearm_stable_flat(
-                route,
-                reference_spread_bps=(
-                    reference_bar.high_bps
-                    if direction == DivergenceDirection.POSITIVE
-                    else reference_bar.low_bps
-                ),
-                now=datetime.now(UTC),
-            )
+        if simulate_fills:
+            for route, direction in (
+                (model.positive_route, model.positive.direction),
+                (model.negative_route, model.negative.direction),
+            ):
+                rearmed[route] = portfolio.rearm_stable_flat(
+                    route,
+                    reference_spread_bps=(
+                        reference_bar.high_bps
+                        if direction == DivergenceDirection.POSITIVE
+                        else reference_bar.low_bps
+                    ),
+                    now=datetime.now(UTC),
+                )
     finally:
         await engine.close()
     return {
@@ -2182,10 +2338,45 @@ def canary_run(
         "state/qualification.json"
     ),
     repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    aggressive_intent: Annotated[Path | None, typer.Option("--aggressive-intent")] = None,
+    aggressive_binding: Annotated[Path | None, typer.Option("--aggressive-binding")] = None,
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")] = Path(
+        "state/laptop/native-runtime-manifest.json"
+    ),
+    aggressive_model: Annotated[Path, typer.Option("--aggressive-model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    aggressive_grid: Annotated[Path, typer.Option("--aggressive-grid")] = Path(
+        "state/aggressive-grid.sqlite3"
+    ),
+    aggressive_profile: Annotated[Path, typer.Option("--aggressive-profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
     """Run at most one minimum-notional canary pair after every independent gate."""
     settings = _load(config)
+    if (aggressive_intent is None) != (aggressive_binding is None):
+        raise typer.BadParameter("aggressive intent and binding must be supplied together")
+    loaded_intent = None
+    loaded_binding = None
+    if aggressive_intent is not None and aggressive_binding is not None:
+        loaded_intent = load_aggressive_live_intent(aggressive_intent.resolve())
+        loaded_binding = load_aggressive_qualification_binding(aggressive_binding.resolve())
+        grid_store = AggressiveGridStore(aggressive_grid.resolve())
+        grid_store.initialise()
+        verify_aggressive_qualification_binding(
+            loaded_binding,
+            load_qualification(qualification.resolve()),
+            load_historical_model(aggressive_model.resolve()),
+            verify_native_runtime_manifest(
+                runtime_manifest.resolve(),
+                repo_root.resolve(),
+                config.resolve(),
+            ),
+            grid_store,
+            profile_sha256=hashlib.sha256(aggressive_profile.read_bytes()).hexdigest(),
+        )
     result = asyncio.run(
         run_canary_once(
             settings,
@@ -2193,6 +2384,8 @@ def canary_run(
             qualification.resolve(),
             repo_root.resolve(),
             confirmation,
+            aggressive_intent=loaded_intent,
+            aggressive_binding=loaded_binding,
         )
     )
     typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))

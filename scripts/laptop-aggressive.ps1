@@ -116,9 +116,7 @@ switch ($Mode) {
         if ($LASTEXITCODE -ne 0) { throw "aggressive qualification binding failed closed" }
     }
     "canary" {
-        throw "Canary requires a separate, explicit live-money authorization; no order was sent"
-    }
-    "pilot" {
+        Write-Host "Canary requires a separate, explicit live-money authorization at execution time."
         & $python -m interexchange_perp_grid.cli aggressive-qualification-check `
             --binding "state/aggressive-qualification.json" `
             --qualification "state/qualification.json" `
@@ -126,7 +124,11 @@ switch ($Mode) {
             --model $model --grid $grid --profile $profile
         if ($LASTEXITCODE -ne 0) { throw "aggressive qualification is missing or stale" }
         & "$PSScriptRoot/laptop-pilot.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope
+            -ProfileScope $ProfileScope -Aggressive
+        if ($LASTEXITCODE -ne 0) { throw "aggressive canary failed closed" }
+    }
+    "pilot" {
+        throw "Aggressive pilot_a is not yet software-ready; live remains disabled and no order was sent"
     }
     "status" {
         $payload = [ordered]@{

@@ -182,6 +182,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "--service-receipt $serviceReceipt" in pilot
     assert "laptop-pilot-report" in pilot
     assert "SetThreadExecutionState" in pilot
+    assert "aggressive-live-intent-once" in pilot
+    assert "--aggressive-intent $aggressiveIntentPath" in pilot
+    assert "aggressive-laptop-stage-report" in pilot
     assert '[ValidateSet("CurrentUser", "LocalMachine")]' in pilot
     assert "laptop-load-s4u-env.ps1" in pilot
     assert "LIVE_CANARY_CONSENT" not in loader
@@ -197,6 +200,8 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "Start-Sleep -Seconds 60" in aggressive
     assert 'IPEG_LIVE_ENABLED -cne "false"' in aggressive
     assert "separate, explicit live-money authorization" in aggressive
+    assert "laptop-pilot.ps1" in aggressive and "-Aggressive" in aggressive
+    assert "Aggressive pilot_a is not yet software-ready" in aggressive
     assert "Docker" not in aggressive
 
 

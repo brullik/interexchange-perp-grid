@@ -10,6 +10,11 @@ from decimal import Decimal
 from pathlib import Path
 
 from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
+from interexchange_perp_grid.live_journal import (
+    LiveOrderJournal,
+    completed_normal_actions_sha256,
+    is_completed_normal_paired_cycle,
+)
 from interexchange_perp_grid.native_runtime import NativeRuntimeManifest
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -222,6 +227,74 @@ def build_aggressive_laptop_stage_evidence(
         evidence_sha256="0" * 64,
     )
     return replace(unsigned, evidence_sha256=_artifact_sha256(unsigned, "evidence_sha256"))
+
+
+async def build_aggressive_laptop_stage_evidence_from_journal(
+    state_path: Path,
+    binding: AggressiveQualificationBinding,
+    *,
+    stage: str,
+    started_at: datetime,
+    ended_at: datetime,
+    post_flat_service_seconds: int,
+) -> AggressiveLaptopStageEvidence:
+    journal = LiveOrderJournal(state_path)
+    await journal.initialise()
+    active = await journal.active_actions()
+    completed = await journal.completed_actions_since(started_at, binding.qualification_hash)
+    matching = tuple(
+        action
+        for action in completed
+        if action.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1"
+        and action.risk_reservation.get("stage") == stage
+        and action.risk_reservation.get("aggressive_binding_sha256") == binding.binding_sha256
+    )
+    blockers: list[str] = []
+    if active:
+        blockers.append("ACTIVE_LIVE_ACTION_REMAINS")
+    if len(matching) != len(completed):
+        blockers.append("NON_AGGRESSIVE_OR_WRONG_BINDING_ACTION_PRESENT")
+    if any(not is_completed_normal_paired_cycle(action) for action in matching):
+        blockers.append("INCOMPLETE_PAIRED_ACTION_PRESENT")
+    levels: list[int] = []
+    losses: list[Decimal] = []
+    routes = {action.route.value for action in matching}
+    for action in matching:
+        try:
+            level = int(str(action.risk_reservation["level_index"]))
+            loss = Decimal(str(action.risk_reservation["projected_stress_usdt"]))
+        except (KeyError, ValueError):
+            blockers.append("AGGRESSIVE_ACTION_IDENTITY_INVALID")
+            continue
+        if not 1 <= level <= 5 or not loss.is_finite() or loss < 0:
+            blockers.append("AGGRESSIVE_ACTION_RISK_INVALID")
+            continue
+        levels.append(level)
+        losses.append(loss)
+    expected = (1,) if stage == "canary" else (1, 2, 3, 4, 5)
+    if tuple(sorted(levels)) != expected or len(routes) != 1:
+        blockers.append("AGGRESSIVE_STAGE_LEVEL_OR_ROUTE_SET_INVALID")
+    maximum = max(losses, default=Decimal(0))
+    limit = Decimal(1) if stage == "canary" else Decimal(5)
+    if maximum > limit:
+        blockers.append("AGGRESSIVE_STAGE_RISK_LIMIT_EXCEEDED")
+    if stage == "pilot_a" and post_flat_service_seconds < 28_800:
+        blockers.append("EIGHT_HOUR_POST_FLAT_SERVICE_REQUIRED")
+    return build_aggressive_laptop_stage_evidence(
+        stage=stage,
+        started_at=started_at,
+        ended_at=ended_at,
+        route_identity=next(iter(routes), ""),
+        aggressive_binding_sha256=binding.binding_sha256,
+        completed_level_indices=tuple(sorted(levels)),
+        completed_actions_sha256=completed_normal_actions_sha256(matching),
+        production_filled_order_count=sum(len(action.legs) for action in matching),
+        active_action_count=len(active),
+        maximum_projected_route_loss_usdt=maximum,
+        stable_flat=not active,
+        post_flat_service_seconds=post_flat_service_seconds,
+        blockers=tuple(dict.fromkeys(blockers)),
+    )
 
 
 def save_aggressive_laptop_stage_evidence(
