@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import multiprocessing
+import os
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -95,6 +97,37 @@ def _ownership(index: int) -> GridTrancheOwnership:
         unrealised_pnl_usdt=Decimal("0"),
         opened_at=opened,
     )
+
+
+def _commit_grid_stage_and_exit(
+    path: str,
+    route: str,
+    stage: str,
+    ownership: GridTrancheOwnership,
+) -> None:
+    store = AggressiveGridStore(Path(path))
+    if stage == "ENTRY_PENDING":
+        store.reserve_entry(
+            route,
+            reference_spread_bps=Decimal("10"),
+            decision_cycle=0,
+            reserved_stress_usdt=ownership.reserved_stress_usdt,
+            now=_NOW + timedelta(seconds=1),
+        )
+    elif stage == "OPEN":
+        store.mark_open(route, 1, ownership, decision_cycle=0, now=_NOW + timedelta(seconds=2))
+    elif stage == "EXIT_PENDING":
+        store.reserve_exit(
+            route,
+            1,
+            tranche_id=ownership.tranche_id,
+            now=_NOW + timedelta(seconds=3),
+        )
+    elif stage == "CLOSED_WAIT_REARM":
+        store.mark_closed(route, 1, ownership, now=_NOW + timedelta(seconds=4))
+    else:
+        raise ValueError("unknown grid process-kill stage")
+    os._exit(0)
 
 
 def test_decision_cycle_continues_durably_after_restart(tmp_path: Path) -> None:
@@ -292,6 +325,30 @@ def test_restart_preserves_pending_open_exit_and_closed_states_without_duplicate
     restarted.mark_closed(route, 1, ownership, now=_NOW + timedelta(minutes=4))
     with pytest.raises(RuntimeError, match="requires EXIT_PENDING"):
         restarted.mark_closed(route, 1, ownership, now=_NOW + timedelta(minutes=5))
+
+
+def test_process_exit_preserves_every_active_grid_transition(tmp_path: Path) -> None:
+    store, route = _store(tmp_path)
+    ownership = _ownership(1)
+    context = multiprocessing.get_context("spawn")
+    for stage, expected in (
+        ("ENTRY_PENDING", GridLevelState.ENTRY_PENDING),
+        ("OPEN", GridLevelState.OPEN),
+        ("EXIT_PENDING", GridLevelState.EXIT_PENDING),
+        ("CLOSED_WAIT_REARM", GridLevelState.CLOSED_WAIT_REARM),
+    ):
+        process = context.Process(
+            target=_commit_grid_stage_and_exit,
+            args=(str(store.path), route, stage, ownership),
+        )
+        process.start()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail(f"grid {stage} process did not terminate")
+        assert process.exitcode == 0
+        assert AggressiveGridStore(store.path).levels(route)[0].state == expected
 
 
 def test_failed_entry_rearms_without_enlarging_earlier_level(tmp_path: Path) -> None:

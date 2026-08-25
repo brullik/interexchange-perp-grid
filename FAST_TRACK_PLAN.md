@@ -87,7 +87,7 @@
 - [x] Real-time shadow работает на живых public Wave 1 data, строит/обновляет on-demand history и ведёт пять simulated tranches.
 - [x] Live coordinator получает уже принятую immutable tranche intent и не повторяет стратегическую логику отдельно.
 - [x] Сохранить protected IOC, journal-before-submit, actual-fill reconciliation, third-venue hedge, emergency flatten и stable-FLAT.
-- [ ] Проверить restart/process-kill в каждом активном level/action state.
+- [x] Проверить restart/process-kill в каждом активном level/action state.
 - [x] Добавить числовой decision breakdown и reason codes для reference, regime, economics, funding, risk, level, re-arm и exit.
 - [x] Обновить qualification evidence, включив все пять levels/weights/stops, historical/reference hashes и profile hash.
 
