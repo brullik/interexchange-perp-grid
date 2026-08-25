@@ -110,11 +110,11 @@
 
 ## A7 — software acceptance, review и merge
 
-- [ ] Запустить все focused tests и полный `make verify`/Windows-equivalent.
-- [ ] Подтвердить обязательные checks: `verify`, `security`, `c4-critical-proof`, `c4-3-proof`, `docker-smoke` либо их актуальные protected-main successors.
-- [ ] Сформировать exact-head replay/fault/restart/laptop-shadow artifacts без production submit.
+- [x] Запустить все focused tests и полный `make verify`/Windows-equivalent.
+- [x] Подтвердить обязательные checks: `verify`, `security`, `c4-critical-proof`, `c4-3-proof`, `docker-smoke` либо их актуальные protected-main successors.
+- [x] Сформировать exact-head replay/fault/restart/laptop-shadow artifacts без production submit.
 - [ ] Получить независимый review, исправить P0/P1/P2 и разрешить все material threads.
-- [ ] Обновить верхний блок `STATUS.md`, не удаляя историю.
+- [x] Обновить верхний блок `STATUS.md`, не удаляя историю.
 - [ ] Mark Ready и squash-merge единственный PR автоматически, только если head SHA неизменен и branch protection полностью зелёная.
 
 **Выход:** aggressive software и Windows public-shadow готовы на `main`; это не live-money authorization.
