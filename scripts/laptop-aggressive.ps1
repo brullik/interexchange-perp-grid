@@ -43,6 +43,10 @@ function Load-LaptopEnvironment {
 
 function Invoke-Verify {
     Require-Python
+    & $python -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 3)"
+    if ($LASTEXITCODE -ne 0) { throw "exact CPython 3.12 is required" }
+    & $python -m pip check
+    if ($LASTEXITCODE -ne 0) { throw "installed dependency check failed" }
     & $python scripts/check_lock.py --lock requirements.lock --pyproject pyproject.toml
     if ($LASTEXITCODE -ne 0) { throw "dependency lock check failed" }
     & $python -m ruff format --check src tests
@@ -103,11 +107,24 @@ switch ($Mode) {
     "qualify" {
         & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
             -ProfileScope $ProfileScope -OwnerException12h:$OwnerException12h
+        if ($LASTEXITCODE -ne 0) { throw "base laptop qualification failed closed" }
+        & $python -m interexchange_perp_grid.cli aggressive-qualification-bind `
+            --qualification "state/qualification.json" `
+            --runtime-manifest "state/laptop/native-runtime-manifest.json" `
+            --model $model --grid $grid --profile $profile `
+            --output "state/aggressive-qualification.json"
+        if ($LASTEXITCODE -ne 0) { throw "aggressive qualification binding failed closed" }
     }
     "canary" {
         throw "Canary requires a separate, explicit live-money authorization; no order was sent"
     }
     "pilot" {
+        & $python -m interexchange_perp_grid.cli aggressive-qualification-check `
+            --binding "state/aggressive-qualification.json" `
+            --qualification "state/qualification.json" `
+            --runtime-manifest "state/laptop/native-runtime-manifest.json" `
+            --model $model --grid $grid --profile $profile
+        if ($LASTEXITCODE -ne 0) { throw "aggressive qualification is missing or stale" }
         & "$PSScriptRoot/laptop-pilot.ps1" -ProfilePath $ProfilePath `
             -ProfileScope $ProfileScope
     }

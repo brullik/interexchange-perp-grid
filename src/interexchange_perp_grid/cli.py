@@ -35,6 +35,12 @@ from interexchange_perp_grid.aggressive_model import (
     load_historical_model_policy,
     save_historical_model,
 )
+from interexchange_perp_grid.aggressive_qualification import (
+    build_aggressive_qualification_binding,
+    load_aggressive_qualification_binding,
+    save_aggressive_qualification_binding,
+    verify_aggressive_qualification_binding,
+)
 from interexchange_perp_grid.aggressive_runtime import (
     AggressiveDecisionCore,
     AggressiveStrategyDecision,
@@ -69,6 +75,7 @@ from interexchange_perp_grid.maintenance import (
 )
 from interexchange_perp_grid.native_runtime import (
     build_native_runtime_manifest,
+    load_native_runtime_manifest,
     resolve_runtime_artifact_digest,
     write_native_runtime_manifest,
 )
@@ -630,6 +637,78 @@ def aggressive_model_proof(
     )
     if historical_model_sha256(model) != model_hash:
         raise typer.Exit(code=3)
+
+
+@app.command("aggressive-qualification-bind")
+def aggressive_qualification_bind(
+    qualification: Annotated[Path, typer.Option("--qualification")],
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
+    output: Annotated[Path, typer.Option("--output")] = Path("state/aggressive-qualification.json"),
+) -> None:
+    """Bind accepted qualification to exact aggressive geometry; never authorize execution."""
+    for required in (qualification, runtime_manifest, model, grid, profile):
+        if not required.is_file():
+            raise typer.BadParameter(f"required aggressive binding input is missing: {required}")
+    loaded_model = load_historical_model(model.resolve())
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    binding = build_aggressive_qualification_binding(
+        load_qualification(qualification.resolve()),
+        loaded_model,
+        load_native_runtime_manifest(runtime_manifest.resolve()),
+        grid_store,
+        profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
+    )
+    save_aggressive_qualification_binding(output.resolve(), binding)
+    typer.echo(json.dumps(asdict(binding), default=str, sort_keys=True))
+
+
+@app.command("aggressive-qualification-check")
+def aggressive_qualification_check(
+    binding: Annotated[Path, typer.Option("--binding")],
+    qualification: Annotated[Path, typer.Option("--qualification")],
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
+) -> None:
+    """Fail closed unless every accepted aggressive qualification identity still matches."""
+    for required in (binding, qualification, runtime_manifest, model, grid, profile):
+        if not required.is_file():
+            raise typer.BadParameter(f"required aggressive binding input is missing: {required}")
+    loaded = load_aggressive_qualification_binding(binding.resolve())
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    verify_aggressive_qualification_binding(
+        loaded,
+        load_qualification(qualification.resolve()),
+        load_historical_model(model.resolve()),
+        load_native_runtime_manifest(runtime_manifest.resolve()),
+        grid_store,
+        profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "status": "PASS",
+                "accepted": loaded.accepted,
+                "binding_sha256": loaded.binding_sha256,
+                "execution_authorized": False,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def _aggressive_reserves_per_base(settings: Settings, price: Decimal) -> CostReserves:

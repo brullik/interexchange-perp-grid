@@ -89,7 +89,7 @@
 - [x] Сохранить protected IOC, journal-before-submit, actual-fill reconciliation, third-venue hedge, emergency flatten и stable-FLAT.
 - [ ] Проверить restart/process-kill в каждом активном level/action state.
 - [x] Добавить числовой decision breakdown и reason codes для reference, regime, economics, funding, risk, level, re-arm и exit.
-- [ ] Обновить qualification evidence, включив все пять levels/weights/stops, historical/reference hashes и profile hash.
+- [x] Обновить qualification evidence, включив все пять levels/weights/stops, historical/reference hashes и profile hash.
 
 **Выход:** один и тот же event stream создаёт одинаковые decisions в replay и shadow; live принимает те же immutable intents, но не может быть включён тестами/конфигом.
 
@@ -97,9 +97,9 @@
 
 - [x] Создать один wrapper `scripts/laptop-aggressive.ps1`, переиспользующий существующие onboarding, native manifest, qualification, pilot и S4U scripts.
 - [x] Поддержать режимы `verify`, `shadow`, `qualify`, `canary`, `pilot`, `status`, `stop` без второго orchestration framework.
-- [ ] `verify` устанавливает/проверяет exact Python 3.12 environment и запускает полный Windows-equivalent verify без production credentials.
+- [x] `verify` устанавливает/проверяет exact Python 3.12 environment и запускает полный Windows-equivalent verify без production credentials.
 - [x] `shadow` запускает live-public aggressive shadow на ноутбуке и не допускает private submit.
-- [ ] `qualify` связывает exact code/config/profile/reference-data/runtime hashes; существующее 12h owner exception можно использовать только в его уже разрешённых границах, не сокращая дальше.
+- [x] `qualify` связывает exact code/config/profile/reference-data/runtime hashes; существующее 12h owner exception можно использовать только в его уже разрешённых границах, не сокращая дальше.
 - [ ] `canary` переиспользует local DPAPI/S4U secrets, отдельное owner consent, Telegram challenge и один minimum-notional/one-tranche route с hard risk <=1 USDT.
 - [ ] `pilot` после successful canary поддерживает один route, все пять tranches и route risk <=5 USDT; каждое stage promotion требует отдельного owner confirmation.
 - [ ] Любой failure возвращает shadow/live=false, сохраняет evidence и запускает существующий recovery/stable-FLAT путь.
