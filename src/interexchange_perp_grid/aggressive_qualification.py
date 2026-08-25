@@ -15,6 +15,7 @@ from interexchange_perp_grid.aggressive_model import (
     HistoricalReferenceModel,
     historical_model_sha256,
 )
+from interexchange_perp_grid.aggressive_runtime import aggressive_runtime_manifest_sha256
 from interexchange_perp_grid.native_runtime import NativeRuntimeManifest
 from interexchange_perp_grid.qualification import QualificationEvidence
 
@@ -49,6 +50,7 @@ class AggressiveQualificationBinding:
     source_sha256: str
     config_sha256: str
     runtime_artifact_digest: str
+    decision_runtime_sha256: str
     model_sha256: str
     source_manifest_sha256: str
     reference_manifest_sha256: str
@@ -71,6 +73,7 @@ class AggressiveQualificationBinding:
             self.source_sha256,
             self.config_sha256,
             self.model_sha256,
+            self.decision_runtime_sha256,
             self.source_manifest_sha256,
             self.reference_manifest_sha256,
             self.profile_sha256,
@@ -127,6 +130,10 @@ def build_aggressive_qualification_binding(
         source_sha256=runtime.source_sha256,
         config_sha256=runtime.config_sha256,
         runtime_artifact_digest=runtime.artifact_digest,
+        decision_runtime_sha256=aggressive_runtime_manifest_sha256(
+            model,
+            runtime.config_sha256,
+        ),
         model_sha256=model_sha,
         source_manifest_sha256=model.source_manifest_sha256,
         reference_manifest_sha256=model.reference_manifest_sha256,
@@ -171,6 +178,7 @@ def load_aggressive_qualification_binding(path: Path) -> AggressiveQualification
         source_sha256=str(payload["source_sha256"]),
         config_sha256=str(payload["config_sha256"]),
         runtime_artifact_digest=str(payload["runtime_artifact_digest"]),
+        decision_runtime_sha256=str(payload["decision_runtime_sha256"]),
         model_sha256=str(payload["model_sha256"]),
         source_manifest_sha256=str(payload["source_manifest_sha256"]),
         reference_manifest_sha256=str(payload["reference_manifest_sha256"]),

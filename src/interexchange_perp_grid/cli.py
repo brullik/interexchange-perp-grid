@@ -44,6 +44,7 @@ from interexchange_perp_grid.aggressive_qualification import (
 from interexchange_perp_grid.aggressive_runtime import (
     AggressiveDecisionCore,
     AggressiveStrategyDecision,
+    aggressive_runtime_manifest_sha256,
 )
 from interexchange_perp_grid.aggressive_shadow import (
     AggressiveShadowDecisionBridge,
@@ -792,16 +793,7 @@ async def _run_aggressive_shadow_once(
     core = AggressiveDecisionCore(profile.policy)
     bridge = AggressiveShadowDecisionBridge(core, grid)
     portfolio = AggressiveShadowPortfolio(grid, profile.policy)
-    runtime_identity = hashlib.sha256(
-        "|".join(
-            (
-                model.code_sha,
-                historical_model_sha256(model),
-                profile.profile_sha256,
-                config_hash(config_path),
-            )
-        ).encode("utf-8")
-    ).hexdigest()
+    runtime_identity = aggressive_runtime_manifest_sha256(model, config_hash(config_path))
     engine = PublicMarketEngine(
         settings,
         public_venues=tuple(Venue(value) for value in settings.venues.public_runtime),

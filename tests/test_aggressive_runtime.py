@@ -16,6 +16,11 @@ from interexchange_perp_grid.aggressive_evaluator import (
     load_aggressive_decision_policy,
 )
 from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, GridLevelState
+from interexchange_perp_grid.aggressive_live import (
+    AggressiveLaptopLiveStage,
+    aggressive_intent_sha256,
+    prepare_aggressive_live_plan,
+)
 from interexchange_perp_grid.aggressive_model import (
     DivergenceDirection,
     HistoricalModelPolicy,
@@ -23,6 +28,10 @@ from interexchange_perp_grid.aggressive_model import (
     ModelEligibility,
     build_historical_reference_model,
     historical_model_sha256,
+)
+from interexchange_perp_grid.aggressive_qualification import (
+    AggressiveDirectionBinding,
+    AggressiveQualificationBinding,
 )
 from interexchange_perp_grid.aggressive_runtime import (
     ActualFillRiskInput,
@@ -257,6 +266,95 @@ def test_replay_shadow_and_live_create_the_same_immutable_intent() -> None:
     assert tranche.route.value == live.intent.route_identity
     assert tranche.entry_long_fills == []
     assert tranche.entry_short_fills == []
+
+
+def _live_binding(intent_model_sha256: str) -> AggressiveQualificationBinding:
+    geometry = AggressiveDirectionBinding(
+        "BTC:okx>bybit",
+        tuple(Decimal(index) for index in range(1, 6)),
+        (Decimal("0.10"), Decimal("0.15"), Decimal("0.20"), Decimal("0.25"), Decimal("0.30")),
+        Decimal(6),
+    )
+    return AggressiveQualificationBinding(
+        schema_version=1,
+        generated_at=_NOW,
+        qualification_hash="1" * 64,
+        qualification_data_sha256="2" * 64,
+        release_sha="3" * 40,
+        source_sha256="4" * 64,
+        config_sha256="5" * 64,
+        runtime_artifact_digest="sha256:" + "6" * 64,
+        decision_runtime_sha256="7" * 64,
+        model_sha256=intent_model_sha256,
+        source_manifest_sha256="8" * 64,
+        reference_manifest_sha256="9" * 64,
+        profile_sha256="a" * 64,
+        qualification_route="BTC:bybit>okx",
+        positive=geometry,
+        negative=replace(geometry, route_identity="BTC:bybit>okx"),
+        accepted=True,
+        binding_sha256="b" * 64,
+    )
+
+
+def test_live_canary_and_pilot_consume_the_same_immutable_intent_without_submit() -> None:
+    decision = _accepted(AggressiveRuntimeMode.LIVE)
+    assert decision.intent is not None
+    intent = replace(
+        decision.intent,
+        strategy_profile_sha256="a" * 64,
+        source_manifest_sha256="8" * 64,
+        reference_manifest_sha256="9" * 64,
+        runtime_manifest_sha256="7" * 64,
+        projected_route_loss_usdt=Decimal("0.5"),
+        projected_portfolio_loss_usdt=Decimal("0.5"),
+    )
+    binding = _live_binding(intent.model_sha256)
+    canary = prepare_aggressive_live_plan(
+        intent,
+        binding,
+        _instrument(Venue.OKX),
+        _instrument(Venue.BYBIT),
+        long_protected_price=Decimal("100.1"),
+        short_protected_price=Decimal("102.9"),
+        stage=AggressiveLaptopLiveStage.CANARY,
+        timeout_seconds=30,
+    )
+    assert canary.route.value == intent.route_identity
+    assert canary.quantity == intent.quantity
+    assert canary.risk_reservation["aggressive_intent_sha256"] == aggressive_intent_sha256(intent)
+    assert canary.risk_reservation["execution_authorized"] is False
+    assert canary.long_request.time_in_force == "IOC"
+    assert canary.short_request.time_in_force == "IOC"
+
+    deeper = replace(
+        intent,
+        level_index=5,
+        projected_route_loss_usdt=Decimal("4.5"),
+        projected_portfolio_loss_usdt=Decimal("4.5"),
+    )
+    with pytest.raises(ValueError, match="level exceeds"):
+        prepare_aggressive_live_plan(
+            deeper,
+            binding,
+            _instrument(Venue.OKX),
+            _instrument(Venue.BYBIT),
+            long_protected_price=Decimal("100.1"),
+            short_protected_price=Decimal("102.9"),
+            stage=AggressiveLaptopLiveStage.CANARY,
+            timeout_seconds=30,
+        )
+    pilot = prepare_aggressive_live_plan(
+        deeper,
+        binding,
+        _instrument(Venue.OKX),
+        _instrument(Venue.BYBIT),
+        long_protected_price=Decimal("100.1"),
+        short_protected_price=Decimal("102.9"),
+        stage=AggressiveLaptopLiveStage.PILOT_A,
+        timeout_seconds=30,
+    )
+    assert pilot.risk_reservation["stage"] == "pilot_a"
 
 
 def test_shared_core_reserves_exactly_one_persisted_level(tmp_path: Path) -> None:

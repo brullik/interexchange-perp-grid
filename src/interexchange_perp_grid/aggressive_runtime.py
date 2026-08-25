@@ -35,6 +35,24 @@ class AggressiveRuntimeMode(StrEnum):
     LIVE = "LIVE"
 
 
+def aggressive_runtime_manifest_sha256(
+    model: HistoricalReferenceModel,
+    config_sha256: str,
+) -> str:
+    """Bind the shared decision runtime to exact code/model/profile/config identity."""
+    if len(config_sha256) != 64:
+        raise ValueError("aggressive runtime config digest must be SHA-256")
+    material = "|".join(
+        (
+            model.code_sha,
+            historical_model_sha256(model),
+            model.strategy_profile_sha256,
+            config_sha256,
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
 class ReplayMinuteOutcome(StrEnum):
     NONE = "NONE"
     TARGET = "TARGET"
