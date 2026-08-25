@@ -267,6 +267,17 @@ class AggressiveGridStore:
             raise RuntimeError("grid route must contain exactly five levels")
         return levels
 
+    def next_decision_cycle(self, route_identity: str) -> int:
+        """Return the next durable cycle value for a single-writer decision loop."""
+        with self._connect() as database:
+            row = database.execute(
+                "SELECT last_decision_cycle FROM aggressive_grid_routes WHERE route_identity = ?",
+                (route_identity,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("grid route is not initialised")
+        return int(row[0]) + 1
+
     def first_unfilled_crossed_level(
         self,
         route_identity: str,

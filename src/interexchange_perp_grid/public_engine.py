@@ -5,7 +5,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -111,6 +111,22 @@ class ScanResult:
     candidate_l2: CandidateL2Result | None = None
     route_calibration: tuple[RouteCalibrationAssessment, ...] = ()
     venue_capability_matrix: VenueCapabilityMatrix | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AggressiveRouteMarketSnapshot:
+    route: DirectedRouteKey
+    long_instrument: Instrument
+    short_instrument: Instrument
+    long_book: OrderBookSnapshot | None
+    short_book: OrderBookSnapshot | None
+    long_quality: DataQualityAssessment
+    short_quality: DataQualityAssessment
+    long_funding: FundingSnapshot | None
+    short_funding: FundingSnapshot | None
+    observed_monotonic_ns: int
+    unavailable_venues: frozenset[Venue]
+    execution_authorized: bool = field(default=False, init=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1341,6 +1357,85 @@ class PublicMarketEngine:
                 )
                 self._route_calibration_previous_routes = current_routes
                 return observations
+        finally:
+            self._finish_public_scan(task)
+
+    async def aggressive_route_market_snapshots(
+        self,
+        timeout_seconds: int,
+    ) -> tuple[AggressiveRouteMarketSnapshot, ...]:
+        """Expose immutable raw Candidate-L2 inputs to the shared aggressive core."""
+        task = self._begin_public_scan()
+        try:
+            async with self._candidate_l2_scan_lock:
+                self._require_open()
+                if not self._initialised:
+                    await self.initialise(timeout_seconds)
+                plan = self._candidate_l2_plan
+                generation = {
+                    venue: self._venue_refresh_generations.get(venue, 0)
+                    for venue in {book.instrument.venue for book in plan.books}
+                }
+                funding = await self._refresh_route_calibration_funding(
+                    plan,
+                    timeout_seconds,
+                )
+                self._require_open()
+                if plan.signature != self._candidate_l2_plan.signature or any(
+                    self._venue_refresh_generations.get(venue, 0) != observed
+                    for venue, observed in generation.items()
+                ):
+                    return ()
+                unavailable = frozenset(self._quarantined)
+                snapshots: list[AggressiveRouteMarketSnapshot] = []
+                for planned in plan.routes:
+                    long_key = (
+                        planned.long_instrument.venue,
+                        planned.long_instrument.symbol,
+                    )
+                    short_key = (
+                        planned.short_instrument.venue,
+                        planned.short_instrument.symbol,
+                    )
+                    long_state = self._candidate_l2_states.get(long_key)
+                    short_state = self._candidate_l2_states.get(short_key)
+                    long_quality = (
+                        self._current_candidate_l2_quality(long_state)
+                        if long_state is not None
+                        else DataQualityAssessment(False, ReasonCode.BOOK_EMPTY, 0)
+                    )
+                    short_quality = (
+                        self._current_candidate_l2_quality(short_state)
+                        if short_state is not None
+                        else DataQualityAssessment(False, ReasonCode.BOOK_EMPTY, 0)
+                    )
+                    long_book = long_state.book if long_state is not None else None
+                    short_book = short_state.book if short_state is not None else None
+                    receipts = tuple(
+                        book.received_monotonic_ns
+                        for book in (long_book, short_book)
+                        if book is not None
+                    )
+                    snapshots.append(
+                        AggressiveRouteMarketSnapshot(
+                            route=DirectedRouteKey(
+                                planned.long_instrument.base,
+                                planned.long_instrument.venue,
+                                planned.short_instrument.venue,
+                            ),
+                            long_instrument=planned.long_instrument,
+                            short_instrument=planned.short_instrument,
+                            long_book=long_book,
+                            short_book=short_book,
+                            long_quality=long_quality,
+                            short_quality=short_quality,
+                            long_funding=funding.get(long_key),
+                            short_funding=funding.get(short_key),
+                            observed_monotonic_ns=max(receipts, default=self._monotonic_ns()),
+                            unavailable_venues=unavailable,
+                        )
+                    )
+                return tuple(snapshots)
         finally:
             self._finish_public_scan(task)
 

@@ -74,31 +74,31 @@
 - [x] Сохранять actual private taker fees; unknown fee/funding/depth блокирует вход.
 - [x] Рассчитывать полный размер с весами частей так, чтобы modelled route loss <=4.50 USDT, hard projected <=5.00 USDT.
 - [x] Для портфеля использовать normal admission <=45 USDT и hard projected <=50 USDT.
-- [ ] После lot/step rounding и каждого фактического fill пересчитывать риск; уменьшать/пропускать часть при нехватке residual budget.
-- [ ] Подключить executable stop и hard projected-loss exit в replay, shadow и live supervisor с одинаковым приоритетом.
+- [x] После lot/step rounding и каждого фактического fill пересчитывать риск; уменьшать/пропускать часть при нехватке residual budget.
+- [x] Подключить executable stop и hard projected-loss exit в replay, shadow и live supervisor с одинаковым приоритетом.
 - [x] Реализовать deterministic route score и tie-breakers из profile.
 
 **Выход:** property/fault tests доказывают лимиты после каждого accepted action, реальную остановку по stop и отсутствие входа только по красивому, но неисполняемому reference spread.
 
 ## A5 — единый evaluator в replay, shadow и live
 
-- [ ] Удалить/обойти упрощённые параллельные decision paths: один decision core, одна model identity и одни reason codes во всех режимах.
-- [ ] Replay исполняет worst-case ordering, если внутри минуты невозможно доказать последовательность target/stop/level.
-- [ ] Real-time shadow работает на живых public Wave 1 data, строит/обновляет on-demand history и ведёт пять simulated tranches.
-- [ ] Live coordinator получает уже принятую immutable tranche intent и не повторяет стратегическую логику отдельно.
-- [ ] Сохранить protected IOC, journal-before-submit, actual-fill reconciliation, third-venue hedge, emergency flatten и stable-FLAT.
+- [x] Удалить/обойти упрощённые параллельные decision paths: один decision core, одна model identity и одни reason codes во всех режимах.
+- [x] Replay исполняет worst-case ordering, если внутри минуты невозможно доказать последовательность target/stop/level.
+- [x] Real-time shadow работает на живых public Wave 1 data, строит/обновляет on-demand history и ведёт пять simulated tranches.
+- [x] Live coordinator получает уже принятую immutable tranche intent и не повторяет стратегическую логику отдельно.
+- [x] Сохранить protected IOC, journal-before-submit, actual-fill reconciliation, third-venue hedge, emergency flatten и stable-FLAT.
 - [ ] Проверить restart/process-kill в каждом активном level/action state.
-- [ ] Добавить числовой decision breakdown и reason codes для reference, regime, economics, funding, risk, level, re-arm и exit.
+- [x] Добавить числовой decision breakdown и reason codes для reference, regime, economics, funding, risk, level, re-arm и exit.
 - [ ] Обновить qualification evidence, включив все пять levels/weights/stops, historical/reference hashes и profile hash.
 
 **Выход:** один и тот же event stream создаёт одинаковые decisions в replay и shadow; live принимает те же immutable intents, но не может быть включён тестами/конфигом.
 
 ## A6 — Windows-native laptop workflow
 
-- [ ] Создать один wrapper `scripts/laptop-aggressive.ps1`, переиспользующий существующие onboarding, native manifest, qualification, pilot и S4U scripts.
-- [ ] Поддержать режимы `verify`, `shadow`, `qualify`, `canary`, `pilot`, `status`, `stop` без второго orchestration framework.
+- [x] Создать один wrapper `scripts/laptop-aggressive.ps1`, переиспользующий существующие onboarding, native manifest, qualification, pilot и S4U scripts.
+- [x] Поддержать режимы `verify`, `shadow`, `qualify`, `canary`, `pilot`, `status`, `stop` без второго orchestration framework.
 - [ ] `verify` устанавливает/проверяет exact Python 3.12 environment и запускает полный Windows-equivalent verify без production credentials.
-- [ ] `shadow` запускает live-public aggressive shadow на ноутбуке и не допускает private submit.
+- [x] `shadow` запускает live-public aggressive shadow на ноутбуке и не допускает private submit.
 - [ ] `qualify` связывает exact code/config/profile/reference-data/runtime hashes; существующее 12h owner exception можно использовать только в его уже разрешённых границах, не сокращая дальше.
 - [ ] `canary` переиспользует local DPAPI/S4U secrets, отдельное owner consent, Telegram challenge и один minimum-notional/one-tranche route с hard risk <=1 USDT.
 - [ ] `pilot` после successful canary поддерживает один route, все пять tranches и route risk <=5 USDT; каждое stage promotion требует отдельного owner confirmation.

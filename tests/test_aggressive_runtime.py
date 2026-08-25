@@ -9,6 +9,7 @@ import pytest
 
 from interexchange_perp_grid.aggressive_evaluator import (
     AggressiveEntryReason,
+    AggressiveExitReason,
     CostReserves,
     HybridEntryInput,
     VenueFundingProjection,
@@ -35,15 +36,26 @@ from interexchange_perp_grid.aggressive_runtime import (
     validate_live_intent,
     worst_case_replay_minute,
 )
+from interexchange_perp_grid.aggressive_shadow import (
+    AggressiveShadowDecisionBridge,
+    AggressiveShadowDecisionInput,
+    AggressiveShadowPortfolio,
+)
 from interexchange_perp_grid.domain import (
     BookLevel,
+    FundingSnapshot,
+    Instrument,
     InstrumentKey,
     OrderBookSnapshot,
     ProductType,
     Venue,
 )
 from interexchange_perp_grid.execution import PairActionState, PairExecutionCoordinator
+from interexchange_perp_grid.market_data import DataQualityAssessment
+from interexchange_perp_grid.public_engine import AggressiveRouteMarketSnapshot
+from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.reference_history import ReferenceSpreadBar
+from interexchange_perp_grid.strategy import DirectedRouteKey
 
 _NOW = datetime(2026, 1, 1, tzinfo=UTC)
 _KEY = InstrumentKey("BTC", "USDT", "USDT", ProductType.LINEAR_USDT_PERPETUAL)
@@ -107,6 +119,61 @@ def _funding(venue: Venue) -> VenueFundingProjection:
     return VenueFundingProjection(venue, Decimal(0), Decimal(100), 1, 1, 28_800)
 
 
+def _instrument(venue: Venue) -> Instrument:
+    return Instrument(
+        venue=venue,
+        symbol="BTC/USDT:USDT",
+        exchange_symbol="BTCUSDT",
+        base="BTC",
+        quote="USDT",
+        settle="USDT",
+        contract_size_base=Decimal(1),
+        amount_step_contracts=Decimal("0.01"),
+        price_tick=Decimal("0.1"),
+        minimum_amount_contracts=Decimal("0.01"),
+        minimum_notional=Decimal("0.01"),
+        taker_fee_rate=Decimal(0),
+        fee_source="fixture",
+    )
+
+
+def _market(offset_ns: int = 0) -> AggressiveRouteMarketSnapshot:
+    next_funding = int((_NOW + timedelta(hours=8)).timestamp() * 1000)
+    long = _instrument(Venue.OKX)
+    short = _instrument(Venue.BYBIT)
+    return AggressiveRouteMarketSnapshot(
+        route=DirectedRouteKey("BTC", Venue.OKX, Venue.BYBIT),
+        long_instrument=long,
+        short_instrument=short,
+        long_book=_book(Venue.OKX, "99.9", "100"),
+        short_book=_book(Venue.BYBIT, "103.1", "103.2"),
+        long_quality=DataQualityAssessment(True, ReasonCode.QUOTE_READY, 0),
+        short_quality=DataQualityAssessment(True, ReasonCode.QUOTE_READY, 0),
+        long_funding=FundingSnapshot(
+            Venue.OKX,
+            long.symbol,
+            Decimal(0),
+            next_funding,
+            "8h",
+            Decimal(100),
+            Decimal(100),
+            int(_NOW.timestamp() * 1000),
+        ),
+        short_funding=FundingSnapshot(
+            Venue.BYBIT,
+            short.symbol,
+            Decimal(0),
+            next_funding,
+            "8h",
+            Decimal(100),
+            Decimal(100),
+            int(_NOW.timestamp() * 1000),
+        ),
+        observed_monotonic_ns=1_000_000_000 + offset_ns,
+        unavailable_venues=frozenset(),
+    )
+
+
 def _request(mode: AggressiveRuntimeMode, offset_ns: int) -> AggressiveStrategyRequest:
     model = _model()
     proposal = HybridEntryInput(
@@ -147,6 +214,7 @@ def _request(mode: AggressiveRuntimeMode, offset_ns: int) -> AggressiveStrategyR
             existing_portfolio_loss_usdt=Decimal(0),
             free_margin_usdt=Decimal(100),
         ),
+        reserves_per_base=CostReserves(*(Decimal(0) for _ in range(9))),
         effective_stop_bps=model.positive.reference_stop_bps,
         decision_cycle=1,
         runtime_manifest_sha256="runtime",
@@ -226,6 +294,105 @@ def test_model_or_runtime_identity_mismatch_fails_closed() -> None:
     request = _request(AggressiveRuntimeMode.SHADOW, 0)
     result = core.evaluate(
         replace(request, proposal=replace(request.proposal, grid_step_bps=Decimal(999)))
+    )
+    assert not result.accepted
+    assert result.reason == AggressiveEntryReason.HISTORICAL_MODEL_INELIGIBLE
+
+
+def test_public_engine_raw_market_bridge_drives_the_same_core(tmp_path: Path) -> None:
+    model = _model()
+    grid = AggressiveGridStore(tmp_path / "grid.sqlite3")
+    grid.initialise()
+    grid.initialise_route(
+        model,
+        DivergenceDirection.POSITIVE,
+        now=_NOW,
+        rearm_retreat_step_fraction=Decimal("0.25"),
+    )
+    policy = load_aggressive_decision_policy(Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")).policy
+    bridge = AggressiveShadowDecisionBridge(AggressiveDecisionCore(policy), grid)
+    decision = None
+    for offset in (0, 250_000_000, 500_000_000):
+        decision = bridge.evaluate(
+            AggressiveShadowDecisionInput(
+                model=model,
+                reference_bar=_bar(19),
+                market=_market(offset),
+                effective_stop_bps=model.positive.reference_stop_bps,
+                reserves=CostReserves(*(Decimal(0) for _ in range(9))),
+                existing_route_loss_usdt=Decimal(0),
+                existing_portfolio_loss_usdt=Decimal(0),
+                free_margin_usdt=Decimal(100),
+                decision_cycle=7,
+                runtime_manifest_sha256="runtime",
+                maximum_book_age_ms=1000,
+                now=_NOW,
+            )
+        )
+    assert decision is not None and decision.accepted
+    assert decision.intent is not None
+    assert decision.intent.route_identity == model.positive_route
+    portfolio = AggressiveShadowPortfolio(grid, policy)
+    portfolio.open(decision)
+    assert grid.levels(model.positive_route)[0].state == GridLevelState.OPEN
+
+    closing_market = replace(
+        _market(600_000_000),
+        long_book=_book(Venue.OKX, "100", "100.1"),
+        short_book=_book(Venue.BYBIT, "100.4", "100.5"),
+    )
+    stop_bar = replace(_bar(20), high_bps=Decimal(1200))
+    closed = portfolio.close_due(
+        model=model,
+        reference_bar=stop_bar,
+        market=closing_market,
+        now=_NOW + timedelta(minutes=1),
+        projected_portfolio_loss_usdt=Decimal(0),
+    )
+    assert closed == ((1, AggressiveExitReason.HARD_PROJECTED_LOSS_OR_REFERENCE_STOP),)
+    assert grid.levels(model.positive_route)[0].state == GridLevelState.CLOSED_WAIT_REARM
+    assert portfolio.rearm_stable_flat(
+        model.positive_route,
+        reference_spread_bps=Decimal(100),
+        now=_NOW + timedelta(minutes=2),
+    ) == (1,)
+    assert grid.levels(model.positive_route)[0].state == GridLevelState.ARMED
+
+
+def test_public_market_bridge_rejects_wrong_reference_contract_identity(
+    tmp_path: Path,
+) -> None:
+    model = _model()
+    grid = AggressiveGridStore(tmp_path / "grid.sqlite3")
+    grid.initialise()
+    grid.initialise_route(
+        model,
+        DivergenceDirection.POSITIVE,
+        now=_NOW,
+        rearm_retreat_step_fraction=Decimal("0.25"),
+    )
+    bridge = AggressiveShadowDecisionBridge(
+        AggressiveDecisionCore(
+            load_aggressive_decision_policy(Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")).policy
+        ),
+        grid,
+    )
+    wrong = replace(_bar(19), contract_metadata_version_b="wrong")
+    result = bridge.evaluate(
+        AggressiveShadowDecisionInput(
+            model=model,
+            reference_bar=wrong,
+            market=_market(),
+            effective_stop_bps=model.positive.reference_stop_bps,
+            reserves=CostReserves(*(Decimal(0) for _ in range(9))),
+            existing_route_loss_usdt=Decimal(0),
+            existing_portfolio_loss_usdt=Decimal(0),
+            free_margin_usdt=Decimal(100),
+            decision_cycle=8,
+            runtime_manifest_sha256="runtime",
+            maximum_book_age_ms=1000,
+            now=_NOW,
+        )
     )
     assert not result.accepted
     assert result.reason == AggressiveEntryReason.HISTORICAL_MODEL_INELIGIBLE

@@ -19,12 +19,30 @@ import typer
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.aggressive_evaluator import (
+    AggressiveExitReason,
+    CostReserves,
+    load_aggressive_decision_policy,
+)
+from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, GridLevelState
 from interexchange_perp_grid.aggressive_model import (
+    DivergenceDirection,
+    HistoricalReferenceModel,
     build_historical_reference_model,
     historical_model_payload,
     historical_model_sha256,
+    load_historical_model,
     load_historical_model_policy,
     save_historical_model,
+)
+from interexchange_perp_grid.aggressive_runtime import (
+    AggressiveDecisionCore,
+    AggressiveStrategyDecision,
+)
+from interexchange_perp_grid.aggressive_shadow import (
+    AggressiveShadowDecisionBridge,
+    AggressiveShadowDecisionInput,
+    AggressiveShadowPortfolio,
 )
 from interexchange_perp_grid.autonomous_orchestrator import load_autonomous_runtime_status
 from interexchange_perp_grid.c4_3_proof import run_c4_3_proof
@@ -612,6 +630,282 @@ def aggressive_model_proof(
     )
     if historical_model_sha256(model) != model_hash:
         raise typer.Exit(code=3)
+
+
+def _aggressive_reserves_per_base(settings: Settings, price: Decimal) -> CostReserves:
+    unit = price / Decimal(10_000)
+    return CostReserves(
+        entry_impact_usdt=Decimal(0),
+        exit_impact_usdt=Decimal(0),
+        entry_slippage_usdt=unit * settings.live.canary_entry_slippage_cap_bps,
+        exit_slippage_usdt=unit * settings.live.canary_close_slippage_cap_bps,
+        latency_usdt=unit * settings.execution.latency_reserve_bps,
+        partial_fill_unmatched_usdt=unit * settings.execution.partial_fill_reserve_bps,
+        emergency_hedge_usdt=unit * settings.execution.emergency_hedge_reserve_bps,
+        reconciliation_forced_exit_usdt=(
+            unit * settings.execution.reconciliation_forced_exit_reserve_bps
+        ),
+        liquidation_distance_usdt=Decimal(0),
+    )
+
+
+def _aggressive_effective_stop(
+    model: HistoricalReferenceModel,
+    direction: DivergenceDirection,
+) -> Decimal:
+    direction_model = (
+        model.positive if direction == DivergenceDirection.POSITIVE else model.negative
+    )
+    tail = model.window_30d.q999_abs_bps
+    if tail is None:
+        return direction_model.reference_stop_bps
+    adaptive = (
+        model.s0_bps + tail if direction == DivergenceDirection.POSITIVE else model.s0_bps - tail
+    )
+    return (
+        max(direction_model.reference_stop_bps, adaptive)
+        if direction == DivergenceDirection.POSITIVE
+        else min(direction_model.reference_stop_bps, adaptive)
+    )
+
+
+async def _run_aggressive_shadow_once(
+    settings: Settings,
+    model_path: Path,
+    history_root: Path,
+    grid_path: Path,
+    profile_path: Path,
+    config_path: Path,
+    timeout_seconds: int,
+) -> dict[str, object]:
+    model = load_historical_model(model_path)
+    profile = load_aggressive_decision_policy(profile_path)
+    if profile.profile_sha256 != model.strategy_profile_sha256:
+        raise RuntimeError("aggressive model/profile identity mismatch")
+    now = datetime.now(UTC)
+    store = ParquetReferenceHistoryStore(history_root)
+    bars = store.query_reference_bars(
+        venue_a=Venue(model.venue_a),
+        venue_b=Venue(model.venue_b),
+        instrument=InstrumentKey(
+            model.base,
+            "USDT",
+            "USDT",
+            ProductType.LINEAR_USDT_PERPETUAL,
+        ),
+        start=now - timedelta(days=2),
+        end=now + timedelta(minutes=1),
+    )
+    if not bars:
+        raise RuntimeError("aggressive shadow requires current reference history")
+    reference_bar = max(bars, key=lambda item: item.interval_start)
+    if reference_bar.interval_start + timedelta(minutes=2) < now:
+        raise RuntimeError("aggressive reference minute is stale")
+    grid = AggressiveGridStore(grid_path)
+    grid.initialise()
+    for direction in (model.positive.direction, model.negative.direction):
+        grid.initialise_route(
+            model,
+            direction,
+            now=now,
+            rearm_retreat_step_fraction=Decimal("0.25"),
+        )
+    core = AggressiveDecisionCore(profile.policy)
+    bridge = AggressiveShadowDecisionBridge(core, grid)
+    portfolio = AggressiveShadowPortfolio(grid, profile.policy)
+    runtime_identity = hashlib.sha256(
+        "|".join(
+            (
+                model.code_sha,
+                historical_model_sha256(model),
+                profile.profile_sha256,
+                config_hash(config_path),
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    engine = PublicMarketEngine(
+        settings,
+        public_venues=tuple(Venue(value) for value in settings.venues.public_runtime),
+    )
+    decisions: list[AggressiveStrategyDecision] = []
+    exits: list[tuple[int, AggressiveExitReason]] = []
+    rearmed: dict[str, tuple[int, ...]] = {}
+    try:
+        broad = await engine.scan_once(
+            model.base,
+            settings.shadow.quantity,
+            timeout_seconds,
+        )
+        active = frozenset(
+            {
+                (
+                    model.base,
+                    model.positive_route.split(":", 1)[1].split(">", 1)[0],
+                    model.positive_route.rsplit(">", 1)[1],
+                ),
+                (
+                    model.base,
+                    model.negative_route.split(":", 1)[1].split(">", 1)[0],
+                    model.negative_route.rsplit(">", 1)[1],
+                ),
+            }
+        )
+        await engine.scan_candidate_l2(
+            timeout_seconds,
+            active_route_keys=active,
+            candidates_admitted=False,
+            prefilter=broad.prefilter,
+        )
+        for confirmation in range(profile.policy.confirmation_snapshots):
+            markets = await engine.aggressive_route_market_snapshots(timeout_seconds)
+            for market in markets:
+                if market.route.value not in {model.positive_route, model.negative_route}:
+                    continue
+                direction = (
+                    model.positive.direction
+                    if market.route.value == model.positive_route
+                    else model.negative.direction
+                )
+                exits.extend(
+                    portfolio.close_due(
+                        model=model,
+                        reference_bar=reference_bar,
+                        market=market,
+                        now=datetime.now(UTC),
+                        projected_portfolio_loss_usdt=sum(
+                            (
+                                level.reserved_stress_usdt
+                                for route in (model.positive_route, model.negative_route)
+                                for level in grid.levels(route)
+                                if level.state == GridLevelState.OPEN
+                            ),
+                            Decimal(0),
+                        ),
+                    )
+                )
+                levels = grid.levels(market.route.value)
+                other_route_active = any(
+                    level.state
+                    in {
+                        GridLevelState.ENTRY_PENDING,
+                        GridLevelState.OPEN,
+                        GridLevelState.EXIT_PENDING,
+                    }
+                    for route in (model.positive_route, model.negative_route)
+                    if route != market.route.value
+                    for level in grid.levels(route)
+                )
+                if other_route_active:
+                    continue
+                existing_route = sum(
+                    (level.reserved_stress_usdt for level in levels),
+                    Decimal(0),
+                )
+                existing_portfolio = sum(
+                    (
+                        level.reserved_stress_usdt
+                        for route in (model.positive_route, model.negative_route)
+                        for level in grid.levels(route)
+                    ),
+                    Decimal(0),
+                )
+                if market.long_book is None or market.short_book is None:
+                    continue
+                price = (
+                    market.long_book.asks[0].price + market.short_book.bids[0].price
+                ) / Decimal(2)
+                decision = bridge.evaluate(
+                    AggressiveShadowDecisionInput(
+                        model=model,
+                        reference_bar=reference_bar,
+                        market=market,
+                        effective_stop_bps=_aggressive_effective_stop(model, direction),
+                        reserves=_aggressive_reserves_per_base(settings, price),
+                        existing_route_loss_usdt=existing_route,
+                        existing_portfolio_loss_usdt=existing_portfolio,
+                        free_margin_usdt=settings.risk.reference_capital_usdt / Decimal(2),
+                        decision_cycle=grid.next_decision_cycle(market.route.value),
+                        runtime_manifest_sha256=runtime_identity,
+                        maximum_book_age_ms=settings.market_data.max_l2_age_ms,
+                        now=datetime.now(UTC),
+                    )
+                )
+                decisions.append(decision)
+                if decision.accepted:
+                    portfolio.open(decision)
+            if confirmation + 1 < profile.policy.confirmation_snapshots:
+                await asyncio.sleep(
+                    profile.policy.confirmation_minimum_elapsed_ms
+                    / 1000
+                    / (profile.policy.confirmation_snapshots - 1)
+                )
+        for route, direction in (
+            (model.positive_route, model.positive.direction),
+            (model.negative_route, model.negative.direction),
+        ):
+            rearmed[route] = portfolio.rearm_stable_flat(
+                route,
+                reference_spread_bps=(
+                    reference_bar.high_bps
+                    if direction == DivergenceDirection.POSITIVE
+                    else reference_bar.low_bps
+                ),
+                now=datetime.now(UTC),
+            )
+    finally:
+        await engine.close()
+    return {
+        "status": "PASS",
+        "model_sha256": historical_model_sha256(model),
+        "profile_sha256": profile.profile_sha256,
+        "runtime_manifest_sha256": runtime_identity,
+        "reference_manifest_sha256": model.reference_manifest_sha256,
+        "reference_minute": reference_bar.interval_start,
+        "decisions": [asdict(item) for item in decisions],
+        "accepted_decisions": sum(item.accepted for item in decisions),
+        "exits": exits,
+        "rearmed": rearmed,
+        "grid": {
+            route: [asdict(level) for level in grid.levels(route)]
+            for route in (model.positive_route, model.negative_route)
+        },
+        "live_enabled": False,
+        "production_submit_calls": 0,
+    }
+
+
+@app.command("aggressive-shadow-once")
+def aggressive_shadow_once(
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
+    ),
+    timeout_seconds: Annotated[int, typer.Option("--timeout", min=1, max=120)] = 30,
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Run one native public aggressive cycle; never authorize or submit an order."""
+    settings = _load(config)
+    if settings.app.mode != "shadow" or settings.live.enabled:
+        raise typer.BadParameter("aggressive public shadow requires mode=shadow and live=false")
+    for required in (model, profile):
+        if not required.is_file():
+            raise typer.BadParameter(f"required aggressive artifact is missing: {required}")
+    result = asyncio.run(
+        _run_aggressive_shadow_once(
+            settings,
+            model.resolve(),
+            history_root.resolve(),
+            grid.resolve(),
+            profile.resolve(),
+            config.resolve(),
+            timeout_seconds,
+        )
+    )
+    typer.echo(json.dumps(result, default=str, sort_keys=True))
 
 
 @app.command("native-runtime-manifest")

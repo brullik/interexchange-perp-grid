@@ -573,6 +573,37 @@ async def test_candidate_l2_feeds_three_route_size_calibration_buckets_from_cach
 
 
 @pytest.mark.asyncio
+async def test_candidate_l2_exposes_raw_immutable_aggressive_route_inputs(
+    tmp_path: Path,
+) -> None:
+    clock = [1_000_000_000]
+    adapters = {venue: FundingCandidateAdapter(venue, clock) for venue in Venue}
+    engine = PublicMarketEngine(
+        settings(tmp_path, maximum_candidates=1),
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+        monotonic_ns=lambda: clock[0],
+    )
+    await engine.scan_candidate_l2(2)
+
+    snapshots = await engine.aggressive_route_market_snapshots(2)
+
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert snapshot.route.value == (
+        f"{snapshot.long_instrument.base}:"
+        f"{snapshot.long_instrument.venue.value}>{snapshot.short_instrument.venue.value}"
+    )
+    assert snapshot.long_book is not None and snapshot.short_book is not None
+    assert snapshot.long_quality.accepted and snapshot.short_quality.accepted
+    assert snapshot.long_funding is not None and snapshot.short_funding is not None
+    assert snapshot.unavailable_venues == frozenset()
+    assert not snapshot.execution_authorized
+
+    await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_route_calibration_never_mixes_funding_across_adapter_generation(
     tmp_path: Path,
 ) -> None:

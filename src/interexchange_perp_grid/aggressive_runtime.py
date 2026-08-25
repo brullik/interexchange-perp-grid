@@ -10,6 +10,7 @@ from interexchange_perp_grid.aggressive_evaluator import (
     AggressiveDecisionPolicy,
     AggressiveEconomicDecision,
     AggressiveEntryReason,
+    CostReserves,
     CrossingConfirmationTracker,
     GridSizingResult,
     HybridEntryInput,
@@ -57,10 +58,12 @@ class AggressiveStrategyRequest:
     model: HistoricalReferenceModel
     proposal: HybridEntryInput
     sizing: AggressiveSizingInput
+    reserves_per_base: CostReserves
     effective_stop_bps: Decimal
     decision_cycle: int
     runtime_manifest_sha256: str
     state_reconciled: bool = True
+    reference_identity_valid: bool = True
 
     def __post_init__(self) -> None:
         if self.decision_cycle < 0:
@@ -251,10 +254,12 @@ class AggressiveDecisionCore:
             direction_model.eligibility != ModelEligibility.DISABLED
             and (request.mode != AggressiveRuntimeMode.LIVE or live_eligible)
             and geometry_matches
+            and request.reference_identity_valid
         )
         proposal = replace(
             request.proposal,
             quantity=quantity,
+            reserves=_scale_reserves(request.reserves_per_base, quantity),
             state_reconciled=request.state_reconciled,
             historical_model_eligible=model_eligible,
             regime_ready=not direction_model.regime_drift_blocked,
@@ -423,4 +428,19 @@ def _direction_model(request: AggressiveStrategyRequest) -> DirectionHistoricalM
         request.model.positive
         if request.proposal.direction == DivergenceDirection.POSITIVE
         else request.model.negative
+    )
+
+
+def _scale_reserves(reserves: CostReserves, quantity: Decimal) -> CostReserves:
+    return replace(
+        reserves,
+        entry_impact_usdt=reserves.entry_impact_usdt * quantity,
+        exit_impact_usdt=reserves.exit_impact_usdt * quantity,
+        entry_slippage_usdt=reserves.entry_slippage_usdt * quantity,
+        exit_slippage_usdt=reserves.exit_slippage_usdt * quantity,
+        latency_usdt=reserves.latency_usdt * quantity,
+        partial_fill_unmatched_usdt=reserves.partial_fill_unmatched_usdt * quantity,
+        emergency_hedge_usdt=reserves.emergency_hedge_usdt * quantity,
+        reconciliation_forced_exit_usdt=(reserves.reconciliation_forced_exit_usdt * quantity),
+        liquidation_distance_usdt=reserves.liquidation_distance_usdt * quantity,
     )

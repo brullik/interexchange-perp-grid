@@ -97,6 +97,33 @@ def _ownership(index: int) -> GridTrancheOwnership:
     )
 
 
+def test_decision_cycle_continues_durably_after_restart(tmp_path: Path) -> None:
+    path = tmp_path / "grid.sqlite3"
+    model = _model()
+    route = model.positive_route
+    store = AggressiveGridStore(path)
+    store.initialise()
+    store.initialise_route(
+        model,
+        DivergenceDirection.POSITIVE,
+        now=_NOW,
+        rearm_retreat_step_fraction=Decimal("0.25"),
+    )
+    assert store.next_decision_cycle(route) == 0
+
+    store.reserve_entry(
+        route,
+        reference_spread_bps=model.positive.levels_bps[0],
+        decision_cycle=0,
+        reserved_stress_usdt=Decimal("1"),
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    restarted = AggressiveGridStore(path)
+    restarted.initialise()
+    assert restarted.next_decision_cycle(route) == 1
+
+
 def _store(tmp_path: Path) -> tuple[AggressiveGridStore, str]:
     store = AggressiveGridStore(tmp_path / "grid.sqlite3")
     store.initialise()

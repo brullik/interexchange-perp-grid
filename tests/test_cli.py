@@ -277,6 +277,45 @@ def test_aggressive_model_proof_replays_local_reference_history_without_submit(
     assert artifact.is_file()
 
 
+def test_aggressive_shadow_cli_uses_public_non_submit_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "model.json"
+    model.write_text("{}", encoding="utf-8")
+
+    async def run_once(*args: object, **kwargs: object) -> dict[str, object]:
+        assert args
+        assert kwargs == {}
+        return {
+            "status": "PASS",
+            "live_enabled": False,
+            "production_submit_calls": 0,
+        }
+
+    monkeypatch.setattr(cli_module, "_run_aggressive_shadow_once", run_once)
+    result = runner.invoke(
+        app,
+        [
+            "aggressive-shadow-once",
+            "--model",
+            str(model),
+            "--history-root",
+            str(tmp_path / "history"),
+            "--grid",
+            str(tmp_path / "grid.sqlite3"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload == {
+        "live_enabled": False,
+        "production_submit_calls": 0,
+        "status": "PASS",
+    }
+
+
 def test_private_probe_reports_only_sanitized_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

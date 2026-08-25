@@ -195,6 +195,7 @@ class AggressiveEconomicDecision:
     long_entry_vwap: Decimal | None
     short_entry_vwap: Decimal | None
     four_leg_fees_usdt: Decimal
+    measured_book_impact_usdt: Decimal
     stressed_total_cost_usdt: Decimal
     favorable_funding_credit_usdt: Decimal
     expected_gross_convergence_pnl_usdt: Decimal
@@ -336,7 +337,9 @@ def evaluate_hybrid_entry(
         return _rejected(proposal, AggressiveEntryReason.DEPTH_INSUFFICIENT)
     long_fill = executable_vwap(proposal.long_book.asks, proposal.quantity)
     short_fill = executable_vwap(proposal.short_book.bids, proposal.quantity)
-    if long_fill is None or short_fill is None:
+    long_exit = executable_vwap(proposal.long_book.bids, proposal.quantity)
+    short_exit = executable_vwap(proposal.short_book.asks, proposal.quantity)
+    if long_fill is None or short_fill is None or long_exit is None or short_exit is None:
         return _rejected(proposal, AggressiveEntryReason.DEPTH_INSUFFICIENT)
     with localcontext() as context:
         context.prec = 50
@@ -354,8 +357,15 @@ def evaluate_hybrid_entry(
     gross = proposal.quantity * average_price * abs(executable_spread - reverse_target) / _BPS
     if gross <= 0:
         return _rejected(proposal, AggressiveEntryReason.CONVERGENCE_NON_POSITIVE)
-    four_leg_fees = (
-        Decimal(2) * proposal.quantity * (long_fill.price * fees[0] + short_fill.price * fees[1])
+    four_leg_fees = proposal.quantity * (
+        (long_fill.price + long_exit.price) * fees[0]
+        + (short_fill.price + short_exit.price) * fees[1]
+    )
+    measured_impact = proposal.quantity * (
+        max(Decimal(0), long_fill.price - proposal.long_book.asks[0].price)
+        + max(Decimal(0), proposal.short_book.bids[0].price - short_fill.price)
+        + max(Decimal(0), proposal.long_book.bids[0].price - long_exit.price)
+        + max(Decimal(0), short_exit.price - proposal.short_book.asks[0].price)
     )
     if (
         proposal.long_funding.venue != proposal.long_venue
@@ -373,7 +383,7 @@ def evaluate_hybrid_entry(
         * policy.adverse_funding_charge_ratio
         * policy.funding_stress_multiplier
     )
-    stressed_cost = four_leg_fees + proposal.reserves.total() + adverse_charge
+    stressed_cost = four_leg_fees + proposal.reserves.total() + measured_impact + adverse_charge
     net = gross - stressed_cost + favorable_credit
     minimum_profit = (
         policy.canary_minimum_expected_net_profit_usdt
@@ -395,6 +405,7 @@ def evaluate_hybrid_entry(
         long_entry_vwap=long_fill.price,
         short_entry_vwap=short_fill.price,
         four_leg_fees_usdt=four_leg_fees,
+        measured_book_impact_usdt=measured_impact,
         stressed_total_cost_usdt=stressed_cost,
         favorable_funding_credit_usdt=favorable_credit,
         expected_gross_convergence_pnl_usdt=gross,
@@ -680,6 +691,7 @@ def _rejected(
         long_entry_vwap=None,
         short_entry_vwap=None,
         four_leg_fees_usdt=Decimal(0),
+        measured_book_impact_usdt=Decimal(0),
         stressed_total_cost_usdt=Decimal(0),
         favorable_funding_credit_usdt=Decimal(0),
         expected_gross_convergence_pnl_usdt=Decimal(0),
