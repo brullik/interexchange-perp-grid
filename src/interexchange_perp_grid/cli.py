@@ -25,6 +25,13 @@ from interexchange_perp_grid.aggressive_evaluator import (
     load_aggressive_decision_policy,
 )
 from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, GridLevelState
+from interexchange_perp_grid.aggressive_laptop_acceptance import (
+    build_aggressive_laptop_acceptance,
+    load_aggressive_laptop_acceptance,
+    load_aggressive_laptop_stage_evidence,
+    save_aggressive_laptop_acceptance,
+    verify_aggressive_laptop_handoff,
+)
 from interexchange_perp_grid.aggressive_model import (
     DivergenceDirection,
     HistoricalReferenceModel,
@@ -78,6 +85,7 @@ from interexchange_perp_grid.native_runtime import (
     build_native_runtime_manifest,
     load_native_runtime_manifest,
     resolve_runtime_artifact_digest,
+    verify_native_runtime_manifest,
     write_native_runtime_manifest,
 )
 from interexchange_perp_grid.observability import configure_logging, render_metrics
@@ -273,6 +281,69 @@ def doctor(config: ConfigPath = Path("config/defaults.yaml")) -> None:
                 "state_path": str(state_path),
             },
             default=str,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("aggressive-laptop-acceptance")
+def aggressive_laptop_acceptance(
+    binding: Annotated[Path, typer.Option("--binding")],
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    canary_evidence: Annotated[Path, typer.Option("--canary-evidence")],
+    pilot_evidence: Annotated[Path, typer.Option("--pilot-evidence")],
+    output: Annotated[Path, typer.Option("--output")] = Path(
+        "state/laptop-aggressive-acceptance.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create accepted laptop evidence only after exact canary, pilot and stable FLAT."""
+    for required in (binding, runtime_manifest, canary_evidence, pilot_evidence):
+        if not required.is_file():
+            raise typer.BadParameter(f"required laptop acceptance input is missing: {required}")
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest.resolve(),
+        repo_root.resolve(),
+        config.resolve(),
+    )
+    acceptance = build_aggressive_laptop_acceptance(
+        load_aggressive_qualification_binding(binding.resolve()),
+        runtime,
+        load_aggressive_laptop_stage_evidence(canary_evidence.resolve()),
+        load_aggressive_laptop_stage_evidence(pilot_evidence.resolve()),
+    )
+    save_aggressive_laptop_acceptance(output.resolve(), acceptance)
+    typer.echo(json.dumps(asdict(acceptance), default=str, sort_keys=True))
+
+
+@app.command("aggressive-vps-handoff-check")
+def aggressive_vps_handoff_check(
+    acceptance: Annotated[Path, typer.Option("--acceptance")],
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Verify a future VPS handoff without connecting to or modifying any VPS."""
+    if not acceptance.is_file() or not runtime_manifest.is_file():
+        raise typer.BadParameter("accepted laptop artifact and exact runtime manifest are required")
+    loaded = load_aggressive_laptop_acceptance(acceptance.resolve())
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest.resolve(),
+        repo_root.resolve(),
+        config.resolve(),
+    )
+    verify_aggressive_laptop_handoff(loaded, runtime)
+    typer.echo(
+        json.dumps(
+            {
+                "status": "PASS",
+                "accepted": True,
+                "release_sha": loaded.release_sha,
+                "acceptance_sha256": loaded.acceptance_sha256,
+                "vps_modified": False,
+                "execution_authorized": False,
+            },
             sort_keys=True,
         )
     )

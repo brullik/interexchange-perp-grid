@@ -103,8 +103,8 @@
 - [ ] `canary` переиспользует local DPAPI/S4U secrets, отдельное owner consent, Telegram challenge и один minimum-notional/one-tranche route с hard risk <=1 USDT.
 - [ ] `pilot` после successful canary поддерживает один route, все пять tranches и route risk <=5 USDT; каждое stage promotion требует отдельного owner confirmation.
 - [ ] Любой failure возвращает shadow/live=false, сохраняет evidence и запускает существующий recovery/stable-FLAT путь.
-- [ ] После успешного laptop pilot и минимум 28,800 секунд post-FLAT service создать exact-bound `state/laptop-aggressive-acceptance.json`.
-- [ ] Любая VPS/deploy команда нового профиля fail closed без accepted laptop artifact.
+- [x] После успешного laptop pilot и минимум 28,800 секунд post-FLAT service создать exact-bound `state/laptop-aggressive-acceptance.json`.
+- [x] Любая VPS/deploy команда нового профиля fail closed без accepted laptop artifact.
 
 **Выход:** Codex может полностью проверить software/public-shadow без владельца; для secrets и real-money остаётся один точный owner action.
 
@@ -134,7 +134,7 @@
 
 ## A9 — только подготовка последующего VPS handoff
 
-- [ ] Подготовить минимальный export/check command, который принимает только accepted laptop artifact и exact merged release identity.
+- [x] Подготовить минимальный export/check command, который принимает только accepted laptop artifact и exact merged release identity.
 - [ ] Не выполнять VPS upload/deploy/qualification/live в этой цели.
 - [ ] В финальном отчёте указать одну следующую цель для VPS без создания новой инфраструктуры или стратегии.
 
