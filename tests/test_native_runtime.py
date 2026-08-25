@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -162,6 +163,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert '[ValidateSet("CurrentUser", "LocalMachine")]' in qualification
     assert "laptop-load-s4u-env.ps1" in qualification
     assert "private-probe" in qualification
+    disable_shadow_telegram = "laptop-disable-shadow-telegram.ps1"
+    assert disable_shadow_telegram in qualification
+    assert qualification.index(disable_shadow_telegram) < qualification.index("pip check")
     assert "--authenticated" in qualification
     assert 'foreach ($venue in @("bybit", "okx"))' in qualification
     assert 'foreach ($venue in @("binanceusdm", "bybit", "okx"))' not in qualification
@@ -193,7 +197,7 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert pilot.index("Start-Process") < pilot.index('$env:IPEG_LIVE_ENABLED = "true"')
     assert pilot.index('$env:IPEG_LIVE_ENABLED = "false"') < pilot.index("Start-Process")
     assert (
-        'ValidateSet("verify", "shadow", "qualify", "canary", "pilot", "status", "stop")'
+        'ValidateSet("verify", "shadow", "smoke30", "qualify", "canary", "pilot", "status", "stop")'
         in aggressive
     )
     assert "reference-history-proof" in aggressive
@@ -203,6 +207,10 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "separate, explicit live-money authorization" in aggressive
     assert "laptop-pilot.ps1" in aggressive and "-Aggressive" in aggressive
     assert "laptop-aggressive-pilot-a.ps1" in aggressive
+    assert '"smoke30"' in aggressive
+    assert "-Smoke30m" in aggressive
+    assert '[Guid]::NewGuid().ToString("N")' in qualification
+    assert "IPEG_LAPTOP_SMOKE_RUN_ID" in qualification
     assert "Docker" not in aggressive
     assert "I_ACCEPT_AGGRESSIVE_PILOT_A_RISK" in aggressive_pilot
     assert "minimum_duration_seconds -ne 86400" in aggressive_pilot
@@ -211,6 +219,39 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "--service-receipt $postFlatReceipt" in aggressive_pilot
     assert '$env:IPEG_LIVE_ENABLED = "false"' in aggressive_pilot
     assert "Docker" not in aggressive_pilot
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")
+def test_laptop_qualification_disables_shadow_telegram_environment() -> None:
+    helper = Path("scripts/laptop-disable-shadow-telegram.ps1").resolve()
+    command = f"""
+$env:IPEG_TELEGRAM_ENABLED = "true"
+$env:IPEG_TELEGRAM_BOT_TOKEN = ([string]123456789) + ":" + ("A" * 33)
+. '{helper}'
+[pscustomobject]@{{
+    enabled = $env:IPEG_TELEGRAM_ENABLED
+    token_present = Test-Path Env:IPEG_TELEGRAM_BOT_TOKEN
+}} | ConvertTo-Json -Compress
+"""
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=20,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert payload == {"enabled": "false", "token_present": False}
+    assert "123456789" not in completed.stdout
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")

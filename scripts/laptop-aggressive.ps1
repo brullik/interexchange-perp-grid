@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("verify", "shadow", "qualify", "canary", "pilot", "status", "stop")]
+    [ValidateSet("verify", "shadow", "smoke30", "qualify", "canary", "pilot", "status", "stop")]
     [string]$Mode,
     [string]$ProfilePath = "state/laptop-profile.clixml",
     [ValidateSet("CurrentUser", "LocalMachine")]
@@ -133,6 +133,12 @@ switch ($Mode) {
             --model $model --grid $grid --profile $profile `
             --output "state/aggressive-qualification.json"
         if ($LASTEXITCODE -ne 0) { throw "aggressive qualification binding failed closed" }
+    }
+    "smoke30" {
+        Ensure-HistoricalModel
+        & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
+            -ProfileScope $ProfileScope -Smoke30m
+        if ($LASTEXITCODE -ne 0) { throw "30-minute qualification rehearsal failed closed" }
     }
     "canary" {
         Write-Host "Canary requires a separate, explicit live-money authorization at execution time."

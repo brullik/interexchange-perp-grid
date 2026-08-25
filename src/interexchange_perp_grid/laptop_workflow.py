@@ -16,9 +16,11 @@ from interexchange_perp_grid.live_journal import (
 )
 from interexchange_perp_grid.qualification import (
     LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS,
+    LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS,
     QualificationEvidence,
     QualificationPolicy,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
     qualification_policy_from_settings,
 )
 from interexchange_perp_grid.service import BootstrapService, BoundedServiceReceipt
@@ -91,6 +93,14 @@ async def run_until_qualification_finalized(
             update={
                 "shadow": settings.shadow.model_copy(
                     update={"scan_interval_seconds": (LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS)}
+                )
+            }
+        )
+    elif selected_policy == laptop_smoke_policy(settings):
+        service_settings = settings.model_copy(
+            update={
+                "shadow": settings.shadow.model_copy(
+                    update={"scan_interval_seconds": LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS}
                 )
             }
         )

@@ -3,7 +3,8 @@ param(
     [string]$ProfilePath = "state/laptop-profile.clixml",
     [ValidateSet("CurrentUser", "LocalMachine")]
     [string]$ProfileScope = "CurrentUser",
-    [switch]$OwnerException12h
+    [switch]$OwnerException12h,
+    [switch]$Smoke30m
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,22 @@ if ($ProfileScope -ceq "LocalMachine") {
     . "$PSScriptRoot/laptop-load-s4u-env.ps1" -ProfilePath $ProfilePath
 } else {
     . "$PSScriptRoot/laptop-load-env.ps1" -ProfilePath $ProfilePath
+}
+
+# Qualification is a non-interactive shadow workload. A Telegram poller adds no
+# evidence, can conflict with an owner-facing instance, and may expose a bot
+# token through third-party HTTP request logging. Keep the encrypted profile
+# intact while removing Telegram from this process before any Python command.
+. "$PSScriptRoot/laptop-disable-shadow-telegram.ps1"
+
+if ($Smoke30m) {
+    $env:IPEG_LAPTOP_SMOKE_RUN_ID = [Guid]::NewGuid().ToString("N")
+    $env:IPEG_STATE_PATH = [IO.Path]::GetFullPath(
+        (Join-Path $root "state/laptop/smoke/$env:IPEG_LAPTOP_SMOKE_RUN_ID/ipeg.sqlite3")
+    )
+    $env:IPEG_PARQUET_DIR = [IO.Path]::GetFullPath(
+        (Join-Path $root "data/laptop/smoke/$env:IPEG_LAPTOP_SMOKE_RUN_ID/market")
+    )
 }
 
 $laptopState = Join-Path $root "state/laptop"
@@ -48,7 +65,9 @@ $env:IPEG_RELEASE_SHA = [string]$manifest.release_sha
 $env:IPEG_CONTAINER_IMAGE_DIGEST = [string]$manifest.artifact_digest
 
 $ownerExceptionConfirmation = $null
-if ($OwnerException12h) {
+if ($Smoke30m) {
+    Write-Host "Preparing isolated non-qualifying 30-minute laptop rehearsal."
+} elseif ($OwnerException12h) {
     $ownerExceptionConfirmation = [Environment]::GetEnvironmentVariable(
         "IPEG_LAPTOP_12H_OWNER_EXCEPTION",
         "Process"
@@ -110,7 +129,15 @@ if ($OwnerException12h) {
 Write-Host "Keep AC power and network connected. Closing this terminal interrupts qualification."
 Write-Host "Live remains disabled; no real order can be submitted in this phase."
 try {
-    if ($OwnerException12h) {
+    if ($Smoke30m) {
+        Write-Host "Starting isolated non-qualifying 30-minute laptop rehearsal."
+        & $python -m interexchange_perp_grid.cli laptop-qualification-smoke-run `
+            --repo-root $root `
+            --config "$root/config/defaults.yaml"
+        if ($LASTEXITCODE -ne 0) { throw "30-minute qualification rehearsal failed" }
+        Write-Host "30-minute rehearsal passed; it cannot authorize canary or live."
+        return
+    } elseif ($OwnerException12h) {
         $env:IPEG_LAPTOP_12H_OWNER_EXCEPTION = $ownerExceptionConfirmation
         & $python -m interexchange_perp_grid.cli laptop-qualification-run `
             --maximum-hours 18 `
@@ -167,5 +194,6 @@ try {
     Write-Host "Native laptop qualification accepted: $qualificationEvidence"
 } finally {
     Remove-Item Env:IPEG_LAPTOP_12H_OWNER_EXCEPTION -ErrorAction SilentlyContinue
+    Remove-Item Env:IPEG_LAPTOP_SMOKE_RUN_ID -ErrorAction SilentlyContinue
     [void][LaptopSleepGuard]::SetThreadExecutionState($continuous)
 }

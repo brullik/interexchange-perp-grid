@@ -171,6 +171,11 @@ class QualificationPolicy:
             raise ValueError("invalid qualification policy")
 
 
+LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS = 1_800
+LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE = 500
+LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS = 2
+
+
 def qualification_policy_from_settings(settings: Settings) -> QualificationPolicy:
     """Build the standard, repository-locked qualification policy."""
     return QualificationPolicy(
@@ -203,6 +208,20 @@ def laptop_owner_exception_policy(settings: Settings) -> QualificationPolicy:
     return replace(
         standard,
         minimum_duration_seconds=LAPTOP_OWNER_EXCEPTION_MINIMUM_DURATION_SECONDS,
+    )
+
+
+def laptop_smoke_policy(settings: Settings) -> QualificationPolicy:
+    """Return a non-accepting 30-minute operational rehearsal policy."""
+    standard = qualification_policy_from_settings(settings)
+    if standard.minimum_duration_seconds != 86_400:
+        raise ValueError("laptop smoke requires the exact standard 24-hour policy")
+    return replace(
+        standard,
+        minimum_duration_seconds=LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS,
+        minimum_synchronised_snapshots_per_venue=(
+            LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+        ),
     )
 
 

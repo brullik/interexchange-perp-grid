@@ -22,9 +22,13 @@ from interexchange_perp_grid.qualification import (
     LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
     LAPTOP_OWNER_EXCEPTION_ENV,
     LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS,
+    LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS,
+    LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE,
+    LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS,
     QualificationEvidence,
     laptop_owner_exception_authorized,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
     qualification_policy_from_settings,
 )
 from interexchange_perp_grid.service import (
@@ -103,6 +107,23 @@ def test_laptop_owner_exception_changes_only_duration_and_requires_windows_recei
     assert laptop_owner_exception_authorized(receipt, platform="win32")
     assert not laptop_owner_exception_authorized(receipt, platform="linux")
     assert not laptop_owner_exception_authorized({}, platform="win32")
+
+
+def test_laptop_smoke_policy_is_short_isolated_and_not_an_accepted_policy(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
+    standard = qualification_policy_from_settings(settings)
+    smoke = laptop_smoke_policy(settings)
+
+    assert smoke.minimum_duration_seconds == LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS
+    assert (
+        smoke.minimum_synchronised_snapshots_per_venue
+        == LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+    )
+    assert smoke != standard
+    assert smoke != laptop_owner_exception_policy(settings)
+    assert LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS * 500 < 1_800
 
 
 @pytest.mark.asyncio
