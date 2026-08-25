@@ -1144,6 +1144,80 @@ class LiveOrderJournal:
             now or datetime.now(UTC),
         )
 
+    async def commit_reconciled_action(
+        self,
+        pair_action_id: str,
+        expected_active_pair_action_ids: tuple[str, ...],
+        expected_event_watermark: int,
+        reconciliation_position_audit_sha256: str,
+        details: dict[str, Any] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> FlatBarrierCommitResult:
+        """Release one closed tranche only while the aggregate active set remains unchanged."""
+        if pair_action_id not in expected_active_pair_action_ids:
+            raise ValueError("reconciled action must belong to the expected active set")
+        if len(set(expected_active_pair_action_ids)) != len(expected_active_pair_action_ids):
+            raise ValueError("expected active action IDs must be unique")
+        if len(reconciliation_position_audit_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in reconciliation_position_audit_sha256
+        ):
+            raise ValueError("reconciliation position audit must be a lowercase SHA-256")
+        return await asyncio.to_thread(
+            self._commit_reconciled_action_sync,
+            pair_action_id,
+            expected_active_pair_action_ids,
+            expected_event_watermark,
+            {
+                **(details or {}),
+                "reconciliation_position_audit_sha256": (reconciliation_position_audit_sha256),
+            },
+            now or datetime.now(UTC),
+        )
+
+    def _commit_reconciled_action_sync(
+        self,
+        pair_action_id: str,
+        expected_active_pair_action_ids: tuple[str, ...],
+        expected_event_watermark: int,
+        details: dict[str, Any],
+        now: datetime,
+    ) -> FlatBarrierCommitResult:
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            observed_watermark = self._event_watermark_in_transaction(database)
+            active_ids = tuple(
+                str(row["pair_action_id"])
+                for row in database.execute(
+                    "SELECT pair_action_id FROM live_pair_actions WHERE state <> ? "
+                    "ORDER BY created_at, pair_action_id",
+                    (LiveActionState.FLAT.value,),
+                ).fetchall()
+            )
+            action = self._load_in_transaction(database, pair_action_id)
+            if action is None:
+                database.rollback()
+                raise KeyError(pair_action_id)
+            if (
+                active_ids != expected_active_pair_action_ids
+                or observed_watermark != expected_event_watermark
+                or action.state not in {LiveActionState.CLOSING, LiveActionState.RECOVERING}
+            ):
+                database.rollback()
+                return FlatBarrierCommitResult(False, action, observed_watermark)
+            self._transition_in_transaction(
+                database,
+                pair_action_id,
+                LiveActionState.FLAT,
+                {**details, "portfolio_reconciled": True},
+                now,
+                residual_delta=Decimal(0),
+            )
+            committed = self._load_in_transaction(database, pair_action_id)
+            database.commit()
+        return FlatBarrierCommitResult(True, committed, observed_watermark)
+
     def _commit_flat_barrier_many_sync(
         self,
         pair_action_ids: tuple[str, ...],
@@ -1465,6 +1539,140 @@ class LiveOrderJournal:
             database.commit()
         return True
 
+    async def latest_order_events(self, pair_action_id: str) -> tuple[PrivateOrder, ...]:
+        return await asyncio.to_thread(self._latest_order_events_sync, pair_action_id)
+
+    def _latest_order_events_sync(self, pair_action_id: str) -> tuple[PrivateOrder, ...]:
+        with self._connect() as database:
+            rows = database.execute(
+                """
+                SELECT event.client_order_id, event.payload_json, event.observed_at,
+                       event.rowid AS event_rowid
+                FROM live_order_events AS event
+                JOIN live_order_legs AS leg
+                  ON leg.client_order_id = event.client_order_id
+                WHERE leg.pair_action_id = ?
+                ORDER BY event.observed_at, event_rowid
+                """,
+                (pair_action_id,),
+            ).fetchall()
+        latest: dict[str, PrivateOrder] = {}
+        for row in rows:
+            latest[str(row["client_order_id"])] = _private_order_from_json(str(row["payload_json"]))
+        return tuple(latest[key] for key in sorted(latest))
+
+    async def update_actual_risk(
+        self,
+        pair_action_id: str,
+        expected_event_watermark: int,
+        actual_risk: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> LiveJournalAction:
+        return await asyncio.to_thread(
+            self._update_actual_risk_sync,
+            pair_action_id,
+            expected_event_watermark,
+            actual_risk,
+            now or datetime.now(UTC),
+        )
+
+    def _update_actual_risk_sync(
+        self,
+        pair_action_id: str,
+        expected_event_watermark: int,
+        actual_risk: dict[str, Any],
+        now: datetime,
+    ) -> LiveJournalAction:
+        required = {
+            "incremental_stress_usdt",
+            "route_total_usdt",
+            "portfolio_total_usdt",
+            "actual_entry_spread_bps",
+            "fill_event_watermark",
+        }
+        if set(actual_risk) != required:
+            raise ValueError("actual risk snapshot fields are invalid")
+        incremental = Decimal(str(actual_risk["incremental_stress_usdt"]))
+        actual_spread = Decimal(str(actual_risk["actual_entry_spread_bps"]))
+        if not incremental.is_finite() or incremental <= 0 or not actual_spread.is_finite():
+            raise ValueError("actual risk snapshot values are invalid")
+        if int(str(actual_risk["fill_event_watermark"])) != expected_event_watermark:
+            raise ValueError("actual risk watermark is inconsistent")
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            observed_watermark = self._event_watermark_in_transaction(database)
+            action = self._load_in_transaction(database, pair_action_id)
+            if action is None:
+                database.rollback()
+                raise KeyError(pair_action_id)
+            if observed_watermark != expected_event_watermark:
+                database.rollback()
+                raise RuntimeError("actual fill risk event watermark changed")
+            if action.state == LiveActionState.FLAT:
+                database.rollback()
+                raise RuntimeError("actual fill risk cannot update a flat action")
+            active_rows = database.execute(
+                "SELECT pair_action_id, route_base, long_venue, short_venue, "
+                "risk_reservation_json, emergency_exclusive FROM live_pair_actions "
+                "WHERE state <> ? AND pair_action_id <> ?",
+                (LiveActionState.FLAT.value, pair_action_id),
+            ).fetchall()
+            route_total = incremental
+            portfolio_total = incremental
+            for row in active_rows:
+                if bool(row["emergency_exclusive"]):
+                    continue
+                peer_stress = self._admission_stress(json.loads(str(row["risk_reservation_json"])))
+                portfolio_total += peer_stress
+                if (
+                    str(row["route_base"]) == action.route.base
+                    and str(row["long_venue"]) == action.route.long_venue.value
+                    and str(row["short_venue"]) == action.route.short_venue.value
+                ):
+                    route_total += peer_stress
+            authoritative_risk = {
+                "incremental_stress_usdt": str(incremental),
+                "route_total_usdt": str(route_total),
+                "portfolio_total_usdt": str(portfolio_total),
+                "actual_entry_spread_bps": str(actual_spread),
+                "fill_event_watermark": expected_event_watermark,
+            }
+            reservation = dict(action.risk_reservation)
+            reservation["actual_fill_risk"] = authoritative_risk
+            database.execute(
+                "UPDATE live_pair_actions SET risk_reservation_json = ?, updated_at = ? "
+                "WHERE pair_action_id = ?",
+                (
+                    json.dumps(reservation, default=str, sort_keys=True),
+                    now.isoformat(),
+                    pair_action_id,
+                ),
+            )
+            database.execute(
+                """
+                INSERT INTO live_action_transitions (
+                    pair_action_id, from_state, to_state, details_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    pair_action_id,
+                    action.state.value,
+                    action.state.value,
+                    json.dumps(
+                        {"actual_fill_risk": authoritative_risk},
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    now.isoformat(),
+                ),
+            )
+            updated = self._load_in_transaction(database, pair_action_id)
+            database.commit()
+        if updated is None:
+            raise RuntimeError("actual fill risk update lost the durable action")
+        return updated
+
     def _quarantine_event_in_transaction(
         self,
         database: sqlite3.Connection,
@@ -1555,6 +1763,17 @@ class LiveOrderJournal:
         return await asyncio.to_thread(
             self._completed_actions_since_sync,
             started_at,
+            qualification_hash,
+        )
+
+    async def actions_updated_after(
+        self,
+        boundary: datetime,
+        qualification_hash: str,
+    ) -> tuple[LiveJournalAction, ...]:
+        return await asyncio.to_thread(
+            self._actions_updated_after_sync,
+            boundary,
             qualification_hash,
         )
 
@@ -1698,6 +1917,28 @@ class LiveOrderJournal:
             )
         return tuple(action for action in actions if action is not None)
 
+    def _actions_updated_after_sync(
+        self,
+        boundary: datetime,
+        qualification_hash: str,
+    ) -> tuple[LiveJournalAction, ...]:
+        if boundary.tzinfo is None or boundary.utcoffset() is None:
+            raise ValueError("journal tail boundary must be timezone-aware")
+        with self._connect() as database:
+            database.execute("BEGIN")
+            rows = database.execute(
+                """
+                SELECT pair_action_id FROM live_pair_actions
+                WHERE updated_at > ? AND qualification_hash = ?
+                ORDER BY updated_at, pair_action_id
+                """,
+                (boundary.isoformat(), qualification_hash),
+            ).fetchall()
+            actions = tuple(
+                self._load_in_transaction(database, str(row["pair_action_id"])) for row in rows
+            )
+        return tuple(action for action in actions if action is not None)
+
     def completed_normal_snapshot_in_transaction(
         self,
         database: sqlite3.Connection,
@@ -1786,7 +2027,7 @@ class LiveOrderJournal:
             raise RuntimeError("global emergency live action lease is already held")
         if risk_reservation is None:
             return
-        new_stress = LiveOrderJournal._projected_stress(risk_reservation)
+        new_stress = LiveOrderJournal._admission_stress(risk_reservation)
         if new_stress > MAX_LIVE_ROUTE_STRESS_USDT:
             raise RuntimeError("maximum live route stress reached")
         rows = database.execute(
@@ -1809,7 +2050,7 @@ class LiveOrderJournal:
             raise RuntimeError("maximum live tranches per route reached")
         route_stress = new_stress + sum(
             (
-                LiveOrderJournal._projected_stress(json.loads(str(row["risk_reservation_json"])))
+                LiveOrderJournal._admission_stress(json.loads(str(row["risk_reservation_json"])))
                 for row in exact_rows
                 if not bool(row["emergency_exclusive"])
             ),
@@ -1819,7 +2060,7 @@ class LiveOrderJournal:
             raise RuntimeError("maximum live route stress reached")
         portfolio_stress = new_stress + sum(
             (
-                LiveOrderJournal._projected_stress(json.loads(str(row["risk_reservation_json"])))
+                LiveOrderJournal._admission_stress(json.loads(str(row["risk_reservation_json"])))
                 for row in database.execute(
                     "SELECT risk_reservation_json, emergency_exclusive "
                     "FROM live_pair_actions "
@@ -1854,6 +2095,21 @@ class LiveOrderJournal:
         if not stress.is_finite() or stress <= 0:
             raise RuntimeError("live risk reservation is invalid")
         return stress
+
+    @staticmethod
+    def _admission_stress(risk_reservation: object) -> Decimal:
+        planned = LiveOrderJournal._projected_stress(risk_reservation)
+        assert isinstance(risk_reservation, dict)
+        actual = risk_reservation.get("actual_fill_risk")
+        if not isinstance(actual, dict):
+            return planned
+        try:
+            repriced = Decimal(str(actual["incremental_stress_usdt"]))
+        except (DecimalException, KeyError, ValueError):
+            raise RuntimeError("live actual-fill risk reservation is invalid") from None
+        if not repriced.is_finite() or repriced <= 0:
+            raise RuntimeError("live actual-fill risk reservation is invalid")
+        return max(planned, repriced)
 
     @staticmethod
     def _acquire_leases_in_transaction(
@@ -2034,3 +2290,42 @@ def _windows_process_identity(process_id: int) -> str | None:
         return f"win:{process_id}:{ticks}"
     finally:
         kernel32.CloseHandle(process)
+
+
+def _private_order_from_json(payload_json: str) -> PrivateOrder:
+    payload = json.loads(payload_json)
+    required = {
+        "venue",
+        "order_id",
+        "client_order_id",
+        "symbol",
+        "side",
+        "status",
+        "requested_base_quantity",
+        "filled_base_quantity",
+        "average_price",
+        "fee_usdt",
+        "observed_at",
+        "limit_price",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise RuntimeError("durable private order event payload is invalid")
+
+    def optional_decimal(key: str) -> Decimal | None:
+        value = payload[key]
+        return None if value is None else Decimal(str(value))
+
+    return PrivateOrder(
+        venue=Venue(str(payload["venue"])),
+        order_id=None if payload["order_id"] is None else str(payload["order_id"]),
+        client_order_id=str(payload["client_order_id"]),
+        symbol=str(payload["symbol"]),
+        side=Side(str(payload["side"])),
+        status=PrivateOrderStatus(str(payload["status"])),
+        requested_base_quantity=Decimal(str(payload["requested_base_quantity"])),
+        filled_base_quantity=Decimal(str(payload["filled_base_quantity"])),
+        average_price=optional_decimal("average_price"),
+        fee_usdt=optional_decimal("fee_usdt"),
+        observed_at=datetime.fromisoformat(str(payload["observed_at"])),
+        limit_price=optional_decimal("limit_price"),
+    )

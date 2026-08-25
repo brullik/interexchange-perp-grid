@@ -255,7 +255,9 @@ async def test_cancelled_progress_worker_is_terminated_without_orphan_process(
     task = asyncio.create_task(
         orchestrator_module._progress_from_subprocess(tmp_path, CONFIG, "epoch")
     )
-    await asyncio.wait_for(started.wait(), timeout=2)
+    # Windows process creation can briefly serialize behind the preceding real
+    # qualification worker.  This is a liveness bound, not a latency assertion.
+    await asyncio.wait_for(started.wait(), timeout=10)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

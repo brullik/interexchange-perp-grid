@@ -131,8 +131,7 @@ async def _progress_from_subprocess(
     command = [
         sys.executable,
         "-m",
-        "interexchange_perp_grid.cli",
-        "qualification-epoch-status",
+        "interexchange_perp_grid.qualification_status_worker",
         "--epoch-id",
         epoch_id,
         "--config",

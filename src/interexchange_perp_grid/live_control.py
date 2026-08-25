@@ -1193,6 +1193,12 @@ def _live_risk_snapshot(
     for action in actions:
         try:
             projected_stress = Decimal(str(action.risk_reservation["projected_stress_usdt"]))
+            actual = action.risk_reservation.get("actual_fill_risk")
+            if isinstance(actual, dict):
+                projected_stress = max(
+                    projected_stress,
+                    Decimal(str(actual["incremental_stress_usdt"])),
+                )
             if (
                 not projected_stress.is_finite()
                 or projected_stress < 0

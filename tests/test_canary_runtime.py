@@ -3,15 +3,22 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
+from interexchange_perp_grid.aggressive_evaluator import (
+    AggressiveExitReason,
+    load_aggressive_decision_policy,
+)
+from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.canary_runtime import (
     OWNER_CONFIRMATION,
+    RuntimeCanaryMonitor,
     _coordinate_live_action,
     _rebuild_active_plan,
     _resume_active_canary,
@@ -31,6 +38,7 @@ from interexchange_perp_grid.domain import (
 from interexchange_perp_grid.execution import ExecutionIntent, OrderPurpose, Side
 from interexchange_perp_grid.live_coordinator import (
     CanaryExecutionPlan,
+    CanaryVenueAdapter,
     CloseReason,
     LiveCanaryCoordinator,
 )
@@ -132,6 +140,206 @@ def test_prepared_opening_gate_requires_stored_ioc_to_remain_marketable() -> Non
     assert not _stored_opening_request_is_still_protected(sell, Decimal(99), Decimal("99.5"))
 
 
+@pytest.mark.parametrize(
+    ("direction", "stop", "target", "outward_spread", "converged_spread"),
+    (
+        (DivergenceDirection.POSITIVE, "10", "2", "11", "1"),
+        (DivergenceDirection.NEGATIVE, "-10", "-2", "-11", "-1"),
+    ),
+)
+def test_runtime_aggressive_monitor_uses_shared_signed_stop_and_target_priority(
+    tmp_path: Path,
+    direction: DivergenceDirection,
+    stop: str,
+    target: str,
+    outward_spread: str,
+    converged_spread: str,
+) -> None:
+    monitor = RuntimeCanaryMonitor(
+        load_settings(Path("config/defaults.yaml")),
+        DirectedRouteKey("BTC", Venue.OKX, Venue.BYBIT),
+        Decimal("0.001"),
+        Decimal(target),
+        {},
+        {},
+        {},
+        {},
+        tmp_path / "state.sqlite3",
+        direction=direction,
+        effective_stop_bps=Decimal(stop),
+        projected_route_loss_usdt=Decimal("0.8"),
+        projected_portfolio_loss_usdt=Decimal("0.8"),
+        route_hard_loss_usdt=Decimal(1),
+        portfolio_hard_loss_usdt=Decimal(1),
+        holding_deadline=datetime.now(UTC) + timedelta(hours=1),
+        aggressive_policy=load_aggressive_decision_policy(
+            Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")
+        ).policy,
+    )
+
+    assert monitor._aggressive_close_reason(Decimal(outward_spread), False) == (
+        AggressiveExitReason.HARD_PROJECTED_LOSS_OR_REFERENCE_STOP
+    )
+    assert monitor._aggressive_close_reason(Decimal(converged_spread), False) == (
+        AggressiveExitReason.REVERSE_GRID_TARGET
+    )
+
+
+def test_holding_monitor_rejects_stale_wrong_symbol_and_near_funding_snapshots(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(Path("config/defaults.yaml"))
+    route = DirectedRouteKey("BTC", Venue.OKX, Venue.BYBIT)
+    instruments = {venue: _instrument(venue) for venue in (Venue.OKX, Venue.BYBIT)}
+
+    def snapshot(
+        venue: Venue,
+        *,
+        symbol: str | None = None,
+        exchange_offset_ms: int = 0,
+        next_offset_ms: int = 3_600_000,
+    ) -> FundingSnapshot:
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        return FundingSnapshot(
+            venue,
+            symbol or instruments[venue].symbol,
+            Decimal("0.0001"),
+            now_ms + next_offset_ms,
+            "8h",
+            Decimal(100),
+            Decimal(100),
+            now_ms + exchange_offset_ms,
+        )
+
+    initial = {venue: snapshot(venue) for venue in instruments}
+    monitor = RuntimeCanaryMonitor(
+        settings,
+        route,
+        Decimal("0.001"),
+        Decimal(0),
+        {},
+        {},
+        instruments,
+        initial,
+        tmp_path / "state.sqlite3",
+    )
+    assert not monitor._funding_deteriorated({venue: snapshot(venue) for venue in instruments})
+    assert monitor._funding_deteriorated(
+        {
+            Venue.OKX: snapshot(Venue.OKX, exchange_offset_ms=-600_000),
+            Venue.BYBIT: snapshot(Venue.BYBIT),
+        }
+    )
+    assert monitor._funding_deteriorated(
+        {
+            Venue.OKX: snapshot(Venue.OKX, symbol="ETH/USDT:USDT"),
+            Venue.BYBIT: snapshot(Venue.BYBIT),
+        }
+    )
+    near = {venue: snapshot(venue, next_offset_ms=30_000) for venue in instruments}
+    monitor._initial_funding = near
+    assert monitor._funding_deteriorated(near)
+
+
+@pytest.mark.asyncio
+async def test_holding_monitor_closes_when_private_positions_diverge_from_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import interexchange_perp_grid.canary_runtime as runtime_module
+
+    route = DirectedRouteKey("BTC", Venue.OKX, Venue.BYBIT)
+    instruments = {venue: _instrument(venue) for venue in (Venue.OKX, Venue.BYBIT)}
+
+    class PublicAdapter:
+        def __init__(self, venue: Venue) -> None:
+            self.venue = venue
+
+        async def watch_order_book(self, instrument: Instrument) -> OrderBookSnapshot:
+            return OrderBookSnapshot(
+                self.venue,
+                instrument.symbol,
+                (BookLevel(Decimal(100), Decimal(1)),),
+                (BookLevel(Decimal("100.1"), Decimal(1)),),
+                int(datetime.now(UTC).timestamp() * 1000),
+                datetime.now(UTC),
+                time.monotonic_ns(),
+                1,
+                1,
+                True,
+                True,
+                0,
+            )
+
+        async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
+            return FundingSnapshot(
+                self.venue,
+                instrument.symbol,
+                Decimal(0),
+                now_ms + 3_600_000,
+                "8h",
+                Decimal(100),
+                Decimal(100),
+                now_ms,
+            )
+
+    class FakeJournal:
+        def __init__(self, path: Path) -> None:
+            del path
+
+        async def active_actions(self) -> tuple[object, ...]:
+            return ()
+
+        async def known_client_order_ids(self) -> set[str]:
+            return set()
+
+    async def controls(_: Path) -> RuntimeControls:
+        return RuntimeControls(False, False, "READY", datetime.now(UTC))
+
+    async def private_states(*args: object, **kwargs: object) -> dict[Venue, object]:
+        del args, kwargs
+        return {}
+
+    monkeypatch.setattr(runtime_module, "LiveOrderJournal", FakeJournal)
+    monkeypatch.setattr(runtime_module, "read_runtime_controls", controls)
+    monkeypatch.setattr(runtime_module, "collect_private_states", private_states)
+    monkeypatch.setattr(runtime_module, "_private_risk_deteriorated", lambda *_: False)
+    monkeypatch.setattr(
+        runtime_module,
+        "reconcile_private_states",
+        lambda *_: SimpleNamespace(consistent=False),
+    )
+    public = {venue: PublicAdapter(venue) for venue in instruments}
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    initial = {
+        venue: FundingSnapshot(
+            venue,
+            instruments[venue].symbol,
+            Decimal(0),
+            now_ms + 3_600_000,
+            "8h",
+            Decimal(100),
+            Decimal(100),
+            now_ms,
+        )
+        for venue in instruments
+    }
+    monitor = RuntimeCanaryMonitor(
+        load_settings(Path("config/defaults.yaml")),
+        route,
+        Decimal("0.001"),
+        Decimal(0),
+        public,  # type: ignore[arg-type]
+        cast(dict[Venue, CanaryVenueAdapter], {venue: object() for venue in instruments}),
+        instruments,
+        initial,
+        tmp_path / "state.sqlite3",
+    )
+
+    assert await monitor.wait_for_close(1) == CloseReason.RISK_DETERIORATION
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
@@ -176,15 +384,16 @@ async def test_production_prepared_gate_denies_current_opening_failure_before_su
             )
 
         async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
             return FundingSnapshot(
                 self.venue,
                 instrument.symbol,
                 Decimal(0),
-                1,
+                now_ms + 28_800_000,
                 "8h",
                 Decimal(100),
                 Decimal(100),
-                1,
+                now_ms,
             )
 
     class PrivateAdapter(DeterministicPrivateExchange):
@@ -260,17 +469,12 @@ async def test_production_prepared_gate_denies_current_opening_failure_before_su
         {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")},
     )
     if failure in {"late_kill", "controls_timeout"}:
+        control_calls = 0
 
         async def controls(_: Path) -> RuntimeControls:
-            return RuntimeControls(
-                paused=False,
-                killed=False,
-                reconciliation_state="READY",
-                updated_at=datetime.now(UTC),
-            )
-
-        async def final_controls(_: Path) -> RuntimeControls:
-            if failure == "controls_timeout":
+            nonlocal control_calls
+            control_calls += 1
+            if failure == "controls_timeout" and control_calls >= 2:
                 while not transport_release.is_set():
                     try:
                         await asyncio.shield(transport_release.wait())
@@ -278,13 +482,12 @@ async def test_production_prepared_gate_denies_current_opening_failure_before_su
                         continue
             return RuntimeControls(
                 paused=False,
-                killed=failure == "late_kill",
+                killed=failure == "late_kill" and control_calls >= 2,
                 reconciliation_state="READY",
                 updated_at=datetime.now(UTC),
             )
 
         monkeypatch.setattr(runtime_module, "read_runtime_controls", controls)
-        monkeypatch.setattr(runtime_module, "read_runtime_controls_bounded", final_controls)
     instruments = {venue: _instrument(venue) for venue in Venue}
     private = {
         venue: PrivateAdapter(venue, instruments[venue], ())
@@ -435,18 +638,16 @@ async def test_prepared_resume_reports_nonterminal_discovery_after_bounded_clean
     active = await coordinator.prepare(plan)
 
     started_at = time.monotonic()
-    with pytest.raises(RuntimeError, match="canary cleanup failed") as cleanup_error:
-        await _resume_active_canary(settings, journal, active)
+    result = await _resume_active_canary(settings, journal, active)
     elapsed = time.monotonic() - started_at
 
-    assert "adapter close: TimeoutError" in str(cleanup_error.value)
-    assert "opening capability gate transport did not terminate" in str(cleanup_error.value)
-    assert elapsed < 3.5
+    assert result.orders_sent == 0 and not result.success
+    assert result.recovery_action == "PREPARED_RESTART_REQUIRES_FRESH_ENTRY_EPOCH"
+    assert elapsed < 0.5
     quarantined = await journal.load(active.pair_action_id)
     assert quarantined is not None
     assert quarantined.state == LiveActionState.QUARANTINED
     release.set()
-    await _shutdown_opening_gate_tasks()
 
 
 @pytest.mark.asyncio
@@ -482,6 +683,29 @@ async def test_owner_gate_denial_performs_no_network_or_adapter_construction(
     assert result.reason == ReasonCode.OWNER_CONFIRMATION_MISSING
     assert result.orders_sent == 0
     assert constructed == 0
+
+
+@pytest.mark.asyncio
+async def test_aggressive_canary_requires_intent_and_binding_together_before_state(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(
+        Path("config/defaults.yaml"),
+        {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")},
+    )
+
+    result = await run_canary_once(
+        settings,
+        Path("config/defaults.yaml"),
+        tmp_path / "missing-qualification.json",
+        Path("."),
+        OWNER_CONFIRMATION,
+        aggressive_binding=object(),  # type: ignore[arg-type]
+    )
+
+    assert result.reason == ReasonCode.CANARY_POLICY_VIOLATION
+    assert result.orders_sent == 0
+    assert not (tmp_path / "state.sqlite3").exists()
 
 
 @pytest.mark.asyncio

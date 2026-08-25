@@ -251,6 +251,154 @@ async def test_one_route_recovery_failure_does_not_block_another_route_flatten(
 
 
 @pytest.mark.asyncio
+async def test_compatible_aggressive_tranches_use_one_portfolio_recovery_owner(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "portfolio.sqlite3")
+    await journal.initialise()
+    for level in (1, 2):
+        action_id = f"aggressive-{level}"
+        await journal.prepare(
+            action_id,
+            _ROUTE,
+            f"level-{level}",
+            replace(
+                _request(Venue.BINANCE_USDM, Side.BUY, f"long-{level}"),
+                client_order_id=venue_client_order_id(action_id, "long"),
+            ),
+            replace(
+                _request(Venue.OKX, Side.SELL, f"short-{level}"),
+                client_order_id=venue_client_order_id(action_id, "short"),
+            ),
+            {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+            {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+            {
+                "strategy": "AGGRESSIVE_SYMBIOSIS_V1",
+                "stage": "pilot_a",
+                "level_index": level,
+                "aggressive_binding_sha256": "c" * 64,
+                "strategy_profile_sha256": "d" * 64,
+                "projected_stress_usdt": "0.8",
+            },
+            "b" * 64,
+        )
+    calls = 0
+
+    async def recover(_: LiveJournalAction) -> object:
+        nonlocal calls
+        calls += 1
+        for action in await journal.active_actions():
+            await _force_exchange_verified_flat(journal, action)
+        return object()
+
+    health = await LiveSafetySupervisor(journal, recover).reconcile_once()
+
+    assert calls == 1
+    assert health.mode == SupervisorMode.IDLE, health
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_scheduler", [False, True])
+async def test_new_aggressive_tranche_replaces_single_tranche_recovery_owner(
+    tmp_path: Path,
+    use_scheduler: bool,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "portfolio-growth.sqlite3")
+    await journal.initialise()
+    first_id = "supervisor-action-1"
+    first = await journal.prepare(
+        first_id,
+        _ROUTE,
+        "tranche-1",
+        replace(
+            _request(Venue.BINANCE_USDM, Side.BUY, "long-1"),
+            client_order_id=venue_client_order_id(first_id, "long"),
+        ),
+        replace(
+            _request(Venue.OKX, Side.SELL, "short-1"),
+            client_order_id=venue_client_order_id(first_id, "short"),
+        ),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {
+            "strategy": "AGGRESSIVE_SYMBIOSIS_V1",
+            "stage": "pilot_a",
+            "level_index": 1,
+            "aggressive_binding_sha256": "c" * 64,
+            "strategy_profile_sha256": "d" * 64,
+            "projected_stress_usdt": "0.8",
+        },
+        "b" * 64,
+    )
+    first_started = asyncio.Event()
+    first_cancelled = asyncio.Event()
+    first_exited = asyncio.Event()
+    calls: list[str] = []
+
+    async def recover(action: LiveJournalAction) -> object:
+        calls.append(action.pair_action_id)
+        if len(calls) == 1:
+            first_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                first_cancelled.set()
+                raise
+            finally:
+                first_exited.set()
+        assert first_exited.is_set()
+        for current in await journal.active_actions():
+            await _force_exchange_verified_flat(journal, current)
+        return object()
+
+    scheduler = PriorityWorkScheduler(pending_limit=16, worker_count=6) if use_scheduler else None
+    supervisor = LiveSafetySupervisor(
+        journal,
+        recover,
+        recovery_timeout_seconds=0.02,
+        priority_scheduler=scheduler,
+    )
+    first_health = await supervisor.reconcile_once()
+    await asyncio.wait_for(first_started.wait(), timeout=1)
+    assert first_health.failure == f"{first.pair_action_id}:TimeoutError"
+    supervisor._recovery_timeout_seconds = 1
+
+    second_id = "supervisor-action-2"
+    await journal.prepare(
+        second_id,
+        _ROUTE,
+        "tranche-2",
+        replace(
+            _request(Venue.BINANCE_USDM, Side.BUY, "long-2"),
+            client_order_id=venue_client_order_id(second_id, "long"),
+        ),
+        replace(
+            _request(Venue.OKX, Side.SELL, "short-2"),
+            client_order_id=venue_client_order_id(second_id, "short"),
+        ),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {
+            "strategy": "AGGRESSIVE_SYMBIOSIS_V1",
+            "stage": "pilot_a",
+            "level_index": 2,
+            "aggressive_binding_sha256": "c" * 64,
+            "strategy_profile_sha256": "d" * 64,
+            "projected_stress_usdt": "0.8",
+        },
+        "b" * 64,
+    )
+    health = await supervisor.reconcile_once()
+
+    assert first_cancelled.is_set()
+    assert calls == [first.pair_action_id, first.pair_action_id]
+    assert health.mode == SupervisorMode.IDLE
+    assert await journal.active_actions() == ()
+    if scheduler is not None:
+        await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_supervisor_stop_health_is_fail_closed_with_multiple_actions(tmp_path: Path) -> None:
     journal = LiveOrderJournal(tmp_path / "state.sqlite3")
     await _prepare_named(journal, "action-btc", "BTC")

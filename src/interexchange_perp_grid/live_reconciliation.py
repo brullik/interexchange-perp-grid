@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
@@ -213,6 +215,32 @@ class ReconciliationReport:
         return self.status == ReconciliationStatus.CONSISTENT
 
 
+def reconciliation_position_signature_sha256(report: ReconciliationReport) -> str:
+    """Bind a reconciliation decision to its exact private position/open-order view."""
+    payload = {
+        "status": report.status.value,
+        "actual_signed_positions": sorted(
+            (venue.value, str(quantity))
+            for venue, quantity in report.actual_signed_positions.items()
+        ),
+        "expected_signed_positions": sorted(
+            (venue.value, str(quantity))
+            for venue, quantity in report.expected_signed_positions.items()
+        ),
+        "open_bot_order_count": report.open_bot_order_count,
+        "open_position_count": report.open_position_count,
+        "raw_open_order_count": report.raw_open_order_count,
+        "raw_nonzero_position_count": report.raw_nonzero_position_count,
+        "unknown_active_record_count": report.unknown_active_record_count,
+        "snapshots_complete": report.snapshots_complete,
+        "unknown_client_order_ids": report.unknown_client_order_ids,
+        "discrepancies": report.discrepancies,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class FlatBarrierPolicy:
     consecutive_snapshots: int = 2
@@ -293,6 +321,35 @@ async def wait_for_stable_flat(
     watermark_factory: Callable[[], Awaitable[int]],
     policy: FlatBarrierPolicy,
 ) -> FlatBarrierResult:
+    return await _wait_for_stable_reconciliation_condition(
+        report_factory,
+        watermark_factory,
+        policy,
+        require_flat=True,
+    )
+
+
+async def wait_for_stable_reconciliation(
+    report_factory: Callable[[], Awaitable[ReconciliationReport]],
+    watermark_factory: Callable[[], Awaitable[int]],
+    policy: FlatBarrierPolicy,
+) -> FlatBarrierResult:
+    """Require a stable complete snapshot equal to the active journal portfolio."""
+    return await _wait_for_stable_reconciliation_condition(
+        report_factory,
+        watermark_factory,
+        policy,
+        require_flat=False,
+    )
+
+
+async def _wait_for_stable_reconciliation_condition(
+    report_factory: Callable[[], Awaitable[ReconciliationReport]],
+    watermark_factory: Callable[[], Awaitable[int]],
+    policy: FlatBarrierPolicy,
+    *,
+    require_flat: bool,
+) -> FlatBarrierResult:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + policy.timeout_seconds
     stable_since: float | None = None
@@ -339,7 +396,19 @@ async def wait_for_stable_flat(
             private_unknown_report = report
         if before != after:
             event_race_observed = True
-        if private_unknown_report is None and report.flat_verified and before == after:
+        reconciled = (
+            report.flat_verified
+            if require_flat
+            else (
+                report.consistent
+                and report.snapshots_complete
+                and not report.unknown_client_order_ids
+                and report.raw_open_order_count == 0
+                and report.unknown_active_record_count == 0
+                and report.actual_signed_positions == report.expected_signed_positions
+            )
+        )
+        if private_unknown_report is None and reconciled and before == after:
             if signature == previous_signature:
                 consecutive += 1
             else:
@@ -689,6 +758,9 @@ def evaluate_canary_risk_from_private_state(
     free_margin_floor_ratio: Decimal,
     effective_leverage_cap: Decimal,
     exit_depth_sufficient: bool,
+    allow_existing_matched_exposure: bool = False,
+    maximum_routes: int = 1,
+    maximum_tranches_per_route: int = 1,
 ) -> RiskDecision:
     if projected_stress_usdt > pair_stress_limit_usdt:
         return RiskDecision(
@@ -739,15 +811,15 @@ def evaluate_canary_risk_from_private_state(
         RiskLimits(
             pair_stress_limit_usdt,
             portfolio_stress_limit_usdt,
+            maximum_routes,
             1,
-            1,
-            1,
+            maximum_tranches_per_route,
             free_margin_floor_ratio,
             effective_leverage_cap,
         )
     )
     book.set_execution_block(
-        unmatched_exposure=existing_exposure,
+        unmatched_exposure=existing_exposure and not allow_existing_matched_exposure,
         unknown_order_state=any(state.error is not None for state in states.values()),
     )
     return book.reserve(

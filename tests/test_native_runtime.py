@@ -123,6 +123,8 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     s4u_loader = Path("scripts/laptop-load-s4u-env.ps1").read_text(encoding="utf-8")
     qualification = Path("scripts/laptop-qualification.ps1").read_text(encoding="utf-8")
     pilot = Path("scripts/laptop-pilot.ps1").read_text(encoding="utf-8")
+    aggressive = Path("scripts/laptop-aggressive.ps1").read_text(encoding="utf-8")
+    aggressive_pilot = Path("scripts/laptop-aggressive-pilot-a.ps1").read_text(encoding="utf-8")
 
     assert "Export-Clixml" not in onboarding
     assert "Import-Clixml" not in loader
@@ -181,12 +183,34 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "--service-receipt $serviceReceipt" in pilot
     assert "laptop-pilot-report" in pilot
     assert "SetThreadExecutionState" in pilot
+    assert "aggressive-live-intent-once" in pilot
+    assert "--aggressive-intent $aggressiveIntentPath" in pilot
+    assert "aggressive-laptop-stage-report" in pilot
     assert '[ValidateSet("CurrentUser", "LocalMachine")]' in pilot
     assert "laptop-load-s4u-env.ps1" in pilot
     assert "LIVE_CANARY_CONSENT" not in loader
     assert "risk-stage-promote" in pilot and "PROMOTE:canary" in pilot
     assert pilot.index("Start-Process") < pilot.index('$env:IPEG_LIVE_ENABLED = "true"')
     assert pilot.index('$env:IPEG_LIVE_ENABLED = "false"') < pilot.index("Start-Process")
+    assert (
+        'ValidateSet("verify", "shadow", "qualify", "canary", "pilot", "status", "stop")'
+        in aggressive
+    )
+    assert "reference-history-proof" in aggressive
+    assert "aggressive-shadow-once" in aggressive
+    assert "Start-Sleep -Seconds 60" in aggressive
+    assert 'IPEG_LIVE_ENABLED -cne "false"' in aggressive
+    assert "separate, explicit live-money authorization" in aggressive
+    assert "laptop-pilot.ps1" in aggressive and "-Aggressive" in aggressive
+    assert "laptop-aggressive-pilot-a.ps1" in aggressive
+    assert "Docker" not in aggressive
+    assert "I_ACCEPT_AGGRESSIVE_PILOT_A_RISK" in aggressive_pilot
+    assert "minimum_duration_seconds -ne 86400" in aggressive_pilot
+    assert "--aggressive-stage pilot_a" in aggressive_pilot
+    assert '"--duration-seconds", "28800"' in aggressive_pilot
+    assert "--service-receipt $postFlatReceipt" in aggressive_pilot
+    assert '$env:IPEG_LIVE_ENABLED = "false"' in aggressive_pilot
+    assert "Docker" not in aggressive_pilot
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from datetime import datetime
 
 from interexchange_perp_grid.domain import (
     BboQuote,
@@ -10,6 +11,7 @@ from interexchange_perp_grid.domain import (
     OrderBookSnapshot,
     Venue,
 )
+from interexchange_perp_grid.reference_history import SourceMinuteBar
 
 
 class ExchangeAdapter(ABC):
@@ -44,6 +46,15 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     async def fetch_funding(self, instrument: Instrument) -> FundingSnapshot:
         raise NotImplementedError
+
+    async def fetch_closed_minute_bars(
+        self,
+        instrument: Instrument,
+        since: datetime,
+        limit: int = 1000,
+    ) -> tuple[SourceMinuteBar, ...]:
+        del instrument, since, limit
+        raise RuntimeError("closed one-minute OHLC capability is required")
 
     @abstractmethod
     async def close(self) -> None:

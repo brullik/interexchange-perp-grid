@@ -40,15 +40,15 @@ risk_stages:
     leverage: '3'
   pilot_a:
     routes: 1
-    tranches: 2
-    pair_usdt: '2'
-    portfolio_usdt: '2'
+    tranches: 5
+    pair_usdt: '5'
+    portfolio_usdt: '5'
     leverage: '2'
   pilot_b:
     routes: 2
-    tranches: 3
-    pair_usdt: '3'
-    portfolio_usdt: '6'
+    tranches: 5
+    pair_usdt: '5'
+    portfolio_usdt: '10'
     leverage: '2'
   wave1_prod:
     routes: 3

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from interexchange_perp_grid.aggressive_evaluator import load_aggressive_decision_policy
 from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.domain import Instrument, Venue
 from interexchange_perp_grid.execution import Side
@@ -113,6 +115,8 @@ class CrashAfterTransitionJournal(LiveOrderJournal):
         (CanaryCloseSignals(risk_deteriorated=True), CloseReason.RISK_DETERIORATION),
         (CanaryCloseSignals(funding_deteriorated=True), CloseReason.FUNDING_DETERIORATION),
         (CanaryCloseSignals(public_or_private_data_stale=True), CloseReason.STALE_DATA),
+        (CanaryCloseSignals(hard_stop_or_loss=True), CloseReason.HARD_STOP_OR_LOSS),
+        (CanaryCloseSignals(hard_holding_time=True), CloseReason.HARD_HOLDING_TIME),
         (CanaryCloseSignals(operator_close_requested=True), CloseReason.OPERATOR_CLOSE),
         (CanaryCloseSignals(emergency_active=True), CloseReason.EMERGENCY),
     ],
@@ -196,6 +200,38 @@ def _plan() -> CanaryExecutionPlan:
         risk_reservation={"projected_stress_usdt": "0.8"},
         qualification_hash="a" * 64,
         timeout_seconds=30,
+    )
+
+
+def _aggressive_hard_breach_plan() -> CanaryExecutionPlan:
+    plan = _plan()
+    reserves = {
+        "entry_impact_usdt": "0.1",
+        "exit_impact_usdt": "0.1",
+        "entry_slippage_usdt": "0.1",
+        "exit_slippage_usdt": "0.1",
+        "latency_usdt": "0.1",
+        "partial_fill_unmatched_usdt": "0.1",
+        "emergency_hedge_usdt": "0.1",
+        "reconciliation_forced_exit_usdt": "0.1",
+        "liquidation_distance_usdt": "0.1",
+    }
+    return replace(
+        plan,
+        risk_reservation={
+            "strategy": "AGGRESSIVE_SYMBIOSIS_V1",
+            "direction": "POSITIVE",
+            "effective_stop_bps": "0",
+            "projected_stress_usdt": "0.8",
+            "route_hard_loss_usdt": "1",
+            "portfolio_hard_loss_usdt": "1",
+            "aggressive_intent": {
+                "executable_entry_spread_bps": "10",
+                "reserves": reserves,
+                "adverse_funding_reserve_usdt": "0.1",
+                "remaining_close_fees_usdt": "0.2",
+            },
+        },
     )
 
 
@@ -764,3 +800,251 @@ async def test_public_protection_failure_falls_through_to_durable_emergency_flat
     assert result.reason == ReasonCode.FORCED_CLOSED
     assert result.terminal_state == LiveActionState.FLAT
     assert result.recovery_action == "EMERGENCY_FLATTEN"
+
+
+@pytest.mark.asyncio
+async def test_portfolio_close_reduces_only_one_tranche_and_preserves_remaining_owner(
+    tmp_path: Path,
+) -> None:
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    filled = tuple(_outcome(PrivateOrderStatus.FILLED, "1") for _ in range(3))
+    adapters = {
+        Venue.BINANCE_USDM: DeterministicPrivateExchange(
+            Venue.BINANCE_USDM, instruments[Venue.BINANCE_USDM], filled
+        ),
+        Venue.OKX: DeterministicPrivateExchange(Venue.OKX, instruments[Venue.OKX], filled),
+        Venue.BYBIT: DeterministicPrivateExchange(Venue.BYBIT, instruments[Venue.BYBIT], ()),
+    }
+    journal = LiveOrderJournal(tmp_path / "portfolio.sqlite3")
+    protection = StaticProtectionProvider(
+        {
+            (venue, side): Decimal("101") if side == Side.BUY else Decimal("99")
+            for venue in Venue
+            for side in Side
+        }
+    )
+
+    def plan(index: int) -> CanaryExecutionPlan:
+        action_id = f"cycle-{index}"
+        return replace(
+            _plan(),
+            pair_action_id=action_id,
+            tranche_id=f"tranche-{index}",
+            long_request=_request(
+                Venue.BINANCE_USDM,
+                venue_client_order_id(action_id, "long"),
+                Side.BUY,
+            ),
+            short_request=_request(
+                Venue.OKX,
+                venue_client_order_id(action_id, "short"),
+                Side.SELL,
+            ),
+        )
+
+    for index in (1, 2):
+        opened = await LiveCanaryCoordinator(
+            journal,
+            adapters,
+            instruments,
+            protection,
+            DeterministicCanaryMonitor(CloseReason.CANARY_TIMEOUT),
+            Venue.BYBIT,
+            portfolio_mode=True,
+        ).run(plan(index))
+        assert opened.success and opened.terminal_state == LiveActionState.HEDGED
+
+    closed = await LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        protection,
+        DeterministicCanaryMonitor(CloseReason.TARGET_CONVERGENCE),
+        Venue.BYBIT,
+        portfolio_mode=True,
+    ).run(plan(2))
+
+    first = await journal.load("cycle-1")
+    second = await journal.load("cycle-2")
+    assert closed.success and closed.portfolio_reconciled
+    assert not closed.flat_barrier_verified
+    assert first is not None and first.state == LiveActionState.HEDGED
+    assert second is not None and second.state == LiveActionState.FLAT
+    for venue in (Venue.BINANCE_USDM, Venue.OKX):
+        assert adapters[venue].submit_calls == 3
+        positions = await adapters[venue].fetch_all_positions()
+        assert len(positions) == 1 and positions[0].base_quantity == Decimal("0.001")
+
+
+@pytest.mark.asyncio
+async def test_hard_route_exit_closes_all_tranches_under_one_flat_barrier(tmp_path: Path) -> None:
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    filled = tuple(_outcome(PrivateOrderStatus.FILLED, "1") for _ in range(10))
+    adapters = {
+        Venue.BINANCE_USDM: DeterministicPrivateExchange(
+            Venue.BINANCE_USDM, instruments[Venue.BINANCE_USDM], filled
+        ),
+        Venue.OKX: DeterministicPrivateExchange(Venue.OKX, instruments[Venue.OKX], filled),
+        Venue.BYBIT: DeterministicPrivateExchange(Venue.BYBIT, instruments[Venue.BYBIT], ()),
+    }
+    journal = LiveOrderJournal(tmp_path / "route-flat.sqlite3")
+    protection = StaticProtectionProvider(
+        {
+            (venue, side): Decimal("101") if side == Side.BUY else Decimal("99")
+            for venue in Venue
+            for side in Side
+        }
+    )
+
+    def plan(index: int) -> CanaryExecutionPlan:
+        action_id = f"route-cycle-{index}"
+        return replace(
+            _plan(),
+            pair_action_id=action_id,
+            tranche_id=f"route-tranche-{index}",
+            long_request=_request(
+                Venue.BINANCE_USDM,
+                venue_client_order_id(action_id, "long"),
+                Side.BUY,
+            ),
+            short_request=_request(
+                Venue.OKX,
+                venue_client_order_id(action_id, "short"),
+                Side.SELL,
+            ),
+        )
+
+    for index in range(1, 6):
+        opened = await LiveCanaryCoordinator(
+            journal,
+            adapters,
+            instruments,
+            protection,
+            DeterministicCanaryMonitor(CloseReason.CANARY_TIMEOUT),
+            Venue.BYBIT,
+            portfolio_mode=True,
+        ).run(plan(index))
+        assert opened.success and opened.terminal_state == LiveActionState.HEDGED
+
+    closed = await LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        protection,
+        DeterministicCanaryMonitor(CloseReason.HARD_HOLDING_TIME),
+        Venue.BYBIT,
+        portfolio_mode=True,
+    ).run(plan(5))
+
+    assert closed.success and closed.flat_barrier_verified and closed.portfolio_reconciled
+    assert closed.close_reason == CloseReason.HARD_HOLDING_TIME
+    assert await journal.active_actions() == ()
+    for venue in (Venue.BINANCE_USDM, Venue.OKX):
+        assert adapters[venue].submit_calls == 10
+        assert await adapters[venue].fetch_all_positions() == ()
+
+
+@pytest.mark.asyncio
+async def test_real_fill_repricing_persists_reserves_and_closes_at_hard_limit(
+    tmp_path: Path,
+) -> None:
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    adapters = {
+        Venue.BINANCE_USDM: DeterministicPrivateExchange(
+            Venue.BINANCE_USDM,
+            instruments[Venue.BINANCE_USDM],
+            tuple(_outcome(PrivateOrderStatus.FILLED, "1") for _ in range(2)),
+        ),
+        Venue.OKX: DeterministicPrivateExchange(
+            Venue.OKX,
+            instruments[Venue.OKX],
+            tuple(_outcome(PrivateOrderStatus.FILLED, "1") for _ in range(2)),
+        ),
+        Venue.BYBIT: DeterministicPrivateExchange(
+            Venue.BYBIT,
+            instruments[Venue.BYBIT],
+            (),
+        ),
+    }
+    journal = LiveOrderJournal(tmp_path / "actual-risk.sqlite3")
+    policy = load_aggressive_decision_policy(Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")).policy
+    result = await LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        StaticProtectionProvider(
+            {
+                (venue, side): Decimal("101") if side == Side.BUY else Decimal("99")
+                for venue in Venue
+                for side in Side
+            }
+        ),
+        DeterministicCanaryMonitor(CloseReason.CANARY_TIMEOUT),
+        Venue.BYBIT,
+        aggressive_policy=policy,
+    ).run(_aggressive_hard_breach_plan())
+    stored = await journal.load("cycle-1")
+
+    assert result.success and result.close_reason == CloseReason.HARD_STOP_OR_LOSS
+    assert result.terminal_state == LiveActionState.FLAT
+    assert stored is not None
+    actual = stored.risk_reservation["actual_fill_risk"]
+    # Includes the explicit 0.20 USDT reserve for the two still-unexecuted close legs.
+    assert Decimal(str(actual["incremental_stress_usdt"])) >= Decimal("1.2001")
+    assert all(
+        adapter.submit_calls == 2 for venue, adapter in adapters.items() if venue != Venue.BYBIT
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_fill_hard_breach_reduces_before_opening_top_up(tmp_path: Path) -> None:
+    instruments = {venue: _instrument(venue) for venue in Venue}
+    adapters = {
+        Venue.BINANCE_USDM: DeterministicPrivateExchange(
+            Venue.BINANCE_USDM,
+            instruments[Venue.BINANCE_USDM],
+            (
+                _outcome(PrivateOrderStatus.FILLED, "1"),
+                _outcome(PrivateOrderStatus.FILLED, "1"),
+            ),
+        ),
+        Venue.OKX: DeterministicPrivateExchange(
+            Venue.OKX,
+            instruments[Venue.OKX],
+            (_outcome(PrivateOrderStatus.REJECTED),),
+        ),
+        Venue.BYBIT: DeterministicPrivateExchange(Venue.BYBIT, instruments[Venue.BYBIT], ()),
+    }
+    plan = _aggressive_hard_breach_plan()
+    plan = replace(
+        plan,
+        risk_reservation={**plan.risk_reservation, "route_hard_loss_usdt": "0.85"},
+    )
+    journal = LiveOrderJournal(tmp_path / "partial-risk.sqlite3")
+    policy = load_aggressive_decision_policy(Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")).policy
+    result = await LiveCanaryCoordinator(
+        journal,
+        adapters,
+        instruments,
+        StaticProtectionProvider(
+            {
+                (venue, side): Decimal("101") if side == Side.BUY else Decimal("99")
+                for venue in Venue
+                for side in Side
+            }
+        ),
+        DeterministicCanaryMonitor(CloseReason.CANARY_TIMEOUT),
+        Venue.BYBIT,
+        aggressive_policy=policy,
+    ).run(plan)
+
+    stored = await journal.load(plan.pair_action_id)
+    assert result.success is False and result.reason == ReasonCode.FORCED_CLOSED
+    assert result.recovery_action == "ACTUAL_FILL_HARD_BREACH_REDUCE"
+    assert result.terminal_state == LiveActionState.FLAT
+    assert adapters[Venue.BINANCE_USDM].submit_calls == 2
+    assert adapters[Venue.OKX].submit_calls == 1  # no risk-increasing top-up
+    assert stored is not None
+    assert Decimal(
+        str(stored.risk_reservation["actual_fill_risk"]["incremental_stress_usdt"])
+    ) >= Decimal("0.85")

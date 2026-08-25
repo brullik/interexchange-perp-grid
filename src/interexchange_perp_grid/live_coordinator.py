@@ -9,6 +9,12 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Protocol
 
+from interexchange_perp_grid.aggressive_evaluator import AggressiveDecisionPolicy, CostReserves
+from interexchange_perp_grid.aggressive_model import DivergenceDirection
+from interexchange_perp_grid.aggressive_runtime import (
+    ActualFillRiskInput,
+    recompute_actual_fill_risk,
+)
 from interexchange_perp_grid.client_ids import (
     is_bot_client_order_id,
     venue_client_order_id,
@@ -30,7 +36,9 @@ from interexchange_perp_grid.live_reconciliation import (
     combined_event_watermark,
     flat_barrier_failure_reason,
     reconcile_private_states,
+    reconciliation_position_signature_sha256,
     wait_for_stable_flat,
+    wait_for_stable_reconciliation,
 )
 from interexchange_perp_grid.private_domain import (
     PrivateOrder,
@@ -43,6 +51,8 @@ from interexchange_perp_grid.strategy import DirectedRouteKey
 
 
 class CloseReason(StrEnum):
+    HARD_STOP_OR_LOSS = "HARD_STOP_OR_LOSS"
+    HARD_HOLDING_TIME = "HARD_HOLDING_TIME"
     TARGET_CONVERGENCE = "TARGET_CONVERGENCE"
     CANARY_TIMEOUT = "CANARY_TIMEOUT"
     RISK_DETERIORATION = "RISK_DETERIORATION"
@@ -60,6 +70,8 @@ class CanaryCloseSignals:
     public_or_private_data_stale: bool = False
     operator_close_requested: bool = False
     emergency_active: bool = False
+    hard_stop_or_loss: bool = False
+    hard_holding_time: bool = False
 
 
 def first_close_reason(signals: CanaryCloseSignals) -> CloseReason | None:
@@ -67,6 +79,8 @@ def first_close_reason(signals: CanaryCloseSignals) -> CloseReason | None:
         (signals.emergency_active, CloseReason.EMERGENCY),
         (signals.operator_close_requested, CloseReason.OPERATOR_CLOSE),
         (signals.public_or_private_data_stale, CloseReason.STALE_DATA),
+        (signals.hard_stop_or_loss, CloseReason.HARD_STOP_OR_LOSS),
+        (signals.hard_holding_time, CloseReason.HARD_HOLDING_TIME),
         (signals.risk_deteriorated, CloseReason.RISK_DETERIORATION),
         (signals.funding_deteriorated, CloseReason.FUNDING_DETERIORATION),
         (signals.target_converged, CloseReason.TARGET_CONVERGENCE),
@@ -143,6 +157,7 @@ class CanaryCycleResult:
     flat_barrier_timed_out: bool = False
     flat_barrier_snapshots: int = 0
     flat_barrier_watermark: int = -1
+    portfolio_reconciled: bool = False
 
 
 class LiveCanaryCoordinator:
@@ -161,6 +176,8 @@ class LiveCanaryCoordinator:
         flat_barrier_policy: FlatBarrierPolicy | None = None,
         opening_gate: Callable[[CanaryExecutionPlan], Awaitable[bool]] | None = None,
         final_opening_gate: Callable[[], Awaitable[bool]] | None = None,
+        portfolio_mode: bool = False,
+        aggressive_policy: AggressiveDecisionPolicy | None = None,
     ) -> None:
         self._journal = journal
         self._adapters = dict(adapters)
@@ -182,6 +199,8 @@ class LiveCanaryCoordinator:
         self._flat_barrier_policy = flat_barrier_policy or FlatBarrierPolicy()
         self._opening_gate = opening_gate
         self._final_opening_gate = final_opening_gate
+        self._portfolio_mode = portfolio_mode
+        self._aggressive_policy = aggressive_policy
         self._orders_sent = 0
         self._sequence = 0
 
@@ -326,10 +345,26 @@ class LiveCanaryCoordinator:
             action = await self._refresh_action(action)
 
         resuming_close = action.state == LiveActionState.CLOSING
+        was_hedged = action.state == LiveActionState.HEDGED
         opening_recovery: str | None = action.recovery_action
+        partial_hard_breach = False
+        if action.state == LiveActionState.PARTIAL:
+            action, partial_hard_breach = await self._record_partial_fill_risk(action)
         hedged = resuming_close or await self._is_hedged(action)
         if not hedged and not resuming_close:
-            action, opening_recovery = await self._recover_opening(action)
+            if partial_hard_breach:
+                action = await self._journal.transition(
+                    action.pair_action_id,
+                    LiveActionState.RECOVERING,
+                    {"reason": "ACTUAL_FILL_HARD_BREACH"},
+                    residual_delta=_journal_delta(action),
+                    recovery_action="ACTUAL_FILL_HARD_BREACH_REDUCE",
+                )
+                await self._close_exchange_positions(action, emergency=False)
+                action = await self._refresh_action(action)
+                opening_recovery = "ACTUAL_FILL_HARD_BREACH_REDUCE"
+            else:
+                action, opening_recovery = await self._recover_opening(action)
             hedged = await self._is_hedged(action)
             if not hedged:
                 barrier = await self._verify_stable_flat(action)
@@ -373,11 +408,65 @@ class LiveCanaryCoordinator:
 
         if not resuming_close and action.state != LiveActionState.HEDGED:
             action = await self._advance_to_hedged(action)
+        actual_hard_breach = False
+        if action.state == LiveActionState.HEDGED:
+            action, actual_hard_breach = await self._record_actual_fill_risk(action)
+        if (
+            self._portfolio_mode
+            and not resuming_close
+            and not was_hedged
+            and not actual_hard_breach
+        ):
+            report = await self._verify(action)
+            return CanaryCycleResult(
+                True,
+                None,
+                self._orders_sent,
+                True,
+                report.residual_delta,
+                opening_recovery,
+                None,
+                action.state,
+                report,
+                None,
+                portfolio_reconciled=report.consistent,
+            )
         close_reason = (
             CloseReason.EMERGENCY
             if resuming_close
+            else CloseReason.HARD_STOP_OR_LOSS
+            if actual_hard_breach
             else await self._wait_close(plan.timeout_seconds)
         )
+        if self._portfolio_mode and close_reason == CloseReason.CANARY_TIMEOUT:
+            report = await self._verify(action)
+            return CanaryCycleResult(
+                report.consistent,
+                None if report.consistent else ReasonCode.RECONCILIATION_INCOMPLETE,
+                self._orders_sent,
+                True,
+                report.residual_delta,
+                opening_recovery,
+                None,
+                action.state,
+                report,
+                None,
+                portfolio_reconciled=report.consistent,
+            )
+        if self._portfolio_mode and close_reason not in {
+            CloseReason.TARGET_CONVERGENCE,
+            CloseReason.CANARY_TIMEOUT,
+        }:
+            route_actions = tuple(
+                item for item in await self._journal.active_actions() if item.route == action.route
+            )
+            if len(route_actions) > 1:
+                return await self._close_entire_route(
+                    action,
+                    route_actions,
+                    close_reason,
+                    opening_recovery,
+                )
         if not resuming_close:
             action = await self._require_action(action.pair_action_id)
             if action.state == LiveActionState.HEDGED:
@@ -395,9 +484,17 @@ class LiveCanaryCoordinator:
                 raise RuntimeError(f"unexpected live-control state {action.state.value}")
         await self._close_exchange_positions(action, emergency=False)
         action = await self._require_action(action.pair_action_id)
-        barrier = await self._verify_stable_flat(action)
+        active_before_terminal = await self._journal.active_actions()
+        partial_portfolio_close = self._portfolio_mode and len(active_before_terminal) > 1
+        barrier = (
+            await self._verify_stable_portfolio()
+            if partial_portfolio_close
+            else await self._verify_stable_flat(action)
+        )
         report = barrier.report
         recovery_action: str | None = opening_recovery
+        if not barrier.verified and partial_portfolio_close:
+            raise RuntimeError("scoped tranche close did not reconcile the remaining portfolio")
         if not barrier.verified:
             action = await self._journal.transition(
                 action.pair_action_id,
@@ -413,7 +510,16 @@ class LiveCanaryCoordinator:
             barrier = await self._verify_stable_flat(action)
             report = barrier.report
         if barrier.verified:
-            action, barrier = await self._to_flat(action, "EXCHANGE_VERIFIED_FLAT", barrier)
+            action, barrier = (
+                await self._to_portfolio_flat(
+                    action,
+                    active_before_terminal,
+                    "EXCHANGE_VERIFIED_SCOPED_CLOSE",
+                    barrier,
+                )
+                if partial_portfolio_close
+                else await self._to_flat(action, "EXCHANGE_VERIFIED_FLAT", barrier)
+            )
         if not barrier.verified:
             if action.state != LiveActionState.QUARANTINED:
                 action = await self._quarantine(
@@ -441,10 +547,91 @@ class LiveCanaryCoordinator:
             action.state,
             report,
             None,
-            barrier.verified,
-            barrier.timed_out,
-            barrier.consecutive_snapshots,
-            barrier.event_watermark,
+            flat_barrier_verified=barrier.verified and not partial_portfolio_close,
+            flat_barrier_timed_out=barrier.timed_out,
+            flat_barrier_snapshots=barrier.consecutive_snapshots,
+            flat_barrier_watermark=barrier.event_watermark,
+            portfolio_reconciled=partial_portfolio_close,
+        )
+
+    async def _close_entire_route(
+        self,
+        action: LiveJournalAction,
+        route_actions: tuple[LiveJournalAction, ...],
+        close_reason: CloseReason,
+        opening_recovery: str | None,
+    ) -> CanaryCycleResult:
+        """Risk-reduce every tranche on a route before committing any one FLAT."""
+        closing: list[LiveJournalAction] = []
+        for snapshot in route_actions:
+            current = await self._require_action(snapshot.pair_action_id)
+            if current.state == LiveActionState.HEDGED:
+                current = await self._journal.transition(
+                    current.pair_action_id,
+                    LiveActionState.CLOSING,
+                    {
+                        "close_reason": close_reason.value,
+                        "scope": "ENTIRE_ROUTE",
+                    },
+                    residual_delta=Decimal(0),
+                )
+            if current.state not in {LiveActionState.CLOSING, LiveActionState.RECOVERING}:
+                raise RuntimeError(
+                    "route-wide close encountered a non-reducible durable action state"
+                )
+            closing.append(current)
+        await asyncio.gather(
+            *(self._close_exchange_positions(item, emergency=False) for item in closing)
+        )
+        barrier = await self._verify_stable_portfolio()
+        if not barrier.verified:
+            raise RuntimeError("route-wide close did not reconcile the remaining portfolio")
+        observed_before = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if observed_before != barrier.event_watermark:
+            raise RuntimeError("route-wide close lost its private-event barrier")
+        journal_watermark = await self._journal.event_watermark()
+        action_ids = tuple(item.pair_action_id for item in route_actions)
+        commit = await self._journal.commit_flat_barrier_many(
+            action_ids,
+            journal_watermark,
+            {
+                "reason": "EXCHANGE_VERIFIED_ROUTE_FLAT",
+                "close_reason": close_reason.value,
+                "reconciliation_position_signature_sha256": (
+                    reconciliation_position_signature_sha256(barrier.report)
+                ),
+            },
+        )
+        observed_after = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        committed = commit.committed and observed_after == barrier.event_watermark
+        terminal = next(
+            (item for item in commit.actions if item.pair_action_id == action.pair_action_id),
+            None,
+        )
+        if not committed or terminal is None:
+            raise RuntimeError("route-wide FLAT commit lost its exact reconciliation barrier")
+        return CanaryCycleResult(
+            True,
+            None,
+            self._orders_sent,
+            True,
+            Decimal(0),
+            opening_recovery,
+            close_reason,
+            terminal.state,
+            barrier.report,
+            None,
+            flat_barrier_verified=True,
+            flat_barrier_timed_out=barrier.timed_out,
+            flat_barrier_snapshots=barrier.consecutive_snapshots,
+            flat_barrier_watermark=barrier.event_watermark,
+            portfolio_reconciled=True,
         )
 
     async def _classify_open_pair(
@@ -559,6 +746,8 @@ class LiveCanaryCoordinator:
     async def _is_hedged(self, action: LiveJournalAction) -> bool:
         report = await self._verify(action)
         gross = sum((abs(value) for value in report.actual_signed_positions.values()), Decimal(0))
+        locally_owned = _journal_signed_positions(action)
+        local_gross = sum((abs(value) for value in locally_owned.values()), Decimal(0))
         return (
             report.status == ReconciliationStatus.CONSISTENT
             and report.snapshots_complete
@@ -567,6 +756,10 @@ class LiveCanaryCoordinator:
             and gross > 0
             and report.residual_delta == 0
             and report.actual_signed_positions == report.expected_signed_positions
+            and local_gross > 0
+            and any(value > 0 for value in locally_owned.values())
+            and any(value < 0 for value in locally_owned.values())
+            and _journal_delta(action) == 0
         )
 
     async def _recover_opening(
@@ -710,25 +903,47 @@ class LiveCanaryCoordinator:
         *,
         emergency: bool,
     ) -> None:
-        states = await collect_private_states(
-            self._adapters,
-            self._account_instruments,
-            reconciliation_trigger="PRE_CLOSE",
-        )
-        positions = tuple(position for state in states.values() for position in state.positions)
+        if emergency:
+            states = await collect_private_states(
+                self._adapters,
+                self._account_instruments,
+                reconciliation_trigger="PRE_CLOSE",
+            )
+            positions = tuple(position for state in states.values() for position in state.positions)
+            close_requests = tuple(
+                (
+                    position.venue,
+                    Side.SELL if position.side == Side.BUY else Side.BUY,
+                    position.base_quantity,
+                    position.symbol,
+                )
+                for position in positions
+            )
+        else:
+            signed_positions = _journal_signed_positions(action)
+            close_requests = tuple(
+                (
+                    venue,
+                    Side.SELL if quantity > 0 else Side.BUY,
+                    abs(quantity),
+                    self._base_instrument(venue, action.route.base).symbol,
+                )
+                for venue, quantity in signed_positions.items()
+                if quantity != 0
+            )
         await asyncio.gather(
             *(
                 self._submit_recovery_leg(
                     action,
-                    position.venue,
-                    Side.SELL if position.side == Side.BUY else Side.BUY,
-                    position.base_quantity,
-                    (OrderPurpose.EMERGENCY_CLOSE if emergency else OrderPurpose.NORMAL_CLOSE),
+                    venue,
+                    side,
+                    quantity,
+                    OrderPurpose.EMERGENCY_CLOSE if emergency else OrderPurpose.NORMAL_CLOSE,
                     "EMERGENCY_FLATTEN" if emergency else "CLOSE",
                     emergency=emergency,
-                    symbol=position.symbol,
+                    symbol=symbol,
                 )
-                for position in positions
+                for venue, side, quantity, symbol in close_requests
             ),
             return_exceptions=True,
         )
@@ -758,12 +973,35 @@ class LiveCanaryCoordinator:
 
     async def _verify(self, action: LiveJournalAction) -> ReconciliationReport:
         refreshed = await self._refresh_action(action)
+        expected: LiveJournalAction | tuple[LiveJournalAction, ...] = refreshed
+        if self._portfolio_mode:
+            expected = await self._journal.active_actions()
         states = await collect_private_states(self._adapters, self._account_instruments)
         return reconcile_private_states(
-            refreshed,
+            expected,
             states,
             await self._journal.known_client_order_ids(),
             set(self._adapters),
+        )
+
+    async def _verify_stable_portfolio(self) -> FlatBarrierResult:
+        async def report_factory() -> ReconciliationReport:
+            actions = await self._journal.active_actions()
+            states = await collect_private_states(self._adapters, self._account_instruments)
+            return reconcile_private_states(
+                actions,
+                states,
+                await self._journal.known_client_order_ids(),
+                set(self._adapters),
+            )
+
+        return await wait_for_stable_reconciliation(
+            report_factory,
+            lambda: combined_event_watermark(
+                self._adapters,
+                self._journal.event_watermark,
+            ),
+            self._flat_barrier_policy,
         )
 
     async def _verify_stable_flat(self, action: LiveJournalAction) -> FlatBarrierResult:
@@ -779,6 +1017,213 @@ class LiveCanaryCoordinator:
             ),
             self._flat_barrier_policy,
         )
+
+    async def _record_actual_fill_risk(
+        self,
+        action: LiveJournalAction,
+    ) -> tuple[LiveJournalAction, bool]:
+        reservation = action.risk_reservation
+        if reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1":
+            return action, False
+        if self._aggressive_policy is None:
+            raise RuntimeError("aggressive actual-fill risk policy is unavailable")
+        orders = await self._journal.latest_order_events(action.pair_action_id)
+        signed_positions = _journal_signed_positions(action)
+        long_quantity = signed_positions.get(action.route.long_venue, Decimal(0))
+        short_quantity = -signed_positions.get(action.route.short_venue, Decimal(0))
+        if long_quantity <= 0 or long_quantity != short_quantity:
+            raise RuntimeError("aggressive actual-fill risk requires a matched paired position")
+
+        def weighted_price(venue: Venue, side: Side) -> Decimal:
+            fills = tuple(
+                order
+                for order in orders
+                if order.venue == venue
+                and order.side == side
+                and order.filled_base_quantity > 0
+                and order.average_price is not None
+            )
+            quantity = sum((order.filled_base_quantity for order in fills), Decimal(0))
+            if quantity <= 0:
+                raise RuntimeError("aggressive actual-fill price evidence is incomplete")
+            return (
+                sum(
+                    (
+                        order.filled_base_quantity * order.average_price
+                        for order in fills
+                        if order.average_price is not None
+                    ),
+                    Decimal(0),
+                )
+                / quantity
+            )
+
+        if any(order.fee_usdt is None for order in orders if order.filled_base_quantity > 0):
+            raise RuntimeError("aggressive actual-fill fee evidence is incomplete")
+        actual_fees = sum(
+            (
+                order.fee_usdt
+                for order in orders
+                if order.filled_base_quantity > 0 and order.fee_usdt is not None
+            ),
+            Decimal(0),
+        )
+        try:
+            direction = DivergenceDirection(str(reservation["direction"]))
+            effective_stop = Decimal(str(reservation["effective_stop_bps"]))
+            raw_intent = reservation["aggressive_intent"]
+            if not isinstance(raw_intent, dict) or not isinstance(raw_intent.get("reserves"), dict):
+                raise ValueError("aggressive reserve breakdown is unavailable")
+            reserve_values = raw_intent["reserves"]
+            assert isinstance(reserve_values, dict)
+            explicit_reserves = CostReserves(
+                **{str(key): Decimal(str(value)) for key, value in reserve_values.items()}
+            ).total()
+            adverse_funding = Decimal(str(raw_intent["adverse_funding_reserve_usdt"]))
+            remaining_close_fees = Decimal(str(raw_intent["remaining_close_fees_usdt"]))
+            route_hard_limit = Decimal(str(reservation["route_hard_loss_usdt"]))
+            portfolio_hard_limit = Decimal(str(reservation["portfolio_hard_loss_usdt"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+            raise RuntimeError("aggressive actual-fill reservation is incomplete") from error
+        if (
+            not adverse_funding.is_finite()
+            or adverse_funding < 0
+            or not remaining_close_fees.is_finite()
+            or remaining_close_fees < 0
+        ):
+            raise RuntimeError("aggressive future cost reserve is invalid")
+        active = await self._journal.active_actions()
+
+        def effective_stress(other: LiveJournalAction) -> Decimal:
+            actual = other.risk_reservation.get("actual_fill_risk")
+            if isinstance(actual, dict) and "incremental_stress_usdt" in actual:
+                return max(
+                    Decimal(str(other.risk_reservation["projected_stress_usdt"])),
+                    Decimal(str(actual["incremental_stress_usdt"])),
+                )
+            return Decimal(str(other.risk_reservation["projected_stress_usdt"]))
+
+        existing_route = sum(
+            (
+                effective_stress(other)
+                for other in active
+                if other.pair_action_id != action.pair_action_id and other.route == action.route
+            ),
+            Decimal(0),
+        )
+        existing_portfolio = sum(
+            (
+                effective_stress(other)
+                for other in active
+                if other.pair_action_id != action.pair_action_id
+            ),
+            Decimal(0),
+        )
+        result = recompute_actual_fill_risk(
+            ActualFillRiskInput(
+                direction=direction,
+                base_quantity=long_quantity,
+                long_fill_price=weighted_price(action.route.long_venue, Side.BUY),
+                short_fill_price=weighted_price(action.route.short_venue, Side.SELL),
+                actual_fees_usdt=actual_fees,
+                adverse_funding_usdt=adverse_funding,
+                other_reserves_usdt=explicit_reserves + remaining_close_fees,
+                effective_stop_bps=effective_stop,
+                existing_route_loss_usdt=existing_route,
+                existing_portfolio_loss_usdt=existing_portfolio,
+            ),
+            self._aggressive_policy,
+        )
+        incremental = result.projected_route_loss_usdt - existing_route
+        watermark = await self._journal.event_watermark()
+        actual_payload: dict[str, object] = {
+            "incremental_stress_usdt": str(incremental),
+            "route_total_usdt": str(result.projected_route_loss_usdt),
+            "portfolio_total_usdt": str(result.projected_portfolio_loss_usdt),
+            "actual_entry_spread_bps": str(result.actual_entry_spread_bps),
+            "fill_event_watermark": watermark,
+        }
+        updated = await self._journal.update_actual_risk(
+            action.pair_action_id,
+            watermark,
+            actual_payload,
+        )
+        authoritative = updated.risk_reservation.get("actual_fill_risk")
+        if not isinstance(authoritative, dict):
+            raise RuntimeError("authoritative actual-fill risk was not persisted")
+        try:
+            hard_breach = (
+                Decimal(str(authoritative["route_total_usdt"])) >= route_hard_limit
+                or Decimal(str(authoritative["portfolio_total_usdt"])) >= portfolio_hard_limit
+            )
+        except (KeyError, ValueError, ArithmeticError) as error:
+            raise RuntimeError("authoritative actual-fill risk is incomplete") from error
+        return updated, hard_breach
+
+    async def _record_partial_fill_risk(
+        self,
+        action: LiveJournalAction,
+    ) -> tuple[LiveJournalAction, bool]:
+        """Persist a deliberately severe risk bound before any opening top-up.
+
+        An unmatched fill is directional exposure.  Until it is paired or
+        reduced, reserve its entire filled notional in addition to the planned
+        route stress.  This makes the decision fail closed before another
+        opening order can increase exposure.
+        """
+        reservation = action.risk_reservation
+        if reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1":
+            return action, False
+        orders = await self._journal.latest_order_events(action.pair_action_id)
+        fills = tuple(order for order in orders if order.filled_base_quantity > 0)
+        if not fills:
+            return action, False
+        if any(order.average_price is None or order.fee_usdt is None for order in fills):
+            raise RuntimeError("aggressive partial-fill evidence is incomplete")
+        signed = _journal_signed_positions(action)
+        unmatched_quantity = abs(sum(signed.values(), Decimal(0)))
+        if unmatched_quantity <= 0:
+            return action, False
+        maximum_fill_price = max(
+            order.average_price for order in fills if order.average_price is not None
+        )
+        actual_fees = sum(
+            (order.fee_usdt for order in fills if order.fee_usdt is not None),
+            Decimal(0),
+        )
+        try:
+            planned = Decimal(str(reservation["projected_stress_usdt"]))
+            entry_spread = Decimal(
+                str(reservation["aggressive_intent"]["executable_entry_spread_bps"])
+            )
+            route_hard_limit = Decimal(str(reservation["route_hard_loss_usdt"]))
+            portfolio_hard_limit = Decimal(str(reservation["portfolio_hard_loss_usdt"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+            raise RuntimeError("aggressive partial-fill reservation is incomplete") from error
+        incremental = planned + unmatched_quantity * maximum_fill_price + actual_fees
+        watermark = await self._journal.event_watermark()
+        updated = await self._journal.update_actual_risk(
+            action.pair_action_id,
+            watermark,
+            {
+                "incremental_stress_usdt": str(incremental),
+                "route_total_usdt": str(incremental),
+                "portfolio_total_usdt": str(incremental),
+                "actual_entry_spread_bps": str(entry_spread),
+                "fill_event_watermark": watermark,
+            },
+        )
+        authoritative = updated.risk_reservation.get("actual_fill_risk")
+        if not isinstance(authoritative, dict):
+            raise RuntimeError("authoritative partial-fill risk was not persisted")
+        try:
+            hard_breach = (
+                Decimal(str(authoritative["route_total_usdt"])) >= route_hard_limit
+                or Decimal(str(authoritative["portfolio_total_usdt"])) >= portfolio_hard_limit
+            )
+        except (KeyError, ValueError, ArithmeticError) as error:
+            raise RuntimeError("authoritative partial-fill risk is incomplete") from error
+        return updated, hard_breach
 
     async def _advance_to_hedged(self, action: LiveJournalAction) -> LiveJournalAction:
         if not await self._is_hedged(action):
@@ -869,8 +1314,8 @@ class LiveCanaryCoordinator:
             and commit.event_watermark == journal_watermark
         ):
             preserve_terminal_flat = any(
-                action.pair_action_id != failed_action.pair_action_id
-                for action in await self._journal.active_actions()
+                active.pair_action_id != failed_action.pair_action_id
+                for active in await self._journal.active_actions()
             )
         if failed_action.state != LiveActionState.QUARANTINED and not preserve_terminal_flat:
             failed_action = await self._quarantine(failed_action, barrier.report, reason)
@@ -884,6 +1329,53 @@ class LiveCanaryCoordinator:
                 False,
                 ReasonCode.FLAT_BARRIER_EVENT_RACE,
             ),
+        )
+
+    async def _to_portfolio_flat(
+        self,
+        action: LiveJournalAction,
+        active_actions: tuple[LiveJournalAction, ...],
+        reason: str,
+        barrier: FlatBarrierResult,
+    ) -> tuple[LiveJournalAction, FlatBarrierResult]:
+        if not barrier.verified:
+            raise RuntimeError("portfolio reconciliation barrier is not verified")
+        observed_before = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if observed_before != barrier.event_watermark:
+            return action, FlatBarrierResult(
+                False,
+                barrier.report,
+                0,
+                observed_before,
+                False,
+                ReasonCode.FLAT_BARRIER_EVENT_RACE,
+            )
+        journal_watermark = await self._journal.event_watermark()
+        commit = await self._journal.commit_reconciled_action(
+            action.pair_action_id,
+            tuple(item.pair_action_id for item in active_actions),
+            journal_watermark,
+            reconciliation_position_signature_sha256(barrier.report),
+            {"reason": reason},
+        )
+        if commit.action is None:
+            raise RuntimeError("portfolio reconciliation commit lost the durable action")
+        observed_after = await combined_event_watermark(
+            self._adapters,
+            self._journal.event_watermark,
+        )
+        if commit.committed and observed_after == barrier.event_watermark:
+            return commit.action, barrier
+        return commit.action, FlatBarrierResult(
+            False,
+            barrier.report,
+            0,
+            observed_after,
+            False,
+            ReasonCode.FLAT_BARRIER_EVENT_RACE,
         )
 
     async def _quarantine(

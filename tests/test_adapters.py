@@ -17,6 +17,10 @@ from interexchange_perp_grid.domain import WAVE1_VENUES, Instrument, Venue
 from interexchange_perp_grid.market_data import BookRegistry
 from interexchange_perp_grid.market_universe import InstrumentRegistry
 from interexchange_perp_grid.reason_codes import ReasonCode
+from interexchange_perp_grid.reference_history import (
+    ReferenceRejectionReason,
+    build_reference_minute,
+)
 
 FIXTURE = Path("tests/fixtures/wave1_markets.json")
 
@@ -130,6 +134,84 @@ async def test_funding_schedule_falls_back_to_unified_funding_timestamp() -> Non
     assert funding.next_funding_timestamp_ms == 1_700_000_100_000
     assert funding.mark_price == Decimal("100.1")
     assert funding.index_price == Decimal("100.0")
+
+
+class OhlcExchange:
+    has: ClassVar[dict[str, object]] = {"fetchOHLCV": True}
+
+    def __init__(self, rows: list[list[object]]) -> None:
+        self.rows = rows
+        self.calls: list[tuple[str, str, int, int]] = []
+
+    async def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str,
+        since: int,
+        limit: int,
+    ) -> list[list[object]]:
+        self.calls.append((symbol, timeframe, since, limit))
+        return self.rows
+
+
+def _ohlc_instrument(venue: Venue) -> Instrument:
+    return Instrument(
+        venue=venue,
+        symbol="BTC/USDT:USDT",
+        exchange_symbol="BTCUSDT",
+        base="BTC",
+        quote="USDT",
+        settle="USDT",
+        contract_size_base=Decimal("1"),
+        amount_step_contracts=Decimal("0.001"),
+        price_tick=Decimal("0.1"),
+        minimum_amount_contracts=Decimal("0.001"),
+        minimum_notional=Decimal("5"),
+        taker_fee_rate=Decimal("0.0006"),
+        fee_source="fixture",
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_fetches_only_closed_aligned_one_minute_ohlc() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    start_ms = int(start.timestamp() * 1_000)
+    exchange = OhlcExchange(
+        [
+            [start_ms + 60_000, "101", "121", "81", "111", "10"],
+            [start_ms, "100", "120", "80", "110", "10"],
+            [int(datetime.now(UTC).timestamp() // 60 * 60_000), "1", "1", "1", "1", "1"],
+        ]
+    )
+    adapter = CcxtProAdapter(Venue.BYBIT, exchange=exchange)
+
+    bars = await adapter.fetch_closed_minute_bars(_ohlc_instrument(Venue.BYBIT), start, 10)
+
+    assert tuple(bar.interval_start for bar in bars) == (start, start.replace(minute=1))
+    assert all(len(bar.contract_metadata_version) == 64 for bar in bars)
+    assert exchange.calls == [("BTC/USDT:USDT", "1m", start_ms, 10)]
+
+
+@pytest.mark.asyncio
+async def test_malformed_source_price_reaches_explicit_reference_rejection() -> None:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    start_ms = int(start.timestamp() * 1_000)
+    left_adapter = CcxtProAdapter(
+        Venue.BYBIT,
+        exchange=OhlcExchange([[start_ms, "100", "120", "80", "110", "10"]]),
+    )
+    right_adapter = CcxtProAdapter(
+        Venue.OKX,
+        exchange=OhlcExchange([[start_ms, "100", "100", "100", "0", "10"]]),
+    )
+    left = await left_adapter.fetch_closed_minute_bars(_ohlc_instrument(Venue.BYBIT), start, 1)
+    right = await right_adapter.fetch_closed_minute_bars(_ohlc_instrument(Venue.OKX), start, 1)
+
+    result = build_reference_minute(left[0], right[0])
+
+    assert result.bar is None
+    assert result.rejection is not None
+    assert result.rejection.reason == ReferenceRejectionReason.SOURCE_NON_POSITIVE
 
 
 class SequenceBookExchange:

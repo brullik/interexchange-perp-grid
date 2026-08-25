@@ -1,20 +1,19 @@
-# Промт продолжения для новой сессии Codex
+# Промт для продолжения той же цели после прерывания Codex
 
 ```text
 /goal
 
-Продолжи единую fast-track цель репозитория brullik/interexchange-perp-grid.
+Продолжай текущую Aggressive Symbiosis V1 в репозитории brullik/interexchange-perp-grid.
 
-Не начинай проект заново и не создавай новый план. Прочитай AGENTS.md, GOAL.md,
-FAST_TRACK_PLAN.md, ACCEPTANCE.md и текущее STATUS.md. Затем проверь текущую ветку,
-открытый draft PR, git diff и последний make verify.
+Не создавай новый план, ветку, PR, архитектуру или набор документов. Сначала прочитай AGENTS.md, затем актуальный верх STATUS.md и чекбоксы FAST_TRACK_PLAN.md. Получи origin/main и текущую ветку/PR, проверь, что не теряешь более новые commits, и продолжи с первого реально незавершённого acceptance-backed checkpoint.
 
-Продолжай с первого незавершённого checkpoint C0–C4 в том же PR. Сначала исправь
-реальные failing checks или незавершённый end-to-end path, затем выполняй следующий
-критерий. Не останавливайся на анализе, документации или отчёте. Обновляй только
-STATUS.md и чекбоксы FAST_TRACK_PLAN.md.
+Сохрани один branch codex/aggressive-symbiosis-v1 и один PR. Не повторяй уже подтверждённую работу, но перепроверь exact-head identity после любого изменения. Исправляй failures самостоятельно, запускай focused tests и make verify/Windows equivalent, обновляй только STATUS.md и чекбоксы плана.
 
-Сохраняй все ограничения GOAL.md. Не запрашивай production secrets и не включай live.
-Остановись только при выполнении всех B/PR/CR criteria либо при настоящем owner action,
-после завершения всей независимой работы.
+Не переписывай execution/journal/reconciliation/recovery/Windows security foundation без падающего regression test. Не ослабляй hard 5/50 USDT, paired-only, margin, leverage, protected IOC, unknown-state fail-closed, no-withdrawal и live gates.
+
+Не останавливайся на отчёте или плане. Доведи software до exact-head green, independent review, resolved threads и squash merge. Затем продолжи все laptop software/public-shadow действия. Для private credentials или реальных средств создай только один точный owner action после завершения всей независимой работы.
+
+Live без локального owner consent запрещён. VPS upload/deploy/live запрещён до verified state/laptop-aggressive-acceptance.json с accepted=true.
+
+В конце сообщи только exact SHA/PR/checks/evidence, текущий laptop stage, production submit count и единственный настоящий blocker/owner action.
 ```

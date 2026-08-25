@@ -103,6 +103,7 @@ class LiveSafetySupervisor:
         self._recovery_lock = asyncio.Lock()
         self._initialise_lock = asyncio.Lock()
         self._recovery_tasks: dict[str, asyncio.Task[object]] = {}
+        self._recovery_work_keys: dict[str, str] = {}
         self._initialised = False
 
     async def initialise(self) -> None:
@@ -123,6 +124,7 @@ class LiveSafetySupervisor:
                 if task.done() and pair_action_id not in active_ids:
                     self._consume_recovery_task(task)
                     self._recovery_tasks.pop(pair_action_id, None)
+                    self._recovery_work_keys.pop(pair_action_id, None)
             if not active:
                 if self._recovery_tasks:
                     return await self._record(
@@ -155,26 +157,116 @@ class LiveSafetySupervisor:
             )
             tasks: dict[str, asyncio.Task[object]] = {}
             account_wide_recovery = len(active) > 1
+            portfolio_recovery = _is_compatible_aggressive_portfolio(active)
+            if portfolio_recovery:
+                active_portfolio_tasks = {
+                    task
+                    for pair_action_id, task in self._recovery_tasks.items()
+                    if pair_action_id in active_ids and not task.done()
+                }
+                portfolio_task_covers_snapshot = len(active_portfolio_tasks) == 1 and all(
+                    self._recovery_tasks.get(pair_action_id) in active_portfolio_tasks
+                    for pair_action_id in active_ids
+                )
+                if active_portfolio_tasks and not portfolio_task_covers_snapshot:
+                    # A single-tranche monitor cannot absorb a newly durable tranche.
+                    # Stop it cleanly, then rebuild one owner from the complete journal
+                    # snapshot so every PREPARED action is submitted and route-wide
+                    # safety monitoring is installed.
+                    handoff_keys = {
+                        self._recovery_work_keys[pair_action_id]
+                        for pair_action_id in active_ids
+                        if self._recovery_tasks.get(pair_action_id) in active_portfolio_tasks
+                        and pair_action_id in self._recovery_work_keys
+                    }
+                    if self._priority_scheduler is not None:
+                        stopped = tuple(
+                            await asyncio.gather(
+                                *(
+                                    self._priority_scheduler.cancel_and_wait(
+                                        key,
+                                        timeout_seconds=self._recovery_timeout_seconds,
+                                    )
+                                    for key in handoff_keys
+                                )
+                            )
+                        )
+                        if not all(stopped):
+                            return await self._record(
+                                SupervisorMode.BLOCKED,
+                                representative.pair_action_id,
+                                None,
+                                len(active),
+                                "PORTFOLIO_HANDOFF_NOT_QUIESCENT",
+                                True,
+                                "RecoveryHandoffTimeout",
+                            )
+                    for task in active_portfolio_tasks:
+                        task.cancel()
+                    _done, pending_handoff = await asyncio.wait(
+                        active_portfolio_tasks,
+                        timeout=self._recovery_timeout_seconds,
+                    )
+                    if pending_handoff:
+                        return await self._record(
+                            SupervisorMode.BLOCKED,
+                            representative.pair_action_id,
+                            None,
+                            len(active),
+                            "PORTFOLIO_HANDOFF_NOT_QUIESCENT",
+                            True,
+                            "RecoveryHandoffTimeout",
+                        )
+                    for pair_action_id, task in tuple(self._recovery_tasks.items()):
+                        if task in active_portfolio_tasks:
+                            self._consume_recovery_task(task)
+                            self._recovery_tasks.pop(pair_action_id, None)
+                            self._recovery_work_keys.pop(pair_action_id, None)
+            shared_portfolio_task = (
+                next(
+                    (
+                        task
+                        for pair_action_id, task in self._recovery_tasks.items()
+                        if pair_action_id in active_ids and not task.done()
+                    ),
+                    None,
+                )
+                if portfolio_recovery
+                else None
+            )
             for action in active:
                 recovery_task = self._recovery_tasks.get(action.pair_action_id)
                 if recovery_task is None:
-                    recovery_task = asyncio.create_task(
-                        self._run_recovery(
-                            action,
-                            (
-                                WorkPriority.EMERGENCY_FLATTEN
-                                if account_wide_recovery
-                                else _recovery_priority(action)
+                    recovery_task = shared_portfolio_task
+                    work_key = "live-recovery:portfolio"
+                    if recovery_task is None:
+                        work_key = (
+                            "live-recovery:portfolio"
+                            if portfolio_recovery
+                            else "live-recovery:account"
+                            if account_wide_recovery
+                            else f"live-recovery:{action.pair_action_id}"
+                        )
+                        recovery_task = asyncio.create_task(
+                            self._run_recovery(
+                                action,
+                                (
+                                    WorkPriority.EMERGENCY_FLATTEN
+                                    if account_wide_recovery
+                                    else _recovery_priority(action)
+                                ),
+                                work_key,
                             ),
-                            (
-                                "live-recovery:account"
-                                if account_wide_recovery
-                                else f"live-recovery:{action.pair_action_id}"
+                            name=(
+                                "live-recovery-portfolio"
+                                if portfolio_recovery
+                                else f"live-recovery-{action.pair_action_id}"
                             ),
-                        ),
-                        name=f"live-recovery-{action.pair_action_id}",
-                    )
+                        )
+                        if portfolio_recovery:
+                            shared_portfolio_task = recovery_task
                     self._recovery_tasks[action.pair_action_id] = recovery_task
+                    self._recovery_work_keys[action.pair_action_id] = work_key
                 tasks[action.pair_action_id] = recovery_task
             _done, pending = await asyncio.wait(
                 tasks.values(),
@@ -194,6 +286,7 @@ class LiveSafetySupervisor:
                 finally:
                     if self._recovery_tasks.get(pair_action_id) is task:
                         self._recovery_tasks.pop(pair_action_id, None)
+                        self._recovery_work_keys.pop(pair_action_id, None)
             failures = tuple(failures_list)
             current = await self._journal.active_actions()
             if not current:
@@ -388,6 +481,43 @@ class LiveSafetySupervisor:
             task.exception()
         except asyncio.CancelledError:
             return
+
+
+def _is_compatible_aggressive_portfolio(
+    actions: tuple[LiveJournalAction, ...],
+) -> bool:
+    if not 2 <= len(actions) <= 5:
+        return False
+    first = actions[0]
+    identity = (
+        first.route,
+        first.qualification_hash,
+        first.risk_reservation.get("aggressive_binding_sha256"),
+        first.risk_reservation.get("strategy_profile_sha256"),
+    )
+    levels: set[int] = set()
+    for action in actions:
+        reservation = action.risk_reservation
+        try:
+            level = int(str(reservation["level_index"]))
+        except (KeyError, ValueError):
+            return False
+        if (
+            reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1"
+            or reservation.get("stage") != "pilot_a"
+            or (
+                action.route,
+                action.qualification_hash,
+                reservation.get("aggressive_binding_sha256"),
+                reservation.get("strategy_profile_sha256"),
+            )
+            != identity
+            or not 1 <= level <= 5
+            or level in levels
+        ):
+            return False
+        levels.add(level)
+    return True
 
 
 def _recovery_priority(action: LiveJournalAction) -> WorkPriority:

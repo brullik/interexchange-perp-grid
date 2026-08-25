@@ -454,6 +454,104 @@ async def test_live_route_stress_is_aggregated_across_distinct_tranches(
 
 
 @pytest.mark.asyncio
+async def test_actual_fill_repricing_blocks_next_tranche_at_hard_route_limit(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal, projected_stress_usdt="3")
+    watermark = await journal.event_watermark()
+    updated = await journal.update_actual_risk(
+        "pair-1",
+        watermark,
+        {
+            "incremental_stress_usdt": "4.5",
+            "route_total_usdt": "4.5",
+            "portfolio_total_usdt": "4.5",
+            "actual_entry_spread_bps": "20",
+            "fill_event_watermark": watermark,
+        },
+    )
+
+    assert updated.risk_reservation["actual_fill_risk"]["incremental_stress_usdt"] == "4.5"
+    with pytest.raises(RuntimeError, match="maximum live route stress"):
+        await _prepare(
+            journal,
+            "pair-2",
+            "pair-2-long",
+            "pair-2-short",
+            tranche_id="tranche-2",
+            projected_stress_usdt="1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_actual_fill_repricing_is_bound_to_exact_private_event_watermark(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal)
+
+    with pytest.raises(RuntimeError, match="event watermark changed"):
+        await journal.update_actual_risk(
+            "pair-1",
+            -1,
+            {
+                "incremental_stress_usdt": "1",
+                "route_total_usdt": "1",
+                "portfolio_total_usdt": "1",
+                "actual_entry_spread_bps": "20",
+                "fill_event_watermark": -1,
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_actual_fill_repricing_uses_serialized_authoritative_totals(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    await _prepare(journal, projected_stress_usdt="0.8")
+    await _prepare(
+        journal,
+        "pair-2",
+        "pair-2-long",
+        "pair-2-short",
+        tranche_id="tranche-2",
+        projected_stress_usdt="0.8",
+    )
+    watermark = await journal.event_watermark()
+
+    async def reprice(pair_id: str) -> LiveJournalAction:
+        return await journal.update_actual_risk(
+            pair_id,
+            watermark,
+            {
+                "incremental_stress_usdt": "2.6",
+                "route_total_usdt": "0",
+                "portfolio_total_usdt": "0",
+                "actual_entry_spread_bps": "20",
+                "fill_event_watermark": watermark,
+            },
+        )
+
+    results = await asyncio.gather(reprice("pair-1"), reprice("pair-2"))
+    reported_totals = {
+        Decimal(str(result.risk_reservation["actual_fill_risk"]["route_total_usdt"]))
+        for result in results
+    }
+    active = await journal.active_actions()
+
+    assert reported_totals == {Decimal("3.4"), Decimal("5.2")}
+    assert sum(
+        (LiveOrderJournal._admission_stress(action.risk_reservation) for action in active),
+        Decimal(0),
+    ) == Decimal("5.2")
+
+
+@pytest.mark.asyncio
 async def test_initialise_rebuilds_missing_leases_for_legacy_active_action(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     journal = LiveOrderJournal(path)
@@ -1163,6 +1261,25 @@ async def test_completed_actions_since_binds_flat_filled_cycle_to_qualification(
     assert tuple(action.pair_action_id for action in completed) == ("pair-1",)
     assert all(leg.status == PrivateOrderStatus.FILLED for leg in completed[0].legs)
     assert await journal.completed_actions_since(started_at, "b" * 64) == ()
+
+
+@pytest.mark.asyncio
+async def test_actions_updated_after_detects_same_qualification_journal_tail(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "tail.sqlite3")
+    await journal.initialise()
+    accepted_pilot_end = datetime.now(UTC) - timedelta(seconds=1)
+    await _prepare(journal)
+    await journal.mark_submit_attempted("pair-1", ("pair-1-long", "pair-1-short"))
+    await journal.transition("pair-1", LiveActionState.REJECTED)
+    await journal.transition("pair-1", LiveActionState.FLAT)
+
+    tail = await journal.actions_updated_after(accepted_pilot_end, _QUALIFICATION)
+
+    assert tuple(action.pair_action_id for action in tail) == ("pair-1",)
+    assert await journal.actions_updated_after(accepted_pilot_end, "b" * 64) == ()
+    assert await journal.actions_updated_after(datetime.now(UTC), _QUALIFICATION) == ()
 
 
 @pytest.mark.asyncio
