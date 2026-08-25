@@ -4,6 +4,7 @@ import argparse
 import ctypes
 import os
 import re
+import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -94,6 +95,7 @@ def main() -> int:
         with log_path.open("a", encoding="utf-8") as log:
             log.write(f"RUNNER_ERROR_TYPE={type(exc).__name__}\n")
             log.write(f"RUNNER_ERROR_MESSAGE={exc}\n")
+            traceback.print_exception(exc, file=log)
     finally:
         run_state.mkdir(parents=True, exist_ok=True)
         exit_path.write_text(str(result), encoding="ascii")

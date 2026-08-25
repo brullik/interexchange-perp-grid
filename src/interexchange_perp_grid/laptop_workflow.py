@@ -27,6 +27,7 @@ from interexchange_perp_grid.service import BootstrapService, BoundedServiceRece
 from interexchange_perp_grid.state import (
     QualificationEpoch,
     QualificationEpochStatus,
+    initialise_state,
     read_qualification_epoch,
     read_service_health,
 )
@@ -107,6 +108,10 @@ async def run_until_qualification_finalized(
                 )
             }
         )
+    state_path = Path(settings.storage.sqlite_path)
+    # A smoke run always has a fresh per-run database. Initialise it before
+    # scheduling the service task so the first epoch read cannot win the event-loop race.
+    await initialise_state(state_path)
     stop_event = asyncio.Event()
     service = asyncio.create_task(
         BootstrapService(service_settings, qualification_policy=selected_policy).run(stop_event),
@@ -118,7 +123,7 @@ async def run_until_qualification_finalized(
             if service.done():
                 await service
                 raise RuntimeError("native qualification service stopped before finalization")
-            epoch = await read_qualification_epoch(Path(settings.storage.sqlite_path))
+            epoch = await read_qualification_epoch(state_path)
             if (
                 epoch is not None
                 and epoch.status == QualificationEpochStatus.FINALIZED

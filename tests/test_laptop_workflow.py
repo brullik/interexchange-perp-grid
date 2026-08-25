@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -76,7 +77,13 @@ async def test_native_qualification_stops_only_after_exact_epoch_finalizes(
         stopped.set()
 
     async def finalized(path: object) -> QualificationEpoch:
-        del path
+        assert isinstance(path, Path)
+        with sqlite3.connect(path) as database:
+            table = database.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'qualification_epochs'"
+            ).fetchone()
+        assert table == ("qualification_epochs",)
         return epoch
 
     monkeypatch.setattr(
