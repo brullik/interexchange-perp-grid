@@ -222,6 +222,28 @@ class BootstrapService:
                     name="continuous-shadow-evaluator",
                 )
             )
+            if qualification_engine is not None:
+
+                async def sample_qualification_books() -> None:
+                    while not stop_event.is_set():
+                        await qualification_engine.sample_qualification_books(
+                            self.settings.shadow.base,
+                            min(5, self.settings.shadow.scan_timeout_seconds),
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                stop_event.wait(),
+                                timeout=self.settings.shadow.scan_interval_seconds,
+                            )
+                        except TimeoutError:
+                            continue
+
+                background_tasks.append(
+                    asyncio.create_task(
+                        sample_qualification_books(),
+                        name="qualification-book-sampler",
+                    )
+                )
             if self.settings.telegram.enabled:
                 background_tasks.append(
                     asyncio.create_task(

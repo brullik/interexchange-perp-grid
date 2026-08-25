@@ -233,7 +233,9 @@ class PublicMarketEngine:
         self._candidate_l2_registry = BookRegistry()
         self._candidate_l2_scan_lock = asyncio.Lock()
         self._selected_scan_lock = asyncio.Lock()
+        self._qualification_sample_lock = asyncio.Lock()
         self._l2_transport_locks: dict[BookKey, asyncio.Lock] = {}
+        self._book_sample_locks: dict[BookKey, asyncio.Lock] = {}
         self._l2_transport_lock_users: dict[BookKey, int] = {}
         self._candidate_l2_plan = CandidateL2Plan((), (), ())
         self._pending_candidate_l2_plan = self._candidate_l2_plan
@@ -2362,6 +2364,20 @@ class PublicMarketEngine:
             or lock.locked()
             or self._l2_transport_lock_users.get(key, 0) > 0
         }
+        self._book_sample_locks = {
+            key: lock
+            for key, lock in self._book_sample_locks.items()
+            if key in known_keys or key in owned_keys or lock.locked()
+        }
+
+    async def _acquire_book_sample_lock(self, key: BookKey) -> asyncio.Lock:
+        lock = self._book_sample_locks.setdefault(key, asyncio.Lock())
+        await lock.acquire()
+        return lock
+
+    def _release_book_sample_lock(self, key: BookKey, lock: asyncio.Lock) -> None:
+        lock.release()
+        self._prune_l2_transport_locks()
 
     async def _acquire_l2_transport_lock(self, key: BookKey) -> asyncio.Lock:
         lock = self._l2_transport_locks.setdefault(key, asyncio.Lock())
@@ -2437,6 +2453,46 @@ class PublicMarketEngine:
                     active_route_keys=active_route_keys,
                     entry_work_admitted=entry_work_admitted,
                 )
+        finally:
+            self._finish_public_scan(task)
+
+    async def sample_qualification_books(
+        self,
+        base: str,
+        timeout_seconds: int,
+    ) -> int:
+        """Persist fresh Wave 1 books without repeating the slower broad decision scan."""
+        task = self._begin_public_scan()
+        try:
+            async with self._qualification_sample_lock:
+                self._require_open()
+                if not self._initialised:
+                    return 0
+                universe = self._universe.snapshot
+                if universe is None:
+                    return 0
+                selected = next(
+                    (
+                        item
+                        for item in universe.common
+                        if item.key.base == base.upper() and item.key.settle == "USDT"
+                    ),
+                    None,
+                )
+                if selected is None:
+                    return 0
+                samples = await asyncio.gather(
+                    *(
+                        self._sample_book(instrument, timeout_seconds, require_new=True)
+                        for instrument in selected.instruments
+                        if instrument.venue in self._wave1_public_venues
+                        and instrument.venue not in self._quarantined
+                    )
+                )
+                books = tuple(book for _, book, _ in samples if book is not None)
+                if books:
+                    await self._recorder.append_books(books)
+                return len(books)
         finally:
             self._finish_public_scan(task)
 
@@ -2640,26 +2696,9 @@ class PublicMarketEngine:
         require_new: bool = False,
     ) -> tuple[Instrument, OrderBookSnapshot | None, DataQualityAssessment | None]:
         key = (instrument.venue, instrument.symbol)
-        watcher = self._candidate_l2_watchers.get(key)
-        if (
-            watcher is not None
-            and not watcher.done()
-            and self._candidate_l2_watcher_instruments.get(key) == instrument
-        ):
-            state = await self._sample_candidate_l2_book(
-                key,
-                timeout_seconds,
-                require_new=require_new,
-            )
-            return (
-                instrument,
-                state.book if state is not None else None,
-                self._current_candidate_l2_quality(state) if state is not None else None,
-            )
-        candidate_owns_subscription = False
         try:
             async with asyncio.timeout(timeout_seconds):
-                lock = await self._acquire_l2_transport_lock(key)
+                sample_lock = await self._acquire_book_sample_lock(key)
                 try:
                     watcher = self._candidate_l2_watchers.get(key)
                     candidate_owns_subscription = (
@@ -2668,23 +2707,26 @@ class PublicMarketEngine:
                         and self._candidate_l2_watcher_instruments.get(key) == instrument
                     )
                     if candidate_owns_subscription:
-                        book = None
-                    else:
+                        state = await self._sample_candidate_l2_book(
+                            key,
+                            timeout_seconds,
+                            require_new=require_new,
+                        )
+                        return (
+                            instrument,
+                            state.book if state is not None else None,
+                            self._current_candidate_l2_quality(state)
+                            if state is not None
+                            else None,
+                        )
+                    transport_lock = await self._acquire_l2_transport_lock(key)
+                    try:
                         book = await self._adapters[instrument.venue].watch_order_book(instrument)
+                        return instrument, book, None
+                    finally:
+                        self._release_l2_transport_lock(key, transport_lock)
                 finally:
-                    self._release_l2_transport_lock(key, lock)
-            if candidate_owns_subscription:
-                state = await self._sample_candidate_l2_book(
-                    key,
-                    timeout_seconds,
-                    require_new=require_new,
-                )
-                return (
-                    instrument,
-                    state.book if state is not None else None,
-                    self._current_candidate_l2_quality(state) if state is not None else None,
-                )
-            return instrument, book, None
+                    self._release_book_sample_lock(key, sample_lock)
         except Exception as error:
             if not self._closed:
                 self._quarantine(
