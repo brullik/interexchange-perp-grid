@@ -540,3 +540,30 @@ def test_incompatible_schema_and_partial_route_fail_closed(tmp_path: Path) -> No
         )
     with pytest.raises(RuntimeError, match="exactly five"):
         AggressiveGridStore(store.path).levels(route)
+
+
+def test_live_journal_projection_fences_consumed_levels_across_restart(tmp_path: Path) -> None:
+    store, route = _store(tmp_path)
+
+    projected = store.synchronize_externally_owned_levels(
+        route,
+        frozenset({1, 3}),
+        now=_NOW,
+    )
+
+    assert [item.state for item in projected] == [
+        GridLevelState.CLOSED_WAIT_REARM,
+        GridLevelState.ARMED,
+        GridLevelState.CLOSED_WAIT_REARM,
+        GridLevelState.ARMED,
+        GridLevelState.ARMED,
+    ]
+    restarted = AggressiveGridStore(store.path)
+    restarted.initialise()
+    selected = restarted.first_unfilled_crossed_level(route, Decimal("1000"))
+    assert selected is not None and selected.level_index == 2
+    assert restarted.synchronize_externally_owned_levels(
+        route,
+        frozenset({1, 3}),
+        now=_NOW + timedelta(seconds=1),
+    ) == restarted.levels(route)

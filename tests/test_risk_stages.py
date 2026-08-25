@@ -43,6 +43,9 @@ def test_locked_risk_stage_table_has_exact_order_and_bounded_limits() -> None:
     )
     assert len(table.runtime_policy_sha256) == 64
     assert max(stage.leverage for stage in table.stages) <= 3
+    pilot_a = next(stage for stage in table.stages if stage.stage == RiskStage.PILOT_A)
+    assert (pilot_a.routes, pilot_a.tranches) == (1, 5)
+    assert (pilot_a.pair_usdt, pilot_a.portfolio_usdt) == (Decimal(5), Decimal(5))
 
 
 def test_locked_risk_stage_table_rejects_reordered_or_weakened_policy(tmp_path: Path) -> None:

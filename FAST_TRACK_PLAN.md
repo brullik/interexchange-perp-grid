@@ -100,9 +100,9 @@
 - [x] `verify` устанавливает/проверяет exact Python 3.12 environment и запускает полный Windows-equivalent verify без production credentials.
 - [x] `shadow` запускает live-public aggressive shadow на ноутбуке и не допускает private submit.
 - [x] `qualify` связывает exact code/config/profile/reference-data/runtime hashes; существующее 12h owner exception можно использовать только в его уже разрешённых границах, не сокращая дальше.
-- [ ] `canary` переиспользует local DPAPI/S4U secrets, отдельное owner consent, Telegram challenge и один minimum-notional/one-tranche route с hard risk <=1 USDT.
-- [ ] `pilot` после successful canary поддерживает один route, все пять tranches и route risk <=5 USDT; каждое stage promotion требует отдельного owner confirmation.
-- [ ] Любой failure возвращает shadow/live=false, сохраняет evidence и запускает существующий recovery/stable-FLAT путь.
+- [x] `canary` переиспользует local DPAPI/S4U secrets, отдельное owner consent, Telegram challenge и один minimum-notional/one-tranche route с hard risk <=1 USDT.
+- [x] `pilot` после successful canary поддерживает один route, все пять tranches и route risk <=5 USDT; каждое stage promotion требует отдельного owner confirmation.
+- [x] Любой failure возвращает shadow/live=false, сохраняет evidence и запускает существующий recovery/stable-FLAT путь.
 - [x] После успешного laptop pilot и минимум 28,800 секунд post-FLAT service создать exact-bound `state/laptop-aggressive-acceptance.json`.
 - [x] Любая VPS/deploy команда нового профиля fail closed без accepted laptop artifact.
 

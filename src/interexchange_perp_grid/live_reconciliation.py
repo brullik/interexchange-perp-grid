@@ -689,6 +689,9 @@ def evaluate_canary_risk_from_private_state(
     free_margin_floor_ratio: Decimal,
     effective_leverage_cap: Decimal,
     exit_depth_sufficient: bool,
+    allow_existing_matched_exposure: bool = False,
+    maximum_routes: int = 1,
+    maximum_tranches_per_route: int = 1,
 ) -> RiskDecision:
     if projected_stress_usdt > pair_stress_limit_usdt:
         return RiskDecision(
@@ -739,15 +742,15 @@ def evaluate_canary_risk_from_private_state(
         RiskLimits(
             pair_stress_limit_usdt,
             portfolio_stress_limit_usdt,
+            maximum_routes,
             1,
-            1,
-            1,
+            maximum_tranches_per_route,
             free_margin_floor_ratio,
             effective_leverage_cap,
         )
     )
     book.set_execution_block(
-        unmatched_exposure=existing_exposure,
+        unmatched_exposure=existing_exposure and not allow_existing_matched_exposure,
         unknown_order_state=any(state.error is not None for state in states.values()),
     )
     return book.reserve(

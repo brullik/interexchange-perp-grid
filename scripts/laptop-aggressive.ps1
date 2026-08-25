@@ -128,7 +128,10 @@ switch ($Mode) {
         if ($LASTEXITCODE -ne 0) { throw "aggressive canary failed closed" }
     }
     "pilot" {
-        throw "Aggressive pilot_a is not yet software-ready; live remains disabled and no order was sent"
+        Write-Host "pilot_a requires separate owner authorization and a standard 24-hour qualification."
+        & "$PSScriptRoot/laptop-aggressive-pilot-a.ps1" -ProfilePath $ProfilePath `
+            -ProfileScope $ProfileScope
+        if ($LASTEXITCODE -ne 0) { throw "aggressive pilot_a failed closed" }
     }
     "status" {
         $payload = [ordered]@{

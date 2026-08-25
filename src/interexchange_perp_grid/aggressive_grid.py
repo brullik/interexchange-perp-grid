@@ -359,6 +359,49 @@ class AggressiveGridStore:
             expected_pending_cycle=decision_cycle,
         )
 
+    def synchronize_externally_owned_levels(
+        self,
+        route_identity: str,
+        level_indices: frozenset[int],
+        *,
+        now: datetime,
+    ) -> tuple[GridLevelRecord, ...]:
+        """Fence levels already owned/completed by the durable live journal.
+
+        The exchange/journal remains the source of fill ownership. This projection exists only so
+        the shared strategy core cannot emit the same live level twice after restart.
+        """
+        self._require_aware(now)
+        if any(not 1 <= level <= _LEVEL_COUNT for level in level_indices):
+            raise ValueError("external live level index is invalid")
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            records = self._levels_locked(database, route_identity)
+            if len(records) != _LEVEL_COUNT:
+                database.rollback()
+                raise RuntimeError("aggressive live grid route is incomplete")
+            updated: list[GridLevelRecord] = []
+            for record in records:
+                if record.level_index not in level_indices:
+                    updated.append(record)
+                    continue
+                if record.state == GridLevelState.ARMED:
+                    record = _replace_level(
+                        record,
+                        state=GridLevelState.CLOSED_WAIT_REARM,
+                        ownership=None,
+                        reserved_stress_usdt=Decimal(0),
+                        pending_decision_cycle=None,
+                        now=now,
+                    )
+                    self._write_level_locked(database, record)
+                elif record.state != GridLevelState.CLOSED_WAIT_REARM:
+                    database.rollback()
+                    raise RuntimeError("external live level conflicts with local grid ownership")
+                updated.append(record)
+            database.commit()
+        return tuple(updated)
+
     def mark_open(
         self,
         route_identity: str,

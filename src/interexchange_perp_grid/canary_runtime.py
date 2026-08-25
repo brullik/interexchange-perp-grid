@@ -115,6 +115,7 @@ from interexchange_perp_grid.venue_capabilities import (
 )
 
 OWNER_CONFIRMATION = "I_ACCEPT_LIVE_CANARY_RISK"
+PILOT_A_OWNER_CONFIRMATION = "I_ACCEPT_AGGRESSIVE_PILOT_A_RISK"
 _OPENING_GATE_TASKS: set[asyncio.Task[object]] = set()
 
 
@@ -226,7 +227,7 @@ class _OpeningGateSnapshot:
     quality: dict[Venue, DataQualityAssessment]
     funding: tuple[FundingSnapshot, ...]
     controls: RuntimeControls
-    action: LiveJournalAction | None
+    actions: tuple[LiveJournalAction, ...]
     known_client_ids: set[str]
 
 
@@ -622,7 +623,7 @@ async def _coordinate_live_action(
                 _fresh_books(settings, public_adapters, instruments),
                 collect_funding(),
                 read_runtime_controls(Path(settings.storage.sqlite_path)),
-                journal.load(current_plan.pair_action_id),
+                journal.active_actions(),
                 journal.known_client_order_ids(),
             )
             books, quality = cast(
@@ -637,7 +638,7 @@ async def _coordinate_live_action(
                 quality=quality,
                 funding=cast(tuple[FundingSnapshot, ...], results[4]),
                 controls=cast(RuntimeControls, results[5]),
-                action=cast(LiveJournalAction | None, results[6]),
+                actions=cast(tuple[LiveJournalAction, ...], results[6]),
                 known_client_ids=cast(set[str], results[7]),
             )
 
@@ -651,10 +652,12 @@ async def _coordinate_live_action(
         public_reports = {report.venue: report for report in snapshot.public_reports}
         private_reports = {report.venue: report for report in snapshot.private_reports}
         funding = {item.venue: item for item in snapshot.funding}
-        if snapshot.action is None:
+        if not any(
+            action.pair_action_id == current_plan.pair_action_id for action in snapshot.actions
+        ):
             return False
         reconciliation = reconcile_private_states(
-            snapshot.action,
+            snapshot.actions,
             snapshot.private_states,
             snapshot.known_client_ids,
             set(adapters),
@@ -663,9 +666,14 @@ async def _coordinate_live_action(
             projected_stress = Decimal(str(current_plan.risk_reservation["projected_stress_usdt"]))
         except (ArithmeticError, KeyError, ValueError):
             return False
+        aggressive_stage = current_plan.risk_reservation.get("stage")
+        is_pilot_a = aggressive_stage == AggressiveLaptopLiveStage.PILOT_A.value
+        risk_limit = (
+            Decimal(5) if is_pilot_a else settings.live.canary_pair_stressed_loss_limit_usdt
+        )
         risk_current = (
             projected_stress.is_finite()
-            and Decimal(0) <= projected_stress <= settings.live.canary_pair_stressed_loss_limit_usdt
+            and Decimal(0) <= projected_stress <= risk_limit
             and not _private_risk_deteriorated(settings, snapshot.private_states)
         )
         preflight_items: list[PrivatePreflightReport] = []
@@ -693,7 +701,8 @@ async def _coordinate_live_action(
                             snapshot.quality[venue].accepted and public_reports[venue].public_ready
                         ),
                         reconciliation_passed=(
-                            reconciliation.consistent and reconciliation.flat_verified
+                            reconciliation.consistent
+                            and (is_pilot_a or reconciliation.flat_verified)
                         ),
                         risk_passed=risk_current,
                         free_margin_floor_ratio=settings.live.canary_free_margin_floor_ratio,
@@ -1069,22 +1078,43 @@ async def run_canary_once(
     owner_confirmation: str,
     aggressive_intent: AggressiveLiveIntentEnvelope | None = None,
     aggressive_binding: AggressiveQualificationBinding | None = None,
+    aggressive_stage: AggressiveLaptopLiveStage = AggressiveLaptopLiveStage.CANARY,
 ) -> CanaryRunEvidence:
     if (aggressive_intent is None) != (aggressive_binding is None):
         return _denied(ReasonCode.CANARY_POLICY_VIOLATION)
-    if owner_confirmation != OWNER_CONFIRMATION:
+    if aggressive_intent is None and aggressive_stage != AggressiveLaptopLiveStage.CANARY:
+        return _denied(ReasonCode.CANARY_POLICY_VIOLATION)
+    required_confirmation = (
+        OWNER_CONFIRMATION
+        if aggressive_stage == AggressiveLaptopLiveStage.CANARY
+        else PILOT_A_OWNER_CONFIRMATION
+    )
+    if owner_confirmation != required_confirmation:
         return _denied(ReasonCode.OWNER_CONFIRMATION_MISSING)
     state_path = Path(settings.storage.sqlite_path)
     await initialise_state(state_path)
     journal = LiveOrderJournal(state_path)
     await journal.initialise()
     active_actions = await journal.active_actions()
-    if len(active_actions) == 1:
-        return await _resume_active_canary(settings, journal, active_actions[0])
-    if active_actions:
+    if aggressive_stage == AggressiveLaptopLiveStage.CANARY:
+        if len(active_actions) == 1:
+            return await _resume_active_canary(settings, journal, active_actions[0])
+        if active_actions:
+            return _denied(ReasonCode.RECONCILIATION_INCOMPLETE, active_actions[0].route)
+    elif any(
+        action.state != LiveActionState.HEDGED
+        or action.risk_reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1"
+        or action.risk_reservation.get("stage") != AggressiveLaptopLiveStage.PILOT_A.value
+        for action in active_actions
+    ):
         return _denied(ReasonCode.RECONCILIATION_INCOMPLETE, active_actions[0].route)
     risk_stage = await read_risk_stage(state_path)
-    if risk_stage.stage == RiskStage.SHADOW or risk_stage.completion_frozen:
+    expected_risk_stage = (
+        RiskStage.CANARY
+        if aggressive_stage == AggressiveLaptopLiveStage.CANARY
+        else RiskStage.PILOT_A
+    )
+    if risk_stage.stage != expected_risk_stage or risk_stage.completion_frozen:
         return _denied(ReasonCode.CANARY_POLICY_VIOLATION)
     if not qualification_path.is_file():
         return _denied(ReasonCode.CURRENT_QUALIFICATION_MISSING)
@@ -1111,7 +1141,9 @@ async def run_canary_once(
             or aggressive_binding.binding_sha256 != aggressive_intent.aggressive_binding_sha256
             or aggressive_binding.qualification_hash != evidence.qualification_hash
             or aggressive_intent.qualification_hash != evidence.qualification_hash
-            or candidate.level_index != 1
+            or not 1
+            <= candidate.level_index
+            <= (1 if aggressive_stage == AggressiveLaptopLiveStage.CANARY else 5)
             or intent_age < 0
             or intent_age > settings.live.canary_timeout_seconds
             or aggressive_route.base != route.base
@@ -1120,6 +1152,19 @@ async def run_canary_once(
         ):
             return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route)
         route = aggressive_route
+        active_levels = {
+            int(str(action.risk_reservation.get("level_index", 0))) for action in active_actions
+        }
+        if (
+            candidate.level_index in active_levels
+            or len(active_actions)
+            >= (1 if aggressive_stage == AggressiveLaptopLiveStage.CANARY else 5)
+            or any(
+                action.route != route or action.qualification_hash != evidence.qualification_hash
+                for action in active_actions
+            )
+        ):
+            return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route)
     locked_stages = load_locked_risk_stage_table(
         config_path.resolve().parent / "RUNTIME_POLICY.yaml"
     )
@@ -1203,8 +1248,13 @@ async def run_canary_once(
             if aggressive_intent is not None
             else evidence.strategy.size_bucket_base_quantity
         )
-        if quantity != expected_quantity:
+        if (
+            aggressive_stage == AggressiveLaptopLiveStage.CANARY and quantity != expected_quantity
+        ) or (
+            aggressive_stage == AggressiveLaptopLiveStage.PILOT_A and expected_quantity < quantity
+        ):
             return _denied(ReasonCode.CANARY_POLICY_VIOLATION, route, quantity)
+        quantity = expected_quantity
         quote = evaluate_directed_route(
             instruments[route.long_venue],
             instruments[route.short_venue],
@@ -1225,7 +1275,7 @@ async def run_canary_once(
             reconciliation_trigger="PRE_SUBMIT",
         )
         reconciliation = reconcile_private_states(
-            None,
+            active_actions or None,
             states,
             await journal.known_client_order_ids(),
             required_venues,
@@ -1317,6 +1367,17 @@ async def run_canary_once(
                 else Decimal(0)
             ),
         )
+        try:
+            existing_projected_stress = sum(
+                (
+                    Decimal(str(action.risk_reservation["projected_stress_usdt"]))
+                    for action in active_actions
+                ),
+                Decimal(0),
+            )
+        except (ArithmeticError, KeyError, ValueError):
+            return _denied(ReasonCode.RISK_PREFLIGHT_FAILED, route, quantity)
+        cumulative_projected_stress = existing_projected_stress + projected_stress
         notional = quantity * max(
             cast(Decimal, quote.entry_long_vwap),
             cast(Decimal, quote.entry_short_vwap),
@@ -1325,12 +1386,15 @@ async def run_canary_once(
             route,
             states,
             notional,
-            projected_stress,
+            cumulative_projected_stress,
             pair_stress_limit_usdt=stage_limits.pair_usdt,
             portfolio_stress_limit_usdt=stage_limits.portfolio_usdt,
             free_margin_floor_ratio=settings.live.canary_free_margin_floor_ratio,
             effective_leverage_cap=stage_limits.leverage,
             exit_depth_sufficient=emergency_assessment.passed,
+            allow_existing_matched_exposure=(aggressive_stage == AggressiveLaptopLiveStage.PILOT_A),
+            maximum_routes=stage_limits.routes,
+            maximum_tranches_per_route=stage_limits.tranches,
         )
         economic = evaluate_live_entry(
             quote,
@@ -1354,7 +1418,7 @@ async def run_canary_once(
         maximum_leverage, minimum_free_margin = _actual_canary_ratios(states, notional)
         action = CanaryAction(
             route,
-            1,
+            len(active_actions) + 1,
             notional,
             notional,
             projected_stress,
@@ -1363,14 +1427,29 @@ async def run_canary_once(
             existing_positions,
             existing_orders,
         )
-        policy = CanaryPolicy(
-            route.base,
-            route,
-            stage_limits.pair_usdt,
-            stage_limits.leverage,
-            settings.live.canary_free_margin_floor_ratio,
-        )
-        policy_passed, policy_reason = policy.evaluate(action)
+        if aggressive_stage == AggressiveLaptopLiveStage.CANARY:
+            policy = CanaryPolicy(
+                route.base,
+                route,
+                stage_limits.pair_usdt,
+                stage_limits.leverage,
+                settings.live.canary_free_margin_floor_ratio,
+            )
+            policy_passed, policy_reason = policy.evaluate(action)
+        else:
+            policy_passed = (
+                action.route == route
+                and action.route.base == route.base
+                and 1 <= action.tranche_count <= stage_limits.tranches
+                and action.notional_usdt >= action.minimum_valid_notional_usdt > 0
+                and Decimal(0) < action.projected_stressed_loss_usdt <= stage_limits.pair_usdt
+                and action.maximum_effective_leverage <= stage_limits.leverage
+                and action.minimum_stressed_free_margin_ratio
+                >= settings.live.canary_free_margin_floor_ratio
+                and action.existing_open_order_count == 0
+                and reconciliation.consistent
+            )
+            policy_reason = None if policy_passed else ReasonCode.CANARY_POLICY_VIOLATION
         if not economic.accepted:
             return _denied(economic.reason, route, quantity, economic=economic)
         if not policy_passed:
@@ -1429,7 +1508,13 @@ async def run_canary_once(
             capability_preflight_passed=all_preflights_passed,
             account_preflight_passed=all_preflights_passed,
             market_data_preflight_passed=all(item.accepted for item in quality.values()),
-            reconciliation_passed=reconciliation.consistent and reconciliation.flat_verified,
+            reconciliation_passed=(
+                reconciliation.consistent
+                and (
+                    aggressive_stage == AggressiveLaptopLiveStage.PILOT_A
+                    or reconciliation.flat_verified
+                )
+            ),
             risk_preflight_passed=risk.accepted,
             pause_or_kill_active=controls.paused or controls.killed,
             unknown_order_exists=bool(reconciliation.unknown_client_order_ids),
@@ -1462,7 +1547,7 @@ async def run_canary_once(
                 instruments[route.short_venue],
                 long_protected_price=economic.long_protected_price,
                 short_protected_price=economic.short_protected_price,
-                stage=AggressiveLaptopLiveStage.CANARY,
+                stage=aggressive_stage,
                 timeout_seconds=settings.live.canary_timeout_seconds,
             )
             plan = replace(

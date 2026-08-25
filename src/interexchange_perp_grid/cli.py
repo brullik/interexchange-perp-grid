@@ -36,6 +36,7 @@ from interexchange_perp_grid.aggressive_laptop_acceptance import (
     verify_aggressive_laptop_handoff,
 )
 from interexchange_perp_grid.aggressive_live import (
+    AggressiveLaptopLiveStage,
     AggressiveLiveIntentEnvelope,
     aggressive_intent_sha256,
     load_aggressive_live_intent,
@@ -72,7 +73,11 @@ from interexchange_perp_grid.aggressive_shadow import (
 from interexchange_perp_grid.autonomous_orchestrator import load_autonomous_runtime_status
 from interexchange_perp_grid.c4_3_proof import run_c4_3_proof
 from interexchange_perp_grid.c4_proof import run_c4_proof
-from interexchange_perp_grid.canary_runtime import run_canary_once, run_emergency_flatten
+from interexchange_perp_grid.canary_runtime import (
+    PILOT_A_OWNER_CONFIRMATION,
+    run_canary_once,
+    run_emergency_flatten,
+)
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Instrument, InstrumentKey, ProductType, Venue
 from interexchange_perp_grid.laptop_workflow import (
@@ -339,6 +344,7 @@ def aggressive_laptop_stage_report(
     ],
     binding: Annotated[Path, typer.Option("--binding")],
     output: Annotated[Path, typer.Option("--output")],
+    service_receipt: Annotated[Path | None, typer.Option("--service-receipt")] = None,
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
     """Build exact stage evidence from the durable journal without submitting an order."""
@@ -354,6 +360,21 @@ def aggressive_laptop_stage_report(
     started = started.astimezone(UTC)
     ended = ended.astimezone(UTC)
     settings = _load(config)
+    if stage == "pilot_a":
+        if service_receipt is None or not service_receipt.is_file():
+            raise typer.BadParameter("pilot_a requires an exact post-FLAT service receipt")
+        bounded_service = load_bounded_service_receipt(service_receipt.resolve())
+        if (
+            Path(bounded_service.state_path).resolve()
+            != Path(settings.storage.sqlite_path).resolve()
+            or bounded_service.requested_seconds < 28_800
+            or bounded_service.observed_monotonic_seconds < 28_800
+        ):
+            raise typer.BadParameter("pilot_a post-FLAT service receipt is invalid")
+        post_flat_service_seconds = min(
+            int(bounded_service.requested_seconds),
+            int(bounded_service.observed_monotonic_seconds),
+        )
     evidence = asyncio.run(
         build_aggressive_laptop_stage_evidence_from_journal(
             Path(settings.storage.sqlite_path),
@@ -368,6 +389,127 @@ def aggressive_laptop_stage_report(
     typer.echo(json.dumps(asdict(evidence), default=str, sort_keys=True))
     if not evidence.accepted:
         raise typer.Exit(code=3)
+
+
+@app.command("aggressive-laptop-stage-progress")
+def aggressive_laptop_stage_progress(
+    stage: Annotated[str, typer.Option("--stage")],
+    started_at: Annotated[str, typer.Option("--started-at")],
+    binding: Annotated[Path, typer.Option("--binding")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Read non-authorizing durable stage progress; never fabricate acceptance."""
+    if stage not in {"canary", "pilot_a"}:
+        raise typer.BadParameter("stage must be canary or pilot_a")
+    try:
+        started = datetime.fromisoformat(started_at)
+    except ValueError as error:
+        raise typer.BadParameter("stage start must be an aware ISO-8601 timestamp") from error
+    if started.tzinfo is None or started.utcoffset() is None:
+        raise typer.BadParameter("stage start must be an aware ISO-8601 timestamp")
+    started = started.astimezone(UTC)
+    settings = _load(config)
+    evidence = asyncio.run(
+        build_aggressive_laptop_stage_evidence_from_journal(
+            Path(settings.storage.sqlite_path),
+            load_aggressive_qualification_binding(binding.resolve()),
+            stage=stage,
+            started_at=started,
+            ended_at=datetime.now(UTC),
+            post_flat_service_seconds=0,
+        )
+    )
+    typer.echo(json.dumps(asdict(evidence), default=str, sort_keys=True))
+
+
+@app.command("aggressive-laptop-promote-pilot-a")
+def aggressive_laptop_promote_pilot_a(
+    canary_evidence: Annotated[Path, typer.Option("--canary-evidence")],
+    binding: Annotated[Path, typer.Option("--binding")],
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    actor: Annotated[str, typer.Option("--actor")] = "laptop-owner",
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Promote the local laptop from canary to pilot_a using exact durable evidence."""
+    if confirmation != PILOT_A_OWNER_CONFIRMATION:
+        raise typer.BadParameter("aggressive pilot_a owner confirmation is invalid")
+    settings = _load(config)
+    loaded_binding = load_aggressive_qualification_binding(binding.resolve())
+    evidence = load_aggressive_laptop_stage_evidence(canary_evidence.resolve())
+    if (
+        evidence.stage != "canary"
+        or not evidence.accepted
+        or evidence.aggressive_binding_sha256 != loaded_binding.binding_sha256
+    ):
+        raise typer.BadParameter("accepted exact aggressive canary evidence is required")
+    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+
+    async def promote() -> RiskStageState:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        current = await read_risk_stage(state_path)
+        if (
+            current.stage != RiskStage.CANARY
+            or current.promoted_at is None
+            or current.qualification_hash != loaded_binding.qualification_hash
+            or current.runtime_policy_sha256 != table.runtime_policy_sha256
+        ):
+            raise RuntimeError("current canary stage identity is unavailable")
+        rebuilt = await build_aggressive_laptop_stage_evidence_from_journal(
+            state_path,
+            loaded_binding,
+            stage="canary",
+            started_at=evidence.started_at,
+            ended_at=evidence.ended_at,
+            post_flat_service_seconds=evidence.post_flat_service_seconds,
+        )
+        if rebuilt != evidence:
+            raise RuntimeError("canary evidence does not match the current durable journal")
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        if await journal.active_actions():
+            raise RuntimeError("pilot promotion requires stable FLAT and zero active actions")
+        completed = tuple(
+            sorted(
+                await journal.completed_actions_since(
+                    current.promoted_at,
+                    loaded_binding.qualification_hash,
+                ),
+                key=lambda action: action.pair_action_id,
+            )
+        )
+        completed_ids = tuple(action.pair_action_id for action in completed)
+        completed_sha256 = completed_normal_actions_sha256(completed)
+        if completed_sha256 != evidence.completed_actions_sha256:
+            raise RuntimeError("canary completion set changed before pilot promotion")
+        journal_actions_sha256 = hashlib.sha256(
+            json.dumps(completed_ids, separators=(",", ":")).encode()
+        ).hexdigest()
+        await record_risk_stage_result(
+            state_path,
+            RiskStage.CANARY,
+            loaded_binding.qualification_hash,
+            table.runtime_policy_sha256,
+            evidence.evidence_sha256,
+            True,
+            actor,
+            await journal.event_watermark(),
+            completed_sha256,
+            journal_actions_sha256,
+            completed_ids,
+        )
+        return await promote_risk_stage(
+            state_path,
+            RiskStage.CANARY,
+            RiskStage.PILOT_A,
+            loaded_binding.qualification_hash,
+            table.runtime_policy_sha256,
+            actor,
+            "PROMOTE:pilot_a",
+        )
+
+    result = asyncio.run(promote())
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
 
 
 @app.command("aggressive-vps-handoff-check")
@@ -687,11 +829,17 @@ def aggressive_live_intent_once(
         "state/aggressive-historical-model.json"
     ),
     history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
-    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-grid.sqlite3"),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-live-grid.sqlite3"),
+    qualification_grid: Annotated[Path, typer.Option("--qualification-grid")] = Path(
+        "state/aggressive-grid.sqlite3"
+    ),
     profile: Annotated[Path, typer.Option("--profile")] = Path(
         "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
     ),
     timeout_seconds: Annotated[int, typer.Option("--timeout", min=1, max=120)] = 30,
+    stage: Annotated[AggressiveLaptopLiveStage, typer.Option("--stage")] = (
+        AggressiveLaptopLiveStage.CANARY
+    ),
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
     """Create one fresh shared LIVE-mode intent; never authorize or submit it."""
@@ -702,16 +850,75 @@ def aggressive_live_intent_once(
     loaded_qualification = load_qualification(qualification.resolve())
     loaded_model = load_historical_model(model.resolve())
     loaded_runtime = load_native_runtime_manifest(runtime_manifest.resolve())
-    grid_store = AggressiveGridStore(grid.resolve())
-    grid_store.initialise()
+    qualification_grid_store = AggressiveGridStore(qualification_grid.resolve())
+    qualification_grid_store.initialise()
     verify_aggressive_qualification_binding(
         loaded_binding,
         loaded_qualification,
         loaded_model,
         loaded_runtime,
-        grid_store,
+        qualification_grid_store,
         profile_sha256=hashlib.sha256(profile.read_bytes()).hexdigest(),
     )
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    for direction in (loaded_model.positive.direction, loaded_model.negative.direction):
+        grid_store.initialise_route(
+            loaded_model,
+            direction,
+            now=datetime.now(UTC),
+            rearm_retreat_step_fraction=Decimal("0.25"),
+        )
+
+    async def synchronize_live_levels() -> None:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        current = await read_risk_stage(state_path)
+        expected = (
+            RiskStage.CANARY if stage == AggressiveLaptopLiveStage.CANARY else RiskStage.PILOT_A
+        )
+        if (
+            current.stage != expected
+            or current.promoted_at is None
+            or current.qualification_hash != loaded_binding.qualification_hash
+        ):
+            raise RuntimeError("aggressive laptop live stage is not current")
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        actions = (
+            *(
+                await journal.completed_actions_since(
+                    current.promoted_at,
+                    loaded_binding.qualification_hash,
+                )
+            ),
+            *(await journal.active_actions()),
+        )
+        stage_actions = tuple(
+            action
+            for action in actions
+            if action.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1"
+            and action.risk_reservation.get("stage") == stage.value
+            and action.risk_reservation.get("aggressive_binding_sha256")
+            == loaded_binding.binding_sha256
+        )
+        if len(stage_actions) != len(actions):
+            raise RuntimeError("live stage journal contains an incompatible action")
+        levels: set[int] = set()
+        for action in stage_actions:
+            level = int(str(action.risk_reservation.get("level_index", 0)))
+            if not 1 <= level <= (1 if stage == AggressiveLaptopLiveStage.CANARY else 5):
+                raise RuntimeError("live stage journal level is invalid")
+            if level in levels:
+                raise RuntimeError("live stage journal contains a duplicate level")
+            levels.add(level)
+        grid_store.synchronize_externally_owned_levels(
+            loaded_binding.qualification_route,
+            frozenset(levels),
+            now=datetime.now(UTC),
+        )
+
+    asyncio.run(synchronize_live_levels())
     intents: list[AggressiveTrancheIntent] = []
     result = asyncio.run(
         _run_aggressive_shadow_once(
@@ -725,14 +932,20 @@ def aggressive_live_intent_once(
             runtime_mode=AggressiveRuntimeMode.LIVE,
             simulate_fills=False,
             private_fee_rates=loaded_qualification.private_taker_fee_rates,
-            entry_stage=AggressiveEntryStage.LOCKED_CANARY,
+            entry_stage=(
+                AggressiveEntryStage.LOCKED_CANARY
+                if stage == AggressiveLaptopLiveStage.CANARY
+                else AggressiveEntryStage.NORMAL
+            ),
             intent_sink=intents,
         )
     )
     selected = tuple(
         intent for intent in intents if intent.route_identity == loaded_binding.qualification_route
     )
-    if len(selected) != 1 or selected[0].level_index != 1:
+    if len(selected) != 1 or (
+        stage == AggressiveLaptopLiveStage.CANARY and selected[0].level_index != 1
+    ):
         typer.echo(json.dumps(result, default=str, sort_keys=True))
         raise typer.Exit(code=3)
     envelope = AggressiveLiveIntentEnvelope(
@@ -2340,6 +2553,9 @@ def canary_run(
     repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
     aggressive_intent: Annotated[Path | None, typer.Option("--aggressive-intent")] = None,
     aggressive_binding: Annotated[Path | None, typer.Option("--aggressive-binding")] = None,
+    aggressive_stage: Annotated[AggressiveLaptopLiveStage, typer.Option("--aggressive-stage")] = (
+        AggressiveLaptopLiveStage.CANARY
+    ),
     runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")] = Path(
         "state/laptop/native-runtime-manifest.json"
     ),
@@ -2386,6 +2602,7 @@ def canary_run(
             confirmation,
             aggressive_intent=loaded_intent,
             aggressive_binding=loaded_binding,
+            aggressive_stage=aggressive_stage,
         )
     )
     typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))

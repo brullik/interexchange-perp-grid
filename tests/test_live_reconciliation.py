@@ -383,6 +383,22 @@ def test_canary_risk_bootstraps_from_exchange_positions_and_one_dollar_limit() -
     assert rejected.accepted is False
     assert rejected.reason == ReasonCode.UNRESOLVED_EXECUTION_STATE
 
+    pilot = evaluate_canary_risk_from_private_state(
+        _ROUTE,
+        exposed,
+        Decimal("5"),
+        Decimal("4.5"),
+        pair_stress_limit_usdt=Decimal("5"),
+        portfolio_stress_limit_usdt=Decimal("5"),
+        free_margin_floor_ratio=Decimal("0.20"),
+        effective_leverage_cap=Decimal("3"),
+        exit_depth_sufficient=True,
+        allow_existing_matched_exposure=True,
+        maximum_routes=1,
+        maximum_tranches_per_route=5,
+    )
+    assert pilot.accepted is True
+
     over_limit = evaluate_canary_risk_from_private_state(
         _ROUTE,
         _empty_states(),

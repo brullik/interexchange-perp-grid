@@ -70,11 +70,13 @@ New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 $reportPath = Join-Path $outputDirectory "report.json"
 $failurePath = Join-Path $outputDirectory "wrapper-failure.json"
 $aggressiveIntentPath = Join-Path $outputDirectory "aggressive-live-intent.json"
+$aggressiveCanaryEvidencePath = Join-Path $root "state/aggressive-canary-stage.json"
 $aggressiveBindingPath = Join-Path $root "state/aggressive-qualification.json"
 $aggressiveRuntimePath = Join-Path $root "state/laptop/native-runtime-manifest.json"
 $aggressiveModelPath = Join-Path $root "state/aggressive-historical-model.json"
 $aggressiveHistoryPath = Join-Path $root "data/reference-history"
-$aggressiveGridPath = Join-Path $root "state/aggressive-grid.sqlite3"
+$aggressiveQualificationGridPath = Join-Path $root "state/aggressive-grid.sqlite3"
+$aggressiveLiveGridPath = Join-Path $outputDirectory "aggressive-live-grid.sqlite3"
 $aggressiveProfilePath = Join-Path $root "config/AGGRESSIVE_SYMBIOSIS_V1.yaml"
 
 if (-not ("LaptopSleepGuard" -as [type])) {
@@ -192,7 +194,8 @@ try {
             --runtime-manifest $aggressiveRuntimePath `
             --model $aggressiveModelPath `
             --history-root $aggressiveHistoryPath `
-            --grid $aggressiveGridPath `
+            --grid $aggressiveLiveGridPath `
+            --qualification-grid $aggressiveQualificationGridPath `
             --profile $aggressiveProfilePath `
             --output $aggressiveIntentPath `
             --config "$root/config/defaults.yaml"
@@ -213,7 +216,7 @@ try {
                 --aggressive-binding $aggressiveBindingPath `
                 --runtime-manifest $aggressiveRuntimePath `
                 --aggressive-model $aggressiveModelPath `
-                --aggressive-grid $aggressiveGridPath `
+                --aggressive-grid $aggressiveQualificationGridPath `
                 --aggressive-profile $aggressiveProfilePath `
                 --config "$root/config/defaults.yaml"
         )
@@ -262,7 +265,8 @@ try {
             --binding $aggressiveBindingPath `
             --started-at $startedAt.ToString("o") `
             --ended-at $endedAt.ToString("o") `
-            --output (Join-Path $outputDirectory "aggressive-canary-stage.json") `
+            --post-flat-service-seconds 0 `
+            --output $aggressiveCanaryEvidencePath `
             --config "$root/config/defaults.yaml"
         if ($LASTEXITCODE -ne 0) { throw "aggressive canary evidence failed closed" }
     }

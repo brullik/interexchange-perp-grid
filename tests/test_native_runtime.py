@@ -124,6 +124,7 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     qualification = Path("scripts/laptop-qualification.ps1").read_text(encoding="utf-8")
     pilot = Path("scripts/laptop-pilot.ps1").read_text(encoding="utf-8")
     aggressive = Path("scripts/laptop-aggressive.ps1").read_text(encoding="utf-8")
+    aggressive_pilot = Path("scripts/laptop-aggressive-pilot-a.ps1").read_text(encoding="utf-8")
 
     assert "Export-Clixml" not in onboarding
     assert "Import-Clixml" not in loader
@@ -201,8 +202,15 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert 'IPEG_LIVE_ENABLED -cne "false"' in aggressive
     assert "separate, explicit live-money authorization" in aggressive
     assert "laptop-pilot.ps1" in aggressive and "-Aggressive" in aggressive
-    assert "Aggressive pilot_a is not yet software-ready" in aggressive
+    assert "laptop-aggressive-pilot-a.ps1" in aggressive
     assert "Docker" not in aggressive
+    assert "I_ACCEPT_AGGRESSIVE_PILOT_A_RISK" in aggressive_pilot
+    assert "minimum_duration_seconds -ne 86400" in aggressive_pilot
+    assert "--aggressive-stage pilot_a" in aggressive_pilot
+    assert '"--duration-seconds", "28800"' in aggressive_pilot
+    assert "--service-receipt $postFlatReceipt" in aggressive_pilot
+    assert '$env:IPEG_LIVE_ENABLED = "false"' in aggressive_pilot
+    assert "Docker" not in aggressive_pilot
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")
