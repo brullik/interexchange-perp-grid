@@ -22,6 +22,7 @@ from interexchange_perp_grid.qualification import (
     config_hash,
     laptop_owner_exception_authorized,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
     qualification_policy_from_settings,
 )
 from interexchange_perp_grid.state import (
@@ -179,10 +180,14 @@ class AutonomousOrchestrator:
     def __post_init__(self) -> None:
         standard = _policy(self.settings)
         laptop_exception = laptop_owner_exception_policy(self.settings)
+        smoke_5m = laptop_smoke_policy(self.settings, 5)
+        smoke_30m = laptop_smoke_policy(self.settings, 30)
         if self.qualification_policy not in {
             None,
             standard,
             laptop_exception,
+            smoke_5m,
+            smoke_30m,
         }:
             raise ValueError("unsupported qualification policy override")
         if (
@@ -190,6 +195,11 @@ class AutonomousOrchestrator:
             and not laptop_owner_exception_authorized()
         ):
             raise ValueError("laptop qualification exception lacks the local Windows receipt")
+        if self.qualification_policy in {smoke_5m, smoke_30m}:
+            # The isolated progress worker intentionally accepts only production and
+            # owner-authorized 12h policies. Rehearsals evaluate their exact selected
+            # policy in-process and can never emit accepted qualification evidence.
+            self.use_progress_subprocess = False
 
     @property
     def state_path(self) -> Path:

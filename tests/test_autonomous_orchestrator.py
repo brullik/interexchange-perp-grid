@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ from interexchange_perp_grid.qualification import (
     LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
     LAPTOP_OWNER_EXCEPTION_ENV,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
+    qualification_policy_from_settings,
 )
 from interexchange_perp_grid.state import (
     QualificationEpochStatus,
@@ -63,6 +66,22 @@ def test_orchestrator_requires_local_receipt_for_laptop_exception(
     )
     orchestrator = AutonomousOrchestrator(settings, qualification_policy=policy)
     assert orchestrator.qualification_policy == policy
+
+
+def test_orchestrator_allows_only_exact_nonaccepting_smoke_policies(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    for minutes in (5, 30):
+        policy = laptop_smoke_policy(settings, minutes)
+        orchestrator = AutonomousOrchestrator(settings, qualification_policy=policy)
+        assert orchestrator.qualification_policy == policy
+        assert orchestrator.use_progress_subprocess is False
+
+    unsupported = replace(
+        qualification_policy_from_settings(settings), minimum_duration_seconds=301
+    )
+    with pytest.raises(ValueError, match="unsupported qualification policy override"):
+        AutonomousOrchestrator(settings, qualification_policy=unsupported)
 
 
 @pytest.mark.asyncio
