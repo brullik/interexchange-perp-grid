@@ -126,6 +126,7 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     pilot = Path("scripts/laptop-pilot.ps1").read_text(encoding="utf-8")
     aggressive = Path("scripts/laptop-aggressive.ps1").read_text(encoding="utf-8")
     aggressive_pilot = Path("scripts/laptop-aggressive-pilot-a.ps1").read_text(encoding="utf-8")
+    detached_smoke = Path("scripts/laptop-smoke-detached.ps1").read_text(encoding="utf-8")
 
     assert "Export-Clixml" not in onboarding
     assert "Import-Clixml" not in loader
@@ -209,8 +210,18 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "laptop-aggressive-pilot-a.ps1" in aggressive
     assert '"smoke30"' in aggressive
     assert '"smoke5"' in aggressive
-    assert "-Smoke30m" in aggressive
-    assert "-Smoke5m" in aggressive
+    assert "laptop-smoke-detached.ps1" in aggressive
+    assert "-SmokeMinutes 30" in aggressive
+    assert "-SmokeMinutes 5" in aggressive
+    assert "Start-Process" in detached_smoke
+    assert "laptop_smoke_runner.py" in detached_smoke
+    assert "subprocess" not in Path("scripts/laptop_smoke_runner.py").read_text(encoding="utf-8")
+    assert "ValidateSet(5, 30)" in detached_smoke
+    assert "[IO.FileMode]::CreateNew" in detached_smoke
+    assert "qualification-smoke.lock" in detached_smoke
+    assert 'IPEG_TELEGRAM_ENABLED = "false"' not in detached_smoke
+    assert "laptop-disable-shadow-telegram.ps1" in detached_smoke
+    assert "IPEG_LIVE_ENABLED" not in detached_smoke
     assert '[Guid]::NewGuid().ToString("N")' in qualification
     assert "IPEG_LAPTOP_SMOKE_RUN_ID" in qualification
     assert "Docker" not in aggressive

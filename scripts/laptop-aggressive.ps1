@@ -136,14 +136,14 @@ switch ($Mode) {
     }
     "smoke30" {
         Ensure-HistoricalModel
-        & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope -Smoke30m
+        & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
+            -ProfileScope $ProfileScope -SmokeMinutes 30
         if ($LASTEXITCODE -ne 0) { throw "30-minute qualification rehearsal failed closed" }
     }
     "smoke5" {
         Ensure-HistoricalModel
-        & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope -Smoke5m
+        & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
+            -ProfileScope $ProfileScope -SmokeMinutes 5
         if ($LASTEXITCODE -ne 0) { throw "5-minute qualification rehearsal failed closed" }
     }
     "canary" {
