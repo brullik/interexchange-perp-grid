@@ -216,6 +216,7 @@ class BootstrapService:
                         self.settings,
                         engine=qualification_engine,
                         runtime=runtime,
+                        qualification_policy=self.qualification_policy,
                         critical_work_count=priority_scheduler.critical_work_count,
                     ).run(stop_event),
                     name="continuous-shadow-evaluator",

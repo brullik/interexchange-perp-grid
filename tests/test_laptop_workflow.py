@@ -227,9 +227,9 @@ async def test_native_smoke_uses_exact_fast_runtime_policy(
     async def fake_service(self: BootstrapService, stop_event: asyncio.Event) -> None:
         assert self.qualification_policy == policy
         assert self.settings.shadow.scan_interval_seconds == 2
-        assert self.settings.shadow.qualification_min_duration_seconds == 300
-        assert self.settings.shadow.qualification_min_synchronised_snapshots_per_venue == 100
-        assert self.settings.shadow.qualification_min_funding_checkpoints_per_venue == 1
+        assert self.settings.shadow.qualification_min_duration_seconds == 86_400
+        assert self.settings.shadow.qualification_min_synchronised_snapshots_per_venue == 10_000
+        assert self.settings.shadow.qualification_min_funding_checkpoints_per_venue == 3
         await stop_event.wait()
         stopped.set()
 
