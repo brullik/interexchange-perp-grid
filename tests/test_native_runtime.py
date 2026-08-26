@@ -218,6 +218,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert '"smoke5"' in aggressive
     assert "laptop-smoke-detached.ps1" in aggressive
     assert "laptop-qualification-scheduled.ps1" in aggressive
+    assert '"state/laptop-profile-s4u.json"' in aggressive
+    assert "-ProfileScope LocalMachine" in aggressive
+    assert "if (-not $?)" in aggressive
     assert "-SmokeMinutes 30" in aggressive
     assert "-SmokeMinutes 5" in aggressive
     assert "Start-Process" in detached_smoke
@@ -235,6 +238,11 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "git status --porcelain --untracked-files=no" in detached_smoke
     assert 'cnotmatch "^[0-9a-f]{32}$"' in detached_smoke
     assert "IPEG-Laptop-Qualification-Once" in scheduled_qualification
+    assert 'ProfilePath = "state/laptop-profile-s4u.json"' in scheduled_qualification
+    assert 'ProfileScope = "LocalMachine"' in scheduled_qualification
+    assert 'ProfileScope -cne "LocalMachine"' in scheduled_qualification
+    assert "Scheduled qualification profile is missing" in scheduled_qualification
+    assert 'protection_scope -cne "LocalMachine"' in scheduled_qualification
     assert "Get-ScheduledTaskInfo" in scheduled_qualification
     assert "LastRunTime -ge $triggerStart" in scheduled_qualification
     assert "LastTaskResult -notin @(267009, 267011)" in scheduled_qualification

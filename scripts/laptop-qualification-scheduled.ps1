@@ -1,12 +1,16 @@
 [CmdletBinding()]
 param(
-    [string]$ProfilePath = "state/laptop-profile.clixml",
+    [string]$ProfilePath = "state/laptop-profile-s4u.json",
     [ValidateSet("CurrentUser", "LocalMachine")]
-    [string]$ProfileScope = "CurrentUser"
+    [string]$ProfileScope = "LocalMachine"
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+if ($ProfileScope -cne "LocalMachine") {
+    throw "Scheduled qualification requires the LocalMachine DPAPI profile"
+}
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
@@ -36,6 +40,16 @@ $profileFullPath = if ([IO.Path]::IsPathRooted($ProfilePath)) {
     [IO.Path]::GetFullPath($ProfilePath)
 } else {
     [IO.Path]::GetFullPath((Join-Path $root $ProfilePath))
+}
+if (-not (Test-Path -LiteralPath $profileFullPath -PathType Leaf)) {
+    throw "Scheduled qualification profile is missing: $profileFullPath"
+}
+$profileEnvelope = Get-Content -LiteralPath $profileFullPath -Raw | ConvertFrom-Json
+if (
+    $profileEnvelope.schema_version -ne 1 -or
+    $profileEnvelope.protection_scope -cne "LocalMachine"
+) {
+    throw "Scheduled qualification requires a valid LocalMachine DPAPI envelope"
 }
 $windowsPowerShell = Join-Path $env:SystemRoot "System32/WindowsPowerShell/v1.0/powershell.exe"
 if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
