@@ -8,6 +8,7 @@ import traceback
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 from interexchange_perp_grid.cli import (
     aggressive_model_proof,
@@ -38,6 +39,7 @@ def main() -> int:
     lock_path = state / "qualification-smoke.lock"
     result = 1
     armed = 0
+    kernel32 = cast(Any, ctypes).windll.kernel32
     try:
         if (
             re.fullmatch(r"[0-9a-f]{32}", run_id) is None
@@ -47,7 +49,7 @@ def main() -> int:
         run_state.mkdir(parents=True, exist_ok=True)
         exit_path.unlink(missing_ok=True)
         pid_path.write_text(str(os.getpid()), encoding="ascii")
-        armed = ctypes.windll.kernel32.SetThreadExecutionState(
+        armed = kernel32.SetThreadExecutionState(
             ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
         )
         if armed == 0:
@@ -107,7 +109,7 @@ def main() -> int:
             except FileNotFoundError:
                 pass
         if armed != 0:
-            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS)
     return result
 
 
