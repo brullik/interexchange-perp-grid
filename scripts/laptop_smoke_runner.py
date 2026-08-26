@@ -6,6 +6,7 @@ import ctypes
 import os
 import re
 import shutil
+import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -160,6 +161,11 @@ def main() -> int:
         if qualification_12h:
             _require_exact_local_main(root)
         run_state.mkdir(parents=True, exist_ok=True)
+        runtime_temp = run_state / "tmp"
+        runtime_temp.mkdir(parents=True, exist_ok=True)
+        os.environ["TEMP"] = str(runtime_temp)
+        os.environ["TMP"] = str(runtime_temp)
+        tempfile.tempdir = str(runtime_temp)
         exit_path.unlink(missing_ok=True)
         pid_path.write_text(str(os.getpid()), encoding="ascii")
         armed = kernel32.SetThreadExecutionState(
