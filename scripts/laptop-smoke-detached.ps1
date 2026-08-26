@@ -5,7 +5,8 @@ param(
     [string]$ProfileScope = "CurrentUser",
     [ValidateSet(5, 30)]
     [int]$SmokeMinutes = 0,
-    [switch]$OwnerException12h
+    [switch]$OwnerException12h,
+    [string]$RunId = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +24,14 @@ if ($ProfileScope -ceq "LocalMachine") {
 if (($SmokeMinutes -eq 0) -eq (-not $OwnerException12h)) {
     throw "Choose exactly one detached smoke or 12-hour qualification mode"
 }
-$env:IPEG_LAPTOP_RUN_ID = [Guid]::NewGuid().ToString("N")
+if ($RunId) {
+    if ($RunId -cnotmatch "^[0-9a-f]{32}$") {
+        throw "Detached qualification run id must be 32 lowercase hexadecimal characters"
+    }
+    $env:IPEG_LAPTOP_RUN_ID = $RunId
+} else {
+    $env:IPEG_LAPTOP_RUN_ID = [Guid]::NewGuid().ToString("N")
+}
 $runKind = if ($OwnerException12h) { "qualification" } else { "smoke" }
 if (-not $OwnerException12h) {
     $env:IPEG_LAPTOP_SMOKE_RUN_ID = $env:IPEG_LAPTOP_RUN_ID

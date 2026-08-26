@@ -127,6 +127,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     aggressive = Path("scripts/laptop-aggressive.ps1").read_text(encoding="utf-8")
     aggressive_pilot = Path("scripts/laptop-aggressive-pilot-a.ps1").read_text(encoding="utf-8")
     detached_smoke = Path("scripts/laptop-smoke-detached.ps1").read_text(encoding="utf-8")
+    scheduled_qualification = Path("scripts/laptop-qualification-scheduled.ps1").read_text(
+        encoding="utf-8"
+    )
 
     assert "Export-Clixml" not in onboarding
     assert "Import-Clixml" not in loader
@@ -214,6 +217,7 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert '"smoke30"' in aggressive
     assert '"smoke5"' in aggressive
     assert "laptop-smoke-detached.ps1" in aggressive
+    assert "laptop-qualification-scheduled.ps1" in aggressive
     assert "-SmokeMinutes 30" in aggressive
     assert "-SmokeMinutes 5" in aggressive
     assert "Start-Process" in detached_smoke
@@ -229,6 +233,17 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "IPEG_LAPTOP_12H_OWNER_EXCEPTION" in detached_smoke
     assert "refs/remotes/origin/main" in detached_smoke
     assert "git status --porcelain --untracked-files=no" in detached_smoke
+    assert 'cnotmatch "^[0-9a-f]{32}$"' in detached_smoke
+    assert "IPEG-Laptop-Qualification-Once" in scheduled_qualification
+    assert "Get-ScheduledTaskInfo" in scheduled_qualification
+    assert "LastRunTime -ge $triggerStart" in scheduled_qualification
+    assert "LastTaskResult -notin @(267009, 267011)" in scheduled_qualification
+    assert "New-ScheduledTaskTrigger -Once" in scheduled_qualification
+    assert "-LogonType Interactive" in scheduled_qualification
+    assert "-RunLevel Limited" in scheduled_qualification
+    assert "-RunId" in scheduled_qualification
+    assert "-OwnerException12h" in scheduled_qualification
+    assert "IPEG_LIVE" not in scheduled_qualification
     assert "--qualification-12h" in runner
     assert "laptop_qualification_run" in runner
     assert "aggressive_qualification_bind" in runner

@@ -124,8 +124,8 @@ switch ($Mode) {
     }
     "qualify" {
         if ($OwnerException12h) {
-            & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
-                -ProfileScope $ProfileScope -OwnerException12h
+            & "$PSScriptRoot/laptop-qualification-scheduled.ps1" -ProfilePath $ProfilePath `
+                -ProfileScope $ProfileScope
             if ($LASTEXITCODE -ne 0) { throw "detached 12-hour qualification failed to start" }
             return
         }
