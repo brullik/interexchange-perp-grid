@@ -178,6 +178,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION" in qualification
     assert "--laptop-owner-exception-12h" in qualification
     assert "--maximum-hours 18" in qualification
+    assert "qualification.lock" in qualification
+    assert "[IO.FileMode]::CreateNew" in qualification
+    assert "refs/remotes/origin/main" in qualification
     assert 'if ($consent -cne "I_ACCEPT_LIVE_CANARY_RISK")' in pilot
     assert "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION" in pilot
     assert "--laptop-owner-exception-12h" in pilot
@@ -222,6 +225,13 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "ValidateSet(5, 30)" in detached_smoke
     assert "[IO.FileMode]::CreateNew" in detached_smoke
     assert "qualification-smoke.lock" in detached_smoke
+    assert "--qualification-12h" in detached_smoke
+    assert "IPEG_LAPTOP_12H_OWNER_EXCEPTION" in detached_smoke
+    assert "refs/remotes/origin/main" in detached_smoke
+    assert "git status --porcelain --untracked-files=no" in detached_smoke
+    assert "--qualification-12h" in runner
+    assert "laptop_qualification_run" in runner
+    assert "aggressive_qualification_bind" in runner
     assert 'IPEG_TELEGRAM_ENABLED = "false"' not in detached_smoke
     assert "laptop-disable-shadow-telegram.ps1" in detached_smoke
     assert "IPEG_LIVE_ENABLED" not in detached_smoke

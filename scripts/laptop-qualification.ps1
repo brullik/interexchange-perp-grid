@@ -27,6 +27,46 @@ if ($ProfileScope -ceq "LocalMachine") {
 
 if ($Smoke5m -and $Smoke30m) { throw "Choose exactly one smoke duration" }
 $smokeMinutes = if ($Smoke5m) { 5 } elseif ($Smoke30m) { 30 } else { 0 }
+$qualificationLockName = if ($smokeMinutes -gt 0) {
+    "qualification-smoke.lock"
+} else {
+    "qualification.lock"
+}
+$qualificationLockPath = Join-Path $root "state/laptop/$qualificationLockName"
+$qualificationLockOwner = [Guid]::NewGuid().ToString("N")
+$qualificationLockStream = $null
+try {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $qualificationLockPath) `
+        -Force | Out-Null
+    $qualificationLockStream = [IO.File]::Open(
+        $qualificationLockPath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    $qualificationLockBytes = [Text.Encoding]::ASCII.GetBytes(
+        "$qualificationLockOwner|$PID"
+    )
+    $qualificationLockStream.Write(
+        $qualificationLockBytes,
+        0,
+        $qualificationLockBytes.Length
+    )
+    $qualificationLockStream.Flush($true)
+} catch [IO.IOException] {
+    throw "Another laptop qualification runner owns the shared qualification state"
+} finally {
+    if ($null -ne $qualificationLockStream) { $qualificationLockStream.Dispose() }
+}
+trap {
+    if (Test-Path -LiteralPath $qualificationLockPath -PathType Leaf) {
+        $owner = Get-Content -LiteralPath $qualificationLockPath -Raw
+        if ($owner.Trim().StartsWith("$qualificationLockOwner|")) {
+            Remove-Item -LiteralPath $qualificationLockPath -Force
+        }
+    }
+    throw $_
+}
 
 if ($smokeMinutes -gt 0) {
     $env:IPEG_LAPTOP_SMOKE_RUN_ID = [Guid]::NewGuid().ToString("N")
@@ -67,6 +107,20 @@ if ($LASTEXITCODE -ne 0) { throw "native runtime manifest failed" }
 $manifest = Get-Content -LiteralPath $env:IPEG_NATIVE_RUNTIME_MANIFEST -Raw | ConvertFrom-Json
 $env:IPEG_RELEASE_SHA = [string]$manifest.release_sha
 $env:IPEG_CONTAINER_IMAGE_DIGEST = [string]$manifest.artifact_digest
+
+if ($smokeMinutes -eq 0) {
+    $branch = (& git branch --show-current).Trim()
+    $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+    $originMain = (& git rev-parse refs/remotes/origin/main).Trim().ToLowerInvariant()
+    $dirty = @(& git status --porcelain --untracked-files=no)
+    if (
+        $LASTEXITCODE -ne 0 -or $branch -cne "main" -or
+        $head -cne $originMain -or $head -cne $env:IPEG_RELEASE_SHA
+    ) {
+        throw "qualification requires clean exact local main matching fetched origin/main"
+    }
+    if ($dirty.Count -gt 0) { throw "qualification requires a clean tracked checkout" }
+}
 
 $ownerExceptionConfirmation = $null
 if ($smokeMinutes -gt 0) {
@@ -200,5 +254,11 @@ try {
 } finally {
     Remove-Item Env:IPEG_LAPTOP_12H_OWNER_EXCEPTION -ErrorAction SilentlyContinue
     Remove-Item Env:IPEG_LAPTOP_SMOKE_RUN_ID -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $qualificationLockPath -PathType Leaf) {
+        $owner = Get-Content -LiteralPath $qualificationLockPath -Raw
+        if ($owner.Trim().StartsWith("$qualificationLockOwner|")) {
+            Remove-Item -LiteralPath $qualificationLockPath -Force
+        }
+    }
     [void][LaptopSleepGuard]::SetThreadExecutionState($continuous)
 }

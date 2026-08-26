@@ -123,9 +123,15 @@ switch ($Mode) {
         }
     }
     "qualify" {
+        if ($OwnerException12h) {
+            & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
+                -ProfileScope $ProfileScope -OwnerException12h
+            if ($LASTEXITCODE -ne 0) { throw "detached 12-hour qualification failed to start" }
+            return
+        }
         Ensure-HistoricalModel
         & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope -OwnerException12h:$OwnerException12h
+            -ProfileScope $ProfileScope
         if ($LASTEXITCODE -ne 0) { throw "base laptop qualification failed closed" }
         & $python -m interexchange_perp_grid.cli aggressive-qualification-bind `
             --qualification "state/qualification.json" `

@@ -872,6 +872,7 @@ def _start_qualification_epoch_sync(
     config_sha256: str,
     container_image_digest: str,
     now: datetime,
+    force_new: bool,
 ) -> QualificationEpoch:
     _validate_epoch_identity(
         release_sha,
@@ -905,15 +906,18 @@ def _start_qualification_epoch_sync(
                 parsed.config_sha256,
                 parsed.container_image_digest,
             )
-            if observed_identity == identity:
+            if observed_identity == identity and not force_new:
                 database.commit()
                 return parsed
             database.execute(
                 "UPDATE qualification_epochs SET status = ?, ended_at = ? WHERE epoch_id = ?",
                 (QualificationEpochStatus.CLOSED.value, now.isoformat(), parsed.epoch_id),
             )
-        finalized = database.execute(
-            """
+        finalized = (
+            None
+            if force_new
+            else database.execute(
+                """
             SELECT epoch_id, route, release_sha, source_sha256, config_sha256,
                    container_image_digest, started_at, ended_at, status
             FROM qualification_epochs
@@ -921,8 +925,9 @@ def _start_qualification_epoch_sync(
               AND container_image_digest = ? AND status = ?
             ORDER BY started_at DESC LIMIT 1
             """,
-            (*identity, QualificationEpochStatus.FINALIZED.value),
-        ).fetchone()
+                (*identity, QualificationEpochStatus.FINALIZED.value),
+            ).fetchone()
+        )
         if finalized is not None:
             database.commit()
             return _epoch_from_row(finalized)
@@ -956,6 +961,8 @@ async def start_qualification_epoch(
     config_sha256: str,
     container_image_digest: str,
     now: datetime | None = None,
+    *,
+    force_new: bool = False,
 ) -> QualificationEpoch:
     return await asyncio.to_thread(
         _start_qualification_epoch_sync,
@@ -966,6 +973,7 @@ async def start_qualification_epoch(
         config_sha256,
         container_image_digest,
         now or datetime.now(UTC),
+        force_new,
     )
 
 
@@ -1016,6 +1024,43 @@ def _read_active_qualification_epoch_sync(path: Path) -> QualificationEpoch | No
 
 async def read_active_qualification_epoch(path: Path) -> QualificationEpoch | None:
     return await asyncio.to_thread(_read_active_qualification_epoch_sync, path)
+
+
+def _close_active_qualification_epoch_sync(
+    path: Path,
+    now: datetime,
+) -> QualificationEpoch | None:
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute(
+            """
+            SELECT epoch_id FROM qualification_epochs
+            WHERE status = ? ORDER BY started_at DESC LIMIT 1
+            """,
+            (QualificationEpochStatus.RUNNING.value,),
+        ).fetchone()
+        if row is None:
+            database.commit()
+            return None
+        epoch_id = str(row[0])
+        database.execute(
+            "UPDATE qualification_epochs SET status = ?, ended_at = ? WHERE epoch_id = ?",
+            (QualificationEpochStatus.CLOSED.value, now.isoformat(), epoch_id),
+        )
+        database.commit()
+    return _read_qualification_epoch_sync(path, epoch_id)
+
+
+async def close_active_qualification_epoch(
+    path: Path,
+    now: datetime | None = None,
+) -> QualificationEpoch | None:
+    """Close an interrupted epoch so a retry can only start from zero."""
+    return await asyncio.to_thread(
+        _close_active_qualification_epoch_sync,
+        path,
+        now or datetime.now(UTC),
+    )
 
 
 def _finalize_qualification_epoch_sync(
