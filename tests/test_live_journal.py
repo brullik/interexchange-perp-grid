@@ -134,6 +134,103 @@ async def _prepare(
     )
 
 
+async def _prepare_fast_live(
+    journal: LiveOrderJournal,
+    *,
+    pair_id: str,
+    base: str,
+    preflight_sha256: str,
+    expires_at: datetime,
+    now: datetime,
+) -> LiveJournalAction:
+    route = DirectedRouteKey(base, Venue.BINANCE_USDM, Venue.OKX)
+    long_request = _request(route.long_venue, venue_client_order_id(pair_id, "long"), Side.BUY)
+    short_request = _request(route.short_venue, venue_client_order_id(pair_id, "short"), Side.SELL)
+    return await journal.prepare(
+        pair_id,
+        route,
+        f"{pair_id}-tranche",
+        long_request,
+        short_request,
+        {route.long_venue: Decimal("0.001"), route.short_venue: Decimal("0.001")},
+        {route.long_venue: Decimal("100.1"), route.short_venue: Decimal("99.9")},
+        {
+            "strategy": "AGGRESSIVE_FAST_LIVE_V2",
+            "projected_stress_usdt": "0.8",
+            "activation_hash": preflight_sha256,
+            "fast_live_preflight_expires_at": expires_at.isoformat(),
+        },
+        "0" * 64,
+        now,
+        activation_hash=preflight_sha256,
+        fast_live_preflight_sha256=preflight_sha256,
+        fast_live_preflight_expires_at=expires_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fast_live_preflight_consumption_is_atomic_and_single_use(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    observed = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    activation = "c" * 64
+
+    results = await asyncio.gather(
+        _prepare_fast_live(
+            journal,
+            pair_id="fast-btc",
+            base="BTC",
+            preflight_sha256=activation,
+            expires_at=observed + timedelta(seconds=600),
+            now=observed,
+        ),
+        _prepare_fast_live(
+            journal,
+            pair_id="fast-eth",
+            base="ETH",
+            preflight_sha256=activation,
+            expires_at=observed + timedelta(seconds=600),
+            now=observed,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, LiveJournalAction) for result in results) == 1
+    failures = tuple(result for result in results if isinstance(result, BaseException))
+    assert len(failures) == 1
+    assert "already consumed" in str(failures[0])
+    with sqlite3.connect(journal.path) as database:
+        assert database.execute(
+            "SELECT count(*) FROM fast_live_preflight_consumption"
+        ).fetchone() == (1,)
+        assert database.execute("SELECT count(*) FROM live_pair_actions").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_expired_fast_live_preflight_never_creates_durable_intent(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    observed = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    with pytest.raises(RuntimeError, match="expired"):
+        await _prepare_fast_live(
+            journal,
+            pair_id="fast-expired",
+            base="BTC",
+            preflight_sha256="d" * 64,
+            expires_at=observed - timedelta(microseconds=1),
+            now=observed,
+        )
+    with sqlite3.connect(journal.path) as database:
+        assert database.execute(
+            "SELECT count(*) FROM fast_live_preflight_consumption"
+        ).fetchone() == (0,)
+        assert database.execute("SELECT count(*) FROM live_pair_actions").fetchone() == (0,)
+
+
 @pytest.mark.asyncio
 async def test_deployment_upgrade_gate_is_atomic_durable_and_blocks_only_new_entry(
     tmp_path: Path,

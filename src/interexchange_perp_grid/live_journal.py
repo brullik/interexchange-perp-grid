@@ -205,6 +205,7 @@ class LiveJournalAction:
     created_at: datetime
     updated_at: datetime
     legs: tuple[JournalLeg, ...]
+    activation_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +337,13 @@ class LiveOrderJournal:
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0
                         CHECK (risk_stage_completion_frozen IN (0, 1))
+                );
+                CREATE TABLE IF NOT EXISTS fast_live_preflight_consumption (
+                    preflight_sha256 TEXT PRIMARY KEY,
+                    activation_hash TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_by_pair_action_id TEXT NOT NULL UNIQUE,
+                    consumed_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS live_deployment_controls (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -648,6 +656,10 @@ class LiveOrderJournal:
         risk_reservation: dict[str, Any],
         qualification_hash: str,
         now: datetime | None = None,
+        *,
+        activation_hash: str | None = None,
+        fast_live_preflight_sha256: str | None = None,
+        fast_live_preflight_expires_at: datetime | None = None,
     ) -> LiveJournalAction:
         return await asyncio.to_thread(
             self._prepare_sync,
@@ -661,6 +673,9 @@ class LiveOrderJournal:
             risk_reservation,
             qualification_hash,
             now or datetime.now(UTC),
+            activation_hash,
+            fast_live_preflight_sha256,
+            fast_live_preflight_expires_at,
         )
 
     def _prepare_sync(
@@ -675,6 +690,9 @@ class LiveOrderJournal:
         risk_reservation: dict[str, Any],
         qualification_hash: str,
         now: datetime,
+        activation_hash: str | None,
+        fast_live_preflight_sha256: str | None,
+        fast_live_preflight_expires_at: datetime | None,
     ) -> LiveJournalAction:
         if not pair_action_id.strip() or not tranche_id.strip():
             raise ValueError("pair action and tranche IDs must be non-empty")
@@ -687,8 +705,39 @@ class LiveOrderJournal:
             raise ValueError("prepared requests must match the exact route")
         if len({request.client_order_id for request in requests}) != 2:
             raise ValueError("pair legs require distinct client order IDs")
-        if len(qualification_hash) != 64:
+        if len(qualification_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in qualification_hash
+        ):
             raise ValueError("qualification hash must be a SHA-256 hex digest")
+        fast_live_fields = (
+            activation_hash,
+            fast_live_preflight_sha256,
+            fast_live_preflight_expires_at,
+        )
+        if any(value is not None for value in fast_live_fields):
+            if (
+                activation_hash is None
+                or fast_live_preflight_sha256 is None
+                or fast_live_preflight_expires_at is None
+                or len(activation_hash) != 64
+                or len(fast_live_preflight_sha256) != 64
+                or activation_hash != fast_live_preflight_sha256
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in activation_hash + fast_live_preflight_sha256
+                )
+                or fast_live_preflight_expires_at.tzinfo is None
+                or fast_live_preflight_expires_at.utcoffset() is None
+                or now.tzinfo is None
+                or now.utcoffset() is None
+                or not isinstance(risk_reservation, dict)
+                or risk_reservation.get("activation_hash") != activation_hash
+                or risk_reservation.get("fast_live_preflight_expires_at")
+                != fast_live_preflight_expires_at.isoformat()
+            ):
+                raise ValueError("fast-live activation identity is incomplete")
+            if now < datetime.fromtimestamp(0, UTC) or now > fast_live_preflight_expires_at:
+                raise RuntimeError("fast-live preflight expired before journal prepare")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             stage_freeze = database.execute(
@@ -709,6 +758,25 @@ class LiveOrderJournal:
                 risk_reservation,
             )
             created = now.isoformat()
+            if fast_live_preflight_sha256 is not None:
+                assert activation_hash is not None
+                assert fast_live_preflight_expires_at is not None
+                try:
+                    database.execute(
+                        "INSERT INTO fast_live_preflight_consumption("
+                        "preflight_sha256, activation_hash, expires_at, "
+                        "consumed_by_pair_action_id, consumed_at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            fast_live_preflight_sha256,
+                            activation_hash,
+                            fast_live_preflight_expires_at.isoformat(),
+                            pair_action_id,
+                            created,
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    database.rollback()
+                    raise RuntimeError("fast-live preflight was already consumed") from error
             database.execute(
                 """
                 INSERT INTO live_pair_actions (
@@ -2196,6 +2264,7 @@ class LiveOrderJournal:
             """,
             (pair_action_id,),
         ).fetchall()
+        risk_reservation = json.loads(str(row["risk_reservation_json"]))
         return LiveJournalAction(
             pair_action_id=str(row["pair_action_id"]),
             route=DirectedRouteKey(
@@ -2205,7 +2274,7 @@ class LiveOrderJournal:
             ),
             tranche_id=str(row["tranche_id"]),
             state=LiveActionState(str(row["state"])),
-            risk_reservation=json.loads(str(row["risk_reservation_json"])),
+            risk_reservation=risk_reservation,
             qualification_hash=str(row["qualification_hash"]),
             residual_delta=Decimal(str(row["residual_delta"])),
             recovery_action=(
@@ -2236,6 +2305,11 @@ class LiveOrderJournal:
                     filled_base_quantity=Decimal(str(leg["filled_base_quantity"])),
                 )
                 for leg in legs
+            ),
+            activation_hash=(
+                str(risk_reservation["activation_hash"])
+                if risk_reservation.get("activation_hash") is not None
+                else None
             ),
         )
 

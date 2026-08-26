@@ -15,7 +15,7 @@ class LiveContext:
     simulation_or_replay: bool = True
     local_unlock_present: bool = False
     telegram_challenge_valid: bool = False
-    current_qualification_valid: bool = False
+    fast_live_preflight_valid: bool = False
     route_allowlisted: bool = False
     canary_policy_passed: bool = False
     capability_preflight_passed: bool = False
@@ -42,8 +42,8 @@ def evaluate_live_order(settings: Settings, context: LiveContext) -> LiveDecisio
         (context.local_unlock_present, LiveDenyReason.LOCAL_UNLOCK_MISSING),
         (context.telegram_challenge_valid, LiveDenyReason.TELEGRAM_CHALLENGE_MISSING),
         (
-            context.current_qualification_valid,
-            LiveDenyReason.CURRENT_QUALIFICATION_MISSING,
+            context.fast_live_preflight_valid,
+            LiveDenyReason.FAST_LIVE_PREFLIGHT_MISSING,
         ),
         (context.route_allowlisted, LiveDenyReason.ROUTE_NOT_ALLOWLISTED),
         (context.canary_policy_passed, LiveDenyReason.CANARY_POLICY_VIOLATION),

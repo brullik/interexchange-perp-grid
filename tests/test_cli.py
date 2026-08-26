@@ -163,6 +163,25 @@ def test_cli_and_public_scan_help_render() -> None:
     assert "--quantity" in ANSI_ESCAPE.sub("", public_help.output)
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "fast-live-preflight",
+        "fast-live-canary",
+        "fast-live-pilot",
+        "fast-live-stage-select",
+    ],
+)
+def test_current_fast_live_contract_has_no_qualification_dependency(command: str) -> None:
+    rendered = runner.invoke(app, [command, "--help"])
+    output = ANSI_ESCAPE.sub("", rendered.output)
+
+    assert rendered.exit_code == 0, output
+    assert "--qualification" not in output
+    if command != "fast-live-stage-select":
+        assert "--preflight" in output
+
+
 def test_laptop_twelve_hour_profile_requires_explicit_local_receipt(
     tmp_path: Path,
 ) -> None:
@@ -729,8 +748,8 @@ def test_canary_run_requires_explicit_live_money_phrase_before_network() -> None
         app,
         ["canary-run", "--confirmation", "NO"],
     )
-    assert result.exit_code == 5
-    assert "OWNER_CONFIRMATION_MISSING" in result.output
+    assert result.exit_code == 2
+    assert "legacy canary-run is disabled" in result.output
 
 
 def test_emergency_flatten_requires_separate_unlock_before_network() -> None:

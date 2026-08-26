@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
@@ -281,6 +282,62 @@ async def test_compatible_aggressive_tranches_use_one_portfolio_recovery_owner(
                 "projected_stress_usdt": "0.8",
             },
             "b" * 64,
+        )
+    calls = 0
+
+    async def recover(_: LiveJournalAction) -> object:
+        nonlocal calls
+        calls += 1
+        for action in await journal.active_actions():
+            await _force_exchange_verified_flat(journal, action)
+        return object()
+
+    health = await LiveSafetySupervisor(journal, recover).reconcile_once()
+
+    assert calls == 1
+    assert health.mode == SupervisorMode.IDLE, health
+
+
+@pytest.mark.asyncio
+async def test_v2_portfolio_accepts_distinct_single_use_activations_under_one_owner(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "fast-portfolio.sqlite3")
+    await journal.initialise()
+    observed = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    for level in (1, 2):
+        action_id = f"fast-aggressive-{level}"
+        activation = f"{level}" * 64
+        expires_at = observed + timedelta(seconds=600)
+        await journal.prepare(
+            action_id,
+            _ROUTE,
+            f"fast-level-{level}",
+            replace(
+                _request(Venue.BINANCE_USDM, Side.BUY, f"fast-long-{level}"),
+                client_order_id=venue_client_order_id(action_id, "long"),
+            ),
+            replace(
+                _request(Venue.OKX, Side.SELL, f"fast-short-{level}"),
+                client_order_id=venue_client_order_id(action_id, "short"),
+            ),
+            {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+            {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+            {
+                "strategy": "AGGRESSIVE_FAST_LIVE_V2",
+                "stage": "pilot_a",
+                "level_index": level,
+                "aggressive_binding_sha256": "c" * 64,
+                "strategy_profile_sha256": "d" * 64,
+                "projected_stress_usdt": "0.8",
+                "activation_hash": activation,
+                "fast_live_preflight_expires_at": expires_at.isoformat(),
+            },
+            "0" * 64,
+            observed,
+            activation_hash=activation,
+            fast_live_preflight_sha256=activation,
+            fast_live_preflight_expires_at=expires_at,
         )
     calls = 0
 

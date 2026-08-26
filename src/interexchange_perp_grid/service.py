@@ -189,7 +189,7 @@ class BootstrapService:
         background_tasks.append(
             asyncio.create_task(supervisor.run(stop_event), name="live-safety-supervisor")
         )
-        if self.settings.app.mode == "shadow":
+        if self.settings.app.mode == "shadow" and self.qualification_policy is not None:
             background_tasks.append(
                 asyncio.create_task(
                     AutonomousOrchestrator(

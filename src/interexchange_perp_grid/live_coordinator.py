@@ -139,6 +139,8 @@ class CanaryExecutionPlan:
     risk_reservation: dict[str, object]
     qualification_hash: str
     timeout_seconds: int
+    activation_hash: str | None = None
+    fast_live_preflight_expires_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +228,9 @@ class LiveCanaryCoordinator:
             },
             plan.risk_reservation,
             plan.qualification_hash,
+            activation_hash=plan.activation_hash,
+            fast_live_preflight_sha256=plan.activation_hash,
+            fast_live_preflight_expires_at=plan.fast_live_preflight_expires_at,
         )
 
     async def run(self, plan: CanaryExecutionPlan) -> CanaryCycleResult:

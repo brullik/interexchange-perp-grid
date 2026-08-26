@@ -19,6 +19,11 @@ import typer
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.aggressive_activation import (
+    AggressiveFastLiveBinding,
+    build_aggressive_fast_live_binding,
+    verify_aggressive_fast_live_binding,
+)
 from interexchange_perp_grid.aggressive_evaluator import (
     AggressiveEntryStage,
     AggressiveExitReason,
@@ -42,10 +47,13 @@ from interexchange_perp_grid.aggressive_laptop_acceptance import (
     verify_aggressive_laptop_handoff,
 )
 from interexchange_perp_grid.aggressive_live import (
+    AggressiveFastLiveIntentEnvelope,
     AggressiveLaptopLiveStage,
     AggressiveLiveIntentEnvelope,
     aggressive_intent_sha256,
+    load_aggressive_fast_live_intent,
     load_aggressive_live_intent,
+    save_aggressive_fast_live_intent,
     save_aggressive_live_intent,
 )
 from interexchange_perp_grid.aggressive_model import (
@@ -85,10 +93,12 @@ from interexchange_perp_grid.canary_runtime import (
     collect_authoritative_live_flat_evidence,
     run_canary_once,
     run_emergency_flatten,
+    run_fast_live_once,
 )
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Instrument, InstrumentKey, ProductType, Venue
 from interexchange_perp_grid.execution import Side
+from interexchange_perp_grid.fast_live_preflight import load_fast_live_preflight
 from interexchange_perp_grid.laptop_workflow import (
     LaptopQualificationIdentity,
     build_laptop_pilot_report,
@@ -98,6 +108,7 @@ from interexchange_perp_grid.laptop_workflow import (
 from interexchange_perp_grid.live_journal import (
     DeploymentUpgradeGate,
     LiveActionState,
+    LiveJournalAction,
     LiveOrderJournal,
     completed_normal_actions_sha256,
     is_completed_normal_paired_cycle,
@@ -197,9 +208,12 @@ from interexchange_perp_grid.state import (
     promote_risk_stage,
     read_qualification_epoch,
     read_risk_stage,
+    read_runtime_controls,
     read_service_health,
     record_risk_stage_result,
+    select_fast_live_risk_stage,
     start_qualification_epoch,
+    update_runtime_controls,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
 from interexchange_perp_grid.supervisor import SupervisorHealth, read_supervisor_health
@@ -1526,6 +1540,639 @@ def aggressive_live_intent_once(
             sort_keys=True,
         )
     )
+
+
+async def _current_private_fee_rates(model: HistoricalReferenceModel) -> dict[Venue, Decimal]:
+    adapters: dict[Venue, CcxtPrivateAdapter] = {}
+    try:
+        result: dict[Venue, Decimal] = {}
+        for venue in (Venue(model.venue_a), Venue(model.venue_b)):
+            adapter = CcxtPrivateAdapter(venue, PrivateCredentials.from_environment(venue))
+            adapters[venue] = adapter
+            instrument = next(
+                (
+                    item
+                    for item in await adapter.list_instruments()
+                    if item.base == model.base
+                    and item.quote == "USDT"
+                    and item.settle == "USDT"
+                    and item.product_type == ProductType.LINEAR_USDT_PERPETUAL
+                    and item.active
+                ),
+                None,
+            )
+            if instrument is None:
+                raise RuntimeError(f"{venue.value}: fast-live instrument is unavailable")
+            fee = await adapter.fetch_trading_fee(instrument)
+            if fee is None or not fee.is_finite() or fee < 0:
+                raise RuntimeError(f"{venue.value}: private taker fee is unavailable")
+            result[venue] = fee
+        return result
+    finally:
+        await asyncio.gather(
+            *(adapter.close() for adapter in adapters.values()),
+            return_exceptions=True,
+        )
+
+
+@app.command("aggressive-fast-live-intent-once")
+def aggressive_fast_live_intent_once(
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    output: Annotated[Path, typer.Option("--output")] = Path(
+        "state/aggressive-fast-live-intent.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-fast-live-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_FAST_LIVE_V2.yaml"
+    ),
+    stage: Annotated[AggressiveLaptopLiveStage, typer.Option("--stage")] = (
+        AggressiveLaptopLiveStage.CANARY
+    ),
+    timeout_seconds: Annotated[int, typer.Option("--timeout", min=1, max=120)] = 30,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create one current V2 intent without qualification, consent, or submit authority."""
+    settings = _load(config)
+    if settings.app.mode != "shadow" or settings.live.enabled:
+        raise typer.BadParameter("fast-live intent preparation requires shadow/live=false")
+    loaded_model = load_historical_model(model.resolve())
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest.resolve(), repo_root.resolve(), config.resolve()
+    )
+    profile_sha256 = hashlib.sha256(profile.read_bytes()).hexdigest()
+    if loaded_model.strategy_profile_sha256 != profile_sha256:
+        raise typer.BadParameter("fast-live model/profile identity mismatch")
+    fees = asyncio.run(_current_private_fee_rates(loaded_model))
+    intents: list[AggressiveTrancheIntent] = []
+    result = asyncio.run(
+        _run_aggressive_shadow_once(
+            settings,
+            model.resolve(),
+            history_root.resolve(),
+            grid.resolve(),
+            profile.resolve(),
+            config.resolve(),
+            timeout_seconds,
+            runtime_mode=AggressiveRuntimeMode.LIVE,
+            simulate_fills=False,
+            private_fee_rates=fees,
+            entry_stage=(
+                AggressiveEntryStage.LOCKED_CANARY
+                if stage == AggressiveLaptopLiveStage.CANARY
+                else AggressiveEntryStage.NORMAL
+            ),
+            intent_sink=intents,
+        )
+    )
+    if len(intents) != 1 or (
+        stage == AggressiveLaptopLiveStage.CANARY and intents[0].level_index != 1
+    ):
+        typer.echo(json.dumps(result, default=str, sort_keys=True))
+        raise typer.Exit(code=3)
+    intent = intents[0]
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    binding = build_aggressive_fast_live_binding(
+        loaded_model,
+        runtime,
+        grid_store,
+        route=intent.route_identity,
+        profile_sha256=profile_sha256,
+    )
+    envelope = AggressiveFastLiveIntentEnvelope(
+        schema_version=2,
+        generated_at=datetime.now(UTC),
+        activation_binding_sha256=binding.binding_sha256,
+        intent=intent,
+        intent_sha256=aggressive_intent_sha256(intent),
+    )
+    save_aggressive_fast_live_intent(output.resolve(), envelope)
+    typer.echo(
+        json.dumps(
+            {
+                "status": "PASS",
+                "intent": asdict(envelope),
+                "execution_authorized": False,
+                "production_submit_calls": 0,
+            },
+            default=str,
+            sort_keys=True,
+        )
+    )
+
+
+def _load_fast_live_artifacts(
+    *,
+    intent_path: Path,
+    model_path: Path,
+    grid_path: Path,
+    profile_path: Path,
+    runtime_manifest_path: Path,
+    repo_root: Path,
+    config_path: Path,
+) -> tuple[AggressiveFastLiveIntentEnvelope, AggressiveFastLiveBinding]:
+    envelope = load_aggressive_fast_live_intent(intent_path.resolve())
+    model = load_historical_model(model_path.resolve())
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest_path.resolve(), repo_root.resolve(), config_path.resolve()
+    )
+    grid = AggressiveGridStore(grid_path.resolve())
+    grid.initialise()
+    profile_sha256 = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    binding = build_aggressive_fast_live_binding(
+        model,
+        runtime,
+        grid,
+        route=envelope.intent.route_identity,
+        profile_sha256=profile_sha256,
+        now=envelope.generated_at,
+    )
+    verify_aggressive_fast_live_binding(
+        binding,
+        model,
+        runtime,
+        grid,
+        profile_sha256=profile_sha256,
+    )
+    if envelope.activation_binding_sha256 != binding.binding_sha256:
+        raise typer.BadParameter("fast-live intent binding is no longer current")
+    return envelope, binding
+
+
+def _exact_merged_main_ready(repo_root: Path) -> bool:
+    root = repo_root.resolve()
+    commands = (
+        ("status", "--porcelain"),
+        ("rev-parse", "HEAD"),
+        ("rev-parse", "origin/main"),
+        ("branch", "--show-current"),
+    )
+    results = [
+        subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        for arguments in commands
+    ]
+    return (
+        all(item.returncode == 0 for item in results)
+        and not results[0].stdout.strip()
+        and results[1].stdout.strip() == results[2].stdout.strip()
+        and results[3].stdout.strip() == "main"
+    )
+
+
+def _run_fast_live_cli(
+    *,
+    preflight_only: bool,
+    stage: AggressiveLaptopLiveStage,
+    confirmation: str,
+    intent: Path,
+    preflight: Path,
+    model: Path,
+    grid: Path,
+    profile: Path,
+    runtime_manifest: Path,
+    repo_root: Path,
+    config: Path,
+) -> None:
+    settings = _load(config)
+    envelope, binding = _load_fast_live_artifacts(
+        intent_path=intent,
+        model_path=model,
+        grid_path=grid,
+        profile_path=profile,
+        runtime_manifest_path=runtime_manifest,
+        repo_root=repo_root,
+        config_path=config,
+    )
+    result = asyncio.run(
+        run_fast_live_once(
+            settings,
+            profile.resolve(),
+            preflight.resolve(),
+            confirmation,
+            envelope.intent,
+            binding,
+            stage=stage,
+            exact_merged_clean_source=_exact_merged_main_ready(repo_root),
+            preflight_only=preflight_only,
+        )
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+    if not result.success:
+        raise typer.Exit(code=5)
+
+
+@app.command("fast-live-preflight")
+def fast_live_preflight(
+    intent: Annotated[Path, typer.Option("--intent")] = Path(
+        "state/aggressive-fast-live-intent.json"
+    ),
+    preflight: Annotated[Path, typer.Option("--preflight")] = Path(
+        "state/fast-live-preflight.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-fast-live-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_FAST_LIVE_V2.yaml"
+    ),
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")] = Path(
+        "state/laptop/native-runtime-manifest.json"
+    ),
+    stage: Annotated[AggressiveLaptopLiveStage, typer.Option("--stage")] = (
+        AggressiveLaptopLiveStage.CANARY
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create one ignored TTL600 PASS/FAIL report; never request owner consent."""
+    _run_fast_live_cli(
+        preflight_only=True,
+        stage=stage,
+        confirmation="",
+        intent=intent,
+        preflight=preflight,
+        model=model,
+        grid=grid,
+        profile=profile,
+        runtime_manifest=runtime_manifest,
+        repo_root=repo_root,
+        config=config,
+    )
+
+
+def _fast_live_entry_command(
+    *,
+    stage: AggressiveLaptopLiveStage,
+    confirmation: str,
+    intent: Path,
+    preflight: Path,
+    model: Path,
+    grid: Path,
+    profile: Path,
+    runtime_manifest: Path,
+    repo_root: Path,
+    config: Path,
+) -> None:
+    _run_fast_live_cli(
+        preflight_only=False,
+        stage=stage,
+        confirmation=confirmation,
+        intent=intent,
+        preflight=preflight,
+        model=model,
+        grid=grid,
+        profile=profile,
+        runtime_manifest=runtime_manifest,
+        repo_root=repo_root,
+        config=config,
+    )
+
+
+@app.command("fast-live-canary")
+def fast_live_canary(
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    intent: Annotated[Path, typer.Option("--intent")] = Path(
+        "state/aggressive-fast-live-intent.json"
+    ),
+    preflight: Annotated[Path, typer.Option("--preflight")] = Path(
+        "state/fast-live-preflight.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-fast-live-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_FAST_LIVE_V2.yaml"
+    ),
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")] = Path(
+        "state/laptop/native-runtime-manifest.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Consume one current preflight and queue at most one minimum-notional pair."""
+    _fast_live_entry_command(
+        stage=AggressiveLaptopLiveStage.CANARY,
+        confirmation=confirmation,
+        intent=intent,
+        preflight=preflight,
+        model=model,
+        grid=grid,
+        profile=profile,
+        runtime_manifest=runtime_manifest,
+        repo_root=repo_root,
+        config=config,
+    )
+
+
+@app.command("fast-live-pilot")
+def fast_live_pilot(
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    intent: Annotated[Path, typer.Option("--intent")] = Path(
+        "state/aggressive-fast-live-intent.json"
+    ),
+    preflight: Annotated[Path, typer.Option("--preflight")] = Path(
+        "state/fast-live-preflight.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-fast-live-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_FAST_LIVE_V2.yaml"
+    ),
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")] = Path(
+        "state/laptop/native-runtime-manifest.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Consume a separate preflight and queue one normal-economics pilot tranche."""
+    _fast_live_entry_command(
+        stage=AggressiveLaptopLiveStage.PILOT_A,
+        confirmation=confirmation,
+        intent=intent,
+        preflight=preflight,
+        model=model,
+        grid=grid,
+        profile=profile,
+        runtime_manifest=runtime_manifest,
+        repo_root=repo_root,
+        config=config,
+    )
+
+
+@app.command("fast-live-status")
+def fast_live_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+    """Report durable V2 state without qualification or submit authority."""
+    settings = _load(config)
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def collect() -> dict[str, object]:
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        active = await journal.active_actions()
+        completed = await journal.completed_actions_since(datetime.fromtimestamp(0, UTC), "0" * 64)
+        fast_completed = tuple(
+            action
+            for action in completed
+            if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+            and is_completed_normal_paired_cycle(action)
+        )
+        controls = await read_runtime_controls(state_path)
+        supervisor = await read_supervisor_health(state_path)
+        return {
+            "status": "PASS",
+            "active_action_count": len(active),
+            "active_actions": [
+                {
+                    "pair_action_id": action.pair_action_id,
+                    "route": action.route.value,
+                    "state": action.state.value,
+                    "stage": action.risk_reservation.get("stage"),
+                    "activation_hash": action.activation_hash,
+                }
+                for action in active
+            ],
+            "completed_fast_live_round_trips": len(fast_completed),
+            "paused": controls.paused,
+            "killed": controls.killed,
+            "supervisor_mode": supervisor.mode.value if supervisor is not None else None,
+            "recovery_required": (supervisor.recovery_required if supervisor is not None else None),
+            "execution_authorized": False,
+        }
+
+    typer.echo(json.dumps(asyncio.run(collect()), default=str, sort_keys=True))
+
+
+@app.command("fast-live-runtime-control")
+def fast_live_runtime_control(
+    action: Annotated[str, typer.Option("--action")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Pause or resume new V2 entries; never stop recovery or submit an order."""
+    if action not in {"pause", "resume"}:
+        raise typer.BadParameter("action must be pause or resume")
+    settings = _load(config)
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def apply() -> dict[str, object]:
+        await initialise_state(state_path)
+        controls = await update_runtime_controls(
+            state_path,
+            paused=action == "pause",
+        )
+        return {
+            "status": "PASS",
+            "action": action,
+            "paused": controls.paused,
+            "killed": controls.killed,
+            "execution_authorized": False,
+        }
+
+    typer.echo(json.dumps(asyncio.run(apply()), sort_keys=True))
+
+
+@app.command("fast-live-stage-select")
+def fast_live_stage_select(
+    target: Annotated[RiskStage, typer.Option("--target")],
+    actor: Annotated[str, typer.Option("--actor")] = "laptop-fast-live-wrapper",
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Select canary/pilot_a without qualification, duration, or submit authority."""
+    settings = _load(config)
+    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+
+    async def select() -> RiskStageState:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        return await select_fast_live_risk_stage(
+            state_path,
+            target,
+            table.runtime_policy_sha256,
+            actor,
+        )
+
+    result = asyncio.run(select())
+    typer.echo(
+        json.dumps(
+            {"status": "PASS", "state": asdict(result), "execution_authorized": False},
+            default=str,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("fast-live-acceptance")
+def fast_live_acceptance(
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    model: Annotated[Path, typer.Option("--model")],
+    grid: Annotated[Path, typer.Option("--grid")],
+    profile: Annotated[Path, typer.Option("--profile")],
+    preflight: Annotated[Path, typer.Option("--preflight")],
+    canary_evidence: Annotated[Path, typer.Option("--canary-evidence")],
+    pilot_evidence: Annotated[Path, typer.Option("--pilot-evidence")],
+    output: Annotated[Path, typer.Option("--output")] = Path(
+        "state/laptop-fast-live-acceptance.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create exact laptop acceptance only after genuine canary and pilot stable-FLAT."""
+    settings = _load(config)
+    if not _exact_merged_main_ready(repo_root):
+        raise typer.BadParameter("fast-live acceptance requires exact clean merged main")
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest.resolve(), repo_root.resolve(), config.resolve()
+    )
+    loaded_model = load_historical_model(model.resolve())
+    profile_sha256 = hashlib.sha256(profile.read_bytes()).hexdigest()
+    if loaded_model.strategy_profile_sha256 != profile_sha256:
+        raise typer.BadParameter("fast-live acceptance model/profile mismatch")
+    preflight_report = load_fast_live_preflight(preflight.resolve())
+    if preflight_report.status != "PASS":
+        raise typer.BadParameter("fast-live acceptance requires a genuine PASS preflight")
+    if (
+        preflight_report.identity.release_sha != runtime.release_sha
+        or preflight_report.identity.source_sha256 != runtime.source_sha256
+        or preflight_report.identity.config_sha256 != runtime.config_sha256
+        or preflight_report.identity.profile_sha256 != profile_sha256
+        or preflight_report.identity.history_sha256 != loaded_model.reference_manifest_sha256
+        or preflight_report.identity.model_sha256 != historical_model_sha256(loaded_model)
+    ):
+        raise typer.BadParameter("fast-live acceptance identity is stale")
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    build_aggressive_fast_live_binding(
+        loaded_model,
+        runtime,
+        grid_store,
+        route=preflight_report.identity.route,
+        profile_sha256=profile_sha256,
+    )
+
+    def load_stage(path: Path, expected: str) -> dict[str, object]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise typer.BadParameter(f"{expected} evidence is unreadable") from error
+        if (
+            not isinstance(payload, dict)
+            or payload.get("stage") != expected
+            or payload.get("stable_flat") is not True
+            or payload.get("active_action_count") != 0
+        ):
+            raise typer.BadParameter(f"{expected} evidence is not stable-FLAT")
+        return {str(key): value for key, value in payload.items()}
+
+    load_stage(canary_evidence.resolve(), "canary")
+    load_stage(pilot_evidence.resolve(), "pilot")
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def audit() -> tuple[tuple[LiveJournalAction, ...], tuple[LiveJournalAction, ...]]:
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        active = await journal.active_actions()
+        completed = await journal.completed_actions_since(datetime.fromtimestamp(0, UTC), "0" * 64)
+        fast = tuple(
+            action
+            for action in completed
+            if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+        )
+        return active, fast
+
+    active_actions, fast_actions_raw = asyncio.run(audit())
+    fast_actions = fast_actions_raw
+    if active_actions:
+        raise typer.BadParameter("fast-live acceptance requires zero active journal actions")
+    canary_actions = tuple(
+        action
+        for action in fast_actions
+        if action.risk_reservation.get("stage") == AggressiveLaptopLiveStage.CANARY.value
+    )
+    pilot_actions = tuple(
+        action
+        for action in fast_actions
+        if action.risk_reservation.get("stage") == AggressiveLaptopLiveStage.PILOT_A.value
+    )
+    if len(canary_actions) != 1 or not pilot_actions or len(pilot_actions) > 5:
+        raise typer.BadParameter("fast-live acceptance requires one canary and 1-5 pilot cycles")
+    if len(fast_actions) != len(canary_actions) + len(pilot_actions):
+        raise typer.BadParameter("fast-live journal contains an unauthorized stage")
+    if any(
+        not is_completed_normal_paired_cycle(action)
+        or action.activation_hash is None
+        or action.risk_reservation.get("activation_hash") != action.activation_hash
+        or action.risk_reservation.get("strategy_profile_sha256") != profile_sha256
+        or action.recovery_action is not None
+        for action in fast_actions
+    ):
+        raise typer.BadParameter("fast-live journal lacks genuine paired normal completion")
+    if preflight_report.preflight_sha256 not in {
+        action.activation_hash for action in pilot_actions
+    }:
+        raise typer.BadParameter("pilot evidence is not bound to the current consumed preflight")
+    if any(
+        _journal_action_effective_stress(action.risk_reservation) > Decimal("1")
+        or int(str(action.risk_reservation.get("level_index", 0))) != 1
+        for action in canary_actions
+    ) or any(
+        _journal_action_effective_stress(action.risk_reservation) > Decimal("5")
+        for action in pilot_actions
+    ):
+        raise typer.BadParameter("fast-live journal exceeds the authorized laptop stage")
+    native_runtime_sha256 = hashlib.sha256(
+        json.dumps(asdict(runtime), default=str, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if preflight_report.identity.native_runtime_sha256 != native_runtime_sha256:
+        raise typer.BadParameter("fast-live native runtime identity changed")
+    payload = {
+        "schema_version": 1,
+        "accepted": True,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "release_sha": runtime.release_sha,
+        "source_sha256": runtime.source_sha256,
+        "config_sha256": runtime.config_sha256,
+        "profile_sha256": profile_sha256,
+        "native_runtime_sha256": native_runtime_sha256,
+        "history_sha256": loaded_model.reference_manifest_sha256,
+        "model_sha256": historical_model_sha256(loaded_model),
+        "pilot_preflight_sha256": preflight_report.preflight_sha256,
+        "route": preflight_report.identity.route,
+        "canary_pair_action_id": canary_actions[0].pair_action_id,
+        "pilot_pair_action_ids": [action.pair_action_id for action in pilot_actions],
+        "completed_actions_sha256": completed_normal_actions_sha256(fast_actions),
+        "stable_flat": True,
+        "active_action_count": 0,
+        "unknown_action_count": 0,
+        "p0_findings": 0,
+        "p1_findings": 0,
+        "production_submit_scope": "owner_confirmed_canary_and_pilot_only",
+        "execution_authorized": False,
+    }
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_name(f".{output.name}.pending")
+    pending.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    pending.replace(output)
+    typer.echo(json.dumps(payload, sort_keys=True))
 
 
 @app.command("aggressive-model-proof")
@@ -3199,7 +3846,7 @@ def private_probe(
     typer.echo(json.dumps(asdict(report), default=str, sort_keys=True))
 
 
-@app.command("canary-run")
+@app.command("canary-run", hidden=True)
 def canary_run(
     confirmation: Annotated[str, typer.Option("--confirmation")],
     qualification: Annotated[Path, typer.Option("--qualification")] = Path(
@@ -3225,7 +3872,12 @@ def canary_run(
     ),
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
-    """Run at most one minimum-notional canary pair after every independent gate."""
+    """Rejected legacy qualification-based entrypoint retained only for compatibility."""
+    raise typer.BadParameter(
+        "legacy canary-run is disabled; use fast-live-preflight and fast-live-canary"
+    )
+    # The unreachable implementation is retained for nondestructive source and
+    # SQLite compatibility during the V2 transition. It has no live authority.
     settings = _load(config)
     if (aggressive_intent is None) != (aggressive_binding is None):
         raise typer.BadParameter("aggressive intent and binding must be supplied together")

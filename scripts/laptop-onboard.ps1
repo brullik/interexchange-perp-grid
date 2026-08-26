@@ -197,7 +197,7 @@ if ($DialogSelfTest) {
 Confirm-Fact "Confirm Binance USD-M, Bybit and OKX use dedicated subaccounts."
 Confirm-Fact "Confirm API permissions are limited to read and futures trading; withdrawal, transfer, wallet, address-book and API-management are disabled."
 Confirm-Fact "Confirm every API key is restricted to this laptop's current public IP."
-Confirm-Fact "Confirm all three subaccounts are funded for qualification and minimum-notional canary recovery."
+Confirm-Fact "Confirm all three subaccounts are funded for minimum-notional canary and recovery."
 
 $chatId = Read-Host "Telegram numeric owner chat ID"
 if ($chatId -notmatch '^-?[0-9]+$') {

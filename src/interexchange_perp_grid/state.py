@@ -2145,6 +2145,103 @@ async def promote_risk_stage(
     )
 
 
+def _select_fast_live_risk_stage_sync(
+    path: Path,
+    target: RiskStage,
+    runtime_policy_sha256: str,
+    actor: str,
+    now: datetime,
+) -> RiskStageState:
+    if target not in {RiskStage.CANARY, RiskStage.PILOT_A}:
+        raise ValueError("fast-live laptop stage must be canary or pilot_a")
+    if not actor.strip() or re.fullmatch(r"[0-9a-f]{64}", runtime_policy_sha256) is None:
+        raise ValueError("fast-live stage identity is invalid")
+    with _connect(path) as database:
+        database.execute("BEGIN IMMEDIATE")
+        database.row_factory = sqlite3.Row
+        row = database.execute(
+            "SELECT stage, qualification_hash, runtime_policy_sha256, promoted_by, "
+            "promoted_at, completion_frozen FROM risk_stage_runtime WHERE singleton = 1"
+        ).fetchone()
+        if row is None:
+            database.rollback()
+            raise RuntimeError("risk stage state is unavailable")
+        current = _risk_stage_from_row(row)
+        active_count = int(
+            database.execute(
+                "SELECT count(*) FROM live_pair_actions WHERE state <> 'FLAT'"
+            ).fetchone()[0]
+        )
+        if active_count:
+            database.rollback()
+            raise RuntimeError("fast-live stage selection requires zero active actions")
+        if current.stage == target and current.runtime_policy_sha256 == runtime_policy_sha256:
+            database.commit()
+            return current
+        if target == RiskStage.CANARY and current.stage != RiskStage.SHADOW:
+            database.rollback()
+            raise RuntimeError("fast-live canary stage must start from shadow")
+        if target == RiskStage.PILOT_A:
+            if current.stage != RiskStage.CANARY:
+                database.rollback()
+                raise RuntimeError("fast-live pilot_a stage requires current canary")
+            completed_ids, _ = LiveOrderJournal(path).completed_normal_snapshot_in_transaction(
+                database,
+                current.promoted_at,
+                "0" * 64,
+            )
+            canary_rows = database.execute(
+                "SELECT pair_action_id, risk_reservation_json, recovery_action "
+                "FROM live_pair_actions WHERE state = 'FLAT' AND qualification_hash = ?",
+                ("0" * 64,),
+            ).fetchall()
+            eligible_canaries = tuple(
+                str(candidate["pair_action_id"])
+                for candidate in canary_rows
+                if candidate["recovery_action"] is None
+                and str(candidate["pair_action_id"]) in completed_ids
+                and json.loads(str(candidate["risk_reservation_json"])).get("strategy")
+                == "AGGRESSIVE_FAST_LIVE_V2"
+                and json.loads(str(candidate["risk_reservation_json"])).get("stage")
+                == RiskStage.CANARY.value
+            )
+            if len(eligible_canaries) != 1:
+                database.rollback()
+                raise RuntimeError(
+                    "fast-live pilot_a requires exactly one genuine completed canary"
+                )
+        database.execute(
+            "UPDATE risk_stage_runtime SET stage = ?, qualification_hash = NULL, "
+            "runtime_policy_sha256 = ?, promoted_by = ?, promoted_at = ?, "
+            "completion_frozen = 0 WHERE singleton = 1",
+            (target.value, runtime_policy_sha256, actor, now.isoformat()),
+        )
+        database.execute(
+            "UPDATE live_entry_controls SET risk_stage_completion_frozen = 0 WHERE singleton = 1"
+        )
+        database.commit()
+    return RiskStageState(target, None, runtime_policy_sha256, actor, now, False)
+
+
+async def select_fast_live_risk_stage(
+    path: Path,
+    target: RiskStage,
+    runtime_policy_sha256: str,
+    actor: str,
+    now: datetime | None = None,
+) -> RiskStageState:
+    """Select a non-authorizing laptop stage without qualification lineage or timers."""
+    await LiveOrderJournal(path).initialise()
+    return await asyncio.to_thread(
+        _select_fast_live_risk_stage_sync,
+        path,
+        target,
+        runtime_policy_sha256,
+        actor,
+        now or datetime.now(UTC),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StoredQualificationStatistics:
     funding_rows: tuple[tuple[Venue, datetime, str, int, str], ...]

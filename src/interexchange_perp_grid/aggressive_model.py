@@ -70,6 +70,7 @@ class HistoricalModelPolicy:
     regime_drift_range_fraction: Decimal = Decimal("0.25")
     regime_drift_robust_sigma_multiple: Decimal = Decimal("3")
     parameter_change_limit_ratio_per_day: Decimal = Decimal("0.20")
+    regime_windows_minutes: tuple[int, ...] = (7 * 1440,)
     level_fractions: tuple[Decimal, ...] = _LOCKED_LEVEL_FRACTIONS
     tranche_weights: tuple[Decimal, ...] = _LOCKED_TRANCHE_WEIGHTS
     stop_buffer_ratio: Decimal = Decimal("0.15")
@@ -108,6 +109,11 @@ class HistoricalModelPolicy:
             raise ValueError("minimum convergence rate must be within [0, 1]")
         if self.convergence_horizon_seconds <= 0:
             raise ValueError("convergence horizon must be positive")
+        if not self.regime_windows_minutes or any(
+            isinstance(value, bool) or value not in {1440, 7 * 1440, 30 * 1440}
+            for value in self.regime_windows_minutes
+        ):
+            raise ValueError("regime windows must use the locked 24h/7d/30d set")
         if self.level_fractions != _LOCKED_LEVEL_FRACTIONS:
             raise ValueError("level fractions must remain locked at 20/40/60/80/100 percent")
         if self.tranche_weights != _LOCKED_TRANCHE_WEIGHTS:
@@ -162,13 +168,18 @@ class HistoricalEpisode:
 class DirectionHistoricalModel:
     direction: DivergenceDirection
     extreme_bps: Decimal
+    directional_q99_bps: Decimal
+    directional_q999_bps: Decimal
     range_bps: Decimal
     levels_bps: tuple[Decimal, ...]
     tranche_weights: tuple[Decimal, ...]
     reference_stop_bps: Decimal
     episodes: tuple[HistoricalEpisode, ...]
     per_level_samples: tuple[tuple[LevelEpisodeSample, ...], ...]
+    completed_episode_count: int
     convergence_rate: Decimal
+    p90_convergence_seconds: int | None
+    p90_adverse_excursion_bps: Decimal | None
     regime_drift_blocked: bool
     eligibility: ModelEligibility
 
@@ -268,7 +279,7 @@ def build_historical_reference_model(
         normal_low,
         normal_high,
         coverage_days,
-        windows[1],
+        windows,
         policy,
     )
     negative = _build_direction(
@@ -279,7 +290,7 @@ def build_historical_reference_model(
         normal_low,
         normal_high,
         coverage_days,
-        windows[1],
+        windows,
         policy,
     )
     first = ordered[0]
@@ -329,18 +340,27 @@ def load_historical_model_policy(path: Path) -> LoadedHistoricalModelPolicy:
     _require_profile_value(reference, "source_timeframe_seconds", 60)
     _require_profile_value(reference, "day_boundary_utc", "00:00")
     _require_profile_value(historical, "positive_and_negative_directions_separate", True)
-    _require_profile_value(
-        historical,
-        "extreme_source",
-        "maximum_valid_reference_bar_high_or_low",
-    )
+    if "extreme_source" in historical:
+        _require_profile_value(
+            historical,
+            "extreme_source",
+            "maximum_valid_reference_bar_high_or_low",
+        )
     _require_profile_value(historical, "current_regime_windows_hours", [24, 168, 720])
     _require_profile_value(historical, "freeze_model_after_first_tranche", True)
     _require_profile_value(grid, "effective_stop_uses_farther_of_reference_and_adaptive_tail", True)
     policy = HistoricalModelPolicy(
         history_target_days=_required_decimal(reference, "history_target_days"),
-        history_minimum_live_days=_required_decimal(reference, "history_minimum_live_days"),
-        history_minimum_shadow_days=_required_decimal(reference, "history_minimum_shadow_days"),
+        history_minimum_live_days=_required_decimal_alias(
+            reference,
+            "history_minimum_live_days",
+            "history_minimum_first_laptop_live_days",
+        ),
+        history_minimum_shadow_days=(
+            _required_decimal(reference, "history_minimum_shadow_days")
+            if "history_minimum_shadow_days" in reference
+            else Decimal("1")
+        ),
         mode_bucket_bps=_required_decimal(reference, "mode_bucket_bps"),
         normal_zone_minimum_half_width_bps=_required_decimal(
             reference, "normal_zone_minimum_half_width_bps"
@@ -355,9 +375,17 @@ def load_historical_model_policy(path: Path) -> LoadedHistoricalModelPolicy:
         parameter_change_limit_ratio_per_day=_required_decimal(
             historical, "parameter_change_limit_ratio_per_day"
         ),
+        regime_windows_minutes=tuple(
+            _required_int_list(historical, "current_regime_windows_hours")[index] * 60
+            for index in range(len(_required_int_list(historical, "current_regime_windows_hours")))
+        ),
         level_fractions=_required_decimal_tuple(grid, "level_fractions"),
         tranche_weights=_required_decimal_tuple(grid, "tranche_weights"),
-        stop_buffer_ratio=_required_decimal(grid, "stop_buffer_ratio"),
+        stop_buffer_ratio=_required_decimal_alias(
+            grid,
+            "stop_buffer_ratio",
+            "reference_stop_buffer_ratio",
+        ),
         rearm_retreat_step_fraction=_required_decimal(grid, "rearm_retreat_step_fraction"),
     )
     return LoadedHistoricalModelPolicy(
@@ -453,9 +481,13 @@ def validate_historical_model(model: HistoricalReferenceModel) -> None:
         model.normal_low_bps,
         model.normal_high_bps,
         model.positive.extreme_bps,
+        model.positive.directional_q99_bps,
+        model.positive.directional_q999_bps,
         model.positive.range_bps,
         model.positive.reference_stop_bps,
         model.negative.extreme_bps,
+        model.negative.directional_q99_bps,
+        model.negative.directional_q999_bps,
         model.negative.range_bps,
         model.negative.reference_stop_bps,
         *model.positive.levels_bps,
@@ -519,12 +551,33 @@ def validate_historical_model(model: HistoricalReferenceModel) -> None:
         ),
     )
     for direction, expected_range, levels, stop in expected:
+        completed = tuple(
+            episode
+            for episode in direction.episodes
+            if episode.close_reason != EpisodeCloseReason.DATA_UNAVAILABLE
+        )
+        expected_convergence = (
+            Decimal(sum(episode.converged for episode in completed)) / Decimal(len(completed))
+            if completed
+            else Decimal(0)
+        )
         if (
             direction.range_bps != expected_range
             or direction.levels_bps != levels
             or direction.tranche_weights != _LOCKED_TRANCHE_WEIGHTS
             or direction.reference_stop_bps != stop
             or len(direction.per_level_samples) != 5
+            or direction.completed_episode_count != len(completed)
+            or direction.convergence_rate != expected_convergence
+            or not Decimal(0) <= direction.directional_q99_bps <= direction.directional_q999_bps
+            or (
+                direction.p90_convergence_seconds is not None
+                and direction.p90_convergence_seconds < 0
+            )
+            or (
+                direction.p90_adverse_excursion_bps is not None
+                and direction.p90_adverse_excursion_bps < 0
+            )
         ):
             raise ValueError("historical model locked directional geometry is inconsistent")
 
@@ -665,7 +718,7 @@ def _build_direction(
     normal_low: Decimal,
     normal_high: Decimal,
     coverage_days: Decimal,
-    window_7d: RobustWindow,
+    windows: tuple[RobustWindow, RobustWindow, RobustWindow],
     policy: HistoricalModelPolicy,
 ) -> DirectionHistoricalModel:
     extreme = (
@@ -698,6 +751,14 @@ def _build_direction(
         if spread_range > 0
         else ()
     )
+    directional_distances = tuple(
+        max(Decimal(0), bar.high_bps - s0)
+        if direction == DivergenceDirection.POSITIVE
+        else max(Decimal(0), s0 - bar.low_bps)
+        for bar in bars
+    )
+    directional_q99 = decimal_quantile(directional_distances, Decimal("0.99"))
+    directional_q999 = decimal_quantile(directional_distances, Decimal("0.999"))
     per_level = tuple(
         tuple(
             sample
@@ -707,20 +768,44 @@ def _build_direction(
         )
         for i in range(1, 6)
     )
-    converged = sum(episode.converged for episode in episodes)
-    convergence_rate = Decimal(converged) / Decimal(len(episodes)) if episodes else Decimal(0)
-    regime_blocked = _regime_blocked(
-        direction,
-        window_7d,
-        s0,
-        spread_range,
-        policy,
+    completed = tuple(
+        episode
+        for episode in episodes
+        if episode.close_reason != EpisodeCloseReason.DATA_UNAVAILABLE
+    )
+    converged = tuple(episode for episode in completed if episode.converged)
+    convergence_rate = (
+        Decimal(len(converged)) / Decimal(len(completed)) if completed else Decimal(0)
+    )
+    convergence_times = tuple(
+        Decimal(int((episode.ended_at - episode.started_at).total_seconds()))
+        for episode in converged
+    )
+    adverse_excursions = tuple(
+        sample.adverse_excursion_bps for episode in completed for sample in episode.level_samples
+    )
+    p90_convergence_seconds = (
+        int(decimal_quantile(convergence_times, Decimal("0.90"))) if convergence_times else None
+    )
+    p90_adverse_excursion = (
+        decimal_quantile(adverse_excursions, Decimal("0.90")) if adverse_excursions else None
+    )
+    regime_blocked = any(
+        _regime_blocked(
+            direction,
+            window,
+            s0,
+            spread_range,
+            policy,
+        )
+        for window in windows
+        if window.minutes in policy.regime_windows_minutes
     )
     if spread_range <= 0 or coverage_days < policy.history_minimum_shadow_days:
         eligibility = ModelEligibility.DISABLED
     elif (
         coverage_days >= policy.history_minimum_live_days
-        and len(episodes) >= policy.minimum_completed_episodes
+        and len(completed) >= policy.minimum_completed_episodes
         and convergence_rate >= policy.minimum_convergence_rate
         and not regime_blocked
     ):
@@ -730,13 +815,18 @@ def _build_direction(
     return DirectionHistoricalModel(
         direction=direction,
         extreme_bps=extreme,
+        directional_q99_bps=directional_q99,
+        directional_q999_bps=directional_q999,
         range_bps=spread_range,
         levels_bps=levels,
         tranche_weights=policy.tranche_weights,
         reference_stop_bps=stop,
         episodes=episodes,
         per_level_samples=per_level,
+        completed_episode_count=len(completed),
         convergence_rate=convergence_rate,
+        p90_convergence_seconds=p90_convergence_seconds,
+        p90_adverse_excursion_bps=p90_adverse_excursion,
         regime_drift_blocked=regime_blocked,
         eligibility=eligibility,
     )
@@ -961,12 +1051,21 @@ def _direction_payload(direction: DirectionHistoricalModel) -> dict[str, object]
     return {
         "direction": direction.direction.value,
         "extreme_bps": str(direction.extreme_bps),
+        "directional_q99_bps": str(direction.directional_q99_bps),
+        "directional_q999_bps": str(direction.directional_q999_bps),
         "range_bps": str(direction.range_bps),
         "levels_bps": [str(value) for value in direction.levels_bps],
         "tranche_weights": [str(value) for value in direction.tranche_weights],
         "reference_stop_bps": str(direction.reference_stop_bps),
         "episode_count": len(direction.episodes),
+        "completed_episode_count": direction.completed_episode_count,
         "convergence_rate": str(direction.convergence_rate),
+        "p90_convergence_seconds": direction.p90_convergence_seconds,
+        "p90_adverse_excursion_bps": (
+            None
+            if direction.p90_adverse_excursion_bps is None
+            else str(direction.p90_adverse_excursion_bps)
+        ),
         "regime_drift_blocked": direction.regime_drift_blocked,
         "eligibility": direction.eligibility.value,
         "episodes": [
@@ -1013,11 +1112,30 @@ def _required_decimal(parent: dict[object, object], key: str) -> Decimal:
     return value
 
 
+def _required_decimal_alias(
+    parent: dict[object, object],
+    legacy_key: str,
+    current_key: str,
+) -> Decimal:
+    if legacy_key in parent:
+        return _required_decimal(parent, legacy_key)
+    return _required_decimal(parent, current_key)
+
+
 def _required_int(parent: dict[object, object], key: str) -> int:
     value = parent.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"strategy profile requires integer {key}")
     return value
+
+
+def _required_int_list(parent: dict[object, object], key: str) -> tuple[int, ...]:
+    value = parent.get(key)
+    if not isinstance(value, list) or any(
+        isinstance(item, bool) or not isinstance(item, int) for item in value
+    ):
+        raise ValueError(f"strategy profile requires integer list {key}")
+    return tuple(value)
 
 
 def _required_decimal_tuple(parent: dict[object, object], key: str) -> tuple[Decimal, ...]:
@@ -1133,12 +1251,17 @@ def _direction_from_payload(payload: dict[str, object]) -> DirectionHistoricalMo
         {
             "direction",
             "extreme_bps",
+            "directional_q99_bps",
+            "directional_q999_bps",
             "range_bps",
             "levels_bps",
             "tranche_weights",
             "reference_stop_bps",
             "episode_count",
+            "completed_episode_count",
             "convergence_rate",
+            "p90_convergence_seconds",
+            "p90_adverse_excursion_bps",
             "regime_drift_blocked",
             "eligibility",
             "episodes",
@@ -1163,6 +1286,23 @@ def _direction_from_payload(payload: dict[str, object]) -> DirectionHistoricalMo
         or episode_count != len(episodes)
     ):
         raise ValueError("direction model episode count mismatch")
+    completed_count = payload["completed_episode_count"]
+    expected_completed = sum(
+        episode.close_reason != EpisodeCloseReason.DATA_UNAVAILABLE for episode in episodes
+    )
+    if (
+        isinstance(completed_count, bool)
+        or not isinstance(completed_count, int)
+        or completed_count != expected_completed
+    ):
+        raise ValueError("direction model completed episode count mismatch")
+    p90_convergence = payload["p90_convergence_seconds"]
+    if p90_convergence is not None and (
+        isinstance(p90_convergence, bool)
+        or not isinstance(p90_convergence, int)
+        or p90_convergence < 0
+    ):
+        raise ValueError("direction model p90 convergence time is invalid")
     regime_blocked = payload["regime_drift_blocked"]
     if not isinstance(regime_blocked, bool):
         raise ValueError("direction regime flag must be boolean")
@@ -1182,13 +1322,18 @@ def _direction_from_payload(payload: dict[str, object]) -> DirectionHistoricalMo
     return DirectionHistoricalModel(
         direction=direction,
         extreme_bps=_decimal_value(payload, "extreme_bps"),
+        directional_q99_bps=_decimal_value(payload, "directional_q99_bps"),
+        directional_q999_bps=_decimal_value(payload, "directional_q999_bps"),
         range_bps=_decimal_value(payload, "range_bps"),
         levels_bps=levels,
         tranche_weights=weights,
         reference_stop_bps=_decimal_value(payload, "reference_stop_bps"),
         episodes=episodes,
         per_level_samples=per_level,
+        completed_episode_count=completed_count,
         convergence_rate=_decimal_value(payload, "convergence_rate"),
+        p90_convergence_seconds=p90_convergence,
+        p90_adverse_excursion_bps=_optional_decimal_value(payload, "p90_adverse_excursion_bps"),
         regime_drift_blocked=regime_blocked,
         eligibility=ModelEligibility(_string_value(payload, "eligibility")),
     )

@@ -134,6 +134,17 @@ def test_locked_profile_is_the_only_policy_source(tmp_path: Path) -> None:
         load_historical_model_policy(drifted)
 
 
+def test_fast_live_v2_profile_uses_thirty_complete_days_for_first_live() -> None:
+    profile_path = Path("config/AGGRESSIVE_FAST_LIVE_V2.yaml")
+    loaded = load_historical_model_policy(profile_path)
+
+    assert loaded.policy.history_target_days == 180
+    assert loaded.policy.history_minimum_live_days == 30
+    assert loaded.policy.history_minimum_shadow_days == 1
+    assert loaded.policy.stop_buffer_ratio == Decimal("0.15")
+    assert loaded.profile_sha256 == hashlib.sha256(profile_path.read_bytes()).hexdigest()
+
+
 @pytest.mark.parametrize(
     ("original", "replacement", "message"),
     (
@@ -292,6 +303,8 @@ def test_episode_requires_normal_reset_and_gap_censors_every_reached_level() -> 
     assert episode.close_reason == EpisodeCloseReason.DATA_UNAVAILABLE
     assert tuple(sample.level_index for sample in episode.level_samples) == (1, 2, 3, 4, 5)
     assert all(sample.censored for sample in episode.level_samples)
+    assert model.positive.completed_episode_count == 0
+    assert model.positive.convergence_rate == 0
     assert model.positive.eligibility == ModelEligibility.DISABLED
 
 
@@ -319,6 +332,11 @@ def test_horizon_censors_and_records_adverse_excursion() -> None:
     assert episode.close_reason == EpisodeCloseReason.HORIZON
     assert episode.ended_at == _START + timedelta(minutes=12)
     assert episode.level_samples[0].adverse_excursion_bps == Decimal("9.6")
+    assert model.positive.completed_episode_count == 1
+    assert model.positive.convergence_rate == 0
+    assert model.positive.p90_adverse_excursion_bps is not None
+    assert Decimal(0) <= model.positive.directional_q99_bps
+    assert model.positive.directional_q99_bps <= model.positive.directional_q999_bps
 
 
 def test_direction_can_be_independently_disabled() -> None:

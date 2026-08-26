@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import os
 import subprocess
 import time
@@ -15,6 +17,7 @@ from uuid import uuid4
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.aggressive_activation import AggressiveFastLiveBinding
 from interexchange_perp_grid.aggressive_evaluator import (
     AggressiveDecisionPolicy,
     AggressiveEntryStage,
@@ -32,10 +35,12 @@ from interexchange_perp_grid.aggressive_live import (
     AggressiveLiveIntentEnvelope,
     aggressive_intent_from_mapping,
     aggressive_intent_sha256,
+    prepare_aggressive_fast_live_plan,
     prepare_aggressive_live_plan,
 )
 from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
+from interexchange_perp_grid.aggressive_runtime import AggressiveTrancheIntent
 from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import (
@@ -46,6 +51,16 @@ from interexchange_perp_grid.domain import (
     Venue,
 )
 from interexchange_perp_grid.execution import ExecutionIntent, OrderPurpose, Side
+from interexchange_perp_grid.fast_live_preflight import (
+    FastLiveIdentity,
+    FastLivePreflightInput,
+    FastLivePreflightReport,
+    consume_fast_live_preflight,
+    evaluate_fast_live_preflight,
+    load_fast_live_preflight,
+    save_fast_live_preflight,
+    validate_fast_live_preflight,
+)
 from interexchange_perp_grid.live_control import (
     LiveControlResult,
     LiveControlService,
@@ -135,6 +150,11 @@ from interexchange_perp_grid.venue_capabilities import (
 OWNER_CONFIRMATION = "I_ACCEPT_LIVE_CANARY_RISK"
 PILOT_A_OWNER_CONFIRMATION = "I_ACCEPT_AGGRESSIVE_PILOT_A_RISK"
 _OPENING_GATE_TASKS: set[asyncio.Task[object]] = set()
+_AGGRESSIVE_STRATEGIES = frozenset({"AGGRESSIVE_SYMBIOSIS_V1", "AGGRESSIVE_FAST_LIVE_V2"})
+
+
+def _is_aggressive_strategy(reservation: dict[str, object]) -> bool:
+    return reservation.get("strategy") in _AGGRESSIVE_STRATEGIES
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +312,17 @@ class CanaryRunEvidence:
     reconciliation: ReconciliationReport | None
     owner_instruction: str | None
     emergency_venue: EmergencyVenueAssessment | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FastLiveRunEvidence:
+    success: bool
+    reason: ReasonCode | None
+    preflight: FastLivePreflightReport | None
+    queued_pair_action_id: str | None
+    route: str
+    quantity: Decimal
+    orders_sent: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,9 +517,7 @@ class RuntimeCanaryMonitor(CanaryMonitor):
         if current is None or current.route != self._route:
             raise RuntimeError("aggressive monitor lost its durable action")
         aggressive = tuple(
-            item
-            for item in active
-            if item.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1"
+            item for item in active if _is_aggressive_strategy(item.risk_reservation)
         )
         if not aggressive:
             raise RuntimeError("aggressive monitor has no durable portfolio")
@@ -781,8 +810,7 @@ async def _watch_aggressive_route_safety(
             active = tuple(
                 item
                 for item in await journal.active_actions()
-                if item.route == route
-                and item.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1"
+                if item.route == route and _is_aggressive_strategy(item.risk_reservation)
             )
             if not active:
                 return
@@ -811,7 +839,7 @@ async def _watch_aggressive_route_safety(
                 (
                     _effective_reserved_stress(item.risk_reservation)
                     for item in await journal.active_actions()
-                    if item.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1"
+                    if _is_aggressive_strategy(item.risk_reservation)
                 ),
                 Decimal(0),
             )
@@ -1024,6 +1052,14 @@ def _rebuild_active_plan(
             raise ValueError("durable request does not match the exact current translation")
         return request
 
+    fast_expiry: datetime | None = None
+    if action.activation_hash is not None:
+        try:
+            fast_expiry = datetime.fromisoformat(
+                str(action.risk_reservation["fast_live_preflight_expires_at"])
+            )
+        except (KeyError, ValueError) as error:
+            raise ValueError("durable fast-live activation expiry is invalid") from error
     return CanaryExecutionPlan(
         pair_action_id=action.pair_action_id,
         route=action.route,
@@ -1034,13 +1070,15 @@ def _rebuild_active_plan(
         risk_reservation=dict(action.risk_reservation),
         qualification_hash=action.qualification_hash,
         timeout_seconds=timeout_seconds,
+        activation_hash=action.activation_hash,
+        fast_live_preflight_expires_at=fast_expiry,
     )
 
 
 def _aggressive_monitor_parameters(
     action: LiveJournalAction,
 ) -> tuple[DivergenceDirection, Decimal, Decimal, Decimal, Decimal, Decimal, datetime] | None:
-    if action.risk_reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1":
+    if not _is_aggressive_strategy(action.risk_reservation):
         return None
     try:
         actual = action.risk_reservation.get("actual_fill_risk")
@@ -1299,7 +1337,8 @@ async def _coordinate_live_action(
             settings.live.canary_entry_slippage_cap_bps,
         )
         aggressive_revalidated = True
-        if current_plan.risk_reservation.get("strategy") == "AGGRESSIVE_SYMBIOSIS_V1":
+        strategy = current_plan.risk_reservation.get("strategy")
+        if strategy in _AGGRESSIVE_STRATEGIES:
             aggressive_revalidated = False
             try:
                 if aggressive_policy is None:
@@ -1319,6 +1358,29 @@ async def _coordinate_live_action(
                 long_venue = Venue(intent.long_venue)
                 short_venue = Venue(intent.short_venue)
                 binding_hash = str(current_plan.risk_reservation["aggressive_binding_sha256"])
+                v2_activation_valid = True
+                if strategy == "AGGRESSIVE_FAST_LIVE_V2":
+                    expires_at = datetime.fromisoformat(
+                        str(current_plan.risk_reservation["fast_live_preflight_expires_at"])
+                    )
+                    v2_activation_valid = (
+                        current_plan.activation_hash is not None
+                        and current_plan.risk_reservation.get("activation_hash")
+                        == current_plan.activation_hash
+                        and len(current_plan.activation_hash) == 64
+                        and all(
+                            character in "0123456789abcdef"
+                            for character in current_plan.activation_hash
+                        )
+                        and expires_at.tzinfo is not None
+                        and expires_at.utcoffset() is not None
+                        and now <= expires_at
+                    )
+                legacy_qualification_valid = (
+                    strategy != "AGGRESSIVE_SYMBIOSIS_V1"
+                    or current_plan.risk_reservation.get("qualification_hash")
+                    == current_plan.qualification_hash
+                )
                 if (
                     aggressive_intent_sha256(intent) != stored_hash
                     or intent.intent_id != current_plan.pair_action_id
@@ -1331,12 +1393,10 @@ async def _coordinate_live_action(
                     or current_plan.short_request.venue != short_venue
                     or current_plan.long_request.symbol != intent.long_symbol
                     or current_plan.short_request.symbol != intent.short_symbol
-                    or len(current_plan.qualification_hash) != 64
+                    or not legacy_qualification_valid
+                    or not v2_activation_valid
                     or len(binding_hash) != 64
-                    or any(
-                        character not in "0123456789abcdef"
-                        for character in current_plan.qualification_hash + binding_hash
-                    )
+                    or any(character not in "0123456789abcdef" for character in binding_hash)
                     or current_plan.risk_reservation.get("strategy_profile_sha256")
                     != intent.strategy_profile_sha256
                 ):
@@ -1550,8 +1610,14 @@ async def _resume_active_canary(
             monitor_parameters = _aggressive_monitor_parameters(active)
             aggressive_policy: AggressiveDecisionPolicy | None = None
             if monitor_parameters is not None:
+                strategy = active.risk_reservation.get("strategy")
+                profile_name = (
+                    "AGGRESSIVE_FAST_LIVE_V2.yaml"
+                    if strategy == "AGGRESSIVE_FAST_LIVE_V2"
+                    else "AGGRESSIVE_SYMBIOSIS_V1.yaml"
+                )
                 loaded_policy = load_aggressive_decision_policy(
-                    Path(__file__).resolve().parents[2] / "config" / "AGGRESSIVE_SYMBIOSIS_V1.yaml"
+                    Path(__file__).resolve().parents[2] / "config" / profile_name
                 )
                 if (
                     active.risk_reservation.get("strategy_profile_sha256")
@@ -1747,10 +1813,31 @@ def _fresh_supervisor_handoff(active: LiveJournalAction, *, now: datetime | None
     observed = now or datetime.now(UTC)
     age_seconds = (observed - active.created_at).total_seconds()
     opening_ids = active.risk_reservation.get("opening_client_order_ids")
+    strategy = active.risk_reservation.get("strategy")
+    legacy_identity_valid = (
+        strategy != "AGGRESSIVE_FAST_LIVE_V2"
+        and active.risk_reservation.get("qualification_hash") == active.qualification_hash
+    )
+    fast_identity_valid = False
+    if strategy == "AGGRESSIVE_FAST_LIVE_V2" and active.activation_hash is not None:
+        try:
+            expires_at = datetime.fromisoformat(
+                str(active.risk_reservation["fast_live_preflight_expires_at"])
+            )
+            fast_identity_valid = (
+                active.risk_reservation.get("activation_hash") == active.activation_hash
+                and len(active.activation_hash) == 64
+                and all(character in "0123456789abcdef" for character in active.activation_hash)
+                and expires_at.tzinfo is not None
+                and expires_at.utcoffset() is not None
+                and observed <= expires_at
+            )
+        except (KeyError, ValueError):
+            fast_identity_valid = False
     return (
         active.risk_reservation.get("supervisor_intent") == "LIVE_CANARY"
         and active.risk_reservation.get("supervisor_queued") is True
-        and active.risk_reservation.get("qualification_hash") == active.qualification_hash
+        and (legacy_identity_valid or fast_identity_valid)
         and isinstance(opening_ids, dict)
         and set(map(str, opening_ids.values())) == {leg.client_order_id for leg in active.legs}
         and active.recovery_action is None
@@ -1872,13 +1959,14 @@ def _compatible_aggressive_pilot_portfolio(
     if not 2 <= len(actions) <= 5:
         return False
     first = actions[0]
+    strategy = first.risk_reservation.get("strategy")
     expected_identity = (
         first.route,
-        first.qualification_hash,
         first.risk_reservation.get("aggressive_binding_sha256"),
         first.risk_reservation.get("strategy_profile_sha256"),
     )
     levels: set[int] = set()
+    activations: set[str] = set()
     for action in actions:
         reservation = action.risk_reservation
         try:
@@ -1887,14 +1975,28 @@ def _compatible_aggressive_pilot_portfolio(
             return False
         identity = (
             action.route,
-            action.qualification_hash,
             reservation.get("aggressive_binding_sha256"),
             reservation.get("strategy_profile_sha256"),
         )
+        fast_activation_valid = True
+        if strategy == "AGGRESSIVE_FAST_LIVE_V2":
+            fast_activation_valid = (
+                action.activation_hash is not None
+                and reservation.get("activation_hash") == action.activation_hash
+                and action.activation_hash not in activations
+            )
+            if action.activation_hash is not None:
+                activations.add(action.activation_hash)
         if (
-            reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1"
+            strategy not in _AGGRESSIVE_STRATEGIES
+            or reservation.get("strategy") != strategy
             or reservation.get("stage") != AggressiveLaptopLiveStage.PILOT_A.value
             or identity != expected_identity
+            or not fast_activation_valid
+            or (
+                strategy == "AGGRESSIVE_SYMBIOSIS_V1"
+                and action.qualification_hash != first.qualification_hash
+            )
             or not 1 <= level <= 5
             or level in levels
             or action.state
@@ -1910,6 +2012,506 @@ def _compatible_aggressive_pilot_portfolio(
             return False
         levels.add(level)
     return True
+
+
+async def run_fast_live_once(
+    settings: Settings,
+    profile_path: Path,
+    preflight_path: Path,
+    owner_confirmation: str,
+    intent: AggressiveTrancheIntent,
+    binding: AggressiveFastLiveBinding,
+    *,
+    stage: AggressiveLaptopLiveStage,
+    exact_merged_clean_source: bool,
+    preflight_only: bool = False,
+) -> FastLiveRunEvidence:
+    """Evaluate V2 immediately; only the non-preflight path may durably queue one pair."""
+    route = DirectedRouteKey(intent.base, Venue(intent.long_venue), Venue(intent.short_venue))
+    expected_entry_stage = (
+        AggressiveEntryStage.LOCKED_CANARY
+        if stage == AggressiveLaptopLiveStage.CANARY
+        else AggressiveEntryStage.NORMAL
+    )
+    owner_phrase = (
+        OWNER_CONFIRMATION
+        if stage == AggressiveLaptopLiveStage.CANARY
+        else PILOT_A_OWNER_CONFIRMATION
+    )
+    identity_matches = (
+        route.value == intent.route_identity == binding.route
+        and intent.direction == binding.direction
+        and intent.entry_stage == expected_entry_stage
+        and intent.model_sha256 == binding.model_sha256
+        and intent.strategy_profile_sha256 == binding.profile_sha256
+        and intent.source_manifest_sha256 == binding.source_manifest_sha256
+        and intent.reference_manifest_sha256 == binding.reference_manifest_sha256
+        and intent.runtime_manifest_sha256 == binding.decision_runtime_sha256
+    )
+    if not identity_matches:
+        return _fast_live_denied(
+            ReasonCode.FAST_LIVE_PREFLIGHT_IDENTITY_CHANGED, route, intent.quantity
+        )
+    if not preflight_only and owner_confirmation != owner_phrase:
+        return _fast_live_denied(ReasonCode.OWNER_CONFIRMATION_MISSING, route, intent.quantity)
+    state_path = Path(settings.storage.sqlite_path)
+    await initialise_state(state_path)
+    journal = LiveOrderJournal(state_path)
+    await journal.initialise()
+    actions = await journal.active_actions()
+    risk_stage = await read_risk_stage(state_path)
+    expected_risk_stage = (
+        RiskStage.CANARY if stage == AggressiveLaptopLiveStage.CANARY else RiskStage.PILOT_A
+    )
+    # Legacy risk-stage qualification lineage is intentionally non-authoritative in V2.
+    # The selected stage is exact-bound by the preflight and enforced directly below.
+    if (
+        actions
+        or risk_stage.completion_frozen
+        or risk_stage.stage != expected_risk_stage
+        or risk_stage.qualification_hash is not None
+    ):
+        return _fast_live_denied(ReasonCode.RECONCILIATION_INCOMPLETE, route, intent.quantity)
+    try:
+        history_days = Decimal(binding.history_days)
+        convergence_rate = Decimal(binding.convergence_rate)
+    except ArithmeticError:
+        return _fast_live_denied(ReasonCode.FAST_LIVE_HISTORY_MODEL_INVALID, route, intent.quantity)
+    history_ready = (
+        history_days >= 30
+        and binding.completed_episodes >= 10
+        and convergence_rate >= Decimal("0.70")
+    )
+    try:
+        emergency_venue = _wave1_emergency_venue(settings, route)
+    except ValueError:
+        return _fast_live_denied(ReasonCode.CANARY_POLICY_VIOLATION, route, intent.quantity)
+    required_venues = {route.long_venue, route.short_venue, emergency_venue}
+    public_adapters = {venue: CcxtProAdapter(venue) for venue in required_venues}
+    private_adapters: dict[Venue, CcxtPrivateAdapter] = {}
+    typed_adapters: dict[Venue, CanaryVenueAdapter] = {}
+    private_stop: asyncio.Event | None = None
+    private_task: asyncio.Task[None] | None = None
+    try:
+        instruments, public_reports = await _discover_instruments(intent.base, public_adapters)
+        capabilities: dict[Venue, PrivateCapabilityReport] = {}
+        for venue in required_venues:
+            private_adapters[venue] = CcxtPrivateAdapter(
+                venue, PrivateCredentials.from_environment(venue)
+            )
+            capabilities[venue] = await private_adapters[venue].probe_private_capabilities()
+        _, private_stop, private_task, typed_adapters = await _start_private_state_supervisor(
+            private_adapters, state_path
+        )
+        books, quality = await _fresh_books(settings, public_adapters, instruments)
+        funding_values = await asyncio.gather(
+            *(public_adapters[venue].fetch_funding(instruments[venue]) for venue in required_venues)
+        )
+        funding = {snapshot.venue: snapshot for snapshot in funding_values}
+        minimum_quantity = minimum_common_base_quantity(
+            instruments[route.long_venue],
+            instruments[route.short_venue],
+            books[route.long_venue].asks[0].price,
+            books[route.short_venue].bids[0].price,
+        )
+        if intent.quantity < minimum_quantity or (
+            stage == AggressiveLaptopLiveStage.CANARY and intent.quantity != minimum_quantity
+        ):
+            return _fast_live_denied(ReasonCode.CANARY_POLICY_VIOLATION, route, intent.quantity)
+        states = await collect_private_states(
+            typed_adapters, instruments, reconciliation_trigger="FAST_LIVE_PREFLIGHT"
+        )
+        reconciliation = reconcile_private_states(
+            (), states, await journal.known_client_order_ids(), required_venues
+        )
+        barrier = await wait_for_stable_flat(
+            lambda: _fast_live_reconciliation(
+                typed_adapters, instruments, journal, required_venues
+            ),
+            lambda: combined_event_watermark(typed_adapters, journal.event_watermark),
+            _flat_barrier_policy(settings),
+        )
+        reconciliation = barrier.report
+        states = dict(reconciliation.states)
+        fee_rates = {
+            venue: state.taker_fee_rate
+            for venue, state in states.items()
+            if state.taker_fee_rate is not None
+        }
+        emergency_state = states[emergency_venue]
+        emergency_account = emergency_state.account
+        emergency = evaluate_emergency_venue(
+            instruments[route.long_venue],
+            instruments[route.short_venue],
+            instruments[emergency_venue],
+            books[emergency_venue],
+            fee_rates.get(emergency_venue),
+            intent.quantity,
+            capability_ready=capabilities[emergency_venue].ready,
+            account_ready=(
+                emergency_state.error is None
+                and emergency_account is not None
+                and emergency_account.margin_mode == "cross"
+                and emergency_account.position_mode == "oneway"
+                and emergency_account.trading_enabled is True
+                and emergency_account.withdrawal_enabled is False
+                and emergency_account.transfer_enabled is False
+            ),
+            data_quality_ready=(
+                quality[emergency_venue].accepted and public_reports[emergency_venue].public_ready
+            ),
+            slippage_cap_bps=settings.live.canary_close_slippage_cap_bps,
+        )
+        now = datetime.now(UTC)
+        projections = {
+            venue: _gate_funding_projection(
+                funding[venue],
+                venue,
+                instruments[venue].symbol,
+                now,
+                86_400,
+                settings.strategy.calibration_funding_refresh_seconds * 1000,
+                settings.market_data.max_clock_skew_ms,
+            )
+            for venue in (route.long_venue, route.short_venue)
+        }
+        aggressive_policy = load_aggressive_decision_policy(profile_path).policy
+        economic = revalidate_hybrid_entry_once(
+            HybridEntryInput(
+                route_identity=intent.route_identity,
+                direction=intent.direction,
+                level_index=intent.level_index,
+                reference_spread_bps=intent.reference_spread_bps,
+                reference_trigger_bps=intent.reference_trigger_bps,
+                grid_step_bps=intent.grid_step_bps,
+                stressed_cost_move_bps=intent.stressed_cost_move_bps,
+                minimum_profit_move_bps=intent.minimum_profit_move_bps,
+                normal_low_bps=intent.normal_low_bps,
+                normal_high_bps=intent.normal_high_bps,
+                quantity=intent.quantity,
+                long_venue=route.long_venue,
+                short_venue=route.short_venue,
+                long_book=books[route.long_venue],
+                short_book=books[route.short_venue],
+                long_private_taker_fee_rate=fee_rates.get(route.long_venue),
+                short_private_taker_fee_rate=fee_rates.get(route.short_venue),
+                long_funding=projections[route.long_venue],
+                short_funding=projections[route.short_venue],
+                reserves=intent.reserves,
+                observed_monotonic_ns=time.monotonic_ns(),
+                maximum_book_age_ms=settings.market_data.max_l2_age_ms,
+                now=now,
+                reference_interval_start=intent.reference_interval_start,
+                stage=expected_entry_stage,
+                state_reconciled=reconciliation.consistent and barrier.verified,
+                historical_model_eligible=history_ready,
+                regime_ready=binding.regime_clear,
+            ),
+            policy=aggressive_policy,
+        )
+        notional = intent.quantity * max(
+            books[route.long_venue].asks[0].price,
+            books[route.short_venue].bids[0].price,
+        )
+        stage_limit = Decimal("1") if stage == AggressiveLaptopLiveStage.CANARY else Decimal("5")
+        projected_loss = max(
+            intent.incremental_tranche_loss_usdt, economic.stressed_total_cost_usdt
+        )
+        risk = evaluate_canary_risk_from_private_state(
+            route,
+            states,
+            notional,
+            projected_loss,
+            pair_stress_limit_usdt=stage_limit,
+            portfolio_stress_limit_usdt=stage_limit,
+            free_margin_floor_ratio=settings.live.canary_free_margin_floor_ratio,
+            effective_leverage_cap=Decimal("3"),
+            exit_depth_sufficient=emergency.passed,
+            maximum_routes=1,
+            maximum_tranches_per_route=(1 if stage == AggressiveLaptopLiveStage.CANARY else 5),
+        )
+        private_reports = _preflight_reports(
+            settings,
+            required_venues,
+            capabilities,
+            states,
+            instruments,
+            funding,
+            public_reports,
+            quality,
+            reconciliation,
+            risk,
+        )
+        private_ready = len(private_reports) == len(required_venues) and all(
+            item.passed for item in private_reports
+        )
+        current_identity = FastLiveIdentity(
+            release_sha=binding.release_sha,
+            source_sha256=binding.source_sha256,
+            config_sha256=binding.config_sha256,
+            profile_sha256=binding.profile_sha256,
+            native_runtime_sha256=binding.native_runtime_sha256,
+            history_sha256=binding.reference_manifest_sha256,
+            model_sha256=binding.model_sha256,
+            route=route.value,
+            direction=binding.direction.value,
+            account_generation_sha256=_fast_live_account_generation_sha256(
+                states, reconciliation, await journal.event_watermark()
+            ),
+            data_generation_sha256=_fast_live_data_generation_sha256(instruments, binding),
+            risk_stage=risk_stage.stage.value,
+            intent_sha256=aggressive_intent_sha256(intent),
+        )
+        controls = await read_runtime_controls(state_path)
+        unlock_present = bool(os.environ.get("IPEG_LOCAL_UNLOCK_SECRET"))
+        telegram_valid = await live_confirmation_valid(state_path)
+        quality_ready = all(item.accepted for item in quality.values())
+        if preflight_only:
+            report = evaluate_fast_live_preflight(
+                FastLivePreflightInput(
+                    identity=current_identity,
+                    exact_merged_clean_source=exact_merged_clean_source,
+                    money_movement_capability_absent=all(
+                        state.account is not None
+                        and state.account.withdrawal_enabled is False
+                        and state.account.transfer_enabled is False
+                        for state in states.values()
+                    ),
+                    private_capabilities_ready=private_ready,
+                    emergency_capability_ready=emergency.passed,
+                    account_modes_permissions_ready=private_ready,
+                    fees_funding_metadata_ready=(
+                        len(fee_rates) == len(required_venues)
+                        and all(value is not None for value in projections.values())
+                    ),
+                    stable_flat=barrier.verified,
+                    zero_open_orders=reconciliation.raw_open_order_count == 0,
+                    journal_known_and_reconciled=reconciliation.consistent and not actions,
+                    clocks_and_market_data_ready=quality_ready,
+                    executable_depth_ready=quality_ready and emergency.passed,
+                    history_model_ready=history_ready,
+                    regime_clear=binding.regime_clear,
+                    economics_positive=economic.accepted,
+                    risk_margin_leverage_ready=risk.accepted,
+                    owner_unlock_absent=not unlock_present,
+                    telegram_challenge_absent=not telegram_valid,
+                    numerical_breakdown={
+                        "history_days": binding.history_days,
+                        "completed_episodes": str(binding.completed_episodes),
+                        "convergence_rate": binding.convergence_rate,
+                        "quantity": str(intent.quantity),
+                        "notional_usdt": str(notional),
+                        "expected_net_pnl_usdt": str(economic.expected_net_pnl_usdt),
+                        "stressed_total_cost_usdt": str(economic.stressed_total_cost_usdt),
+                        "projected_route_loss_usdt": str(projected_loss),
+                    },
+                ),
+                now=now,
+            )
+            save_fast_live_preflight(preflight_path, report)
+            return FastLiveRunEvidence(
+                report.status == "PASS",
+                None if report.status == "PASS" else report.reason,
+                report,
+                None,
+                route.value,
+                intent.quantity,
+            )
+        try:
+            report = load_fast_live_preflight(preflight_path)
+        except (OSError, ValueError, KeyError):
+            return _fast_live_denied(ReasonCode.FAST_LIVE_PREFLIGHT_MISSING, route, intent.quantity)
+        invalid = validate_fast_live_preflight(report, current_identity, now=now)
+        if invalid is not None:
+            return FastLiveRunEvidence(False, invalid, report, None, route.value, intent.quantity)
+        guard = evaluate_live_order(
+            settings,
+            LiveContext(
+                ci_or_test=_ci_or_test_environment(),
+                simulation_or_replay=settings.app.mode != "live",
+                local_unlock_present=unlock_present,
+                telegram_challenge_valid=telegram_valid,
+                fast_live_preflight_valid=True,
+                route_allowlisted=report.identity.route == route.value,
+                canary_policy_passed=projected_loss <= stage_limit,
+                capability_preflight_passed=private_ready,
+                account_preflight_passed=private_ready,
+                market_data_preflight_passed=quality_ready,
+                reconciliation_passed=barrier.verified,
+                risk_preflight_passed=risk.accepted,
+                pause_or_kill_active=controls.paused or controls.killed,
+                unknown_order_exists=bool(reconciliation.unknown_client_order_ids),
+            ),
+        )
+        if not guard.allowed or not economic.accepted or not emergency.passed:
+            return FastLiveRunEvidence(
+                False,
+                guard.reason or ReasonCode.ECONOMIC_PREFLIGHT_FAILED,
+                report,
+                None,
+                route.value,
+                intent.quantity,
+            )
+        long_fill = executable_vwap(books[route.long_venue].asks, intent.quantity)
+        short_fill = executable_vwap(books[route.short_venue].bids, intent.quantity)
+        if long_fill is None or short_fill is None:
+            return _fast_live_denied(ReasonCode.DEPTH_INSUFFICIENT, route, intent.quantity)
+        plan = prepare_aggressive_fast_live_plan(
+            intent,
+            binding,
+            instruments[route.long_venue],
+            instruments[route.short_venue],
+            preflight_sha256=report.preflight_sha256,
+            preflight_expires_at=report.expires_at,
+            long_protected_price=protected_ioc_price(
+                Side.BUY,
+                long_fill.marginal_price,
+                instruments[route.long_venue].price_tick,
+                settings.live.canary_entry_slippage_cap_bps,
+            ),
+            short_protected_price=protected_ioc_price(
+                Side.SELL,
+                short_fill.marginal_price,
+                instruments[route.short_venue].price_tick,
+                settings.live.canary_entry_slippage_cap_bps,
+            ),
+            stage=stage,
+            timeout_seconds=settings.live.canary_timeout_seconds,
+        )
+        plan = replace(
+            plan,
+            risk_reservation={
+                **plan.risk_reservation,
+                "projected_stress_usdt": projected_loss,
+                "projected_route_total_usdt": max(projected_loss, intent.projected_route_loss_usdt),
+                "projected_portfolio_total_usdt": max(
+                    projected_loss, intent.projected_portfolio_loss_usdt
+                ),
+                "activation_hash": report.preflight_sha256,
+                "fast_live_preflight_expires_at": report.expires_at.isoformat(),
+                "supervisor_intent": "LIVE_CANARY",
+                "supervisor_queued": True,
+            },
+        )
+        queued = await LiveCanaryCoordinator(
+            journal,
+            typed_adapters,
+            instruments,
+            PublicProtectionProvider(settings, public_adapters, instruments),
+            ImmediateRecoveryCloseMonitor(),
+            emergency_venue,
+            flat_barrier_policy=_flat_barrier_policy(settings),
+        ).prepare(plan)
+        # SQLite consumption and durable pair ownership are authoritative.
+        # A cosmetic ignored-file update cannot roll back or duplicate the action.
+        with contextlib.suppress(OSError, ValueError):
+            consume_fast_live_preflight(
+                preflight_path,
+                current_identity,
+                aggressive_intent_sha256(intent),
+            )
+        return FastLiveRunEvidence(
+            True, None, report, queued.pair_action_id, route.value, intent.quantity
+        )
+    except (KeyError, ValueError, ArithmeticError):
+        return _fast_live_denied(ReasonCode.FAST_LIVE_PREFLIGHT_FAILED, route, intent.quantity)
+    finally:
+        await _stop_private_state_supervisor(private_stop, private_task)
+        await asyncio.gather(
+            *(adapter.close() for adapter in public_adapters.values()),
+            *(adapter.close() for adapter in private_adapters.values()),
+            return_exceptions=True,
+        )
+
+
+def _fast_live_denied(
+    reason: ReasonCode,
+    route: DirectedRouteKey,
+    quantity: Decimal,
+) -> FastLiveRunEvidence:
+    return FastLiveRunEvidence(False, reason, None, None, route.value, quantity)
+
+
+async def _fast_live_reconciliation(
+    adapters: dict[Venue, CanaryVenueAdapter],
+    instruments: dict[Venue, Instrument],
+    journal: LiveOrderJournal,
+    required_venues: set[Venue],
+) -> ReconciliationReport:
+    states = await collect_private_states(
+        adapters,
+        instruments,
+        reconciliation_trigger="FAST_LIVE_STABLE_FLAT",
+    )
+    return reconcile_private_states(
+        (), states, await journal.known_client_order_ids(), required_venues
+    )
+
+
+def _fast_live_account_generation_sha256(
+    states: dict[Venue, VenuePrivateState],
+    reconciliation: ReconciliationReport,
+    journal_watermark: int,
+) -> str:
+    payload = {
+        "venues": [
+            {
+                "venue": venue.value,
+                "margin_mode": state.account.margin_mode if state.account else None,
+                "position_mode": state.account.position_mode if state.account else None,
+                "trading_enabled": state.account.trading_enabled if state.account else None,
+                "withdrawal_enabled": state.account.withdrawal_enabled if state.account else None,
+                "transfer_enabled": state.account.transfer_enabled if state.account else None,
+                "permissions": sorted(state.account.permissions) if state.account else [],
+                "equity_usdt": str(state.account.equity_usdt) if state.account else None,
+                "free_margin_usdt": (
+                    str(state.account.free_margin_usdt) if state.account else None
+                ),
+                "taker_fee_rate": (
+                    str(state.taker_fee_rate) if state.taker_fee_rate is not None else None
+                ),
+                "raw_open_orders": state.raw_open_order_count,
+                "raw_nonzero_positions": state.raw_nonzero_position_count,
+            }
+            for venue, state in sorted(states.items(), key=lambda item: item[0].value)
+        ],
+        "reconciliation_sha256": reconciliation_position_signature_sha256(reconciliation),
+        "journal_watermark": journal_watermark,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _fast_live_data_generation_sha256(
+    instruments: dict[Venue, Instrument],
+    binding: AggressiveFastLiveBinding,
+) -> str:
+    payload = {
+        "reference_manifest_sha256": binding.reference_manifest_sha256,
+        "model_sha256": binding.model_sha256,
+        "instruments": [
+            {
+                "venue": venue.value,
+                "symbol": instrument.symbol,
+                "base": instrument.base,
+                "quote": instrument.quote,
+                "settle": instrument.settle,
+                "contract_size_base": str(instrument.contract_size_base),
+                "amount_step_contracts": str(instrument.amount_step_contracts),
+                "price_tick": str(instrument.price_tick),
+                "minimum_notional": (
+                    str(instrument.minimum_notional)
+                    if instrument.minimum_notional is not None
+                    else None
+                ),
+            }
+            for venue, instrument in sorted(instruments.items(), key=lambda item: item[0].value)
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 async def run_canary_once(
@@ -2335,7 +2937,9 @@ async def run_canary_once(
             simulation_or_replay=settings.app.mode != "live",
             local_unlock_present=bool(os.environ.get("IPEG_LOCAL_UNLOCK_SECRET")),
             telegram_challenge_valid=await live_confirmation_valid(state_path),
-            current_qualification_valid=qualification_valid,
+            # A legacy qualification can neither grant nor deny V2 entry.
+            # The retained compatibility function therefore never gains live authority.
+            fast_live_preflight_valid=False,
             route_allowlisted=(
                 evidence.route == route
                 or (
