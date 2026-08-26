@@ -123,6 +123,7 @@ def test_detached_qualification_orchestration_and_cleanup(
         negative=SimpleNamespace(direction="negative"),
     )
     monkeypatch.setattr(runner.ctypes, "windll", SimpleNamespace(kernel32=Kernel()), raising=False)
+    monkeypatch.setattr(runner.tempfile, "tempdir", None)
     monkeypatch.setattr(runner, "AggressiveGridStore", Grid)
     monkeypatch.setattr(runner, "load_historical_model", lambda _path: model)
     monkeypatch.setattr(
@@ -178,6 +179,7 @@ def test_detached_qualification_orchestration_and_cleanup(
     log = (run_state / "runner.log").read_text(encoding="utf-8")
     assert "PRIVATE_VALUE" not in log
     assert len(tuple(run_state.glob("superseded-*.json"))) == 3
+    assert runner.tempfile.tempdir == str(run_state / "tmp")
     assert calls[-1] == "sleep:2147483648"
     if failure_stage is not None:
         if failure_stage == "qualification:run":
