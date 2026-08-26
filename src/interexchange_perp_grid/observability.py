@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from typing import cast
 
@@ -30,9 +31,25 @@ LIVE_GUARD_DENIALS = Counter(
     registry=REGISTRY,
 )
 
+_TELEGRAM_TOKEN = re.compile(r"(?<![A-Za-z0-9_-])(?:bot)?\d{6,}:[A-Za-z0-9_-]{20,}")
+
+
+class _SecretRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = _TELEGRAM_TOKEN.sub("<REDACTED_TELEGRAM_TOKEN>", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
 
 def configure_logging(level: str) -> None:
     logging.basicConfig(format="%(message)s", level=level, stream=sys.stdout, force=True)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_SecretRedactionFilter())
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     structlog.configure(
         processors=(
             structlog.contextvars.merge_contextvars,

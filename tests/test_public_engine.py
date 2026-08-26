@@ -544,6 +544,28 @@ async def test_wave1_public_scan_does_not_require_private_credentials(
 
 
 @pytest.mark.asyncio
+async def test_qualification_sampler_persists_fresh_wave1_books_without_broad_rescan(
+    tmp_path: Path,
+) -> None:
+    adapters = {venue: FakeAdapter(venue) for venue in WAVE1_VENUES}
+    settings = load_settings(CONFIG, {"IPEG_PARQUET_DIR": str(tmp_path)})
+    engine = PublicMarketEngine(
+        settings,
+        adapter_factory=adapters.__getitem__,
+        recorder=ParquetMarketRecorder(tmp_path),
+    )
+    await engine.scan_once("BTC", Decimal("0.001"), timeout_seconds=1)
+    broad_calls = {venue: adapter.book_calls for venue, adapter in adapters.items()}
+
+    sampled = await engine.sample_qualification_books("BTC", timeout_seconds=1)
+    await engine.close()
+
+    assert sampled == 3
+    assert all(adapter.book_calls == broad_calls[venue] + 1 for venue, adapter in adapters.items())
+    assert query_recorded_level_count(tmp_path) == 12
+
+
+@pytest.mark.asyncio
 async def test_continuous_runtime_qualifies_expansion_public_without_live_authority(
     tmp_path: Path,
 ) -> None:

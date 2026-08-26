@@ -171,6 +171,14 @@ class QualificationPolicy:
             raise ValueError("invalid qualification policy")
 
 
+LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS = 1_800
+LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE = 500
+LAPTOP_SMOKE_FAST_MINIMUM_DURATION_SECONDS = 300
+LAPTOP_SMOKE_FAST_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE = 100
+LAPTOP_SMOKE_MINIMUM_FUNDING_CHECKPOINTS_PER_VENUE = 1
+LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS = 2
+
+
 def qualification_policy_from_settings(settings: Settings) -> QualificationPolicy:
     """Build the standard, repository-locked qualification policy."""
     return QualificationPolicy(
@@ -203,6 +211,27 @@ def laptop_owner_exception_policy(settings: Settings) -> QualificationPolicy:
     return replace(
         standard,
         minimum_duration_seconds=LAPTOP_OWNER_EXCEPTION_MINIMUM_DURATION_SECONDS,
+    )
+
+
+def laptop_smoke_policy(settings: Settings, duration_minutes: int = 30) -> QualificationPolicy:
+    """Return a non-accepting 5- or 30-minute operational rehearsal policy."""
+    standard = qualification_policy_from_settings(settings)
+    if standard.minimum_duration_seconds != 86_400:
+        raise ValueError("laptop smoke requires the exact standard 24-hour policy")
+    if duration_minutes == 5:
+        duration_seconds = LAPTOP_SMOKE_FAST_MINIMUM_DURATION_SECONDS
+        minimum_snapshots = LAPTOP_SMOKE_FAST_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+    elif duration_minutes == 30:
+        duration_seconds = LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS
+        minimum_snapshots = LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+    else:
+        raise ValueError("laptop smoke duration must be exactly 5 or 30 minutes")
+    return replace(
+        standard,
+        minimum_duration_seconds=duration_seconds,
+        minimum_synchronised_snapshots_per_venue=minimum_snapshots,
+        minimum_funding_checkpoints_per_venue=(LAPTOP_SMOKE_MINIMUM_FUNDING_CHECKPOINTS_PER_VENUE),
     )
 
 
@@ -666,7 +695,13 @@ def _venue_book_statistics(
         for previous, current in pairwise(synchronised)
     )
     sequence_gaps: list[int] = []
-    for previous, current in pairwise(synchronised):
+    for previous, current in pairwise(snapshot_events):
+        # Persisted snapshots are periodic materialisations, not every exchange
+        # delta. A jump between two adapter-confirmed synchronised snapshots is
+        # therefore expected; only a snapshot explicitly rejected by the venue
+        # sequence tracker can represent a sequence break here.
+        if current.synchronised:
+            continue
         if previous.sequence_end is None or current.sequence_start is None:
             continue
         gap = current.sequence_start - previous.sequence_end - 1

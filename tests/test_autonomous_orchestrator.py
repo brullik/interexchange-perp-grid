@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -17,7 +19,10 @@ from interexchange_perp_grid.config import load_settings
 from interexchange_perp_grid.qualification import (
     LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
     LAPTOP_OWNER_EXCEPTION_ENV,
+    QualificationProgress,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
+    qualification_policy_from_settings,
 )
 from interexchange_perp_grid.state import (
     QualificationEpochStatus,
@@ -63,6 +68,42 @@ def test_orchestrator_requires_local_receipt_for_laptop_exception(
     )
     orchestrator = AutonomousOrchestrator(settings, qualification_policy=policy)
     assert orchestrator.qualification_policy == policy
+
+
+def test_orchestrator_allows_only_exact_nonaccepting_smoke_policies(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    for minutes in (5, 30):
+        policy = laptop_smoke_policy(settings, minutes)
+        orchestrator = AutonomousOrchestrator(settings, qualification_policy=policy)
+        assert orchestrator.qualification_policy == policy
+        assert orchestrator.use_progress_subprocess is False
+
+        harmless = SimpleNamespace(
+            ready_to_finalize=False,
+            blockers=(
+                "SIGNAL_STATISTICS_MISSING",
+                "SIMULATED_NET_PNL_NOT_POSITIVE",
+                "STRATEGY_PARAMETERS_MISSING",
+                "REPLAY_NOT_COMPLETED",
+            ),
+        )
+        assert orchestrator_module._ready_to_finalize_for_policy(
+            settings, policy, cast(QualificationProgress, harmless)
+        )
+        unsafe = SimpleNamespace(
+            ready_to_finalize=False,
+            blockers=("BYBIT_SYNCHRONISED_SNAPSHOTS_INSUFFICIENT",),
+        )
+        assert not orchestrator_module._ready_to_finalize_for_policy(
+            settings, policy, cast(QualificationProgress, unsafe)
+        )
+
+    unsupported = replace(
+        qualification_policy_from_settings(settings), minimum_duration_seconds=301
+    )
+    with pytest.raises(ValueError, match="unsupported qualification policy override"):
+        AutonomousOrchestrator(settings, qualification_policy=unsupported)
 
 
 @pytest.mark.asyncio

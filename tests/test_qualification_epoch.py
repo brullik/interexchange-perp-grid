@@ -9,6 +9,7 @@ import pytest
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.state import (
     QualificationEpochStatus,
+    close_active_qualification_epoch,
     finalize_qualification_epoch,
     initialise_state,
     read_qualification_epoch,
@@ -93,6 +94,54 @@ async def test_any_identity_change_closes_old_epoch_and_resets_duration(
     assert new.status == QualificationEpochStatus.RUNNING
     with pytest.raises(RuntimeError, match="running exact epoch"):
         await record_qualification_exception(path, old.epoch_id, "MixedEpoch")
+
+
+@pytest.mark.asyncio
+async def test_explicit_retry_closes_matching_epoch_and_starts_from_zero(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    await initialise_state(path)
+    start = datetime(2026, 8, 15, tzinfo=UTC)
+    old = await start_qualification_epoch(path, _ROUTE, _RELEASE, _SOURCE, _CONFIG, _IMAGE, start)
+    closed_at = start + timedelta(hours=2)
+    closed = await close_active_qualification_epoch(path, closed_at)
+    assert closed is not None
+    assert closed.epoch_id == old.epoch_id
+    assert closed.status == QualificationEpochStatus.CLOSED
+    assert closed.ended_at == closed_at
+    assert await close_active_qualification_epoch(path, closed_at) is None
+
+    restarted_at = closed_at + timedelta(seconds=1)
+    restarted = await start_qualification_epoch(
+        path, _ROUTE, _RELEASE, _SOURCE, _CONFIG, _IMAGE, restarted_at
+    )
+    assert restarted.epoch_id != old.epoch_id
+    assert restarted.started_at == restarted_at
+    assert restarted.status == QualificationEpochStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_force_new_never_reuses_same_identity_finalized_epoch(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    await initialise_state(path)
+    start = datetime(2026, 8, 15, tzinfo=UTC)
+    old = await start_qualification_epoch(path, _ROUTE, _RELEASE, _SOURCE, _CONFIG, _IMAGE, start)
+    await finalize_qualification_epoch(path, old.epoch_id, start + timedelta(hours=12))
+    restarted_at = start + timedelta(hours=13)
+    restarted = await start_qualification_epoch(
+        path,
+        _ROUTE,
+        _RELEASE,
+        _SOURCE,
+        _CONFIG,
+        _IMAGE,
+        restarted_at,
+        force_new=True,
+    )
+    assert restarted.epoch_id != old.epoch_id
+    assert restarted.started_at == restarted_at
+    assert restarted.status == QualificationEpochStatus.RUNNING
 
 
 @pytest.mark.asyncio

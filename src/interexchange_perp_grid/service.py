@@ -20,6 +20,7 @@ from interexchange_perp_grid.canary_runtime import (
     recover_active_actions,
 )
 from interexchange_perp_grid.config import Settings
+from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.live_journal import LiveJournalAction, LiveOrderJournal
 from interexchange_perp_grid.observability import (
     SERVICE_HEARTBEATS,
@@ -28,6 +29,7 @@ from interexchange_perp_grid.observability import (
     get_logger,
 )
 from interexchange_perp_grid.priority_scheduler import PriorityWorkScheduler
+from interexchange_perp_grid.public_engine import PublicMarketEngine
 from interexchange_perp_grid.qualification import QualificationPolicy
 from interexchange_perp_grid.shadow import ContinuousShadowEvaluator, ShadowRuntime
 from interexchange_perp_grid.state import (
@@ -200,16 +202,48 @@ class BootstrapService:
         if self.run_shadow and self.settings.app.mode == "shadow":
             runtime = ShadowRuntime(self.settings)
             await runtime.start()
+            qualification_engine = None
+            if self.qualification_policy is not None:
+                qualification_engine = PublicMarketEngine(
+                    self.settings,
+                    public_venues=tuple(
+                        Venue(value) for value in self.settings.venues.wave1_public
+                    ),
+                )
             background_tasks.append(
                 asyncio.create_task(
                     ContinuousShadowEvaluator(
                         self.settings,
+                        engine=qualification_engine,
                         runtime=runtime,
+                        qualification_policy=self.qualification_policy,
                         critical_work_count=priority_scheduler.critical_work_count,
                     ).run(stop_event),
                     name="continuous-shadow-evaluator",
                 )
             )
+            if qualification_engine is not None:
+
+                async def sample_qualification_books() -> None:
+                    while not stop_event.is_set():
+                        await qualification_engine.sample_qualification_books(
+                            self.settings.shadow.base,
+                            min(5, self.settings.shadow.scan_timeout_seconds),
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                stop_event.wait(),
+                                timeout=self.settings.shadow.scan_interval_seconds,
+                            )
+                        except TimeoutError:
+                            continue
+
+                background_tasks.append(
+                    asyncio.create_task(
+                        sample_qualification_books(),
+                        name="qualification-book-sampler",
+                    )
+                )
             if self.settings.telegram.enabled:
                 background_tasks.append(
                     asyncio.create_task(

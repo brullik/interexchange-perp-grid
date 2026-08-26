@@ -30,6 +30,7 @@ from interexchange_perp_grid.execution import (
 from interexchange_perp_grid.live_journal import LiveOrderJournal
 from interexchange_perp_grid.observability import get_logger
 from interexchange_perp_grid.public_engine import PublicMarketEngine, PublicWorkload, ScanResult
+from interexchange_perp_grid.qualification import QualificationPolicy
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.risk import (
     RiskBook,
@@ -1128,6 +1129,7 @@ class ContinuousShadowEvaluator:
         trader: ShadowTrader | None = None,
         route_calibrator: PersistentRouteCalibrator | None = None,
         critical_work_count: Callable[[], int] | None = None,
+        qualification_policy: QualificationPolicy | None = None,
     ) -> None:
         self.settings = settings
         self.runtime = runtime or ShadowRuntime(settings)
@@ -1136,12 +1138,20 @@ class ContinuousShadowEvaluator:
             public_venues=tuple(Venue(value) for value in settings.venues.public_runtime),
         )
         self._trader = trader or ShadowTrader(settings, self.runtime)
+        calibration_minimum_samples = (
+            qualification_policy.minimum_synchronised_snapshots_per_venue
+            if qualification_policy is not None
+            else settings.shadow.qualification_min_synchronised_snapshots_per_venue
+        )
+        calibration_minimum_duration = (
+            qualification_policy.minimum_duration_seconds
+            if qualification_policy is not None
+            else settings.shadow.qualification_min_duration_seconds
+        )
         self._route_calibrator = route_calibrator or PersistentRouteCalibrator(
             Path(settings.storage.sqlite_path),
-            minimum_samples=(settings.shadow.qualification_min_synchronised_snapshots_per_venue),
-            minimum_observation_period=timedelta(
-                seconds=settings.shadow.qualification_min_duration_seconds
-            ),
+            minimum_samples=calibration_minimum_samples,
+            minimum_observation_period=timedelta(seconds=calibration_minimum_duration),
             minimum_profit_usdt=settings.strategy.minimum_profit_usdt or Decimal("0.01"),
             parameter_change_limit_ratio_per_day=(
                 settings.strategy.grid_parameter_change_limit_ratio

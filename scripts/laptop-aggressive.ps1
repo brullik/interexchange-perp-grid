@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("verify", "shadow", "qualify", "canary", "pilot", "status", "stop")]
+    [ValidateSet("verify", "shadow", "smoke5", "smoke30", "qualify", "canary", "pilot", "status", "stop")]
     [string]$Mode,
     [string]$ProfilePath = "state/laptop-profile.clixml",
     [ValidateSet("CurrentUser", "LocalMachine")]
@@ -123,9 +123,15 @@ switch ($Mode) {
         }
     }
     "qualify" {
+        if ($OwnerException12h) {
+            & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
+                -ProfileScope $ProfileScope -OwnerException12h
+            if ($LASTEXITCODE -ne 0) { throw "detached 12-hour qualification failed to start" }
+            return
+        }
         Ensure-HistoricalModel
         & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope -OwnerException12h:$OwnerException12h
+            -ProfileScope $ProfileScope
         if ($LASTEXITCODE -ne 0) { throw "base laptop qualification failed closed" }
         & $python -m interexchange_perp_grid.cli aggressive-qualification-bind `
             --qualification "state/qualification.json" `
@@ -133,6 +139,16 @@ switch ($Mode) {
             --model $model --grid $grid --profile $profile `
             --output "state/aggressive-qualification.json"
         if ($LASTEXITCODE -ne 0) { throw "aggressive qualification binding failed closed" }
+    }
+    "smoke30" {
+        & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
+            -ProfileScope $ProfileScope -SmokeMinutes 30
+        if ($LASTEXITCODE -ne 0) { throw "30-minute qualification rehearsal failed closed" }
+    }
+    "smoke5" {
+        & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
+            -ProfileScope $ProfileScope -SmokeMinutes 5
+        if ($LASTEXITCODE -ne 0) { throw "5-minute qualification rehearsal failed closed" }
     }
     "canary" {
         Write-Host "Canary requires a separate, explicit live-money authorization at execution time."

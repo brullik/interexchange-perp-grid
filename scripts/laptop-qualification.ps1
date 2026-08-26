@@ -3,7 +3,9 @@ param(
     [string]$ProfilePath = "state/laptop-profile.clixml",
     [ValidateSet("CurrentUser", "LocalMachine")]
     [string]$ProfileScope = "CurrentUser",
-    [switch]$OwnerException12h
+    [switch]$OwnerException12h,
+    [switch]$Smoke5m,
+    [switch]$Smoke30m
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +17,65 @@ if ($ProfileScope -ceq "LocalMachine") {
     . "$PSScriptRoot/laptop-load-s4u-env.ps1" -ProfilePath $ProfilePath
 } else {
     . "$PSScriptRoot/laptop-load-env.ps1" -ProfilePath $ProfilePath
+}
+
+# Qualification is a non-interactive shadow workload. A Telegram poller adds no
+# evidence, can conflict with an owner-facing instance, and may expose a bot
+# token through third-party HTTP request logging. Keep the encrypted profile
+# intact while removing Telegram from this process before any Python command.
+. "$PSScriptRoot/laptop-disable-shadow-telegram.ps1"
+
+if ($Smoke5m -and $Smoke30m) { throw "Choose exactly one smoke duration" }
+$smokeMinutes = if ($Smoke5m) { 5 } elseif ($Smoke30m) { 30 } else { 0 }
+$qualificationLockName = if ($smokeMinutes -gt 0) {
+    "qualification-smoke.lock"
+} else {
+    "qualification.lock"
+}
+$qualificationLockPath = Join-Path $root "state/laptop/$qualificationLockName"
+$qualificationLockOwner = [Guid]::NewGuid().ToString("N")
+$qualificationLockStream = $null
+try {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $qualificationLockPath) `
+        -Force | Out-Null
+    $qualificationLockStream = [IO.File]::Open(
+        $qualificationLockPath,
+        [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write,
+        [IO.FileShare]::None
+    )
+    $qualificationLockBytes = [Text.Encoding]::ASCII.GetBytes(
+        "$qualificationLockOwner|$PID"
+    )
+    $qualificationLockStream.Write(
+        $qualificationLockBytes,
+        0,
+        $qualificationLockBytes.Length
+    )
+    $qualificationLockStream.Flush($true)
+} catch [IO.IOException] {
+    throw "Another laptop qualification runner owns the shared qualification state"
+} finally {
+    if ($null -ne $qualificationLockStream) { $qualificationLockStream.Dispose() }
+}
+trap {
+    if (Test-Path -LiteralPath $qualificationLockPath -PathType Leaf) {
+        $owner = Get-Content -LiteralPath $qualificationLockPath -Raw
+        if ($owner.Trim().StartsWith("$qualificationLockOwner|")) {
+            Remove-Item -LiteralPath $qualificationLockPath -Force
+        }
+    }
+    throw $_
+}
+
+if ($smokeMinutes -gt 0) {
+    $env:IPEG_LAPTOP_SMOKE_RUN_ID = [Guid]::NewGuid().ToString("N")
+    $env:IPEG_STATE_PATH = [IO.Path]::GetFullPath(
+        (Join-Path $root "state/laptop/smoke/$env:IPEG_LAPTOP_SMOKE_RUN_ID/ipeg.sqlite3")
+    )
+    $env:IPEG_PARQUET_DIR = [IO.Path]::GetFullPath(
+        (Join-Path $root "data/laptop/smoke/$env:IPEG_LAPTOP_SMOKE_RUN_ID/market")
+    )
 }
 
 $laptopState = Join-Path $root "state/laptop"
@@ -47,8 +108,24 @@ $manifest = Get-Content -LiteralPath $env:IPEG_NATIVE_RUNTIME_MANIFEST -Raw | Co
 $env:IPEG_RELEASE_SHA = [string]$manifest.release_sha
 $env:IPEG_CONTAINER_IMAGE_DIGEST = [string]$manifest.artifact_digest
 
+if ($smokeMinutes -eq 0) {
+    $branch = (& git branch --show-current).Trim()
+    $head = (& git rev-parse HEAD).Trim().ToLowerInvariant()
+    $originMain = (& git rev-parse refs/remotes/origin/main).Trim().ToLowerInvariant()
+    $dirty = @(& git status --porcelain --untracked-files=no)
+    if (
+        $LASTEXITCODE -ne 0 -or $branch -cne "main" -or
+        $head -cne $originMain -or $head -cne $env:IPEG_RELEASE_SHA
+    ) {
+        throw "qualification requires clean exact local main matching fetched origin/main"
+    }
+    if ($dirty.Count -gt 0) { throw "qualification requires a clean tracked checkout" }
+}
+
 $ownerExceptionConfirmation = $null
-if ($OwnerException12h) {
+if ($smokeMinutes -gt 0) {
+    Write-Host "Preparing isolated non-qualifying $smokeMinutes-minute laptop rehearsal."
+} elseif ($OwnerException12h) {
     $ownerExceptionConfirmation = [Environment]::GetEnvironmentVariable(
         "IPEG_LAPTOP_12H_OWNER_EXCEPTION",
         "Process"
@@ -110,7 +187,16 @@ if ($OwnerException12h) {
 Write-Host "Keep AC power and network connected. Closing this terminal interrupts qualification."
 Write-Host "Live remains disabled; no real order can be submitted in this phase."
 try {
-    if ($OwnerException12h) {
+    if ($smokeMinutes -gt 0) {
+        Write-Host "Starting isolated non-qualifying $smokeMinutes-minute laptop rehearsal."
+        & $python -m interexchange_perp_grid.cli laptop-qualification-smoke-run `
+            --minutes $smokeMinutes `
+            --repo-root $root `
+            --config "$root/config/defaults.yaml"
+        if ($LASTEXITCODE -ne 0) { throw "$smokeMinutes-minute qualification rehearsal failed" }
+        Write-Host "$smokeMinutes-minute rehearsal passed; it cannot authorize canary or live."
+        return
+    } elseif ($OwnerException12h) {
         $env:IPEG_LAPTOP_12H_OWNER_EXCEPTION = $ownerExceptionConfirmation
         & $python -m interexchange_perp_grid.cli laptop-qualification-run `
             --maximum-hours 18 `
@@ -167,5 +253,12 @@ try {
     Write-Host "Native laptop qualification accepted: $qualificationEvidence"
 } finally {
     Remove-Item Env:IPEG_LAPTOP_12H_OWNER_EXCEPTION -ErrorAction SilentlyContinue
+    Remove-Item Env:IPEG_LAPTOP_SMOKE_RUN_ID -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $qualificationLockPath -PathType Leaf) {
+        $owner = Get-Content -LiteralPath $qualificationLockPath -Raw
+        if ($owner.Trim().StartsWith("$qualificationLockOwner|")) {
+            Remove-Item -LiteralPath $qualificationLockPath -Force
+        }
+    }
     [void][LaptopSleepGuard]::SetThreadExecutionState($continuous)
 }

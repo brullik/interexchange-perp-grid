@@ -16,15 +16,18 @@ from interexchange_perp_grid.live_journal import (
 )
 from interexchange_perp_grid.qualification import (
     LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS,
+    LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS,
     QualificationEvidence,
     QualificationPolicy,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
     qualification_policy_from_settings,
 )
 from interexchange_perp_grid.service import BootstrapService, BoundedServiceReceipt
 from interexchange_perp_grid.state import (
     QualificationEpoch,
     QualificationEpochStatus,
+    initialise_state,
     read_qualification_epoch,
     read_service_health,
 )
@@ -90,10 +93,25 @@ async def run_until_qualification_finalized(
         service_settings = settings.model_copy(
             update={
                 "shadow": settings.shadow.model_copy(
-                    update={"scan_interval_seconds": (LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS)}
+                    update={"scan_interval_seconds": LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS}
                 )
             }
         )
+    elif selected_policy in (
+        laptop_smoke_policy(settings, 5),
+        laptop_smoke_policy(settings, 30),
+    ):
+        service_settings = settings.model_copy(
+            update={
+                "shadow": settings.shadow.model_copy(
+                    update={"scan_interval_seconds": LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS}
+                )
+            }
+        )
+    state_path = Path(settings.storage.sqlite_path)
+    # A smoke run always has a fresh per-run database. Initialise it before
+    # scheduling the service task so the first epoch read cannot win the event-loop race.
+    await initialise_state(state_path)
     stop_event = asyncio.Event()
     service = asyncio.create_task(
         BootstrapService(service_settings, qualification_policy=selected_policy).run(stop_event),
@@ -105,7 +123,7 @@ async def run_until_qualification_finalized(
             if service.done():
                 await service
                 raise RuntimeError("native qualification service stopped before finalization")
-            epoch = await read_qualification_epoch(Path(settings.storage.sqlite_path))
+            epoch = await read_qualification_epoch(state_path)
             if (
                 epoch is not None
                 and epoch.status == QualificationEpochStatus.FINALIZED

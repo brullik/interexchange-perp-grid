@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -125,6 +126,7 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     pilot = Path("scripts/laptop-pilot.ps1").read_text(encoding="utf-8")
     aggressive = Path("scripts/laptop-aggressive.ps1").read_text(encoding="utf-8")
     aggressive_pilot = Path("scripts/laptop-aggressive-pilot-a.ps1").read_text(encoding="utf-8")
+    detached_smoke = Path("scripts/laptop-smoke-detached.ps1").read_text(encoding="utf-8")
 
     assert "Export-Clixml" not in onboarding
     assert "Import-Clixml" not in loader
@@ -162,6 +164,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert '[ValidateSet("CurrentUser", "LocalMachine")]' in qualification
     assert "laptop-load-s4u-env.ps1" in qualification
     assert "private-probe" in qualification
+    disable_shadow_telegram = "laptop-disable-shadow-telegram.ps1"
+    assert disable_shadow_telegram in qualification
+    assert qualification.index(disable_shadow_telegram) < qualification.index("pip check")
     assert "--authenticated" in qualification
     assert 'foreach ($venue in @("bybit", "okx"))' in qualification
     assert 'foreach ($venue in @("binanceusdm", "bybit", "okx"))' not in qualification
@@ -173,6 +178,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION" in qualification
     assert "--laptop-owner-exception-12h" in qualification
     assert "--maximum-hours 18" in qualification
+    assert "qualification.lock" in qualification
+    assert "[IO.FileMode]::CreateNew" in qualification
+    assert "refs/remotes/origin/main" in qualification
     assert 'if ($consent -cne "I_ACCEPT_LIVE_CANARY_RISK")' in pilot
     assert "I_ACCEPT_LAPTOP_12H_QUALIFICATION_EXCEPTION" in pilot
     assert "--laptop-owner-exception-12h" in pilot
@@ -193,8 +201,8 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert pilot.index("Start-Process") < pilot.index('$env:IPEG_LIVE_ENABLED = "true"')
     assert pilot.index('$env:IPEG_LIVE_ENABLED = "false"') < pilot.index("Start-Process")
     assert (
-        'ValidateSet("verify", "shadow", "qualify", "canary", "pilot", "status", "stop")'
-        in aggressive
+        'ValidateSet("verify", "shadow", "smoke5", "smoke30", "qualify", '
+        '"canary", "pilot", "status", "stop")' in aggressive
     )
     assert "reference-history-proof" in aggressive
     assert "aggressive-shadow-once" in aggressive
@@ -203,6 +211,32 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "separate, explicit live-money authorization" in aggressive
     assert "laptop-pilot.ps1" in aggressive and "-Aggressive" in aggressive
     assert "laptop-aggressive-pilot-a.ps1" in aggressive
+    assert '"smoke30"' in aggressive
+    assert '"smoke5"' in aggressive
+    assert "laptop-smoke-detached.ps1" in aggressive
+    assert "-SmokeMinutes 30" in aggressive
+    assert "-SmokeMinutes 5" in aggressive
+    assert "Start-Process" in detached_smoke
+    assert "laptop_smoke_runner.py" in detached_smoke
+    runner = Path("scripts/laptop_smoke_runner.py").read_text(encoding="utf-8")
+    assert "subprocess" not in runner
+    assert "reference_history_proof" in runner
+    assert "aggressive_model_proof" in runner
+    assert "ValidateSet(5, 30)" in detached_smoke
+    assert "[IO.FileMode]::CreateNew" in detached_smoke
+    assert "qualification-smoke.lock" in detached_smoke
+    assert "--qualification-12h" in detached_smoke
+    assert "IPEG_LAPTOP_12H_OWNER_EXCEPTION" in detached_smoke
+    assert "refs/remotes/origin/main" in detached_smoke
+    assert "git status --porcelain --untracked-files=no" in detached_smoke
+    assert "--qualification-12h" in runner
+    assert "laptop_qualification_run" in runner
+    assert "aggressive_qualification_bind" in runner
+    assert 'IPEG_TELEGRAM_ENABLED = "false"' not in detached_smoke
+    assert "laptop-disable-shadow-telegram.ps1" in detached_smoke
+    assert "IPEG_LIVE_ENABLED" not in detached_smoke
+    assert '[Guid]::NewGuid().ToString("N")' in qualification
+    assert "IPEG_LAPTOP_SMOKE_RUN_ID" in qualification
     assert "Docker" not in aggressive
     assert "I_ACCEPT_AGGRESSIVE_PILOT_A_RISK" in aggressive_pilot
     assert "minimum_duration_seconds -ne 86400" in aggressive_pilot
@@ -211,6 +245,39 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "--service-receipt $postFlatReceipt" in aggressive_pilot
     assert '$env:IPEG_LIVE_ENABLED = "false"' in aggressive_pilot
     assert "Docker" not in aggressive_pilot
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")
+def test_laptop_qualification_disables_shadow_telegram_environment() -> None:
+    helper = Path("scripts/laptop-disable-shadow-telegram.ps1").resolve()
+    command = f"""
+$env:IPEG_TELEGRAM_ENABLED = "true"
+$env:IPEG_TELEGRAM_BOT_TOKEN = ([string]123456789) + ":" + ("A" * 33)
+. '{helper}'
+[pscustomobject]@{{
+    enabled = $env:IPEG_TELEGRAM_ENABLED
+    token_present = Test-Path Env:IPEG_TELEGRAM_BOT_TOKEN
+}} | ConvertTo-Json -Compress
+"""
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=20,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert payload == {"enabled": "false", "token_present": False}
+    assert "123456789" not in completed.stdout
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")

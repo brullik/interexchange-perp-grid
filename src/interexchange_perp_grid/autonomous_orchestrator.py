@@ -22,6 +22,7 @@ from interexchange_perp_grid.qualification import (
     config_hash,
     laptop_owner_exception_authorized,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
     qualification_policy_from_settings,
 )
 from interexchange_perp_grid.state import (
@@ -110,6 +111,25 @@ def _build_progress_sync(
     return asyncio.run(build_qualification_progress(state_path, data_root, epoch_id, policy))
 
 
+def _ready_to_finalize_for_policy(
+    settings: Settings,
+    policy: QualificationPolicy,
+    progress: QualificationProgress,
+) -> bool:
+    if policy not in {
+        laptop_smoke_policy(settings, 5),
+        laptop_smoke_policy(settings, 30),
+    }:
+        return progress.ready_to_finalize
+    nonaccepting_rehearsal_only = {
+        "REPLAY_NOT_COMPLETED",
+        "SIGNAL_STATISTICS_MISSING",
+        "SIMULATED_NET_PNL_NOT_POSITIVE",
+        "STRATEGY_PARAMETERS_MISSING",
+    }
+    return all(blocker in nonaccepting_rehearsal_only for blocker in progress.blockers)
+
+
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
@@ -179,10 +199,14 @@ class AutonomousOrchestrator:
     def __post_init__(self) -> None:
         standard = _policy(self.settings)
         laptop_exception = laptop_owner_exception_policy(self.settings)
+        smoke_5m = laptop_smoke_policy(self.settings, 5)
+        smoke_30m = laptop_smoke_policy(self.settings, 30)
         if self.qualification_policy not in {
             None,
             standard,
             laptop_exception,
+            smoke_5m,
+            smoke_30m,
         }:
             raise ValueError("unsupported qualification policy override")
         if (
@@ -190,6 +214,11 @@ class AutonomousOrchestrator:
             and not laptop_owner_exception_authorized()
         ):
             raise ValueError("laptop qualification exception lacks the local Windows receipt")
+        if self.qualification_policy in {smoke_5m, smoke_30m}:
+            # The isolated progress worker intentionally accepts only production and
+            # owner-authorized 12h policies. Rehearsals evaluate their exact selected
+            # policy in-process and can never emit accepted qualification evidence.
+            self.use_progress_subprocess = False
 
     @property
     def state_path(self) -> Path:
@@ -344,7 +373,7 @@ class AutonomousOrchestrator:
                 selected_policy,
             )
             progress = _ProgressSnapshot(
-                observed.ready_to_finalize,
+                _ready_to_finalize_for_policy(self.settings, selected_policy, observed),
                 observed.completion_ratio,
                 observed.blockers,
             )

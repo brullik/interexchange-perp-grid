@@ -134,6 +134,7 @@ from interexchange_perp_grid.qualification import (
     current_code_commit_sha,
     laptop_owner_exception_authorized,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
     load_qualification,
     load_runtime_evidence,
     qualification_is_current,
@@ -2094,6 +2095,66 @@ def laptop_qualification_run(
         )
     )
     typer.echo(json.dumps(asdict(epoch), default=str, sort_keys=True))
+
+
+@app.command("laptop-qualification-smoke-run")
+def laptop_qualification_smoke_run(
+    minutes: Annotated[int, typer.Option("--minutes")] = 30,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Run one isolated, non-accepting 30-minute qualification rehearsal."""
+    root = repo_root.resolve()
+    settings = _load(config)
+    if settings.app.mode != "shadow" or settings.live.enabled:
+        raise typer.BadParameter(
+            "laptop qualification smoke requires shadow mode and live disabled"
+        )
+    if minutes not in (5, 30):
+        raise typer.BadParameter("laptop qualification smoke must be exactly 5 or 30 minutes")
+    smoke_run_id = os.environ.get("IPEG_LAPTOP_SMOKE_RUN_ID", "")
+    if re.fullmatch(r"[0-9a-f]{32}", smoke_run_id) is None:
+        raise typer.BadParameter("laptop qualification smoke requires a unique run id")
+    expected_state = (root / "state" / "laptop" / "smoke" / smoke_run_id / "ipeg.sqlite3").resolve()
+    expected_market = (root / "data" / "laptop" / "smoke" / smoke_run_id / "market").resolve()
+    if Path(settings.storage.sqlite_path).resolve() != expected_state:
+        raise typer.BadParameter("laptop qualification smoke requires its isolated state path")
+    if Path(settings.storage.parquet_dir).resolve() != expected_market:
+        raise typer.BadParameter("laptop qualification smoke requires its isolated market path")
+    release_sha = current_code_commit_sha(root)
+    if release_sha is None:
+        raise typer.BadParameter("exact release commit SHA is unavailable")
+    runtime_digest = resolve_runtime_artifact_digest(root, config.resolve())
+    route = _parse_route(os.environ.get("IPEG_QUALIFICATION_ROUTE", ""))
+    if route.value != "BTC:bybit>okx":
+        raise typer.BadParameter("laptop qualification smoke route must be BTC:bybit>okx")
+    policy = laptop_smoke_policy(settings, minutes)
+    epoch = asyncio.run(
+        run_until_qualification_finalized(
+            settings,
+            LaptopQualificationIdentity(route, release_sha, runtime_digest),
+            maximum_seconds=(minutes + 5) * 60,
+            poll_interval_seconds=2,
+            qualification_policy=policy,
+        )
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "accepted": False,
+                "epoch": asdict(epoch),
+                "live_authorized": False,
+                "policy": asdict(policy),
+                "purpose": f"NON_QUALIFYING_{minutes}_MINUTE_REHEARSAL",
+                "run_id": smoke_run_id,
+                "scheduled_minutes": minutes,
+                "schema_version": 1,
+                "status": "PASS",
+            },
+            default=str,
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("laptop-pilot-report")

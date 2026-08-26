@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,9 +23,16 @@ from interexchange_perp_grid.qualification import (
     LAPTOP_OWNER_EXCEPTION_CONFIRMATION,
     LAPTOP_OWNER_EXCEPTION_ENV,
     LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS,
+    LAPTOP_SMOKE_FAST_MINIMUM_DURATION_SECONDS,
+    LAPTOP_SMOKE_FAST_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE,
+    LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS,
+    LAPTOP_SMOKE_MINIMUM_FUNDING_CHECKPOINTS_PER_VENUE,
+    LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE,
+    LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS,
     QualificationEvidence,
     laptop_owner_exception_authorized,
     laptop_owner_exception_policy,
+    laptop_smoke_policy,
     qualification_policy_from_settings,
 )
 from interexchange_perp_grid.service import (
@@ -69,7 +77,13 @@ async def test_native_qualification_stops_only_after_exact_epoch_finalizes(
         stopped.set()
 
     async def finalized(path: object) -> QualificationEpoch:
-        del path
+        assert isinstance(path, Path)
+        with sqlite3.connect(path) as database:
+            table = database.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'qualification_epochs'"
+            ).fetchone()
+        assert table == ("qualification_epochs",)
         return epoch
 
     monkeypatch.setattr(
@@ -103,6 +117,39 @@ def test_laptop_owner_exception_changes_only_duration_and_requires_windows_recei
     assert laptop_owner_exception_authorized(receipt, platform="win32")
     assert not laptop_owner_exception_authorized(receipt, platform="linux")
     assert not laptop_owner_exception_authorized({}, platform="win32")
+
+
+def test_laptop_smoke_policy_is_short_isolated_and_not_an_accepted_policy(
+    tmp_path: Path,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
+    standard = qualification_policy_from_settings(settings)
+    smoke = laptop_smoke_policy(settings)
+    fast_smoke = laptop_smoke_policy(settings, 5)
+
+    assert smoke.minimum_duration_seconds == LAPTOP_SMOKE_MINIMUM_DURATION_SECONDS
+    assert (
+        smoke.minimum_synchronised_snapshots_per_venue
+        == LAPTOP_SMOKE_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+    )
+    assert smoke != standard
+    assert smoke != laptop_owner_exception_policy(settings)
+    assert fast_smoke.minimum_duration_seconds == LAPTOP_SMOKE_FAST_MINIMUM_DURATION_SECONDS
+    assert (
+        fast_smoke.minimum_synchronised_snapshots_per_venue
+        == LAPTOP_SMOKE_FAST_MINIMUM_SYNCHRONISED_SNAPSHOTS_PER_VENUE
+    )
+    assert fast_smoke != smoke
+    assert (
+        fast_smoke.minimum_funding_checkpoints_per_venue
+        == LAPTOP_SMOKE_MINIMUM_FUNDING_CHECKPOINTS_PER_VENUE
+        == 1
+    )
+    assert smoke.minimum_funding_checkpoints_per_venue == 1
+    assert standard.minimum_funding_checkpoints_per_venue == 3
+    with pytest.raises(ValueError, match="exactly 5 or 30"):
+        laptop_smoke_policy(settings, 10)
+    assert LAPTOP_SMOKE_SCAN_INTERVAL_SECONDS * 500 < 1_800
 
 
 @pytest.mark.asyncio
@@ -154,6 +201,58 @@ async def test_native_laptop_exception_accepts_exact_twelve_hour_deadline(
     assert result == epoch
     assert stopped.is_set()
     assert LAPTOP_OWNER_EXCEPTION_SCAN_INTERVAL_SECONDS * 10_000 < 43_200
+
+
+@pytest.mark.asyncio
+async def test_native_smoke_uses_exact_fast_runtime_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(tmp_path / "state.sqlite3")})
+    policy = laptop_smoke_policy(settings, 5)
+    stopped = asyncio.Event()
+    observed_at = datetime(2026, 8, 21, tzinfo=UTC)
+    epoch = QualificationEpoch(
+        "epoch-smoke",
+        ROUTE,
+        RELEASE,
+        "c" * 64,
+        "d" * 64,
+        DIGEST,
+        observed_at - timedelta(minutes=5),
+        observed_at,
+        QualificationEpochStatus.FINALIZED,
+    )
+
+    async def fake_service(self: BootstrapService, stop_event: asyncio.Event) -> None:
+        assert self.qualification_policy == policy
+        assert self.settings.shadow.scan_interval_seconds == 2
+        assert self.settings.shadow.qualification_min_duration_seconds == 86_400
+        assert self.settings.shadow.qualification_min_synchronised_snapshots_per_venue == 10_000
+        assert self.settings.shadow.qualification_min_funding_checkpoints_per_venue == 3
+        await stop_event.wait()
+        stopped.set()
+
+    async def finalized(path: object) -> QualificationEpoch:
+        assert isinstance(path, Path)
+        return epoch
+
+    monkeypatch.setattr(
+        "interexchange_perp_grid.laptop_workflow.BootstrapService.run",
+        fake_service,
+    )
+    monkeypatch.setattr(workflow_module, "read_qualification_epoch", finalized)
+
+    result = await run_until_qualification_finalized(
+        settings,
+        LaptopQualificationIdentity(ROUTE, RELEASE, DIGEST),
+        maximum_seconds=600,
+        poll_interval_seconds=0.01,
+        qualification_policy=policy,
+    )
+
+    assert result == epoch
+    assert stopped.is_set()
 
 
 @pytest.mark.asyncio
