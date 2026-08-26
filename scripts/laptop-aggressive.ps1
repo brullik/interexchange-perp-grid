@@ -124,9 +124,14 @@ switch ($Mode) {
     }
     "qualify" {
         if ($OwnerException12h) {
-            & "$PSScriptRoot/laptop-qualification-scheduled.ps1" -ProfilePath $ProfilePath `
-                -ProfileScope $ProfileScope
-            if ($LASTEXITCODE -ne 0) { throw "detached 12-hour qualification failed to start" }
+            $scheduledProfile = if ($ProfileScope -ceq "LocalMachine") {
+                $ProfilePath
+            } else {
+                "state/laptop-profile-s4u.json"
+            }
+            & "$PSScriptRoot/laptop-qualification-scheduled.ps1" `
+                -ProfilePath $scheduledProfile -ProfileScope LocalMachine
+            if (-not $?) { throw "detached 12-hour qualification failed to start" }
             return
         }
         Ensure-HistoricalModel
