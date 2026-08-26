@@ -70,6 +70,7 @@ $arguments = @(
     "-ProfilePath", (Quote-TaskArgument $profileFullPath),
     "-ProfileScope", $ProfileScope,
     "-OwnerException12h",
+    "-WaitForRunner",
     "-RunId", $runId
 ) -join " "
 $startAt = (Get-Date).AddSeconds(20)
@@ -86,9 +87,34 @@ $settings = New-ScheduledTaskSettingsSet `
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings | Out-Null
 
+$registered = Get-ScheduledTask -TaskName $taskName
+$registeredLimitText = [string]$registered.Settings.ExecutionTimeLimit
+try {
+    $registeredLimit = [Xml.XmlConvert]::ToTimeSpan($registeredLimitText)
+} catch {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    throw "Registered qualification task has an unreadable execution limit"
+}
+if ($registeredLimit -lt (New-TimeSpan -Hours 30)) {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    throw "Registered qualification task execution limit is shorter than 30 hours"
+}
+$registrationPath = Join-Path $root "state/laptop/qualification/$runId/task-registration.json"
+New-Item -ItemType Directory -Path (Split-Path -Parent $registrationPath) -Force | Out-Null
+[ordered]@{
+    schema_version = 1
+    task_name = $taskName
+    run_id = $runId
+    starts_at = $startAt.ToUniversalTime().ToString("o")
+    execution_time_limit_seconds = [int]$registeredLimit.TotalSeconds
+    wait_for_runner = $true
+    live_enabled = $false
+} | ConvertTo-Json | Set-Content -LiteralPath $registrationPath -Encoding UTF8
+
 [pscustomobject]@{
     task_name = $taskName
     run_id = $runId
     starts_at = $startAt.ToUniversalTime().ToString("o")
+    registration = $registrationPath
     live_enabled = $false
 } | ConvertTo-Json -Compress

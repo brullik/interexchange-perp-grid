@@ -115,7 +115,7 @@
 - [x] Сформировать exact-head replay/fault/restart/laptop-shadow artifacts без production submit.
 - [x] Получить независимый review, исправить P0/P1/P2 и разрешить все material threads.
 - [x] Обновить верхний блок `STATUS.md`, не удаляя историю.
-- [ ] Mark Ready и squash-merge единственный PR автоматически, только если head SHA неизменен и branch protection полностью зелёная.
+- [x] Mark Ready и squash-merge единственный PR автоматически, только если head SHA неизменен и branch protection полностью зелёная.
 
 **Выход:** aggressive software и Windows public-shadow готовы на `main`; это не live-money authorization.
 

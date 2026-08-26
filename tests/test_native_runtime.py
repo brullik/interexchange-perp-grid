@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -248,6 +249,11 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "LastRunTime -ge $triggerStart" in scheduled_qualification
     assert "LastTaskResult -notin @(267009, 267011)" in scheduled_qualification
     assert "New-ScheduledTaskTrigger -Once" in scheduled_qualification
+    assert "Get-ScheduledTask -TaskName $taskName" in scheduled_qualification
+    assert "[Xml.XmlConvert]::ToTimeSpan" in scheduled_qualification
+    assert "execution limit is shorter than 30 hours" in scheduled_qualification
+    assert "task-registration.json" in scheduled_qualification
+    assert "wait_for_runner = $true" in scheduled_qualification
     scheduled_limit = re.search(
         r"ExecutionTimeLimit \(New-TimeSpan -Hours (\d+)\)", scheduled_qualification
     )
@@ -260,6 +266,10 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "-RunLevel Limited" in scheduled_qualification
     assert "-RunId" in scheduled_qualification
     assert "-OwnerException12h" in scheduled_qualification
+    assert "-WaitForRunner" in scheduled_qualification
+    assert "laptop-process-lifecycle.ps1" in detached_smoke
+    assert "Wait-IpegOwnedProcess -Process $process" in detached_smoke
+    assert "Only the scheduled 12-hour qualification may own" in detached_smoke
     assert "IPEG_LIVE" not in scheduled_qualification
     assert "--qualification-12h" in runner
     assert "laptop_qualification_run" in runner
@@ -277,6 +287,41 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "--service-receipt $postFlatReceipt" in aggressive_pilot
     assert '$env:IPEG_LIVE_ENABLED = "false"' in aggressive_pilot
     assert "Docker" not in aggressive_pilot
+
+
+def test_owned_process_waits_and_propagates_failure(tmp_path: Path) -> None:
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if shell is None:
+        pytest.skip("PowerShell is unavailable")
+    child = tmp_path / "owned_child.py"
+    child.write_text(
+        "import sys, time\ntime.sleep(0.35)\nraise SystemExit(int(sys.argv[1]))\n",
+        encoding="utf-8",
+    )
+    helper = Path("scripts/laptop-process-lifecycle.ps1").resolve()
+
+    def run_child(exit_code: int) -> subprocess.CompletedProcess[str]:
+        command = (
+            f". '{helper}'; "
+            "$timer = [Diagnostics.Stopwatch]::StartNew(); "
+            f"$child = Start-Process -FilePath '{Path(sys.executable).resolve()}' "
+            f"-ArgumentList @('{child}', '{exit_code}') -PassThru; "
+            "Wait-IpegOwnedProcess -Process $child -FailureLabel 'Synthetic runner'; "
+            "$timer.Stop(); Write-Output $timer.ElapsedMilliseconds"
+        )
+        return subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", command],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    success = run_child(0)
+    assert success.returncode == 0, success.stderr
+    assert int(success.stdout.strip().splitlines()[-1]) >= 300
+    failure = run_child(7)
+    assert failure.returncode != 0
+    assert "Synthetic runner failed closed with exit 7" in (failure.stdout + failure.stderr)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")

@@ -6,6 +6,7 @@ param(
     [ValidateSet(5, 30)]
     [int]$SmokeMinutes = 0,
     [switch]$OwnerException12h,
+    [switch]$WaitForRunner,
     [string]$RunId = ""
 )
 
@@ -20,9 +21,13 @@ if ($ProfileScope -ceq "LocalMachine") {
     . "$PSScriptRoot/laptop-load-env.ps1" -ProfilePath $ProfilePath
 }
 . "$PSScriptRoot/laptop-disable-shadow-telegram.ps1"
+. "$PSScriptRoot/laptop-process-lifecycle.ps1"
 
 if (($SmokeMinutes -eq 0) -eq (-not $OwnerException12h)) {
     throw "Choose exactly one detached smoke or 12-hour qualification mode"
+}
+if ($WaitForRunner -and -not $OwnerException12h) {
+    throw "Only the scheduled 12-hour qualification may own and wait for its runner"
 }
 if ($RunId) {
     if ($RunId -cnotmatch "^[0-9a-f]{32}$") {
@@ -178,6 +183,9 @@ try {
     Write-Host "RUN_ID=$env:IPEG_LAPTOP_RUN_ID"
     Write-Host "STATE=$env:IPEG_STATE_PATH"
     Write-Host "Live remains disabled."
+    if ($WaitForRunner) {
+        Wait-IpegOwnedProcess -Process $process -FailureLabel "Owned qualification runner"
+    }
 } finally {
     if ($null -ne $lockStream) { $lockStream.Dispose() }
     if (-not $spawned -and (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
