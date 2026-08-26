@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -247,6 +248,14 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "LastRunTime -ge $triggerStart" in scheduled_qualification
     assert "LastTaskResult -notin @(267009, 267011)" in scheduled_qualification
     assert "New-ScheduledTaskTrigger -Once" in scheduled_qualification
+    scheduled_limit = re.search(
+        r"ExecutionTimeLimit \(New-TimeSpan -Hours (\d+)\)", scheduled_qualification
+    )
+    runner_limit = re.search(r"maximum_hours=(\d+)", runner)
+    assert scheduled_limit is not None
+    assert runner_limit is not None
+    assert int(scheduled_limit.group(1)) >= int(runner_limit.group(1)) + 12
+    assert "ExecutionTimeLimit (New-TimeSpan -Minutes 10)" not in scheduled_qualification
     assert "-LogonType Interactive" in scheduled_qualification
     assert "-RunLevel Limited" in scheduled_qualification
     assert "-RunId" in scheduled_qualification
