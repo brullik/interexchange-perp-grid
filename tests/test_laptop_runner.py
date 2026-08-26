@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -40,12 +41,12 @@ def test_exact_local_main_requires_matching_branch_release_and_origin(
     sha = "a" * 40
     _git_main(tmp_path, sha)
     monkeypatch.setenv("IPEG_RELEASE_SHA", sha)
-    assert runner._require_exact_local_main(tmp_path) == sha  # type: ignore[attr-defined]
+    assert runner._require_exact_local_main(tmp_path) == sha
     (tmp_path / ".git/HEAD").write_text(
         "ref: refs/heads/codex/aggressive-symbiosis-v1\n", encoding="ascii"
     )
     with pytest.raises(RuntimeError, match="main branch"):
-        runner._require_exact_local_main(tmp_path)  # type: ignore[attr-defined]
+        runner._require_exact_local_main(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -144,12 +145,12 @@ def test_detached_qualification_orchestration_and_cleanup(
         monkeypatch.setattr(runner, target, record(name))
     monkeypatch.setattr(runner, "code_hash", lambda _path: "d" * 64)
     monkeypatch.setattr(runner, "config_hash", lambda _path: "e" * 64)
-    original_copy = runner.shutil.copy2
+    original_copy = shutil.copy2
 
     def copy_grid(source: Path, target: Path) -> Path:
         if failure_stage == "grid:publish":
             raise RuntimeError("PRIVATE_VALUE")
-        return original_copy(source, target)
+        return Path(original_copy(source, target))
 
     monkeypatch.setattr(runner.shutil, "copy2", copy_grid)
     for name, value in {
@@ -168,7 +169,7 @@ def test_detached_qualification_orchestration_and_cleanup(
         ["runner", "--repo-root", str(tmp_path), "--qualification-12h", "--run-id", run_id],
     )
 
-    result = runner.main()  # type: ignore[attr-defined]
+    result = runner.main()
     run_state = tmp_path / "state/laptop/qualification" / run_id
     assert result == (1 if failure_stage is not None else 0)
     assert (run_state / "runner.exit").read_text(encoding="ascii") == str(result)
