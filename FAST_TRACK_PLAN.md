@@ -1,151 +1,125 @@
-# Aggressive Symbiosis V1 — единственный fast-track план
+# Aggressive Fast Live V2 — единственный план
 
-Это единственный план реализации новой стратегии. Не создавай второй roadmap, PRD, ADR-каталог, requirements matrix, research backlog или параллельную систему статусов.
+Codex обновляет только эти чекбоксы и `STATUS.md`. Не создавать другой roadmap.
 
-## Рабочий режим
+## Правила ускорения
 
-- Базовая точка при подготовке пакета: `main` SHA `8ef3ad3dbf746917a5fa6cb46f366634ea5747f9`. Перед работой обязательно получить фактический `origin/main`; не откатывать более новые изменения.
-- Одна ветка: `codex/aggressive-symbiosis-v1`.
-- Один draft PR, который последовательно проходит все software-only этапы.
-- Существующие execution, private adapters, journal, reconciliation, recovery, emergency, Telegram, qualification и Windows laptop workflows считаются рабочим baseline. Их не переписывать без падающего теста, доказывающего необходимость узкого изменения.
-- Реализовать сначала один полный Wave 1 маршрут. Историю остальных маршрутов загружать on-demand после работающего вертикального среза.
-- После каждого этапа запускать целевые тесты. Перед checkpoint-коммитом запускать `make verify` или существующий Windows-эквивалент.
-- Не ждать длительную qualification внутри coding-сессии: реализовать и проверить runner на deterministic/short profile, затем использовать существующий durable Windows workflow. Длительное наблюдение не заменяет кодовые и fault-тесты.
-- Обновлять только чекбоксы этого файла и верхний блок `STATUS.md`. Исторический журнал `STATUS.md` не удалять и не переписывать.
+- Одна ветка `codex/aggressive-fast-live-v2`, один draft PR.
+- Один полный Wave 1 route раньше широкого охвата.
+- Не ждать длительных процессов и рыночной возможности во время кодинга.
+- Не удалять безопасный working code ради чистоты; сначала убрать активные зависимости и доказать tests.
+- Не менять execution/recovery/security foundation без regression test.
+- Не переходить на VPS.
 
-## A0 — зафиксировать baseline и границы изменения
+## A0 — baseline и установка контракта
 
-- [x] Получить актуальный `origin/main`, зафиксировать полный SHA и проверить отсутствие незавершённого активного PR по этой цели.
-- [x] Запустить текущий `make verify`/Windows-equivalent и сохранить честный baseline результата.
-- [x] Подтвердить `mode=shadow`, `live_enabled=false`, `live_orders_allowed=false` и отсутствие production submit.
-- [x] Составить краткую карту повторного использования существующих модулей; не создавать отдельный документ — записать одну строку решения в `STATUS.md`.
-- [x] Создать/продолжить одну ветку и один draft PR.
+- [x] Получить актуальный `origin/main`, проверить clean tree и записать exact baseline SHA.
+- [x] Проверить отсутствие другого активного PR этой цели; продолжить его, если существует.
+- [x] Установить `AGENTS.md`, `GOAL.md`, `FAST_TRACK_PLAN.md`, `ACCEPTANCE.md`, `config/AGGRESSIVE_FAST_LIVE_V2.yaml`.
+- [x] Запустить baseline `make verify` и Windows-equivalent; отличить существующий failure от нового regression.
+- [ ] Создать/продолжить один draft PR.
 
-**Выход:** текущая система зелёная либо каждое исходное падение явно отделено от новых изменений; live остаётся невозможным.
+**Exit:** baseline зафиксирован, contract files применены, existing behavior reproducible.
 
-## A1 — канонические 1m reference-spread bars
+## A1 — полностью убрать длительную квалификацию из live path
 
-- [x] Добавить минимальные typed models для закрытого source 1m OHLC и canonical 1m reference-spread OHLC.
-- [x] Расширить существующую adapter/history boundary минимальной public OHLC capability; native override только при воспроизводимом capability gap.
-- [x] Реализовать фиксированную canonical venue order и связь с двумя directed executable routes.
-- [x] Реализовать точные формулы `O_A/O_B`, `H_A/L_B`, `L_A/H_B`, `C_A/C_B` с детерминированной precision/rounding policy.
-- [x] Запретить forward-fill, несинхронные минуты, незакрытые бары, неоднозначные дубликаты и contract-version mismatch.
-- [x] Реализовать агрегацию 1m spread bars в 5m/15m/1h/4h/1d; прямой расчёт из старших биржевых свечей физически не использовать.
-- [x] Реализовать resumable, idempotent, rate-limit-aware on-demand history cache в существующем Parquet/DuckDB контуре.
-- [x] Добавить одну CLI-команду/подкоманду, которая для заданной пары строит reference bars, выводит coverage/quality/hash и ничего не торгует.
-- [x] Добавить deterministic fixtures и property tests для формул, пропусков, дубликатов, границ интервалов и restart-resume.
+- [ ] Найти все runtime/CLI/script/config/test зависимости live от epoch, duration, observation count, funding checkpoints и qualification artifact.
+- [ ] Удалить эти зависимости из live guard, canary, risk-stage, orchestrator и laptop path.
+- [ ] Убрать `--qualification` из актуальных canary/pilot/promotion команд.
+- [ ] Остановить создание/возобновление qualification epochs и scheduled qualification tasks.
+- [ ] Сделать старые qualification artifacts неавторитетными: они не разрешают и не блокируют live.
+- [ ] Сохранить недеструктивную совместимость SQLite, если физическое удаление legacy tables создаёт лишний риск.
+- [ ] Добавить тесты, доказывающие отсутствие любого 12h/24h/count-based live gate.
 
-**Выход:** одинаковый набор source bars создаёт byte/hash-identical reference bars; неполный интервал не участвует в модели.
+**Exit:** live path не читает qualification state; focused tests green.
 
-## A2 — historical reference model и агрессивная геометрия
+## A2 — FAST_LIVE_PREFLIGHT
 
-- [x] Реализовать целевое окно 180d, live minimum 90d и shadow-only minimum 30d.
-- [x] Рассчитать modal `S0` с точными tie-break rules и normal zone.
-- [x] Отдельно рассчитать `H_plus`, `H_minus`, диапазоны и положительное/отрицательное направление.
-- [x] Реализовать исторические convergence episodes, censoring, per-level convergence/adverse excursion и live gate 10 episodes + 70% within 24h.
-- [x] Сохранить текущие 24h/7d/30d median/MAD/quantile statistics как current-regime и long-tail guard.
-- [x] Реализовать regime-drift block и заморозку модели после первой части.
-- [x] Рассчитать уровни 20/40/60/80/100%, веса 10/15/20/25/30%, reference stop +15% и effective stop с adaptive tail.
-- [x] Версионировать и persist model identity: source-data hash, reference-bar hash, config hash, route identity, contract metadata version и code SHA.
-- [x] Старые/неполные persisted calibration records мигрировать однозначно либо fail closed; не угадывать недостающие поля.
+- [ ] Добавить typed preflight report и stable reason codes.
+- [ ] Привязать PASS к exact merged SHA/config/profile/native runtime/route/account/data generation/risk stage.
+- [ ] Проверять clean source, required checks, private capabilities, FLAT/orders/journal, clocks, data, metadata, fees, funding, depth, economics, margin and risk.
+- [ ] TTL 600 seconds, immediate invalidation on relevant change, single-use intent.
+- [ ] Записывать ignored `state/fast-live-preflight.json` без секретов.
+- [ ] Добавить positive и fail-closed tests каждого blocker.
 
-**Выход:** для обеих сторон пары модель и пять уровней воспроизводимы из истории и одинаковы после restart.
+**Exit:** preflight завершается немедленно и не накапливает длительность/счётчики.
 
-## A3 — полноценная persistent five-level state machine
+## A3 — 1m reference-spread vertical slice
 
-- [x] Хранить состояние каждого уровня: `ARMED`, `ENTRY_PENDING`, `OPEN`, `EXIT_PENDING`, `CLOSED_WAIT_REARM`, `DISABLED`.
-- [x] Выбирать `first_unfilled_crossed_level`, а не всегда `entry_levels_bps[0]`.
-- [x] Один уровень может быть заполнен ровно один раз до re-arm; шестая часть невозможна.
-- [x] При gap через несколько уровней открывать не более одной части за decision cycle, затем заново получать свежие L2 books, economics и risk.
-- [x] Каждой части принадлежит actual two-leg quantity/fills/fees/funding/target/stop/risk/model version.
-- [x] Реализовать reverse-grid exit глубоких частей и normal-zone exit первой части.
-- [x] Реализовать re-arm только после retreat минимум на 0.25 шага и повторного пересечения.
-- [x] После restart восстановить те же level states и запретить duplicate open/close.
+- [ ] Добавить минимальную OHLC capability в текущий adapter boundary.
+- [ ] Синхронизировать closed UTC minutes без forward-fill.
+- [ ] Реализовать Open/High/Low/Close формулы из `GOAL.md` через `Decimal`/fixed point.
+- [ ] Агрегировать 5m/15m/1h/4h/1d только из 1m spread bars.
+- [ ] Persist Parquet manifest/hash и DuckDB query/replay.
+- [ ] Реализовать on-demand backfill сначала для одного Wave 1 route.
+- [ ] Добавить deterministic fixtures, missing-minute и direct-1h-prohibition tests.
 
-**Выход:** deterministic replay демонстрирует уровни 1→5, частичные reverse exits, re-arm, повторную осцилляцию и полный stable-FLAT без превышения лимитов.
+**Exit:** один route имеет воспроизводимую 30-day модель без прямого старшего расчёта.
 
-## A4 — hybrid entry, aggressive economics и sizing
+## A4 — historical model и пять уровней
 
-- [x] Один общий evaluator требует одновременно reference trigger и свежий executable L2/VWAP edge.
-- [x] Использовать profile `config/AGGRESSIVE_SYMBIOSIS_V1.yaml` как единственный источник новых числовых параметров.
-- [x] Установить normal cost multiplier 1.35 и minimum expected net profit 0.15 USDT; canary override 0.01 действует только в locked canary stage.
-- [x] Учитывать 50% прогнозируемого положительного funding, 100% неблагоприятного и 2x adverse funding stress.
-- [x] Запрещать вход, если convergence PnL без положительного funding неположителен.
-- [x] Сохранять actual private taker fees; unknown fee/funding/depth блокирует вход.
-- [x] Рассчитывать полный размер с весами частей так, чтобы modelled route loss <=4.50 USDT, hard projected <=5.00 USDT.
-- [x] Для портфеля использовать normal admission <=45 USDT и hard projected <=50 USDT.
-- [x] После lot/step rounding и каждого фактического fill пересчитывать риск; уменьшать/пропускать часть при нехватке residual budget.
-- [x] Подключить executable stop и hard projected-loss exit в replay, shadow и live supervisor с одинаковым приоритетом.
-- [x] Реализовать deterministic route score и tie-breakers из profile.
+- [ ] Рассчитать mode/normal zone, directional extremes, q99/q99.9, episodes, convergence and adverse excursion.
+- [ ] Применить 30-day first-live minimum, 10 episodes, 70% convergence, regime block.
+- [ ] Создать пять уровней 20/40/60/80/100 и веса 10/15/20/25/30.
+- [ ] Persist arm/open/closed/rearm state каждого уровня и frozen model identity.
+- [ ] Исправить любой путь, который повторно использует только E1.
+- [ ] Реализовать sequential gap catch-up with fresh books between tranches.
+- [ ] Реализовать effective stop, reverse-grid exits и 0.25-step re-arm.
+- [ ] Добавить restart/replay tests полного пятиуровневого цикла.
 
-**Выход:** property/fault tests доказывают лимиты после каждого accepted action, реальную остановку по stop и отсутствие входа только по красивому, но неисполняемому reference spread.
+**Exit:** open/add/reverse-close/re-arm/stop survive restart deterministically.
 
-## A5 — единый evaluator в replay, shadow и live
+## A5 — economics, risk и parity
 
-- [x] Удалить/обойти упрощённые параллельные decision paths: один decision core, одна model identity и одни reason codes во всех режимах.
-- [x] Replay исполняет worst-case ordering, если внутри минуты невозможно доказать последовательность target/stop/level.
-- [x] Real-time shadow работает на живых public Wave 1 data, строит/обновляет on-demand history и ведёт пять simulated tranches.
-- [x] Live coordinator получает уже принятую immutable tranche intent и не повторяет стратегическую логику отдельно.
-- [x] Сохранить protected IOC, journal-before-submit, actual-fill reconciliation, third-venue hedge, emergency flatten и stable-FLAT.
-- [x] Проверить restart/process-kill в каждом активном level/action state.
-- [x] Добавить числовой decision breakdown и reason codes для reference, regime, economics, funding, risk, level, re-arm и exit.
-- [x] Обновить qualification evidence, включив все пять levels/weights/stops, historical/reference hashes и profile hash.
+- [ ] Применить 1.35x cost multiplier и 0.15 USDT normal minimum.
+- [ ] Учитывать положительный funding на 50%, отрицательный на 100%, stress 2x.
+- [ ] Требовать положительный convergence PnL без positive funding.
+- [ ] Рассчитать back-loaded sizing под 4.50/5 route и 45/50 portfolio limits.
+- [ ] Пересчитывать риск по actual fills перед следующей tranche.
+- [ ] Подключить executable stop к replay, shadow, canary и pilot.
+- [ ] Использовать один decision core; убрать упрощённую отдельную live-логику.
+- [ ] Сохранить IOC caps, actual-fill recovery, third venue, emergency flatten and stable-FLAT proofs.
 
-**Выход:** один и тот же event stream создаёт одинаковые decisions в replay и shadow; live принимает те же immutable intents, но не может быть включён тестами/конфигом.
+**Exit:** all targeted/property/fault/restart tests green.
 
-## A6 — Windows-native laptop workflow
+## A6 — Windows fast-live wrapper
 
-- [x] Создать один wrapper `scripts/laptop-aggressive.ps1`, переиспользующий существующие onboarding, native manifest, qualification, pilot и S4U scripts.
-- [x] Поддержать режимы `verify`, `shadow`, `qualify`, `canary`, `pilot`, `status`, `stop` без второго orchestration framework.
-- [x] `verify` устанавливает/проверяет exact Python 3.12 environment и запускает полный Windows-equivalent verify без production credentials.
-- [x] `shadow` запускает live-public aggressive shadow на ноутбуке и не допускает private submit.
-- [x] `qualify` связывает exact code/config/profile/reference-data/runtime hashes; существующее 12h owner exception можно использовать только в его уже разрешённых границах, не сокращая дальше.
-- [x] `canary` переиспользует local DPAPI/S4U secrets, отдельное owner consent, Telegram challenge и один minimum-notional/one-tranche route с hard risk <=1 USDT.
-- [x] `pilot` после successful canary поддерживает один route, все пять tranches и route risk <=5 USDT; каждое stage promotion требует отдельного owner confirmation.
-- [x] Любой failure возвращает shadow/live=false, сохраняет evidence и запускает существующий recovery/stable-FLAT путь.
-- [x] После успешного laptop pilot и минимум 28,800 секунд post-FLAT service создать exact-bound `state/laptop-aggressive-acceptance.json`.
-- [x] Любая VPS/deploy команда нового профиля fail closed без accepted laptop artifact.
+- [ ] Создать `scripts/laptop-fast-live.ps1` с `verify/onboard/preflight/canary/pilot/status/stop`.
+- [ ] Переиспользовать existing DPAPI/S4U/native runtime/Telegram/supervisor; не создавать second secret store.
+- [ ] Полностью убрать `qualify` action и dependency на `laptop-qualification.ps1` из нового пути.
+- [ ] Canary: one route/one tranche/min notional/<=1 USDT and separate owner consent.
+- [ ] Pilot: new preflight, separate owner consent, one route/up to five tranches/<=5 USDT.
+- [ ] После successful pilot stable-FLAT сразу создавать `state/laptop-fast-live-acceptance.json`; no 8h wait.
+- [ ] В `finally` всегда shadow/live=false и secret env cleanup.
+- [ ] Добавить Windows script/CLI contract tests.
 
-**Выход:** Codex может полностью проверить software/public-shadow без владельца; для secrets и real-money остаётся один точный owner action.
+**Exit:** native laptop runbook is one command surface with no long wait gate.
 
-## A7 — software acceptance, review и merge
+## A7 — exact-head verification, review и merge
 
-- [x] Запустить все focused tests и полный `make verify`/Windows-equivalent.
-- [x] Подтвердить обязательные checks: `verify`, `security`, `c4-critical-proof`, `c4-3-proof`, `docker-smoke` либо их актуальные protected-main successors.
-- [x] Сформировать exact-head replay/fault/restart/laptop-shadow artifacts без production submit.
-- [x] Получить независимый review, исправить P0/P1/P2 и разрешить все material threads.
-- [x] Обновить верхний блок `STATUS.md`, не удаляя историю.
-- [ ] Mark Ready и squash-merge единственный PR автоматически, только если head SHA неизменен и branch protection полностью зелёная.
+- [ ] Запустить focused suites, `make verify`, security, C4 critical/C4.3, Docker smoke and Windows-equivalent.
+- [ ] Доказать `production_submit_calls=0` для CI/replay/shadow.
+- [ ] Проверить migrations/restart from current baseline state.
+- [ ] Обновить `STATUS.md` честным exact-head evidence; не переписывать историческую хронику.
+- [ ] Получить independent review, исправить P0/P1/P2 и material threads.
+- [ ] Mark Ready и squash-merge при unchanged head and all required green.
 
-**Выход:** aggressive software и Windows public-shadow готовы на `main`; это не live-money authorization.
+**Exit:** one merged PR, exact merged SHA, no unresolved material defects.
 
-## A8 — owner-operated laptop live ladder
+## A8 — единственный owner action
 
-Этот этап нельзя подменять fabricated evidence и нельзя выполнять без локальных restricted credentials и явного решения владельца.
+После A0–A7 Codex завершает все независимые действия и выдаёт один owner action:
 
-- [ ] Выдать один owner action для локального DPAPI onboarding restricted trade-only/no-withdrawal credentials и его machine-readable validation.
-- [ ] После явного owner consent выполнить minimum-notional canary на ноутбуке.
-- [ ] Доказать filled open/close legs, exact fees/funding, reconciliation, stable-FLAT и post-FLAT service.
-- [ ] При дефекте вернуть live=false, исправить его в той же scoped цели/одном follow-up PR, повторить software gates и только затем новый owner-confirmed canary.
-- [ ] После успешного canary отдельным подтверждением выполнить laptop `pilot_a`: один route, до пяти уровней, hard route risk <=5 USDT.
-- [ ] Создать и проверить `state/laptop-aggressive-acceptance.json` с `accepted=true` и exact hashes.
+- [ ] локальный DPAPI/S4U onboarding restricted credentials;
+- [ ] запуск `preflight`;
+- [ ] отдельное подтверждение `canary`;
+- [ ] после stable-FLAT отдельное подтверждение `pilot`.
 
-**Выход:** алгоритм реально работает на ноутбуке. До этого VPS запрещён.
+Codex не просит секреты в чат и не принимает решение о реальных средствах за владельца.
 
-## A9 — только подготовка последующего VPS handoff
+## A9 — laptop acceptance и будущий VPS handoff
 
-- [x] Подготовить минимальный export/check command, который принимает только accepted laptop artifact и exact merged release identity.
-- [ ] Не выполнять VPS upload/deploy/qualification/live в этой цели.
-- [ ] В финальном отчёте указать одну следующую цель для VPS без создания новой инфраструктуры или стратегии.
-
-**Выход:** воспроизводимый handoff подготовлен, но ни один VPS не изменён.
-
-## Разрешённые причины остановки
-
-Codex останавливается только когда:
-
-1. A0–A7 полностью завершены и остался owner action из A8; или
-2. все A0–A9 завершены с честным accepted laptop live artifact; или
-3. обнаружен настоящий внешний blocker, который невозможно устранить кодом, тестом, mock/replay, публичным API или уже доступными GitHub правами.
-
-Перед остановкой завершить всю независимую работу. Не создавать owner action для обычного выбора реализации, долгого теста, CI, review, merge, документации или исправимого дефекта.
+- [ ] После реального pilot проверить exact evidence и stable-FLAT.
+- [ ] Создать ignored `state/laptop-fast-live-acceptance.json` с accepted=true.
+- [ ] Подготовить, но не выполнять VPS handoff, который fail-closed без exact accepted artifact/release.
+- [ ] Не подключаться к VPS и не переносить secrets.
