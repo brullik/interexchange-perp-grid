@@ -4,14 +4,12 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from decimal import Decimal
 from enum import StrEnum
 
 from interexchange_perp_grid.domain import Instrument, InstrumentKey, Venue
+from interexchange_perp_grid.spread_math import log_ratio_bps
 from interexchange_perp_grid.strategy import DirectedRouteKey
-
-_BPS_SCALE = Decimal("10000")
-_BPS_QUANTUM = Decimal("0.00000001")
 
 
 class SourceBarQuality(StrEnum):
@@ -343,6 +341,8 @@ def aggregate_reference_bars(
 ) -> tuple[AggregatedReferenceBar, ...]:
     if timeframe_minutes not in (5, 15, 60, 240, 1440):
         raise ValueError("unsupported reference aggregation timeframe")
+    if any(not isinstance(bar, ReferenceSpreadBar) for bar in bars):
+        raise TypeError("reference aggregates accept only canonical one-minute spread bars")
     _validate_requested_window(window_start, window_end)
     if not bars and (
         window_start is None
@@ -576,10 +576,7 @@ def _source_rejection_reason(source: SourceMinuteBar) -> ReferenceRejectionReaso
 
 
 def _spread_bps(numerator: Decimal, denominator: Decimal) -> Decimal:
-    with localcontext() as context:
-        context.prec = 50
-        value = (numerator / denominator).ln() * _BPS_SCALE
-        return value.quantize(_BPS_QUANTUM, rounding=ROUND_HALF_EVEN)
+    return log_ratio_bps(numerator, denominator)
 
 
 def _require_utc_minute(value: datetime) -> None:

@@ -203,6 +203,14 @@ function Invoke-LiveEntry([string]$Stage) {
         $env:IPEG_LIVE_ENABLED = "false"
         Remove-Item Env:IPEG_LOCAL_UNLOCK_SECRET -ErrorAction SilentlyContinue
         if ($exitCode -ne 0) { throw "Fast-live $Stage failed closed before durable ownership" }
+        $resultJson = $output | Where-Object {
+            $_ -is [string] -and $_.TrimStart().StartsWith("{")
+        } | Select-Object -Last 1
+        if (-not $resultJson) { throw "Fast-live $Stage result is not machine-readable" }
+        $entry = $resultJson | ConvertFrom-Json
+        if ($entry.success -ne $true -or -not $entry.queued_pair_action_id) {
+            throw "Fast-live $Stage lacks durable pair ownership"
+        }
         $timeout = if ($Stage -ceq "canary") { 900 } else { 86400 }
         $flat = Wait-StableFlat -PriorCompleted ([int]$before.completed_fast_live_round_trips) `
             -TimeoutSeconds $timeout
@@ -214,6 +222,8 @@ function Invoke-LiveEntry([string]$Stage) {
             stable_flat = $true
             active_action_count = [int]$flat.active_action_count
             completed_fast_live_round_trips = [int]$flat.completed_fast_live_round_trips
+            pair_action_id = [string]$entry.queued_pair_action_id
+            route = [string]$entry.route
             production_submit_scope = "owner_confirmed_$Stage"
         } | ConvertTo-Json | Set-Content -LiteralPath $evidencePath -Encoding utf8
         Write-Host "Fast-live $Stage completed with exchange-verified stable FLAT."

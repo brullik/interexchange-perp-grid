@@ -159,6 +159,10 @@ async def _prepare_fast_live(
             "projected_stress_usdt": "0.8",
             "activation_hash": preflight_sha256,
             "fast_live_preflight_expires_at": expires_at.isoformat(),
+            "initial_adverse_funding_reserve_usdt": "0.1",
+            "initial_remaining_close_fees_usdt": "0.1",
+            "initial_measured_book_impact_usdt": "0.1",
+            "initial_total_reserves_usdt": "0.1",
         },
         "0" * 64,
         now,
@@ -166,6 +170,48 @@ async def _prepare_fast_live(
         fast_live_preflight_sha256=preflight_sha256,
         fast_live_preflight_expires_at=expires_at,
     )
+
+
+@pytest.mark.asyncio
+async def test_final_v2_reserves_update_twice_before_submit_and_never_after_order_event(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    now = datetime.now(UTC)
+    action = await _prepare_fast_live(
+        journal,
+        pair_id="v2-final-reserves",
+        base="BTC",
+        preflight_sha256="f" * 64,
+        expires_at=now + timedelta(minutes=10),
+        now=now,
+    )
+    components = {
+        "initial_adverse_funding_reserve_usdt": Decimal("0.2"),
+        "initial_remaining_close_fees_usdt": Decimal("0.3"),
+        "initial_measured_book_impact_usdt": Decimal("0.4"),
+        "initial_total_reserves_usdt": Decimal("0.5"),
+    }
+    first = await journal.update_final_opening_reserves(action.pair_action_id, components)
+    await journal.mark_submit_attempted(
+        action.pair_action_id,
+        tuple(leg.client_order_id for leg in action.legs),
+    )
+    second = await journal.update_final_opening_reserves(action.pair_action_id, components)
+
+    assert first.risk_reservation["initial_total_reserves_usdt"] == "0.5"
+    assert second.state == LiveActionState.SUBMITTING
+    await journal.record_order_event(
+        action.pair_action_id,
+        replace(
+            _event(filled="0", status=PrivateOrderStatus.OPEN),
+            client_order_id=action.legs[0].client_order_id,
+        ),
+        "post-submit-event",
+    )
+    with pytest.raises(RuntimeError, match="after an order event"):
+        await journal.update_final_opening_reserves(action.pair_action_id, components)
 
 
 @pytest.mark.asyncio
@@ -567,10 +613,16 @@ async def test_actual_fill_repricing_blocks_next_tranche_at_hard_route_limit(
             "portfolio_total_usdt": "4.5",
             "actual_entry_spread_bps": "20",
             "fill_event_watermark": watermark,
+            "actual_open_fees_usdt": "0.1",
+            "remaining_close_fees_usdt": "0.1",
+            "initial_measured_book_impact_usdt": "0.2",
+            "adverse_funding_usdt": "0.05",
+            "other_reserves_usdt": "0.3",
         },
     )
 
     assert updated.risk_reservation["actual_fill_risk"]["incremental_stress_usdt"] == "4.5"
+    assert updated.risk_reservation["actual_fill_risk"]["actual_open_fees_usdt"] == "0.1"
     with pytest.raises(RuntimeError, match="maximum live route stress"):
         await _prepare(
             journal,

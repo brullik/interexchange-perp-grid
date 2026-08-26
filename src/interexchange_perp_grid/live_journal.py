@@ -1629,6 +1629,96 @@ class LiveOrderJournal:
             latest[str(row["client_order_id"])] = _private_order_from_json(str(row["payload_json"]))
         return tuple(latest[key] for key in sorted(latest))
 
+    async def update_final_opening_reserves(
+        self,
+        pair_action_id: str,
+        components: dict[str, Decimal],
+        *,
+        now: datetime | None = None,
+    ) -> LiveJournalAction:
+        """Persist component-wise conservative V2 reserves before any transport submit."""
+        allowed = {
+            "initial_adverse_funding_reserve_usdt",
+            "initial_remaining_close_fees_usdt",
+            "initial_measured_book_impact_usdt",
+            "initial_total_reserves_usdt",
+        }
+        if set(components) != allowed or any(
+            not value.is_finite() or value < 0 for value in components.values()
+        ):
+            raise ValueError("final opening reserve components are invalid")
+        return await asyncio.to_thread(
+            self._update_final_opening_reserves_sync,
+            pair_action_id,
+            components,
+            now or datetime.now(UTC),
+        )
+
+    def _update_final_opening_reserves_sync(
+        self,
+        pair_action_id: str,
+        components: dict[str, Decimal],
+        now: datetime,
+    ) -> LiveJournalAction:
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            action = self._load_in_transaction(database, pair_action_id)
+            if (
+                action is None
+                or action.state not in {LiveActionState.PREPARED, LiveActionState.SUBMITTING}
+                or action.risk_reservation.get("strategy") != "AGGRESSIVE_FAST_LIVE_V2"
+            ):
+                database.rollback()
+                raise RuntimeError("final opening reserves require one pre-submit V2 action")
+            observed_events = database.execute(
+                "SELECT COUNT(*) FROM live_order_events AS event "
+                "JOIN live_order_legs AS leg ON leg.client_order_id = event.client_order_id "
+                "WHERE leg.pair_action_id = ?",
+                (pair_action_id,),
+            ).fetchone()
+            if observed_events is None or int(observed_events[0]) != 0:
+                database.rollback()
+                raise RuntimeError("final opening reserves cannot change after an order event")
+            reservation = dict(action.risk_reservation)
+            for key, current in components.items():
+                previous = Decimal(str(reservation[key]))
+                if not previous.is_finite() or previous < 0:
+                    database.rollback()
+                    raise RuntimeError("stored opening reserve component is invalid")
+                reservation[key] = str(max(previous, current))
+            database.execute(
+                "UPDATE live_pair_actions SET risk_reservation_json = ?, updated_at = ? "
+                "WHERE pair_action_id = ?",
+                (
+                    json.dumps(reservation, default=str, sort_keys=True),
+                    now.isoformat(),
+                    pair_action_id,
+                ),
+            )
+            database.execute(
+                """
+                INSERT INTO live_action_transitions (
+                    pair_action_id, from_state, to_state, details_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    pair_action_id,
+                    action.state.value,
+                    action.state.value,
+                    json.dumps(
+                        {"final_opening_reserves": components},
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    now.isoformat(),
+                ),
+            )
+            database.commit()
+        updated = self._load_sync(pair_action_id)
+        if updated is None:
+            raise RuntimeError("updated V2 action disappeared")
+        return updated
+
     async def update_actual_risk(
         self,
         pair_action_id: str,
@@ -1659,7 +1749,15 @@ class LiveOrderJournal:
             "actual_entry_spread_bps",
             "fill_event_watermark",
         }
-        if set(actual_risk) != required:
+        breakdown_fields = {
+            "actual_open_fees_usdt",
+            "remaining_close_fees_usdt",
+            "initial_measured_book_impact_usdt",
+            "adverse_funding_usdt",
+            "other_reserves_usdt",
+        }
+        supplied = set(actual_risk)
+        if not required.issubset(supplied) or not supplied.issubset(required | breakdown_fields):
             raise ValueError("actual risk snapshot fields are invalid")
         incremental = Decimal(str(actual_risk["incremental_stress_usdt"]))
         actual_spread = Decimal(str(actual_risk["actual_entry_spread_bps"]))
@@ -1667,6 +1765,11 @@ class LiveOrderJournal:
             raise ValueError("actual risk snapshot values are invalid")
         if int(str(actual_risk["fill_event_watermark"])) != expected_event_watermark:
             raise ValueError("actual risk watermark is inconsistent")
+        breakdown = {
+            key: Decimal(str(actual_risk[key])) for key in breakdown_fields if key in actual_risk
+        }
+        if any(not value.is_finite() or value < 0 for value in breakdown.values()):
+            raise ValueError("actual risk cost breakdown is invalid")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             observed_watermark = self._event_watermark_in_transaction(database)
@@ -1705,6 +1808,7 @@ class LiveOrderJournal:
                 "portfolio_total_usdt": str(portfolio_total),
                 "actual_entry_spread_bps": str(actual_spread),
                 "fill_event_watermark": expected_event_watermark,
+                **{key: str(value) for key, value in breakdown.items()},
             }
             reservation = dict(action.risk_reservation)
             reservation["actual_fill_risk"] = authoritative_risk

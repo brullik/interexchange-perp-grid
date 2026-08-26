@@ -33,6 +33,7 @@ from interexchange_perp_grid.aggressive_evaluator import (
 from interexchange_perp_grid.aggressive_grid import (
     AggressiveGridStore,
     ExternalGridLevelProjection,
+    FrozenGridSizingPlan,
     GridLegFill,
     GridLevelState,
     GridTrancheOwnership,
@@ -51,6 +52,7 @@ from interexchange_perp_grid.aggressive_live import (
     AggressiveLaptopLiveStage,
     AggressiveLiveIntentEnvelope,
     aggressive_intent_sha256,
+    frozen_grid_sizing_from_mapping,
     load_aggressive_fast_live_intent,
     load_aggressive_live_intent,
     save_aggressive_fast_live_intent,
@@ -872,10 +874,252 @@ def _journal_action_effective_stress(risk_reservation: object) -> Decimal:
     return max(planned, repriced)
 
 
+def _fast_live_cost_evidence_complete(action: LiveJournalAction) -> bool:
+    fees = action.risk_reservation.get("initial_private_taker_fee_rates")
+    rates = action.risk_reservation.get("initial_funding_rates")
+    timestamps = action.risk_reservation.get("initial_funding_next_timestamp_ms")
+    actual = action.risk_reservation.get("actual_fill_risk")
+    if (
+        not isinstance(fees, dict)
+        or not isinstance(rates, dict)
+        or not isinstance(timestamps, dict)
+        or not isinstance(actual, dict)
+    ):
+        return False
+    funding_timestamps: list[int] = []
+    for venue in (action.route.long_venue.value, action.route.short_venue.value):
+        try:
+            fee = Decimal(str(fees[venue]))
+            rate = Decimal(str(rates[venue]))
+            timestamp = int(str(timestamps[venue]))
+        except (KeyError, ValueError, ArithmeticError):
+            return False
+        if not fee.is_finite() or fee < 0 or not rate.is_finite() or timestamp <= 0:
+            return False
+        funding_timestamps.append(timestamp)
+    try:
+        actual_values = tuple(
+            Decimal(str(actual[key]))
+            for key in (
+                "incremental_stress_usdt",
+                "route_total_usdt",
+                "portfolio_total_usdt",
+                "actual_entry_spread_bps",
+                "actual_open_fees_usdt",
+                "remaining_close_fees_usdt",
+                "initial_measured_book_impact_usdt",
+                "adverse_funding_usdt",
+                "other_reserves_usdt",
+            )
+        )
+        fill_watermark = int(str(actual["fill_event_watermark"]))
+    except (KeyError, ValueError, ArithmeticError):
+        return False
+    if any(
+        int(action.created_at.timestamp() * 1000)
+        <= timestamp
+        <= int(action.updated_at.timestamp() * 1000)
+        for timestamp in funding_timestamps
+    ):
+        try:
+            realised_funding = Decimal(str(actual["realized_funding_usdt"]))
+        except (KeyError, ValueError, ArithmeticError):
+            return False
+        if not realised_funding.is_finite():
+            return False
+    return not (
+        any(not value.is_finite() for value in actual_values)
+        or min(actual_values[:3]) <= 0
+        or min(actual_values[4:]) < 0
+        or fill_watermark <= 0
+    )
+
+
 def _required_order_decimal(value: Decimal | None) -> Decimal:
     if value is None or not value.is_finite():
         raise ValueError("live journal fill value is missing")
     return value
+
+
+async def _fast_live_grid_ownership(
+    journal: LiveOrderJournal,
+    action: LiveJournalAction,
+) -> GridTrancheOwnership:
+    orders = {
+        order.client_order_id: order
+        for order in await journal.latest_order_events(action.pair_action_id)
+    }
+    opening_ids = action.risk_reservation.get("opening_client_order_ids")
+    actual = action.risk_reservation.get("actual_fill_risk")
+    if not isinstance(opening_ids, dict) or not isinstance(actual, dict):
+        raise RuntimeError("V2 journal ownership is incomplete")
+    long_order = orders[str(opening_ids["long"])]
+    short_order = orders[str(opening_ids["short"])]
+    if (
+        long_order.filled_base_quantity <= 0
+        or long_order.filled_base_quantity != short_order.filled_base_quantity
+    ):
+        raise RuntimeError("V2 opening legs are not quantity matched")
+    return GridTrancheOwnership(
+        tranche_id=action.tranche_id,
+        normalized_base_quantity=long_order.filled_base_quantity,
+        legs=(
+            GridLegFill(
+                action.route.long_venue,
+                long_order.symbol,
+                Side.BUY,
+                long_order.filled_base_quantity,
+                _required_order_decimal(long_order.average_price),
+                _required_order_decimal(long_order.fee_usdt),
+                Decimal(0),
+            ),
+            GridLegFill(
+                action.route.short_venue,
+                short_order.symbol,
+                Side.SELL,
+                short_order.filled_base_quantity,
+                _required_order_decimal(short_order.average_price),
+                _required_order_decimal(short_order.fee_usdt),
+                Decimal(0),
+            ),
+        ),
+        executable_entry_spread_bps=Decimal(str(actual["actual_entry_spread_bps"])),
+        reverse_target_bps=Decimal(str(action.risk_reservation["target_exit_spread_bps"])),
+        effective_stop_bps=Decimal(str(action.risk_reservation["effective_stop_bps"])),
+        maximum_holding_deadline=datetime.fromisoformat(
+            str(action.risk_reservation["hard_holding_deadline"])
+        ),
+        reserved_stress_usdt=_journal_action_effective_stress(action.risk_reservation),
+        entry_slippage_usdt=Decimal(0),
+        realised_pnl_usdt=Decimal(0),
+        unrealised_pnl_usdt=Decimal(0),
+        opened_at=datetime.fromisoformat(str(action.risk_reservation["route_opened_at"])),
+    )
+
+
+async def _synchronize_fast_live_journal_grid(
+    settings: Settings,
+    grid: AggressiveGridStore,
+    route_identity: str,
+) -> bool:
+    """Repair the local strategy fence from the authoritative V2 journal."""
+    journal = LiveOrderJournal(Path(settings.storage.sqlite_path))
+    await journal.initialise()
+    active = await journal.active_actions()
+    completed = await journal.completed_actions_since(datetime.fromtimestamp(0, UTC), "0" * 64)
+    all_v2 = tuple(
+        action
+        for action in (*completed, *active)
+        if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+    )
+    route_actions = tuple(action for action in all_v2 if action.route.value == route_identity)
+    latest_by_level: dict[int, LiveJournalAction] = {}
+    for action in sorted(route_actions, key=lambda item: (item.updated_at, item.pair_action_id)):
+        reservation = action.risk_reservation
+        level = int(str(reservation["level_index"]))
+        cycle = int(str(reservation["decision_cycle"]))
+        if not 1 <= level <= 5 or cycle < 0:
+            raise RuntimeError("V2 journal grid identity is invalid")
+        latest_by_level[level] = action
+
+    projections: list[ExternalGridLevelProjection] = []
+    levels = {item.level_index: item for item in grid.levels(route_identity)}
+    non_canary = tuple(
+        action
+        for action in route_actions
+        if action.risk_reservation.get("stage") != AggressiveLaptopLiveStage.CANARY.value
+    )
+    if non_canary:
+        latest_plan_action = max(
+            non_canary,
+            key=lambda action: int(str(action.risk_reservation["decision_cycle"])),
+        )
+        latest_level = int(str(latest_plan_action.risk_reservation["level_index"]))
+        latest_cycle = int(str(latest_plan_action.risk_reservation["decision_cycle"]))
+        latest_was_rearmed = (
+            latest_plan_action.state == LiveActionState.FLAT
+            and levels[latest_level].state == GridLevelState.ARMED
+            and grid.next_decision_cycle(route_identity) > latest_cycle
+        )
+        if not latest_was_rearmed:
+            plan = frozen_grid_sizing_from_mapping(
+                latest_plan_action.risk_reservation.get("grid_sizing_plan")
+            )
+            active_plans = {
+                frozen_grid_sizing_from_mapping(action.risk_reservation.get("grid_sizing_plan"))
+                for action in active
+                if action.route.value == route_identity
+                and action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+                and action.risk_reservation.get("stage") != AggressiveLaptopLiveStage.CANARY.value
+            }
+            if active_plans and active_plans != {plan}:
+                raise RuntimeError("active V2 journal sizing plans are inconsistent")
+            observed = grid.frozen_sizing_plan(route_identity)
+            if observed is None:
+                grid.freeze_sizing_plan(plan)
+            elif observed != plan:
+                raise RuntimeError("V2 journal frozen sizing conflicts with local grid")
+    journal_cycles = {
+        (
+            int(str(action.risk_reservation["level_index"])),
+            int(str(action.risk_reservation["decision_cycle"])),
+        )
+        for action in route_actions
+    }
+    for current in levels.values():
+        if (
+            current.state == GridLevelState.ENTRY_PENDING
+            and current.pending_decision_cycle is not None
+            and (current.level_index, current.pending_decision_cycle) not in journal_cycles
+        ):
+            raise RuntimeError("orphan V2 grid reservation requires fail-closed recovery")
+    for level, action in sorted(latest_by_level.items()):
+        cycle = int(str(action.risk_reservation["decision_cycle"]))
+        current = levels[level]
+        if action.state == LiveActionState.FLAT:
+            # ARMED with an already-consumed cycle proves a later durable rearm; do not replay
+            # the historical close and erase the new-crossing fence.
+            if (
+                current.state == GridLevelState.ARMED
+                and grid.next_decision_cycle(route_identity) > cycle
+            ):
+                continue
+            ownership = await _fast_live_grid_ownership(journal, action)
+            projections.append(
+                ExternalGridLevelProjection(
+                    level,
+                    GridLevelState.CLOSED_WAIT_REARM,
+                    Decimal(0),
+                    decision_cycle=cycle,
+                    ownership=ownership,
+                )
+            )
+        elif action.state in {LiveActionState.HEDGED, LiveActionState.CLOSING}:
+            ownership = await _fast_live_grid_ownership(journal, action)
+            projections.append(
+                ExternalGridLevelProjection(
+                    level,
+                    GridLevelState.OPEN,
+                    _journal_action_effective_stress(action.risk_reservation),
+                    ownership=ownership,
+                )
+            )
+        else:
+            projections.append(
+                ExternalGridLevelProjection(
+                    level,
+                    GridLevelState.ENTRY_PENDING,
+                    _journal_action_effective_stress(action.risk_reservation),
+                    decision_cycle=cycle,
+                )
+            )
+    if projections:
+        grid.synchronize_journal_levels(
+            route_identity,
+            tuple(projections),
+            now=datetime.now(UTC),
+        )
+    return any(action.state != LiveActionState.FLAT for action in all_v2)
 
 
 @app.command()
@@ -1607,8 +1851,36 @@ def aggressive_fast_live_intent_once(
     profile_sha256 = hashlib.sha256(profile.read_bytes()).hexdigest()
     if loaded_model.strategy_profile_sha256 != profile_sha256:
         raise typer.BadParameter("fast-live model/profile identity mismatch")
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    grid_now = datetime.now(UTC)
+    for direction in (loaded_model.positive.direction, loaded_model.negative.direction):
+        grid_store.initialise_route(
+            loaded_model,
+            direction,
+            now=grid_now,
+            rearm_retreat_step_fraction=Decimal("0.25"),
+        )
+
+    async def synchronize_grid() -> bool:
+        transitional = False
+        for route_identity in (loaded_model.positive_route, loaded_model.negative_route):
+            transitional = (
+                await _synchronize_fast_live_journal_grid(
+                    settings,
+                    grid_store,
+                    route_identity,
+                )
+                or transitional
+            )
+        return transitional
+
+    if asyncio.run(synchronize_grid()):
+        typer.echo(json.dumps({"status": "WAITING_FOR_DURABLE_LIVE_TRANSITION"}))
+        raise typer.Exit(code=3)
     fees = asyncio.run(_current_private_fee_rates(loaded_model))
     intents: list[AggressiveTrancheIntent] = []
+    accepted_decisions: list[AggressiveStrategyDecision] = []
     result = asyncio.run(
         _run_aggressive_shadow_once(
             settings,
@@ -1627,6 +1899,8 @@ def aggressive_fast_live_intent_once(
                 else AggressiveEntryStage.NORMAL
             ),
             intent_sink=intents,
+            decision_sink=accepted_decisions,
+            allow_journal_rearm=True,
         )
     )
     if len(intents) != 1 or (
@@ -1635,20 +1909,32 @@ def aggressive_fast_live_intent_once(
         typer.echo(json.dumps(result, default=str, sort_keys=True))
         raise typer.Exit(code=3)
     intent = intents[0]
-    grid_store = AggressiveGridStore(grid.resolve())
-    grid_store.initialise()
+    if len(accepted_decisions) != 1 or accepted_decisions[0].intent != intent:
+        raise RuntimeError("fast-live decision/sizing evidence is ambiguous")
+    sizing_plan = grid_store.frozen_sizing_plan(intent.route_identity) or FrozenGridSizingPlan(
+        route_identity=intent.route_identity,
+        model_sha256=intent.model_sha256,
+        full_route_base_quantity=accepted_decisions[0].sizing.full_route_base_quantity,
+        tranche_base_quantities=accepted_decisions[0].sizing.tranche_base_quantities,
+        tranche_projected_losses_usdt=(accepted_decisions[0].sizing.tranche_projected_losses_usdt),
+        projected_margin_usdt=accepted_decisions[0].sizing.projected_margin_usdt,
+        created_at=intent.decided_at,
+    )
+    generated_at = datetime.now(UTC)
     binding = build_aggressive_fast_live_binding(
         loaded_model,
         runtime,
         grid_store,
         route=intent.route_identity,
         profile_sha256=profile_sha256,
+        now=generated_at,
     )
     envelope = AggressiveFastLiveIntentEnvelope(
         schema_version=2,
-        generated_at=datetime.now(UTC),
+        generated_at=generated_at,
         activation_binding_sha256=binding.binding_sha256,
         intent=intent,
+        sizing_plan=sizing_plan,
         intent_sha256=aggressive_intent_sha256(intent),
     )
     save_aggressive_fast_live_intent(output.resolve(), envelope)
@@ -1763,6 +2049,8 @@ def _run_fast_live_cli(
             confirmation,
             envelope.intent,
             binding,
+            envelope.sizing_plan,
+            grid.resolve(),
             stage=stage,
             exact_merged_clean_source=_exact_merged_main_ready(repo_root),
             preflight_only=preflight_only,
@@ -2059,7 +2347,14 @@ def fast_live_acceptance(
         raise typer.BadParameter("fast-live acceptance identity is stale")
     grid_store = AggressiveGridStore(grid.resolve())
     grid_store.initialise()
-    build_aggressive_fast_live_binding(
+    asyncio.run(
+        _synchronize_fast_live_journal_grid(
+            settings,
+            grid_store,
+            preflight_report.identity.route,
+        )
+    )
+    current_binding = build_aggressive_fast_live_binding(
         loaded_model,
         runtime,
         grid_store,
@@ -2081,27 +2376,74 @@ def fast_live_acceptance(
             raise typer.BadParameter(f"{expected} evidence is not stable-FLAT")
         return {str(key): value for key, value in payload.items()}
 
-    load_stage(canary_evidence.resolve(), "canary")
-    load_stage(pilot_evidence.resolve(), "pilot")
+    canary_stage = load_stage(canary_evidence.resolve(), "canary")
+    pilot_stage = load_stage(pilot_evidence.resolve(), "pilot")
     state_path = Path(settings.storage.sqlite_path)
 
-    async def audit() -> tuple[tuple[LiveJournalAction, ...], tuple[LiveJournalAction, ...]]:
+    async def audit() -> tuple[
+        tuple[LiveJournalAction, ...],
+        tuple[LiveJournalAction, ...],
+        int,
+        frozenset[str],
+    ]:
         await initialise_state(state_path)
         journal = LiveOrderJournal(state_path)
         await journal.initialise()
         active = await journal.active_actions()
         completed = await journal.completed_actions_since(datetime.fromtimestamp(0, UTC), "0" * 64)
         fast = tuple(
-            action
-            for action in completed
-            if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+            sorted(
+                (
+                    action
+                    for action in completed
+                    if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+                ),
+                key=lambda action: action.pair_action_id,
+            )
         )
-        return active, fast
+        complete_actual_orders: set[str] = set()
+        for action in fast:
+            orders = tuple(
+                order
+                for order in await journal.latest_order_events(action.pair_action_id)
+                if order.filled_base_quantity > 0
+            )
+            if len(orders) == 4 and all(
+                order.status is not None
+                and order.status.value == "FILLED"
+                and order.average_price is not None
+                and order.average_price.is_finite()
+                and order.average_price > 0
+                and order.fee_usdt is not None
+                and order.fee_usdt.is_finite()
+                and order.fee_usdt >= 0
+                for order in orders
+            ):
+                complete_actual_orders.add(action.pair_action_id)
+        return (
+            active,
+            fast,
+            await journal.event_watermark(),
+            frozenset(complete_actual_orders),
+        )
 
-    active_actions, fast_actions_raw = asyncio.run(audit())
-    fast_actions = fast_actions_raw
-    if active_actions:
+    active_before, fast_before, journal_watermark_before, actual_orders_before = asyncio.run(
+        audit()
+    )
+    if active_before:
         raise typer.BadParameter("fast-live acceptance requires zero active journal actions")
+    fresh_flat = asyncio.run(collect_authoritative_live_flat_evidence(settings, loaded_model.base))
+    active_actions, fast_actions, journal_watermark_after, actual_orders_after = asyncio.run(
+        audit()
+    )
+    if (
+        not fresh_flat.stable_flat
+        or active_actions
+        or fast_actions != fast_before
+        or actual_orders_after != actual_orders_before
+        or journal_watermark_after != journal_watermark_before
+    ):
+        raise typer.BadParameter("fresh exchange-verified stable-FLAT evidence is required")
     canary_actions = tuple(
         action
         for action in fast_actions
@@ -2116,11 +2458,21 @@ def fast_live_acceptance(
         raise typer.BadParameter("fast-live acceptance requires one canary and 1-5 pilot cycles")
     if len(fast_actions) != len(canary_actions) + len(pilot_actions):
         raise typer.BadParameter("fast-live journal contains an unauthorized stage")
+    if actual_orders_after != {action.pair_action_id for action in fast_actions}:
+        raise typer.BadParameter("fast-live journal lacks complete actual fill and fee evidence")
+    if canary_stage.get("pair_action_id") != canary_actions[0].pair_action_id or pilot_stage.get(
+        "pair_action_id"
+    ) not in {action.pair_action_id for action in pilot_actions}:
+        raise typer.BadParameter("fast-live stage evidence is not bound to the durable journal")
     if any(
         not is_completed_normal_paired_cycle(action)
+        or not _fast_live_cost_evidence_complete(action)
         or action.activation_hash is None
         or action.risk_reservation.get("activation_hash") != action.activation_hash
+        or action.risk_reservation.get("aggressive_binding_sha256")
+        != current_binding.binding_sha256
         or action.risk_reservation.get("strategy_profile_sha256") != profile_sha256
+        or action.route.value != current_binding.route
         or action.recovery_action is not None
         for action in fast_actions
     ):
@@ -2162,6 +2514,9 @@ def fast_live_acceptance(
         "stable_flat": True,
         "active_action_count": 0,
         "unknown_action_count": 0,
+        "final_private_event_watermark": fresh_flat.private_event_watermark,
+        "final_reconciliation_sha256": fresh_flat.reconciliation_sha256,
+        "final_journal_event_watermark": journal_watermark_after,
         "p0_findings": 0,
         "p1_findings": 0,
         "production_submit_scope": "owner_confirmed_canary_and_pilot_only",
@@ -2365,7 +2720,10 @@ def _aggressive_reserves_per_base(settings: Settings, price: Decimal) -> CostRes
         reconciliation_forced_exit_usdt=(
             unit * settings.execution.reconciliation_forced_exit_reserve_bps
         ),
-        liquidation_distance_usdt=Decimal(0),
+        # Charge a distinct liquidation-proximity reserve in addition to normal exit slippage.
+        # This keeps margin/leverage checks from being the only protection while paired
+        # recovery is still in progress.
+        liquidation_distance_usdt=unit * settings.live.canary_close_slippage_cap_bps,
     )
 
 
@@ -2395,9 +2753,7 @@ def _aggressive_effective_stop(
     direction_model = (
         model.positive if direction == DivergenceDirection.POSITIVE else model.negative
     )
-    tail = model.window_30d.q999_abs_bps
-    if tail is None:
-        return direction_model.reference_stop_bps
+    tail = direction_model.directional_q999_bps
     adaptive = (
         model.s0_bps + tail if direction == DivergenceDirection.POSITIVE else model.s0_bps - tail
     )
@@ -2422,6 +2778,8 @@ async def _run_aggressive_shadow_once(
     private_fee_rates: dict[Venue, Decimal] | None = None,
     entry_stage: AggressiveEntryStage = AggressiveEntryStage.NORMAL,
     intent_sink: list[AggressiveTrancheIntent] | None = None,
+    decision_sink: list[AggressiveStrategyDecision] | None = None,
+    allow_journal_rearm: bool = False,
 ) -> dict[str, object]:
     model = load_historical_model(model_path)
     profile = load_aggressive_decision_policy(profile_path)
@@ -2459,6 +2817,21 @@ async def _run_aggressive_shadow_once(
     core = AggressiveDecisionCore(profile.policy)
     bridge = AggressiveShadowDecisionBridge(core, grid)
     portfolio = AggressiveShadowPortfolio(grid, profile.policy)
+    rearmed: dict[str, tuple[int, ...]] = {}
+    if allow_journal_rearm:
+        for route, direction in (
+            (model.positive_route, model.positive.direction),
+            (model.negative_route, model.negative.direction),
+        ):
+            rearmed[route] = portfolio.rearm_stable_flat(
+                route,
+                reference_spread_bps=(
+                    reference_bar.high_bps
+                    if direction == DivergenceDirection.POSITIVE
+                    else reference_bar.low_bps
+                ),
+                now=now,
+            )
     runtime_identity = aggressive_runtime_manifest_sha256(model, config_hash(config_path))
     engine = PublicMarketEngine(
         settings,
@@ -2466,7 +2839,6 @@ async def _run_aggressive_shadow_once(
     )
     decisions: list[AggressiveStrategyDecision] = []
     exits: list[tuple[int, AggressiveExitReason]] = []
-    rearmed: dict[str, tuple[int, ...]] = {}
     try:
         broad = await engine.scan_once(
             model.base,
@@ -2583,6 +2955,8 @@ async def _run_aggressive_shadow_once(
                 decisions.append(decision)
                 if decision.accepted and decision.intent is not None and intent_sink is not None:
                     intent_sink.append(decision.intent)
+                if decision.accepted and decision_sink is not None:
+                    decision_sink.append(decision)
                 if decision.accepted and simulate_fills:
                     portfolio.open(decision)
             if confirmation + 1 < profile.policy.confirmation_snapshots:

@@ -19,6 +19,7 @@ from interexchange_perp_grid.reference_history import (
     directed_routes_for_reference_pair,
     reference_bars_sha256,
 )
+from interexchange_perp_grid.spread_math import log_ratio_bps
 
 START = datetime(2026, 1, 1, tzinfo=UTC)
 KEY = InstrumentKey(base="BTC", settle="USDT")
@@ -214,6 +215,25 @@ def test_aggregation_uses_only_complete_consecutive_one_minute_reference_bars() 
     assert incomplete[0].observed_minutes == 4
     assert incomplete[0].open_bps is None
     assert incomplete[0].close_bps is None
+
+
+def test_higher_timeframe_exchange_candles_cannot_enter_reference_aggregation() -> None:
+    hourly_exchange_bar = _source(Venue.BYBIT)
+
+    with pytest.raises(TypeError, match="only canonical one-minute spread bars"):
+        aggregate_reference_bars((hourly_exchange_bar,), 60)  # type: ignore[arg-type]
+
+
+def test_shared_log_ratio_is_fixed_precision_and_reverses_exactly() -> None:
+    forward = log_ratio_bps(Decimal("101.37"), Decimal("99.91"))
+    reverse = log_ratio_bps(Decimal("99.91"), Decimal("101.37"))
+
+    assert forward == -reverse
+    assert forward.as_tuple().exponent == -8
+    arithmetic = (Decimal("101.37") - Decimal("99.91")) / Decimal("99.91") * Decimal(10000)
+    assert forward != arithmetic
+    with pytest.raises(ValueError, match="positive and finite"):
+        log_ratio_bps(Decimal(0), Decimal(1))
 
 
 def test_reference_minute_rejects_contract_sync_price_and_quality_faults() -> None:

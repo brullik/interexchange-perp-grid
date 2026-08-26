@@ -48,6 +48,7 @@ from interexchange_perp_grid.aggressive_runtime import (
     AggressiveStrategyDecision,
     AggressiveStrategyRequest,
     ReplayMinuteOutcome,
+    projected_tranche_loss_at_current_economics,
     recompute_actual_fill_risk,
     validate_live_intent,
     worst_case_replay_minute,
@@ -162,7 +163,7 @@ def _market(offset_ns: int = 0) -> AggressiveRouteMarketSnapshot:
         long_instrument=long,
         short_instrument=short,
         long_book=_book(Venue.OKX, "99.9", "100"),
-        short_book=_book(Venue.BYBIT, "103.1", "103.2"),
+        short_book=_book(Venue.BYBIT, "111.1", "111.2"),
         long_quality=DataQualityAssessment(True, ReasonCode.QUOTE_READY, 0),
         short_quality=DataQualityAssessment(True, ReasonCode.QUOTE_READY, 0),
         long_funding=FundingSnapshot(
@@ -207,7 +208,7 @@ def _request(mode: AggressiveRuntimeMode, offset_ns: int) -> AggressiveStrategyR
         long_venue=Venue.OKX,
         short_venue=Venue.BYBIT,
         long_book=_book(Venue.OKX, "99.9", "100"),
-        short_book=_book(Venue.BYBIT, "103.1", "103.2"),
+        short_book=_book(Venue.BYBIT, "111.1", "111.2"),
         long_private_taker_fee_rate=Decimal(0),
         short_private_taker_fee_rate=Decimal(0),
         long_funding=_funding(Venue.OKX),
@@ -273,6 +274,49 @@ def test_replay_shadow_and_live_create_the_same_immutable_intent() -> None:
     assert tranche.route.value == live.intent.route_identity
     assert tranche.entry_long_fills == []
     assert tranche.entry_short_fills == []
+
+
+def test_projected_risk_includes_the_same_full_stressed_economics_as_entry() -> None:
+    decision = _accepted(AggressiveRuntimeMode.LIVE)
+    assert decision.intent is not None
+    intent = decision.intent
+    reference_price = (intent.long_entry_vwap + intent.short_entry_vwap) / Decimal(2)
+    stop_loss = (
+        intent.quantity
+        * reference_price
+        * abs(intent.effective_stop_bps - intent.executable_entry_spread_bps)
+        / Decimal(10_000)
+    )
+
+    assert intent.incremental_tranche_loss_usdt == (
+        stop_loss + decision.economics.stressed_total_cost_usdt
+    )
+    assert decision.sizing.tranche_projected_losses_usdt[0] >= (
+        stop_loss + decision.economics.stressed_total_cost_usdt
+    )
+
+
+def test_current_cost_repricing_never_drops_the_stop_component() -> None:
+    decision = _accepted(AggressiveRuntimeMode.LIVE)
+    assert decision.intent is not None
+    current = replace(
+        decision.economics,
+        executable_entry_spread_bps=Decimal(0),
+        stressed_total_cost_usdt=Decimal("1"),
+    )
+    intent = replace(
+        decision.intent,
+        reference_trigger_bps=Decimal("200"),
+        effective_stop_bps=Decimal("1150"),
+    )
+
+    repriced = projected_tranche_loss_at_current_economics(intent, current)
+
+    assert repriced > current.stressed_total_cost_usdt
+    assert repriced > max(
+        intent.incremental_tranche_loss_usdt,
+        current.stressed_total_cost_usdt,
+    )
 
 
 def _live_binding(intent_model_sha256: str) -> AggressiveQualificationBinding:
@@ -448,6 +492,80 @@ def test_later_level_uses_first_level_frozen_route_allocation() -> None:
     assert second.sizing.tranche_base_quantities == first.sizing.tranche_base_quantities
 
 
+def test_shared_core_opens_five_and_reverse_closes_deeper_first_across_restart(
+    tmp_path: Path,
+) -> None:
+    model = _model()
+    grid = AggressiveGridStore(tmp_path / "grid.sqlite3")
+    grid.initialise()
+    grid.initialise_route(
+        model,
+        DivergenceDirection.POSITIVE,
+        now=_NOW,
+        rearm_retreat_step_fraction=Decimal("0.25"),
+    )
+    policy = load_aggressive_decision_policy(Path("config/AGGRESSIVE_FAST_LIVE_V2.yaml")).policy
+    core = AggressiveDecisionCore(policy)
+    portfolio = AggressiveShadowPortfolio(grid, policy)
+    for level_index in range(1, 6):
+        decision = None
+        for sample in range(3):
+            request = _request(AggressiveRuntimeMode.LIVE, sample * 250_000_000)
+            existing_loss = sum(
+                (level.reserved_stress_usdt for level in grid.levels(model.positive_route)),
+                Decimal(0),
+            )
+            request = replace(
+                request,
+                proposal=replace(
+                    request.proposal,
+                    level_index=level_index,
+                    reference_trigger_bps=model.positive.levels_bps[level_index - 1],
+                    reference_spread_bps=model.positive.levels_bps[-1] + Decimal(1),
+                ),
+                sizing=replace(
+                    request.sizing,
+                    existing_route_loss_usdt=existing_loss,
+                    existing_portfolio_loss_usdt=existing_loss,
+                    frozen_route_sizing=grid.frozen_sizing_plan(model.positive_route),
+                ),
+                decision_cycle=level_index,
+            )
+            decision = core.evaluate(request)
+        assert decision is not None and decision.accepted
+        portfolio.open(decision)
+
+    restarted_grid = AggressiveGridStore(grid.path)
+    assert tuple(level.state for level in restarted_grid.levels(model.positive_route)) == (
+        GridLevelState.OPEN,
+        GridLevelState.OPEN,
+        GridLevelState.OPEN,
+        GridLevelState.OPEN,
+        GridLevelState.OPEN,
+    )
+    restarted_portfolio = AggressiveShadowPortfolio(restarted_grid, policy)
+    blocked_model = replace(
+        model,
+        positive=replace(model.positive, regime_drift_blocked=True),
+    )
+    closed = restarted_portfolio.close_due(
+        model=blocked_model,
+        reference_bar=_bar(20),
+        market=replace(
+            _market(9_000_000_000),
+            long_book=_book(Venue.OKX, "100", "100.1"),
+            short_book=_book(Venue.BYBIT, "100.4", "100.5"),
+        ),
+        now=_NOW + timedelta(minutes=1),
+        projected_portfolio_loss_usdt=Decimal(0),
+    )
+    assert tuple(level for level, _reason in closed) == (5, 4, 3, 2, 1)
+    assert all(
+        level.state == GridLevelState.CLOSED_WAIT_REARM
+        for level in restarted_grid.levels(model.positive_route)
+    )
+
+
 def test_model_or_runtime_identity_mismatch_fails_closed() -> None:
     decision = _accepted(AggressiveRuntimeMode.LIVE)
     assert decision.intent is not None
@@ -519,7 +637,7 @@ def test_public_engine_raw_market_bridge_drives_the_same_core(tmp_path: Path) ->
         now=_NOW + timedelta(minutes=1),
         projected_portfolio_loss_usdt=Decimal(0),
     )
-    assert closed == ((1, AggressiveExitReason.HARD_PROJECTED_LOSS_OR_REFERENCE_STOP),)
+    assert closed == ((1, AggressiveExitReason.REVERSE_GRID_TARGET),)
     assert grid.levels(model.positive_route)[0].state == GridLevelState.CLOSED_WAIT_REARM
     assert portfolio.rearm_stable_flat(
         model.positive_route,
@@ -587,6 +705,42 @@ def test_actual_fill_recomputation_rejects_hard_loss_after_slippage() -> None:
     )
     assert not result.accepted
     assert result.projected_route_loss_usdt >= Decimal(5)
+
+
+def test_full_grid_sizing_fails_closed_when_deeper_tranche_l2_is_not_economic() -> None:
+    request = _request(AggressiveRuntimeMode.LIVE, 0)
+    thin_long = replace(
+        request.proposal.long_book,
+        asks=(
+            BookLevel(Decimal("100"), Decimal("0.20")),
+            BookLevel(Decimal("500"), Decimal("100")),
+        ),
+    )
+    thin_short = replace(
+        request.proposal.short_book,
+        bids=(
+            BookLevel(Decimal("111.1"), Decimal("0.20")),
+            BookLevel(Decimal("1"), Decimal("100")),
+        ),
+    )
+    core = AggressiveDecisionCore(
+        load_aggressive_decision_policy(Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")).policy
+    )
+    decision = None
+    for offset in (0, 250_000_000, 500_000_000):
+        decision = core.evaluate(
+            replace(
+                request,
+                proposal=replace(
+                    request.proposal,
+                    long_book=thin_long,
+                    short_book=thin_short,
+                    observed_monotonic_ns=1_000_000_000 + offset,
+                ),
+            )
+        )
+    assert decision is not None
+    assert not decision.accepted
 
 
 @pytest.mark.parametrize("direction", tuple(DivergenceDirection))

@@ -16,10 +16,24 @@ from typer.testing import CliRunner
 
 import interexchange_perp_grid.cli as cli_module
 from interexchange_perp_grid.adapters.private import PrivateCredentials
-from interexchange_perp_grid.cli import _run_public_scan, app
+from interexchange_perp_grid.aggressive_model import (
+    DivergenceDirection,
+    HistoricalReferenceModel,
+)
+from interexchange_perp_grid.cli import (
+    _aggressive_effective_stop,
+    _aggressive_reserves_per_base,
+    _fast_live_cost_evidence_complete,
+    _run_public_scan,
+    app,
+)
 from interexchange_perp_grid.config import load_settings
 from interexchange_perp_grid.domain import Instrument, InstrumentKey, ProductType, Venue
-from interexchange_perp_grid.live_journal import LiveOrderJournal
+from interexchange_perp_grid.live_journal import (
+    LiveActionState,
+    LiveJournalAction,
+    LiveOrderJournal,
+)
 from interexchange_perp_grid.public_engine import ScanResult
 from interexchange_perp_grid.reference_history import (
     SourceBarQuality,
@@ -27,6 +41,7 @@ from interexchange_perp_grid.reference_history import (
     build_reference_series,
 )
 from interexchange_perp_grid.reference_store import ParquetReferenceHistoryStore
+from interexchange_perp_grid.strategy import DirectedRouteKey
 
 runner = CliRunner()
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -182,6 +197,114 @@ def test_current_fast_live_contract_has_no_qualification_dependency(command: str
         assert "--preflight" in output
 
 
+def test_fast_live_acceptance_requires_complete_private_fee_and_funding_evidence() -> None:
+    observed = datetime(2026, 8, 26, tzinfo=UTC)
+    reservation: dict[str, object] = {
+        "initial_private_taker_fee_rates": {
+            Venue.BYBIT.value: "0.00055",
+            Venue.OKX.value: "0.00050",
+        },
+        "initial_funding_rates": {
+            Venue.BYBIT.value: "-0.0001",
+            Venue.OKX.value: "0.0002",
+        },
+        "initial_funding_next_timestamp_ms": {
+            Venue.BYBIT.value: "1787702400000",
+            Venue.OKX.value: "1787702400000",
+        },
+        "actual_fill_risk": {
+            "incremental_stress_usdt": "0.4",
+            "route_total_usdt": "0.4",
+            "portfolio_total_usdt": "0.4",
+            "actual_entry_spread_bps": "8.1",
+            "actual_open_fees_usdt": "0.05",
+            "remaining_close_fees_usdt": "0.05",
+            "initial_measured_book_impact_usdt": "0.02",
+            "adverse_funding_usdt": "0.01",
+            "other_reserves_usdt": "0.2",
+            "realized_funding_usdt": "0",
+            "fill_event_watermark": 4,
+        },
+    }
+    action = LiveJournalAction(
+        pair_action_id="fast-live-canary",
+        route=DirectedRouteKey("BTC", Venue.BYBIT, Venue.OKX),
+        tranche_id="level-1",
+        state=LiveActionState.FLAT,
+        risk_reservation=reservation,
+        qualification_hash="0" * 64,
+        residual_delta=Decimal(0),
+        recovery_action=None,
+        created_at=observed,
+        updated_at=observed,
+        legs=(),
+        activation_hash="a" * 64,
+    )
+
+    assert _fast_live_cost_evidence_complete(action)
+    assert not _fast_live_cost_evidence_complete(
+        replace(
+            action,
+            risk_reservation={
+                **reservation,
+                "initial_funding_rates": {Venue.BYBIT.value: "NaN"},
+            },
+        )
+    )
+    actual_risk = reservation["actual_fill_risk"]
+    assert isinstance(actual_risk, dict)
+    assert not _fast_live_cost_evidence_complete(
+        replace(
+            action,
+            risk_reservation={
+                **reservation,
+                "actual_fill_risk": {
+                    key: value
+                    for key, value in actual_risk.items()
+                    if key != "realized_funding_usdt"
+                },
+            },
+        )
+    )
+    assert not _fast_live_cost_evidence_complete(
+        replace(
+            action,
+            risk_reservation={
+                **reservation,
+                "initial_funding_next_timestamp_ms": {
+                    Venue.BYBIT.value: "0",
+                    Venue.OKX.value: "1787702400000",
+                },
+            },
+        )
+    )
+
+
+def test_effective_stop_uses_directional_tail_distance_from_nonzero_mode() -> None:
+    model = SimpleNamespace(
+        s0_bps=Decimal("50"),
+        positive=SimpleNamespace(
+            directional_q999_bps=Decimal("7"),
+            reference_stop_bps=Decimal("55"),
+        ),
+        negative=SimpleNamespace(
+            directional_q999_bps=Decimal("11"),
+            reference_stop_bps=Decimal("42"),
+        ),
+    )
+
+    typed_model = cast(HistoricalReferenceModel, model)
+    assert _aggressive_effective_stop(typed_model, DivergenceDirection.POSITIVE) == Decimal("57")
+    assert _aggressive_effective_stop(typed_model, DivergenceDirection.NEGATIVE) == Decimal("39")
+
+
+def test_aggressive_reserves_charge_a_distinct_liquidation_distance_component() -> None:
+    reserves = _aggressive_reserves_per_base(load_settings(CONFIG), Decimal("100"))
+
+    assert reserves.liquidation_distance_usdt > 0
+    assert reserves.total() > reserves.liquidation_distance_usdt
+
+
 def test_laptop_twelve_hour_profile_requires_explicit_local_receipt(
     tmp_path: Path,
 ) -> None:
@@ -291,6 +414,7 @@ def test_reference_history_proof_is_public_deterministic_and_non_executable(
             return None
 
     monkeypatch.setattr(cli_module, "CcxtProAdapter", PublicHistoryAdapter)
+    monkeypatch.setattr(cli_module, "current_code_commit_sha", lambda root: "a" * 40)
 
     result = runner.invoke(
         app,
@@ -323,6 +447,34 @@ def test_reference_history_proof_is_public_deterministic_and_non_executable(
     assert len(payload["source_sha256"]) == 64
     assert len(payload["reference_sha256"]) == 64
     assert len(instances) == 2
+
+    model_artifact = tmp_path / "model.json"
+    replay = runner.invoke(
+        app,
+        [
+            "aggressive-model-proof",
+            "--venue-a",
+            "bybit",
+            "--venue-b",
+            "okx",
+            "--start",
+            start.isoformat(),
+            "--end",
+            (start + timedelta(minutes=5)).isoformat(),
+            "--history-root",
+            str(tmp_path / "history"),
+            "--artifact",
+            str(model_artifact),
+            "--profile",
+            "config/AGGRESSIVE_FAST_LIVE_V2.yaml",
+        ],
+    )
+    assert replay.exit_code == 0, replay.output
+    replay_payload = json.loads(replay.output)
+    assert replay_payload["status"] == "PASS"
+    assert replay_payload["reference_rows"] == 5
+    assert replay_payload["production_submit_calls"] == 0
+    assert model_artifact.is_file()
 
 
 def test_reference_history_proof_rejects_naive_since_before_network(

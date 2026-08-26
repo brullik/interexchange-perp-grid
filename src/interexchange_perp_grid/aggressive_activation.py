@@ -155,6 +155,9 @@ def _native_runtime_sha256(runtime: NativeRuntimeManifest) -> str:
 def _binding_sha256(binding: AggressiveFastLiveBinding) -> str:
     payload = asdict(binding)
     payload["binding_sha256"] = ""
+    # Freshness belongs to the single-use preflight TTL. Wall-clock construction time is
+    # deliberately not part of the exact code/config/model/grid identity.
+    payload["generated_at"] = ""
     return hashlib.sha256(
         json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

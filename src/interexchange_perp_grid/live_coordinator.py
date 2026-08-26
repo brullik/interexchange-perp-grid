@@ -49,6 +49,8 @@ from interexchange_perp_grid.private_execution import translate_protected_order
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.strategy import DirectedRouteKey
 
+_AGGRESSIVE_STRATEGIES = frozenset({"AGGRESSIVE_SYMBIOSIS_V1", "AGGRESSIVE_FAST_LIVE_V2"})
+
 
 class CloseReason(StrEnum):
     HARD_STOP_OR_LOSS = "HARD_STOP_OR_LOSS"
@@ -1028,7 +1030,7 @@ class LiveCanaryCoordinator:
         action: LiveJournalAction,
     ) -> tuple[LiveJournalAction, bool]:
         reservation = action.risk_reservation
-        if reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1":
+        if reservation.get("strategy") not in _AGGRESSIVE_STRATEGIES:
             return action, False
         if self._aggressive_policy is None:
             raise RuntimeError("aggressive actual-fill risk policy is unavailable")
@@ -1080,12 +1082,28 @@ class LiveCanaryCoordinator:
             if not isinstance(raw_intent, dict) or not isinstance(raw_intent.get("reserves"), dict):
                 raise ValueError("aggressive reserve breakdown is unavailable")
             reserve_values = raw_intent["reserves"]
-            assert isinstance(reserve_values, dict)
-            explicit_reserves = CostReserves(
+            if not isinstance(reserve_values, dict):
+                raise ValueError("aggressive reserve breakdown is unavailable")
+            intent_reserves = CostReserves(
                 **{str(key): Decimal(str(value)) for key, value in reserve_values.items()}
             ).total()
-            adverse_funding = Decimal(str(raw_intent["adverse_funding_reserve_usdt"]))
-            remaining_close_fees = Decimal(str(raw_intent["remaining_close_fees_usdt"]))
+            if reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2":
+                explicit_reserves = Decimal(str(reservation["initial_total_reserves_usdt"]))
+                adverse_funding = Decimal(str(reservation["initial_adverse_funding_reserve_usdt"]))
+                remaining_close_fees = Decimal(
+                    str(reservation["initial_remaining_close_fees_usdt"])
+                )
+            else:
+                explicit_reserves = intent_reserves
+                adverse_funding = Decimal(str(raw_intent["adverse_funding_reserve_usdt"]))
+                remaining_close_fees = Decimal(str(raw_intent["remaining_close_fees_usdt"]))
+            measured_impact = Decimal(
+                str(
+                    reservation["initial_measured_book_impact_usdt"]
+                    if reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+                    else reservation.get("initial_measured_book_impact_usdt", "0")
+                )
+            )
             route_hard_limit = Decimal(str(reservation["route_hard_loss_usdt"]))
             portfolio_hard_limit = Decimal(str(reservation["portfolio_hard_loss_usdt"]))
         except (KeyError, TypeError, ValueError, ArithmeticError) as error:
@@ -1095,6 +1113,10 @@ class LiveCanaryCoordinator:
             or adverse_funding < 0
             or not remaining_close_fees.is_finite()
             or remaining_close_fees < 0
+            or not measured_impact.is_finite()
+            or measured_impact < 0
+            or not explicit_reserves.is_finite()
+            or explicit_reserves < 0
         ):
             raise RuntimeError("aggressive future cost reserve is invalid")
         active = await self._journal.active_actions()
@@ -1132,7 +1154,7 @@ class LiveCanaryCoordinator:
                 short_fill_price=weighted_price(action.route.short_venue, Side.SELL),
                 actual_fees_usdt=actual_fees,
                 adverse_funding_usdt=adverse_funding,
-                other_reserves_usdt=explicit_reserves + remaining_close_fees,
+                other_reserves_usdt=explicit_reserves + remaining_close_fees + measured_impact,
                 effective_stop_bps=effective_stop,
                 existing_route_loss_usdt=existing_route,
                 existing_portfolio_loss_usdt=existing_portfolio,
@@ -1146,6 +1168,11 @@ class LiveCanaryCoordinator:
             "route_total_usdt": str(result.projected_route_loss_usdt),
             "portfolio_total_usdt": str(result.projected_portfolio_loss_usdt),
             "actual_entry_spread_bps": str(result.actual_entry_spread_bps),
+            "actual_open_fees_usdt": str(actual_fees),
+            "remaining_close_fees_usdt": str(remaining_close_fees),
+            "initial_measured_book_impact_usdt": str(measured_impact),
+            "adverse_funding_usdt": str(adverse_funding),
+            "other_reserves_usdt": str(explicit_reserves),
             "fill_event_watermark": watermark,
         }
         updated = await self._journal.update_actual_risk(
@@ -1177,7 +1204,7 @@ class LiveCanaryCoordinator:
         opening order can increase exposure.
         """
         reservation = action.risk_reservation
-        if reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1":
+        if reservation.get("strategy") not in _AGGRESSIVE_STRATEGIES:
             return action, False
         orders = await self._journal.latest_order_events(action.pair_action_id)
         fills = tuple(order for order in orders if order.filled_base_quantity > 0)
@@ -1206,14 +1233,41 @@ class LiveCanaryCoordinator:
         except (KeyError, TypeError, ValueError, ArithmeticError) as error:
             raise RuntimeError("aggressive partial-fill reservation is incomplete") from error
         incremental = planned + unmatched_quantity * maximum_fill_price + actual_fees
+        active = await self._journal.active_actions()
+
+        def effective_stress(other: LiveJournalAction) -> Decimal:
+            actual = other.risk_reservation.get("actual_fill_risk")
+            if isinstance(actual, dict) and "incremental_stress_usdt" in actual:
+                return max(
+                    Decimal(str(other.risk_reservation["projected_stress_usdt"])),
+                    Decimal(str(actual["incremental_stress_usdt"])),
+                )
+            return Decimal(str(other.risk_reservation["projected_stress_usdt"]))
+
+        other_route = sum(
+            (
+                effective_stress(other)
+                for other in active
+                if other.pair_action_id != action.pair_action_id and other.route == action.route
+            ),
+            Decimal(0),
+        )
+        other_portfolio = sum(
+            (
+                effective_stress(other)
+                for other in active
+                if other.pair_action_id != action.pair_action_id
+            ),
+            Decimal(0),
+        )
         watermark = await self._journal.event_watermark()
         updated = await self._journal.update_actual_risk(
             action.pair_action_id,
             watermark,
             {
                 "incremental_stress_usdt": str(incremental),
-                "route_total_usdt": str(incremental),
-                "portfolio_total_usdt": str(incremental),
+                "route_total_usdt": str(other_route + incremental),
+                "portfolio_total_usdt": str(other_portfolio + incremental),
                 "actual_entry_spread_bps": str(entry_spread),
                 "fill_event_watermark": watermark,
             },

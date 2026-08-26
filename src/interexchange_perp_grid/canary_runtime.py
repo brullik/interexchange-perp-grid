@@ -30,6 +30,7 @@ from interexchange_perp_grid.aggressive_evaluator import (
     revalidate_hybrid_entry_once,
     select_aggressive_exit_reason,
 )
+from interexchange_perp_grid.aggressive_grid import AggressiveGridStore, FrozenGridSizingPlan
 from interexchange_perp_grid.aggressive_live import (
     AggressiveLaptopLiveStage,
     AggressiveLiveIntentEnvelope,
@@ -40,7 +41,10 @@ from interexchange_perp_grid.aggressive_live import (
 )
 from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
-from interexchange_perp_grid.aggressive_runtime import AggressiveTrancheIntent
+from interexchange_perp_grid.aggressive_runtime import (
+    AggressiveTrancheIntent,
+    projected_tranche_loss_at_current_economics,
+)
 from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import (
@@ -1227,10 +1231,17 @@ async def _coordinate_live_action(
             )
             for venue in capability_venues
         }
-        if not any(
-            action.pair_action_id == current_plan.pair_action_id for action in snapshot.actions
-        ):
+        current_action = next(
+            (
+                action
+                for action in snapshot.actions
+                if action.pair_action_id == current_plan.pair_action_id
+            ),
+            None,
+        )
+        if current_action is None:
             return False
+        current_reservation = current_action.risk_reservation
         reconciliation = reconcile_private_states(
             snapshot.actions,
             snapshot.private_states,
@@ -1337,6 +1348,7 @@ async def _coordinate_live_action(
             settings.live.canary_entry_slippage_cap_bps,
         )
         aggressive_revalidated = True
+        final_v2_reserves: dict[str, Decimal] | None = None
         strategy = current_plan.risk_reservation.get("strategy")
         if strategy in _AGGRESSIVE_STRATEGIES:
             aggressive_revalidated = False
@@ -1433,13 +1445,89 @@ async def _coordinate_live_action(
                     historical_model_eligible=True,
                     regime_ready=True,
                 )
-                aggressive_revalidated = revalidate_hybrid_entry_once(
+                current_economics = revalidate_hybrid_entry_once(
                     current_entry,
                     policy=aggressive_policy,
-                ).accepted
+                )
+                current_loss = max(
+                    intent.incremental_tranche_loss_usdt,
+                    projected_tranche_loss_at_current_economics(intent, current_economics),
+                )
+                stored_stress = Decimal(str(current_plan.risk_reservation["projected_stress_usdt"]))
+                route_limit = Decimal(str(current_plan.risk_reservation["route_hard_loss_usdt"]))
+                portfolio_limit = Decimal(
+                    str(current_plan.risk_reservation["portfolio_hard_loss_usdt"])
+                )
+                other_actions = tuple(
+                    action
+                    for action in snapshot.actions
+                    if action.pair_action_id != current_plan.pair_action_id
+                )
+                other_route = sum(
+                    (
+                        _effective_reserved_stress(action.risk_reservation)
+                        for action in other_actions
+                        if action.route == current_plan.route
+                    ),
+                    Decimal(0),
+                )
+                other_portfolio = sum(
+                    (
+                        _effective_reserved_stress(action.risk_reservation)
+                        for action in other_actions
+                    ),
+                    Decimal(0),
+                )
+                if strategy == "AGGRESSIVE_FAST_LIVE_V2" and current_economics.accepted:
+                    final_v2_reserves = {
+                        "initial_adverse_funding_reserve_usdt": max(
+                            Decimal(0),
+                            current_economics.stressed_total_cost_usdt
+                            - current_economics.four_leg_fees_usdt
+                            - current_economics.measured_book_impact_usdt
+                            - intent.reserves.total(),
+                        ),
+                        "initial_remaining_close_fees_usdt": (
+                            current_economics.remaining_close_fees_usdt
+                        ),
+                        "initial_measured_book_impact_usdt": (
+                            current_economics.measured_book_impact_usdt
+                        ),
+                        "initial_total_reserves_usdt": intent.reserves.total(),
+                    }
+                    opening_fees = max(
+                        Decimal(0),
+                        current_economics.four_leg_fees_usdt
+                        - current_economics.remaining_close_fees_usdt,
+                    )
+                    stop_only = max(
+                        Decimal(0),
+                        current_loss - current_economics.stressed_total_cost_usdt,
+                    )
+                    current_loss = max(
+                        current_loss,
+                        stop_only
+                        + opening_fees
+                        + sum(
+                            (
+                                max(
+                                    Decimal(str(current_reservation[key])),
+                                    current,
+                                )
+                                for key, current in final_v2_reserves.items()
+                            ),
+                            Decimal(0),
+                        ),
+                    )
+                aggressive_revalidated = (
+                    current_economics.accepted
+                    and current_loss <= stored_stress
+                    and other_route + current_loss <= route_limit
+                    and other_portfolio + current_loss <= portfolio_limit
+                )
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 aggressive_revalidated = False
-        return (
+        gate_allowed = (
             not snapshot.controls.paused
             and not snapshot.controls.killed
             and all(
@@ -1458,6 +1546,15 @@ async def _coordinate_live_action(
             )
             and aggressive_revalidated
         )
+        if gate_allowed and final_v2_reserves is not None:
+            try:
+                await journal.update_final_opening_reserves(
+                    current_plan.pair_action_id,
+                    final_v2_reserves,
+                )
+            except (KeyError, RuntimeError, ValueError, ArithmeticError):
+                return False
+        return gate_allowed
 
     return await LiveCanaryCoordinator(
         journal,
@@ -1911,6 +2008,7 @@ async def recover_active_actions(
                 active,
                 key=lambda item: (
                     priorities.get(item.state, 99),
+                    -int(str(item.risk_reservation.get("level_index", 0))),
                     item.created_at,
                     item.pair_action_id,
                 ),
@@ -2021,6 +2119,8 @@ async def run_fast_live_once(
     owner_confirmation: str,
     intent: AggressiveTrancheIntent,
     binding: AggressiveFastLiveBinding,
+    sizing_plan: FrozenGridSizingPlan,
+    grid_path: Path,
     *,
     stage: AggressiveLaptopLiveStage,
     exact_merged_clean_source: bool,
@@ -2215,7 +2315,8 @@ async def run_fast_live_once(
         )
         stage_limit = Decimal("1") if stage == AggressiveLaptopLiveStage.CANARY else Decimal("5")
         projected_loss = max(
-            intent.incremental_tranche_loss_usdt, economic.stressed_total_cost_usdt
+            intent.incremental_tranche_loss_usdt,
+            projected_tranche_loss_at_current_economics(intent, economic),
         )
         risk = evaluate_canary_risk_from_private_state(
             route,
@@ -2359,6 +2460,7 @@ async def run_fast_live_once(
         plan = prepare_aggressive_fast_live_plan(
             intent,
             binding,
+            sizing_plan,
             instruments[route.long_venue],
             instruments[route.short_venue],
             preflight_sha256=report.preflight_sha256,
@@ -2391,17 +2493,59 @@ async def run_fast_live_once(
                 "fast_live_preflight_expires_at": report.expires_at.isoformat(),
                 "supervisor_intent": "LIVE_CANARY",
                 "supervisor_queued": True,
+                "initial_private_taker_fee_rates": {
+                    venue.value: fee_rates[venue] for venue in required_venues
+                },
+                "initial_funding_rates": {
+                    venue.value: funding[venue].rate for venue in required_venues
+                },
+                "initial_funding_next_timestamp_ms": {
+                    venue.value: funding[venue].next_funding_timestamp_ms
+                    for venue in required_venues
+                },
+                "initial_measured_book_impact_usdt": economic.measured_book_impact_usdt,
+                "initial_adverse_funding_reserve_usdt": max(
+                    Decimal(0),
+                    economic.stressed_total_cost_usdt
+                    - economic.four_leg_fees_usdt
+                    - economic.measured_book_impact_usdt
+                    - intent.reserves.total(),
+                ),
+                "initial_remaining_close_fees_usdt": economic.remaining_close_fees_usdt,
+                "initial_total_reserves_usdt": intent.reserves.total(),
             },
         )
-        queued = await LiveCanaryCoordinator(
-            journal,
-            typed_adapters,
-            instruments,
-            PublicProtectionProvider(settings, public_adapters, instruments),
-            ImmediateRecoveryCloseMonitor(),
-            emergency_venue,
-            flat_barrier_policy=_flat_barrier_policy(settings),
-        ).prepare(plan)
+        grid = AggressiveGridStore(grid_path)
+        grid.initialise()
+        if stage != AggressiveLaptopLiveStage.CANARY:
+            grid.freeze_sizing_plan(sizing_plan)
+        pending = grid.reserve_entry(
+            intent.route_identity,
+            reference_spread_bps=intent.reference_spread_bps,
+            decision_cycle=intent.decision_cycle,
+            reserved_stress_usdt=projected_loss,
+            now=datetime.now(UTC),
+        )
+        try:
+            if pending.level_index != intent.level_index:
+                raise RuntimeError("durable V2 journal/grid reservation level mismatch")
+            queued = await LiveCanaryCoordinator(
+                journal,
+                typed_adapters,
+                instruments,
+                PublicProtectionProvider(settings, public_adapters, instruments),
+                ImmediateRecoveryCloseMonitor(),
+                emergency_venue,
+                flat_barrier_policy=_flat_barrier_policy(settings),
+            ).prepare(plan)
+        except Exception:
+            grid.mark_entry_failed(
+                intent.route_identity,
+                pending.level_index,
+                decision_cycle=intent.decision_cycle,
+                now=datetime.now(UTC),
+            )
+            raise
         # SQLite consumption and durable pair ownership are authoritative.
         # A cosmetic ignored-file update cannot roll back or duplicate the action.
         with contextlib.suppress(OSError, ValueError):

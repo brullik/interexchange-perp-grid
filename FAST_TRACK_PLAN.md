@@ -52,7 +52,7 @@ Codex обновляет только эти чекбоксы и `STATUS.md`. Н
 - [x] Агрегировать 5m/15m/1h/4h/1d только из 1m spread bars.
 - [x] Persist Parquet manifest/hash и DuckDB query/replay.
 - [x] Реализовать on-demand backfill сначала для одного Wave 1 route.
-- [ ] Добавить deterministic fixtures, missing-minute и direct-1h-prohibition tests.
+- [x] Добавить deterministic fixtures, missing-minute и direct-1h-prohibition tests.
 
 **Exit:** один route имеет воспроизводимую 30-day модель без прямого старшего расчёта.
 
@@ -62,10 +62,10 @@ Codex обновляет только эти чекбоксы и `STATUS.md`. Н
 - [x] Применить 30-day first-live minimum, 10 episodes, 70% convergence, regime block.
 - [x] Создать пять уровней 20/40/60/80/100 и веса 10/15/20/25/30.
 - [x] Persist arm/open/closed/rearm state каждого уровня и frozen model identity.
-- [ ] Исправить любой путь, который повторно использует только E1.
-- [ ] Реализовать sequential gap catch-up with fresh books between tranches.
-- [ ] Реализовать effective stop, reverse-grid exits и 0.25-step re-arm.
-- [ ] Добавить restart/replay tests полного пятиуровневого цикла.
+- [x] Исправить любой путь, который повторно использует только E1.
+- [x] Реализовать sequential gap catch-up with fresh books between tranches.
+- [x] Реализовать effective stop, reverse-grid exits и 0.25-step re-arm.
+- [x] Добавить restart/replay tests полного пятиуровневого цикла.
 
 **Exit:** open/add/reverse-close/re-arm/stop survive restart deterministically.
 
@@ -74,10 +74,10 @@ Codex обновляет только эти чекбоксы и `STATUS.md`. Н
 - [x] Применить 1.35x cost multiplier и 0.15 USDT normal minimum.
 - [x] Учитывать положительный funding на 50%, отрицательный на 100%, stress 2x.
 - [x] Требовать положительный convergence PnL без positive funding.
-- [ ] Рассчитать back-loaded sizing под 4.50/5 route и 45/50 portfolio limits.
+- [x] Рассчитать back-loaded sizing под 4.50/5 route и 45/50 portfolio limits.
 - [x] Пересчитывать риск по actual fills перед следующей tranche.
-- [ ] Подключить executable stop к replay, shadow, canary и pilot.
-- [ ] Использовать один decision core; убрать упрощённую отдельную live-логику.
+- [x] Подключить executable stop к replay, shadow, canary и pilot.
+- [x] Использовать один decision core; убрать упрощённую отдельную live-логику.
 - [x] Сохранить IOC caps, actual-fill recovery, third venue, emergency flatten and stable-FLAT proofs.
 
 **Exit:** all targeted/property/fault/restart tests green.
@@ -98,10 +98,10 @@ Codex обновляет только эти чекбоксы и `STATUS.md`. Н
 ## A7 — exact-head verification, review и merge
 
 - [ ] Запустить focused suites, `make verify`, security, C4 critical/C4.3, Docker smoke and Windows-equivalent.
-- [ ] Доказать `production_submit_calls=0` для CI/replay/shadow.
-- [ ] Проверить migrations/restart from current baseline state.
-- [ ] Обновить `STATUS.md` честным exact-head evidence; не переписывать историческую хронику.
-- [ ] Получить independent review, исправить P0/P1/P2 и material threads.
+- [x] Доказать `production_submit_calls=0` для CI/replay/shadow.
+- [x] Проверить migrations/restart from current baseline state.
+- [x] Обновить `STATUS.md` честным exact-head evidence; не переписывать историческую хронику.
+- [x] Получить independent review, исправить P0/P1/P2 и material threads.
 - [ ] Mark Ready и squash-merge при unchanged head and all required green.
 
 **Exit:** one merged PR, exact merged SHA, no unresolved material defects.

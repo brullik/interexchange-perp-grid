@@ -13,6 +13,10 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+if ($Mode -in @("canary", "pilot")) {
+    throw "Legacy qualification-based live entry is disabled; use scripts/laptop-fast-live.ps1."
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $python = Join-Path $root ".venv/Scripts/python.exe"

@@ -3,10 +3,17 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from interexchange_perp_grid.aggressive_activation import (
+    AggressiveFastLiveBinding,
+    _binding_sha256,
+)
+from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.risk_stages import load_locked_risk_stage_table
 from interexchange_perp_grid.state import (
     RiskStage,
@@ -34,6 +41,33 @@ def test_fast_live_wrapper_exposes_exact_actions_and_no_qualification_path() -> 
     assert "laptop-load-env.ps1" in text
     assert "laptop-load-s4u-env.ps1" in text
     assert "laptop-onboard.ps1" in text
+
+
+def test_fast_live_binding_identity_does_not_depend_on_construction_clock() -> None:
+    binding = AggressiveFastLiveBinding(
+        1,
+        datetime(2026, 1, 1, tzinfo=UTC),
+        "a" * 40,
+        "b" * 64,
+        "c" * 64,
+        "d" * 64,
+        "e" * 64,
+        "f" * 64,
+        "1" * 64,
+        "2" * 64,
+        "3" * 64,
+        "BTC:okx>bybit",
+        DivergenceDirection.POSITIVE,
+        "30",
+        10,
+        "0.7",
+        True,
+        "0" * 64,
+    )
+
+    assert _binding_sha256(binding) == _binding_sha256(
+        replace(binding, generated_at=binding.generated_at + timedelta(seconds=1))
+    )
 
 
 @pytest.mark.asyncio
@@ -68,6 +102,7 @@ async def test_fast_live_stage_has_no_qualification_lineage_and_pilot_requires_c
         "scripts/laptop-qualification.ps1",
         "scripts/laptop-qualification-scheduled.ps1",
         "scripts/laptop-smoke-detached.ps1",
+        "scripts/laptop-aggressive.ps1",
         "scripts/laptop-pilot.ps1",
         "scripts/laptop-aggressive-pilot-a.ps1",
     ],

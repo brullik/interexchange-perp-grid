@@ -12,6 +12,7 @@ from pathlib import Path
 
 from interexchange_perp_grid.aggressive_activation import AggressiveFastLiveBinding
 from interexchange_perp_grid.aggressive_evaluator import AggressiveEntryStage, CostReserves
+from interexchange_perp_grid.aggressive_grid import FrozenGridSizingPlan
 from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
 from interexchange_perp_grid.aggressive_runtime import AggressiveTrancheIntent
@@ -74,6 +75,7 @@ class AggressiveFastLiveIntentEnvelope:
     generated_at: datetime
     activation_binding_sha256: str
     intent: AggressiveTrancheIntent
+    sizing_plan: FrozenGridSizingPlan
     intent_sha256: str
     execution_authorized: bool = False
 
@@ -91,6 +93,14 @@ class AggressiveFastLiveIntentEnvelope:
             raise ValueError("aggressive fast-live intent identity is invalid")
         if aggressive_intent_sha256(self.intent) != self.intent_sha256:
             raise ValueError("aggressive fast-live intent hash mismatch")
+        if (
+            self.sizing_plan.route_identity != self.intent.route_identity
+            or self.sizing_plan.model_sha256 != self.intent.model_sha256
+            or self.sizing_plan.created_at != self.intent.decided_at
+            or self.sizing_plan.tranche_base_quantities[self.intent.level_index - 1]
+            != self.intent.quantity
+        ):
+            raise ValueError("aggressive fast-live sizing identity is invalid")
 
 
 def save_aggressive_fast_live_intent(
@@ -120,6 +130,7 @@ def load_aggressive_fast_live_intent(path: Path) -> AggressiveFastLiveIntentEnve
         generated_at=datetime.fromisoformat(str(payload["generated_at"])),
         activation_binding_sha256=str(payload["activation_binding_sha256"]),
         intent=aggressive_intent_from_mapping(raw),
+        sizing_plan=frozen_grid_sizing_from_mapping(payload.get("sizing_plan")),
         intent_sha256=str(payload["intent_sha256"]),
         execution_authorized=bool(payload.get("execution_authorized", False)),
     )
@@ -208,6 +219,24 @@ def aggressive_intent_from_mapping(raw: object) -> AggressiveTrancheIntent:
     return intent
 
 
+def frozen_grid_sizing_from_mapping(raw: object) -> FrozenGridSizingPlan:
+    if not isinstance(raw, dict):
+        raise ValueError("aggressive fast-live sizing payload is invalid")
+    return FrozenGridSizingPlan(
+        route_identity=str(raw["route_identity"]),
+        model_sha256=str(raw["model_sha256"]),
+        full_route_base_quantity=Decimal(str(raw["full_route_base_quantity"])),
+        tranche_base_quantities=tuple(
+            Decimal(str(value)) for value in raw["tranche_base_quantities"]
+        ),
+        tranche_projected_losses_usdt=tuple(
+            Decimal(str(value)) for value in raw["tranche_projected_losses_usdt"]
+        ),
+        projected_margin_usdt=Decimal(str(raw["projected_margin_usdt"])),
+        created_at=datetime.fromisoformat(str(raw["created_at"])),
+    )
+
+
 def aggressive_intent_sha256(intent: AggressiveTrancheIntent) -> str:
     encoded = json.dumps(
         asdict(intent),
@@ -272,6 +301,7 @@ def prepare_aggressive_live_plan(
 def prepare_aggressive_fast_live_plan(
     intent: AggressiveTrancheIntent,
     binding: AggressiveFastLiveBinding,
+    sizing_plan: FrozenGridSizingPlan,
     long_instrument: Instrument,
     short_instrument: Instrument,
     *,
@@ -284,6 +314,12 @@ def prepare_aggressive_fast_live_plan(
 ) -> CanaryExecutionPlan:
     if intent.execution_authorized or binding.execution_authorized:
         raise ValueError("fast-live strategy artifacts cannot authorize execution")
+    if (
+        sizing_plan.route_identity != intent.route_identity
+        or sizing_plan.model_sha256 != intent.model_sha256
+        or sizing_plan.tranche_base_quantities[intent.level_index - 1] != intent.quantity
+    ):
+        raise ValueError("fast-live sizing plan does not match intent")
     identities = (
         (intent.model_sha256, binding.model_sha256),
         (intent.strategy_profile_sha256, binding.profile_sha256),
@@ -310,6 +346,7 @@ def prepare_aggressive_fast_live_plan(
         compatibility_qualification_hash="0" * 64,
         activation_hash=preflight_sha256,
         fast_live_preflight_expires_at=preflight_expires_at,
+        grid_sizing_plan=sizing_plan,
     )
 
 
@@ -328,6 +365,7 @@ def _build_aggressive_live_plan(
     compatibility_qualification_hash: str,
     activation_hash: str | None = None,
     fast_live_preflight_expires_at: datetime | None = None,
+    grid_sizing_plan: FrozenGridSizingPlan | None = None,
 ) -> CanaryExecutionPlan:
     limits = _LIMITS[stage]
     if timeout_seconds <= 0:
@@ -418,6 +456,9 @@ def _build_aggressive_live_plan(
             "portfolio_hard_loss_usdt": limits.portfolio_hard_loss_usdt,
             "aggressive_intent_sha256": aggressive_intent_sha256(intent),
             "aggressive_intent": asdict(intent),
+            "grid_sizing_plan": (
+                asdict(grid_sizing_plan) if grid_sizing_plan is not None else None
+            ),
             "aggressive_binding_sha256": binding_sha256,
             "strategy_profile_sha256": intent.strategy_profile_sha256,
             "opening_client_order_ids": {
