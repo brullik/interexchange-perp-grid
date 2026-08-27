@@ -489,29 +489,44 @@ def _is_compatible_aggressive_portfolio(
     if not 2 <= len(actions) <= 5:
         return False
     first = actions[0]
+    strategy = first.risk_reservation.get("strategy")
     identity = (
         first.route,
-        first.qualification_hash,
         first.risk_reservation.get("aggressive_binding_sha256"),
         first.risk_reservation.get("strategy_profile_sha256"),
     )
     levels: set[int] = set()
+    activations: set[str] = set()
     for action in actions:
         reservation = action.risk_reservation
         try:
             level = int(str(reservation["level_index"]))
         except (KeyError, ValueError):
             return False
+        fast_activation_valid = True
+        if strategy == "AGGRESSIVE_FAST_LIVE_V2":
+            fast_activation_valid = (
+                action.activation_hash is not None
+                and reservation.get("activation_hash") == action.activation_hash
+                and action.activation_hash not in activations
+            )
+            if action.activation_hash is not None:
+                activations.add(action.activation_hash)
         if (
-            reservation.get("strategy") != "AGGRESSIVE_SYMBIOSIS_V1"
+            strategy not in {"AGGRESSIVE_SYMBIOSIS_V1", "AGGRESSIVE_FAST_LIVE_V2"}
+            or reservation.get("strategy") != strategy
             or reservation.get("stage") != "pilot_a"
             or (
                 action.route,
-                action.qualification_hash,
                 reservation.get("aggressive_binding_sha256"),
                 reservation.get("strategy_profile_sha256"),
             )
             != identity
+            or not fast_activation_valid
+            or (
+                strategy == "AGGRESSIVE_SYMBIOSIS_V1"
+                and action.qualification_hash != first.qualification_hash
+            )
             or not 1 <= level <= 5
             or level in levels
         ):

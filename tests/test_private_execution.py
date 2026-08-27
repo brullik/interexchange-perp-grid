@@ -400,6 +400,7 @@ def test_private_preflight_checks_every_account_and_runtime_gate() -> None:
         datetime.now(UTC),
         False,
         False,
+        "a" * 64,
     )
     inputs = PrivatePreflightInput(
         ready_capability(),
@@ -437,6 +438,7 @@ def test_private_preflight_checks_every_account_and_runtime_gate() -> None:
         datetime.now(UTC),
         True,
         True,
+        "b" * 64,
     )
     rejected = run_private_preflight(
         PrivatePreflightInput(
@@ -584,7 +586,7 @@ async def test_live_canary_submission_is_physically_behind_every_guard() -> None
         simulation_or_replay=False,
         local_unlock_present=True,
         telegram_challenge_valid=True,
-        current_qualification_valid=True,
+        fast_live_preflight_valid=True,
         route_allowlisted=True,
         canary_policy_passed=True,
         capability_preflight_passed=True,
@@ -648,7 +650,7 @@ async def test_expansion_code_candidate_cannot_expand_live_canary_allowlist(
         simulation_or_replay=False,
         local_unlock_present=True,
         telegram_challenge_valid=True,
-        current_qualification_valid=True,
+        fast_live_preflight_valid=True,
         route_allowlisted=True,
         canary_policy_passed=True,
         capability_preflight_passed=True,

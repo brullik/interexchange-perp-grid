@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
 
 from interexchange_perp_grid.aggressive_evaluator import (
@@ -17,6 +17,7 @@ from interexchange_perp_grid.aggressive_evaluator import (
     HybridEntryInput,
     canonical_executable_spread_bps,
     evaluate_hybrid_entry,
+    revalidate_hybrid_entry_once,
     size_aggressive_grid,
 )
 from interexchange_perp_grid.aggressive_grid import (
@@ -57,6 +58,40 @@ def aggressive_runtime_manifest_sha256(
         )
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def projected_tranche_loss_at_current_economics(
+    intent: AggressiveTrancheIntent,
+    economics: AggressiveEconomicDecision,
+) -> Decimal:
+    """Reprice one immutable intent with the latest executable cost evidence."""
+    if (
+        economics.executable_entry_spread_bps is None
+        or economics.long_entry_vwap is None
+        or economics.short_entry_vwap is None
+        or any(
+            not value.is_finite() or value <= 0
+            for value in (
+                intent.quantity,
+                economics.long_entry_vwap,
+                economics.short_entry_vwap,
+            )
+        )
+        or not economics.stressed_total_cost_usdt.is_finite()
+        or economics.stressed_total_cost_usdt < 0
+        or not economics.executable_entry_spread_bps.is_finite()
+        or not intent.effective_stop_bps.is_finite()
+        or not intent.reference_trigger_bps.is_finite()
+    ):
+        raise ValueError("current aggressive tranche risk evidence is invalid")
+    average_price = (economics.long_entry_vwap + economics.short_entry_vwap) / Decimal(2)
+    stop_loss = (
+        intent.quantity
+        * average_price
+        * abs(intent.effective_stop_bps - economics.executable_entry_spread_bps)
+        / _BPS
+    )
+    return stop_loss + economics.stressed_total_cost_usdt
 
 
 class ReplayMinuteOutcome(StrEnum):
@@ -372,34 +407,102 @@ class AggressiveDecisionCore:
             policy=self.policy,
             confirmations=self._confirmations,
         )
+        if (
+            economics.accepted
+            and sizing.accepted
+            and frozen is None
+            and request.proposal.stage == AggressiveEntryStage.NORMAL
+        ):
+            for _iteration in range(5):
+                resized = _resize_for_complete_executable_risk(
+                    request,
+                    sizing,
+                    direction_model,
+                    reference_price,
+                    self.policy,
+                )
+                resized_quantity = (
+                    resized.tranche_base_quantities[level_index - 1]
+                    if resized.accepted
+                    else Decimal(0)
+                )
+                sizing = resized
+                if resized_quantity <= 0:
+                    sizing = _runtime_risk_rejected(request)
+                    break
+                if resized_quantity == quantity:
+                    break
+                if resized_quantity > quantity:
+                    raise RuntimeError("executable-risk sizing attempted to increase exposure")
+                quantity = resized_quantity
+                proposal = replace(
+                    proposal,
+                    quantity=quantity,
+                    reserves=_scale_reserves(request.reserves_per_base, quantity),
+                )
+                economics = revalidate_hybrid_entry_once(proposal, policy=self.policy)
+                if not economics.accepted:
+                    break
+            else:
+                sizing = _runtime_risk_rejected(request)
+        elif (
+            economics.accepted
+            and sizing.accepted
+            and frozen is None
+            and request.proposal.stage == AggressiveEntryStage.LOCKED_CANARY
+        ):
+            canary_quantities = tuple(
+                quantity if index == level_index else Decimal(0) for index in range(1, 6)
+            )
+            sizing = _evaluate_complete_executable_grid_risk(
+                request,
+                replace(
+                    sizing,
+                    full_route_base_quantity=quantity,
+                    tranche_base_quantities=canary_quantities,
+                ),
+                direction_model,
+                reference_price,
+                self.policy,
+            )
+        elif economics.accepted and sizing.accepted and frozen is not None:
+            sizing = _evaluate_complete_executable_grid_risk(
+                request,
+                sizing,
+                direction_model,
+                reference_price,
+                self.policy,
+            )
         if not economics.accepted or not sizing.accepted:
             reason = (
                 AggressiveEntryReason.RISK_REJECTED if not sizing.accepted else economics.reason
             )
             return AggressiveStrategyDecision(False, reason, economics, sizing, None)
-        incremental_tranche_loss = quantity * (
-            reference_price
-            * abs(request.effective_stop_bps - direction_model.levels_bps[level_index - 1])
-            / _BPS
-            + request.sizing.per_full_base_reserve_usdt
-        )
+        if (
+            economics.executable_entry_spread_bps is None
+            or economics.long_entry_vwap is None
+            or economics.short_entry_vwap is None
+        ):
+            raise RuntimeError("accepted aggressive economics is incomplete")
+        complete_tranche_losses = sizing.tranche_projected_losses_usdt
+        incremental_tranche_loss = complete_tranche_losses[level_index - 1]
         projected_route_loss = (
             request.sizing.existing_route_loss_usdt + incremental_tranche_loss
             if request.proposal.stage == AggressiveEntryStage.LOCKED_CANARY
             else request.sizing.existing_route_loss_usdt
-            + incremental_tranche_loss
-            + sum(frozen.tranche_projected_losses_usdt[level_index:], Decimal(0))
-            if frozen is not None
-            else sizing.projected_route_loss_usdt
+            + sum(complete_tranche_losses[level_index - 1 :], Decimal(0))
         )
         projected_portfolio_loss = (
             request.sizing.existing_portfolio_loss_usdt + incremental_tranche_loss
             if request.proposal.stage == AggressiveEntryStage.LOCKED_CANARY
             else request.sizing.existing_portfolio_loss_usdt
-            + incremental_tranche_loss
-            + sum(frozen.tranche_projected_losses_usdt[level_index:], Decimal(0))
-            if frozen is not None
-            else sizing.projected_portfolio_loss_usdt
+            + sum(complete_tranche_losses[level_index - 1 :], Decimal(0))
+        )
+        sizing = replace(
+            sizing,
+            tranche_projected_losses_usdt=complete_tranche_losses,
+            projected_route_loss_usdt=projected_route_loss,
+            projected_portfolio_loss_usdt=projected_portfolio_loss,
         )
         if request.proposal.stage == AggressiveEntryStage.LOCKED_CANARY and (
             incremental_tranche_loss > Decimal(1)
@@ -426,10 +529,12 @@ class AggressiveDecisionCore:
                 sizing,
                 None,
             )
-        assert economics.executable_entry_spread_bps is not None
-        assert economics.reverse_target_bps is not None
-        assert economics.long_entry_vwap is not None
-        assert economics.short_entry_vwap is not None
+        if (
+            economics.reverse_target_bps is None
+            or economics.long_entry_vwap is None
+            or economics.short_entry_vwap is None
+        ):
+            raise RuntimeError("accepted aggressive target evidence is incomplete")
         intent = AggressiveTrancheIntent(
             base=request.model.base,
             route_identity=expected_route,
@@ -633,4 +738,196 @@ def _scale_reserves(reserves: CostReserves, quantity: Decimal) -> CostReserves:
         emergency_hedge_usdt=reserves.emergency_hedge_usdt * quantity,
         reconciliation_forced_exit_usdt=(reserves.reconciliation_forced_exit_usdt * quantity),
         liquidation_distance_usdt=reserves.liquidation_distance_usdt * quantity,
+    )
+
+
+def _resize_for_complete_executable_risk(
+    request: AggressiveStrategyRequest,
+    sizing: GridSizingResult,
+    direction_model: DirectionHistoricalModel,
+    reference_price: Decimal,
+    policy: AggressiveDecisionPolicy,
+) -> GridSizingResult:
+    """Round down the initial route size using the complete executable risk formula.
+
+    The first L2 evaluation is performed at the largest preliminary size. Each smaller candidate
+    is then re-evaluated through the same pure confirmed-entry economics before another possible
+    round-down. Exposure never increases inside one decision, and the result must converge while
+    satisfying the locked route, portfolio and local-margin limits.
+    """
+    assessed = _evaluate_complete_executable_grid_risk(
+        request,
+        sizing,
+        direction_model,
+        reference_price,
+        policy,
+    )
+    route_remaining = policy.route_modelled_loss_limit_usdt - (
+        request.sizing.existing_route_loss_usdt
+    )
+    portfolio_remaining = policy.portfolio_modelled_loss_limit_usdt - (
+        request.sizing.existing_portfolio_loss_usdt
+    )
+    total_loss = sum(assessed.tranche_projected_losses_usdt, Decimal(0))
+    if min(total_loss, route_remaining, portfolio_remaining) <= 0:
+        return _runtime_risk_rejected(request)
+    preliminary_full_cap = max(
+        (
+            quantity / weight
+            for quantity, weight in zip(
+                sizing.tranche_base_quantities,
+                direction_model.tranche_weights,
+                strict=True,
+            )
+            if quantity > 0
+        ),
+        default=Decimal(0),
+    )
+    loss_scale = min(route_remaining / total_loss, portfolio_remaining / total_loss, Decimal(1))
+    margin_limit = request.sizing.free_margin_usdt * (
+        Decimal(1) - policy.local_free_margin_floor_ratio
+    )
+    margin_scale = (
+        min(margin_limit / assessed.projected_margin_usdt, Decimal(1))
+        if assessed.projected_margin_usdt > 0
+        else Decimal(0)
+    )
+    complete_scale = min(loss_scale, margin_scale)
+    if complete_scale == 1:
+        return assessed
+    raw_full_quantity = preliminary_full_cap * complete_scale
+    full_quantity = (raw_full_quantity / request.sizing.quantity_step).to_integral_value(
+        rounding=ROUND_FLOOR
+    ) * request.sizing.quantity_step
+    minimum = max(
+        request.sizing.minimum_base_quantity,
+        request.sizing.minimum_notional_usdt / reference_price,
+    )
+    tranche_quantities = tuple(
+        quantity if quantity >= minimum else Decimal(0)
+        for quantity in (
+            (full_quantity * weight / request.sizing.quantity_step).to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+            * request.sizing.quantity_step
+            for weight in direction_model.tranche_weights
+        )
+    )
+    effective_full_quantity = sum(tranche_quantities, Decimal(0))
+    projected_margin = (
+        effective_full_quantity * reference_price / policy.initial_effective_leverage_cap
+    )
+    return GridSizingResult(
+        accepted=effective_full_quantity > 0,
+        reason=(
+            AggressiveEntryReason.ACCEPTED
+            if effective_full_quantity > 0
+            else AggressiveEntryReason.RISK_REJECTED
+        ),
+        full_route_base_quantity=effective_full_quantity,
+        tranche_base_quantities=tranche_quantities,
+        # The next loop iteration re-evaluates every non-linear tranche exactly at these sizes.
+        tranche_projected_losses_usdt=(Decimal(0),) * 5,
+        projected_route_loss_usdt=request.sizing.existing_route_loss_usdt,
+        projected_portfolio_loss_usdt=request.sizing.existing_portfolio_loss_usdt,
+        projected_margin_usdt=projected_margin,
+    )
+
+
+def _evaluate_complete_executable_grid_risk(
+    request: AggressiveStrategyRequest,
+    sizing: GridSizingResult,
+    direction_model: DirectionHistoricalModel,
+    reference_price: Decimal,
+    policy: AggressiveDecisionPolicy,
+) -> GridSizingResult:
+    """Price every planned tranche against the current non-linear L2 book."""
+    losses: list[Decimal] = []
+    margin_reference_price = reference_price
+    start_index = request.proposal.level_index - 1 if request.sizing.frozen_route_sizing else 0
+    for tranche_index, (quantity, level_bps) in enumerate(
+        zip(
+            sizing.tranche_base_quantities,
+            direction_model.levels_bps,
+            strict=True,
+        )
+    ):
+        if tranche_index < start_index:
+            losses.append(Decimal(0))
+            continue
+        if quantity <= 0:
+            losses.append(Decimal(0))
+            continue
+        proposal = replace(
+            request.proposal,
+            quantity=quantity,
+            reserves=_scale_reserves(request.reserves_per_base, quantity),
+            state_reconciled=request.state_reconciled,
+            historical_model_eligible=True,
+            regime_ready=not direction_model.regime_drift_blocked,
+        )
+        economics = revalidate_hybrid_entry_once(proposal, policy=policy)
+        if (
+            not economics.accepted
+            or economics.executable_entry_spread_bps is None
+            or economics.long_entry_vwap is None
+            or economics.short_entry_vwap is None
+        ):
+            return _runtime_risk_rejected(request)
+        executable_reference_price = (
+            economics.long_entry_vwap + economics.short_entry_vwap
+        ) / Decimal(2)
+        margin_reference_price = max(margin_reference_price, executable_reference_price)
+        current_stop_distance = abs(
+            request.effective_stop_bps - economics.executable_entry_spread_bps
+        )
+        stop_distance = (
+            current_stop_distance
+            if tranche_index == request.proposal.level_index - 1
+            else max(abs(request.effective_stop_bps - level_bps), current_stop_distance)
+        )
+        losses.append(
+            quantity * executable_reference_price * stop_distance / _BPS
+            + economics.stressed_total_cost_usdt
+        )
+    total_loss = sum(losses, Decimal(0))
+    projected_route = request.sizing.existing_route_loss_usdt + total_loss
+    projected_portfolio = request.sizing.existing_portfolio_loss_usdt + total_loss
+    projected_margin = (
+        sum(sizing.tranche_base_quantities[start_index:], Decimal(0))
+        * margin_reference_price
+        / policy.initial_effective_leverage_cap
+    )
+    accepted = (
+        total_loss > 0
+        and projected_route <= policy.route_modelled_loss_limit_usdt
+        and projected_route < policy.route_hard_projected_loss_limit_usdt
+        and projected_portfolio <= policy.portfolio_modelled_loss_limit_usdt
+        and projected_portfolio < policy.portfolio_hard_projected_loss_limit_usdt
+        and projected_margin
+        <= request.sizing.free_margin_usdt * (Decimal(1) - policy.local_free_margin_floor_ratio)
+    )
+    return replace(
+        sizing,
+        accepted=accepted,
+        reason=(
+            AggressiveEntryReason.ACCEPTED if accepted else AggressiveEntryReason.RISK_REJECTED
+        ),
+        tranche_projected_losses_usdt=tuple(losses),
+        projected_route_loss_usdt=projected_route,
+        projected_portfolio_loss_usdt=projected_portfolio,
+        projected_margin_usdt=projected_margin,
+    )
+
+
+def _runtime_risk_rejected(request: AggressiveStrategyRequest) -> GridSizingResult:
+    return GridSizingResult(
+        accepted=False,
+        reason=AggressiveEntryReason.RISK_REJECTED,
+        full_route_base_quantity=Decimal(0),
+        tranche_base_quantities=(Decimal(0),) * 5,
+        tranche_projected_losses_usdt=(Decimal(0),) * 5,
+        projected_route_loss_usdt=request.sizing.existing_route_loss_usdt,
+        projected_portfolio_loss_usdt=request.sizing.existing_portfolio_loss_usdt,
+        projected_margin_usdt=Decimal(0),
     )

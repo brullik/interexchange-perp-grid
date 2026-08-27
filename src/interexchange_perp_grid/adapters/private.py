@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -59,6 +60,10 @@ class PrivateCredentials:
         if not self.api_key or not self.secret:
             raise ValueError("private API key and secret are required")
 
+    def account_identity_sha256(self, venue: Venue) -> str:
+        """Return a non-reversible stable identity for the exact venue/API-key account."""
+        return hashlib.sha256(f"{venue.value}\0{self.api_key}".encode()).hexdigest()
+
     @classmethod
     def from_environment(
         cls,
@@ -88,6 +93,9 @@ class CcxtPrivateAdapter:
         self._private_event_watermark = 0
         self._private_events_pending: set[int] = set()
         self._private_event_lock = asyncio.Lock()
+        self._account_identity_sha256 = (
+            credentials.account_identity_sha256(venue) if credentials is not None else None
+        )
         if credentials is not None:
             self._exchange.apiKey = credentials.api_key
             self._exchange.secret = credentials.secret
@@ -193,6 +201,7 @@ class CcxtPrivateAdapter:
             observed_at=datetime.now(UTC),
             withdrawal_enabled=withdrawal_enabled,
             transfer_enabled=transfer_enabled,
+            account_identity_sha256=self._account_identity_sha256,
         )
 
     async def watch_orders(self, instrument: Instrument) -> tuple[PrivateOrder, ...]:
@@ -286,7 +295,9 @@ class CcxtPrivateAdapter:
                     )
                 else:
                     try:
-                        account = _normalise_stream_account(self.venue, raw)
+                        account = _normalise_stream_account(
+                            self.venue, raw, self._account_identity_sha256
+                        )
                     except (TypeError, ValueError) as error:
                         account = None
                         unknown = (
@@ -706,7 +717,11 @@ def _normalise_account_position_updates(
     return tuple(positions), tuple(unknown)
 
 
-def _normalise_stream_account(venue: Venue, raw: Mapping[str, object]) -> AccountSnapshot:
+def _normalise_stream_account(
+    venue: Venue,
+    raw: Mapping[str, object],
+    account_identity_sha256: str | None = None,
+) -> AccountSnapshot:
     total = _currency_value(raw, "total", "USDT")
     free = _currency_value(raw, "free", "USDT")
     info = _mapping(raw.get("info"))
@@ -743,6 +758,7 @@ def _normalise_stream_account(venue: Venue, raw: Mapping[str, object]) -> Accoun
             if raw.get("transferEnabled") is not None
             else info.get("canTransfer")
         ),
+        account_identity_sha256,
     )
 
 

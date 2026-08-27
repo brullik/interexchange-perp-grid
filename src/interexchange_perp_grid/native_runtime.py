@@ -107,6 +107,20 @@ def _artifact_digest(manifest: NativeRuntimeManifest) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def native_runtime_manifest_sha256(manifest: NativeRuntimeManifest) -> str:
+    """Return the stable semantic identity of one verified native runtime.
+
+    ``generated_at`` records when the manifest file was materialised and must not
+    change the execution identity.  The final artifact digest remains included so
+    corruption of a persisted manifest still changes this binding.
+    """
+    payload = asdict(manifest)
+    payload.pop("generated_at")
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def build_native_runtime_manifest(
     repo_root: Path,
     config_path: Path,

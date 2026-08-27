@@ -4,10 +4,11 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, DecimalException
 from enum import StrEnum
 from pathlib import Path
@@ -205,6 +206,7 @@ class LiveJournalAction:
     created_at: datetime
     updated_at: datetime
     legs: tuple[JournalLeg, ...]
+    activation_hash: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +338,18 @@ class LiveOrderJournal:
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     risk_stage_completion_frozen INTEGER NOT NULL DEFAULT 0
                         CHECK (risk_stage_completion_frozen IN (0, 1))
+                );
+                CREATE TABLE IF NOT EXISTS fast_live_preflight_consumption (
+                    preflight_sha256 TEXT PRIMARY KEY,
+                    activation_hash TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_by_pair_action_id TEXT NOT NULL UNIQUE,
+                    consumed_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS fast_live_preflight_issuance (
+                    preflight_sha256 TEXT PRIMARY KEY,
+                    expires_at TEXT NOT NULL,
+                    issued_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS live_deployment_controls (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -636,6 +650,56 @@ class LiveOrderJournal:
         if deployment_freeze is None or bool(deployment_freeze["upgrade_entry_frozen"]):
             raise RuntimeError("deployment upgrade freeze blocks new live action")
 
+    async def issue_fast_live_preflight(
+        self,
+        preflight_sha256: str,
+        expires_at: datetime,
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._issue_fast_live_preflight_sync,
+            preflight_sha256,
+            expires_at,
+            now or datetime.now(UTC),
+        )
+
+    def _issue_fast_live_preflight_sync(
+        self,
+        preflight_sha256: str,
+        expires_at: datetime,
+        now: datetime,
+    ) -> None:
+        if (
+            len(preflight_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in preflight_sha256)
+            or now.tzinfo is None
+            or now.utcoffset() is None
+            or expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+            or expires_at != now + timedelta(seconds=600)
+        ):
+            raise ValueError("fast-live preflight issuance identity is invalid")
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            consumed = database.execute(
+                "SELECT 1 FROM fast_live_preflight_consumption WHERE preflight_sha256 = ?",
+                (preflight_sha256,),
+            ).fetchone()
+            if consumed is not None:
+                database.rollback()
+                raise RuntimeError("consumed fast-live preflight cannot be reissued")
+            try:
+                database.execute(
+                    "INSERT INTO fast_live_preflight_issuance("
+                    "preflight_sha256, expires_at, issued_at) VALUES (?, ?, ?)",
+                    (preflight_sha256, expires_at.isoformat(), now.isoformat()),
+                )
+            except sqlite3.IntegrityError as error:
+                database.rollback()
+                raise RuntimeError("fast-live preflight was already issued") from error
+            database.commit()
+
     async def prepare(
         self,
         pair_action_id: str,
@@ -648,6 +712,10 @@ class LiveOrderJournal:
         risk_reservation: dict[str, Any],
         qualification_hash: str,
         now: datetime | None = None,
+        *,
+        activation_hash: str | None = None,
+        fast_live_preflight_sha256: str | None = None,
+        fast_live_preflight_expires_at: datetime | None = None,
     ) -> LiveJournalAction:
         return await asyncio.to_thread(
             self._prepare_sync,
@@ -661,6 +729,9 @@ class LiveOrderJournal:
             risk_reservation,
             qualification_hash,
             now or datetime.now(UTC),
+            activation_hash,
+            fast_live_preflight_sha256,
+            fast_live_preflight_expires_at,
         )
 
     def _prepare_sync(
@@ -675,6 +746,9 @@ class LiveOrderJournal:
         risk_reservation: dict[str, Any],
         qualification_hash: str,
         now: datetime,
+        activation_hash: str | None,
+        fast_live_preflight_sha256: str | None,
+        fast_live_preflight_expires_at: datetime | None,
     ) -> LiveJournalAction:
         if not pair_action_id.strip() or not tranche_id.strip():
             raise ValueError("pair action and tranche IDs must be non-empty")
@@ -687,8 +761,44 @@ class LiveOrderJournal:
             raise ValueError("prepared requests must match the exact route")
         if len({request.client_order_id for request in requests}) != 2:
             raise ValueError("pair legs require distinct client order IDs")
-        if len(qualification_hash) != 64:
+        if len(qualification_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in qualification_hash
+        ):
             raise ValueError("qualification hash must be a SHA-256 hex digest")
+        fast_live_fields = (
+            activation_hash,
+            fast_live_preflight_sha256,
+            fast_live_preflight_expires_at,
+        )
+        if any(value is not None for value in fast_live_fields):
+            if (
+                activation_hash is None
+                or fast_live_preflight_sha256 is None
+                or fast_live_preflight_expires_at is None
+                or len(activation_hash) != 64
+                or len(fast_live_preflight_sha256) != 64
+                or activation_hash != fast_live_preflight_sha256
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in activation_hash + fast_live_preflight_sha256
+                )
+                or fast_live_preflight_expires_at.tzinfo is None
+                or fast_live_preflight_expires_at.utcoffset() is None
+                or now.tzinfo is None
+                or now.utcoffset() is None
+                or not isinstance(risk_reservation, dict)
+                or risk_reservation.get("activation_hash") != activation_hash
+                or risk_reservation.get("fast_live_preflight_expires_at")
+                != fast_live_preflight_expires_at.isoformat()
+                or re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(risk_reservation.get("consumption_data_generation_sha256", "")),
+                )
+                is None
+            ):
+                raise ValueError("fast-live activation identity is incomplete")
+            if now < datetime.fromtimestamp(0, UTC) or now > fast_live_preflight_expires_at:
+                raise RuntimeError("fast-live preflight expired before journal prepare")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             stage_freeze = database.execute(
@@ -709,6 +819,37 @@ class LiveOrderJournal:
                 risk_reservation,
             )
             created = now.isoformat()
+            if fast_live_preflight_sha256 is not None:
+                assert activation_hash is not None
+                assert fast_live_preflight_expires_at is not None
+                issuance = database.execute(
+                    "SELECT expires_at, issued_at FROM fast_live_preflight_issuance "
+                    "WHERE preflight_sha256 = ?",
+                    (fast_live_preflight_sha256,),
+                ).fetchone()
+                if (
+                    issuance is None
+                    or str(issuance["expires_at"]) != fast_live_preflight_expires_at.isoformat()
+                    or datetime.fromisoformat(str(issuance["issued_at"])) > now
+                ):
+                    database.rollback()
+                    raise RuntimeError("fast-live preflight was not durably issued")
+                try:
+                    database.execute(
+                        "INSERT INTO fast_live_preflight_consumption("
+                        "preflight_sha256, activation_hash, expires_at, "
+                        "consumed_by_pair_action_id, consumed_at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            fast_live_preflight_sha256,
+                            activation_hash,
+                            fast_live_preflight_expires_at.isoformat(),
+                            pair_action_id,
+                            created,
+                        ),
+                    )
+                except sqlite3.IntegrityError as error:
+                    database.rollback()
+                    raise RuntimeError("fast-live preflight was already consumed") from error
             database.execute(
                 """
                 INSERT INTO live_pair_actions (
@@ -760,13 +901,28 @@ class LiveOrderJournal:
                         str(protected),
                     ),
                 )
+            prepare_details = (
+                {
+                    "fast_live_preflight_sha256": fast_live_preflight_sha256,
+                    "consumption_data_generation_sha256": risk_reservation[
+                        "consumption_data_generation_sha256"
+                    ],
+                }
+                if fast_live_preflight_sha256 is not None
+                else {}
+            )
             database.execute(
                 """
                 INSERT INTO live_action_transitions (
                     pair_action_id, from_state, to_state, details_json, observed_at
-                ) VALUES (?, NULL, ?, '{}', ?)
+                ) VALUES (?, NULL, ?, ?, ?)
                 """,
-                (pair_action_id, LiveActionState.PREPARED.value, created),
+                (
+                    pair_action_id,
+                    LiveActionState.PREPARED.value,
+                    json.dumps(prepare_details, default=str, sort_keys=True),
+                    created,
+                ),
             )
             database.commit()
         action = self._load_sync(pair_action_id)
@@ -1561,6 +1717,114 @@ class LiveOrderJournal:
             latest[str(row["client_order_id"])] = _private_order_from_json(str(row["payload_json"]))
         return tuple(latest[key] for key in sorted(latest))
 
+    async def update_final_opening_reserves(
+        self,
+        pair_action_id: str,
+        components: dict[str, Decimal],
+        *,
+        data_generation_sha256: str,
+        now: datetime | None = None,
+    ) -> LiveJournalAction:
+        """Persist component-wise conservative V2 reserves before any transport submit."""
+        allowed = {
+            "initial_adverse_funding_reserve_usdt",
+            "initial_remaining_close_fees_usdt",
+            "initial_measured_book_impact_usdt",
+            "initial_total_reserves_usdt",
+        }
+        if (
+            set(components) != allowed
+            or any(not value.is_finite() or value < 0 for value in components.values())
+            or re.fullmatch(r"[0-9a-f]{64}", data_generation_sha256) is None
+        ):
+            raise ValueError("final opening reserve components are invalid")
+        return await asyncio.to_thread(
+            self._update_final_opening_reserves_sync,
+            pair_action_id,
+            components,
+            data_generation_sha256,
+            now or datetime.now(UTC),
+        )
+
+    def _update_final_opening_reserves_sync(
+        self,
+        pair_action_id: str,
+        components: dict[str, Decimal],
+        data_generation_sha256: str,
+        now: datetime,
+    ) -> LiveJournalAction:
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            action = self._load_in_transaction(database, pair_action_id)
+            if (
+                action is None
+                or action.state not in {LiveActionState.PREPARED, LiveActionState.SUBMITTING}
+                or action.risk_reservation.get("strategy") != "AGGRESSIVE_FAST_LIVE_V2"
+            ):
+                database.rollback()
+                raise RuntimeError("final opening reserves require one pre-submit V2 action")
+            observed_events = database.execute(
+                "SELECT COUNT(*) FROM live_order_events AS event "
+                "JOIN live_order_legs AS leg ON leg.client_order_id = event.client_order_id "
+                "WHERE leg.pair_action_id = ?",
+                (pair_action_id,),
+            ).fetchone()
+            if observed_events is None or int(observed_events[0]) != 0:
+                database.rollback()
+                raise RuntimeError("final opening reserves cannot change after an order event")
+            reservation = dict(action.risk_reservation)
+            for key, current in components.items():
+                previous = Decimal(str(reservation[key]))
+                if not previous.is_finite() or previous < 0:
+                    database.rollback()
+                    raise RuntimeError("stored opening reserve component is invalid")
+                reservation[key] = str(max(previous, current))
+            raw_history = reservation.get("opening_data_generation_sha256_history", [])
+            if not isinstance(raw_history, list) or any(
+                re.fullmatch(r"[0-9a-f]{64}", str(value)) is None for value in raw_history
+            ):
+                database.rollback()
+                raise RuntimeError("stored opening data-generation history is invalid")
+            history = [str(value) for value in raw_history]
+            history.append(data_generation_sha256)
+            reservation["opening_data_generation_sha256_history"] = history
+            reservation["latest_opening_data_generation_sha256"] = data_generation_sha256
+            database.execute(
+                "UPDATE live_pair_actions SET risk_reservation_json = ?, updated_at = ? "
+                "WHERE pair_action_id = ?",
+                (
+                    json.dumps(reservation, default=str, sort_keys=True),
+                    now.isoformat(),
+                    pair_action_id,
+                ),
+            )
+            database.execute(
+                """
+                INSERT INTO live_action_transitions (
+                    pair_action_id, from_state, to_state, details_json, observed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    pair_action_id,
+                    action.state.value,
+                    action.state.value,
+                    json.dumps(
+                        {
+                            "final_opening_reserves": components,
+                            "data_generation_sha256": data_generation_sha256,
+                        },
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    now.isoformat(),
+                ),
+            )
+            database.commit()
+        updated = self._load_sync(pair_action_id)
+        if updated is None:
+            raise RuntimeError("updated V2 action disappeared")
+        return updated
+
     async def update_actual_risk(
         self,
         pair_action_id: str,
@@ -1591,7 +1855,15 @@ class LiveOrderJournal:
             "actual_entry_spread_bps",
             "fill_event_watermark",
         }
-        if set(actual_risk) != required:
+        breakdown_fields = {
+            "actual_open_fees_usdt",
+            "remaining_close_fees_usdt",
+            "initial_measured_book_impact_usdt",
+            "adverse_funding_usdt",
+            "other_reserves_usdt",
+        }
+        supplied = set(actual_risk)
+        if not required.issubset(supplied) or not supplied.issubset(required | breakdown_fields):
             raise ValueError("actual risk snapshot fields are invalid")
         incremental = Decimal(str(actual_risk["incremental_stress_usdt"]))
         actual_spread = Decimal(str(actual_risk["actual_entry_spread_bps"]))
@@ -1599,6 +1871,11 @@ class LiveOrderJournal:
             raise ValueError("actual risk snapshot values are invalid")
         if int(str(actual_risk["fill_event_watermark"])) != expected_event_watermark:
             raise ValueError("actual risk watermark is inconsistent")
+        breakdown = {
+            key: Decimal(str(actual_risk[key])) for key in breakdown_fields if key in actual_risk
+        }
+        if any(not value.is_finite() or value < 0 for value in breakdown.values()):
+            raise ValueError("actual risk cost breakdown is invalid")
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
             observed_watermark = self._event_watermark_in_transaction(database)
@@ -1637,6 +1914,7 @@ class LiveOrderJournal:
                 "portfolio_total_usdt": str(portfolio_total),
                 "actual_entry_spread_bps": str(actual_spread),
                 "fill_event_watermark": expected_event_watermark,
+                **{key: str(value) for key, value in breakdown.items()},
             }
             reservation = dict(action.risk_reservation)
             reservation["actual_fill_risk"] = authoritative_risk
@@ -1765,6 +2043,10 @@ class LiveOrderJournal:
             started_at,
             qualification_hash,
         )
+
+    async def completed_fast_live_actions(self) -> tuple[LiveJournalAction, ...]:
+        """Return completed V2 actions without consulting legacy qualification lineage."""
+        return await asyncio.to_thread(self._completed_fast_live_actions_sync)
 
     async def actions_updated_after(
         self,
@@ -1917,6 +2199,24 @@ class LiveOrderJournal:
             )
         return tuple(action for action in actions if action is not None)
 
+    def _completed_fast_live_actions_sync(self) -> tuple[LiveJournalAction, ...]:
+        with self._connect() as database:
+            database.execute("BEGIN")
+            rows = database.execute(
+                "SELECT pair_action_id, risk_reservation_json FROM live_pair_actions "
+                "WHERE state = ? ORDER BY created_at, pair_action_id",
+                (LiveActionState.FLAT.value,),
+            ).fetchall()
+            actions = tuple(
+                action
+                for row in rows
+                if json.loads(str(row["risk_reservation_json"])).get("strategy")
+                == "AGGRESSIVE_FAST_LIVE_V2"
+                and (action := self._load_in_transaction(database, str(row["pair_action_id"])))
+                is not None
+            )
+        return actions
+
     def _actions_updated_after_sync(
         self,
         boundary: datetime,
@@ -1956,6 +2256,31 @@ class LiveOrderJournal:
             for row in rows
             if (action := self._load_in_transaction(database, str(row["pair_action_id"])))
             is not None
+        )
+        return (
+            tuple(action.pair_action_id for action in actions),
+            completed_normal_actions_sha256(actions),
+        )
+
+    def completed_fast_live_normal_snapshot_in_transaction(
+        self,
+        database: sqlite3.Connection,
+        started_at: datetime,
+    ) -> tuple[tuple[str, ...], str]:
+        """Snapshot genuine V2 cycles without legacy qualification filtering."""
+        rows = database.execute(
+            "SELECT pair_action_id, risk_reservation_json FROM live_pair_actions "
+            "WHERE state = ? AND created_at >= ? ORDER BY pair_action_id",
+            (LiveActionState.FLAT.value, started_at.isoformat()),
+        ).fetchall()
+        actions = tuple(
+            action
+            for row in rows
+            if json.loads(str(row["risk_reservation_json"])).get("strategy")
+            == "AGGRESSIVE_FAST_LIVE_V2"
+            and (action := self._load_in_transaction(database, str(row["pair_action_id"])))
+            is not None
+            and is_completed_normal_paired_cycle(action)
         )
         return (
             tuple(action.pair_action_id for action in actions),
@@ -2196,6 +2521,7 @@ class LiveOrderJournal:
             """,
             (pair_action_id,),
         ).fetchall()
+        risk_reservation = json.loads(str(row["risk_reservation_json"]))
         return LiveJournalAction(
             pair_action_id=str(row["pair_action_id"]),
             route=DirectedRouteKey(
@@ -2205,7 +2531,7 @@ class LiveOrderJournal:
             ),
             tranche_id=str(row["tranche_id"]),
             state=LiveActionState(str(row["state"])),
-            risk_reservation=json.loads(str(row["risk_reservation_json"])),
+            risk_reservation=risk_reservation,
             qualification_hash=str(row["qualification_hash"]),
             residual_delta=Decimal(str(row["residual_delta"])),
             recovery_action=(
@@ -2236,6 +2562,11 @@ class LiveOrderJournal:
                     filled_base_quantity=Decimal(str(leg["filled_base_quantity"])),
                 )
                 for leg in legs
+            ),
+            activation_hash=(
+                str(risk_reservation["activation_hash"])
+                if risk_reservation.get("activation_hash") is not None
+                else None
             ),
         )
 

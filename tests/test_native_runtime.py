@@ -4,6 +4,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from interexchange_perp_grid.native_runtime import (
     NATIVE_RUNTIME_KIND,
     build_native_runtime_manifest,
     load_native_runtime_manifest,
+    native_runtime_manifest_sha256,
     resolve_runtime_artifact_digest,
     verify_native_runtime_manifest,
     write_native_runtime_manifest,
@@ -65,6 +67,22 @@ def test_native_manifest_binds_clean_source_config_interpreter_and_dependencies(
     assert len(manifest.artifact_digest) == 71
     assert load_native_runtime_manifest(path) == manifest
     assert verify_native_runtime_manifest(path, repo, config) == manifest
+
+
+def test_native_runtime_identity_ignores_manifest_generation_clock(tmp_path: Path) -> None:
+    repo, config = _repo(tmp_path)
+    observed = datetime(2026, 8, 27, 9, tzinfo=UTC)
+
+    canary_manifest = build_native_runtime_manifest(repo, config, now=observed)
+    pilot_manifest = build_native_runtime_manifest(
+        repo, config, now=observed + timedelta(minutes=5)
+    )
+
+    assert canary_manifest.generated_at != pilot_manifest.generated_at
+    assert canary_manifest.artifact_digest == pilot_manifest.artifact_digest
+    assert native_runtime_manifest_sha256(canary_manifest) == native_runtime_manifest_sha256(
+        pilot_manifest
+    )
 
 
 def test_native_manifest_rejects_dirty_or_changed_runtime(
@@ -146,7 +164,9 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "$secure.MakeReadOnly()" in onboarding
     assert "$secretTextBox.Clear()" in onboarding
     assert "Write-Host $plain" not in onboarding
-    assert 'QualificationRoute = "BTC:bybit>okx"' in onboarding
+    assert 'FastLiveRoute = "BTC:bybit>okx"' in onboarding
+    assert "LocalLiveUnlockVerifier = New-LiveUnlockVerifier" in onboarding
+    assert "pbkdf2-sha256" in onboarding
     assert "LIVE_CANARY_CONSENT" not in onboarding
     assert "IPEG_LOCAL_UNLOCK_SECRET" not in onboarding
     assert '$env:IPEG_LIVE_ENABLED = "false"' in loader
@@ -156,7 +176,10 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "DataProtectionScope]::LocalMachine" in s4u_loader
     assert "Add-Type -AssemblyName System.Security" in s4u_migrator
     assert "Add-Type -AssemblyName System.Security" in s4u_loader
-    assert '/inheritance:r /grant:r "${owner}:(F)"' in s4u_migrator
+    assert "function Set-OwnerOnlyAcl" in s4u_migrator
+    assert "SetAccessRuleProtection($true, $false)" in s4u_migrator
+    assert "[IO.File]::SetAccessControl" in s4u_migrator
+    assert "File.Replace preserves the destination DACL" in s4u_migrator
     assert "[IO.File]::GetAccessControl" in s4u_loader
     assert "Get-Acl" not in s4u_loader
     assert "AreAccessRulesProtected" in s4u_loader
@@ -204,26 +227,16 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "risk-stage-promote" in pilot and "PROMOTE:canary" in pilot
     assert pilot.index("Start-Process") < pilot.index('$env:IPEG_LIVE_ENABLED = "true"')
     assert pilot.index('$env:IPEG_LIVE_ENABLED = "false"') < pilot.index("Start-Process")
-    assert (
-        'ValidateSet("verify", "shadow", "smoke5", "smoke30", "qualify", '
-        '"canary", "pilot", "status", "stop")' in aggressive
-    )
+    assert 'ValidateSet("verify", "shadow", "status", "stop")' in aggressive
     assert "reference-history-proof" in aggressive
     assert "aggressive-shadow-once" in aggressive
     assert "Start-Sleep -Seconds 60" in aggressive
     assert 'IPEG_LIVE_ENABLED -cne "false"' in aggressive
-    assert "separate, explicit live-money authorization" in aggressive
-    assert "laptop-pilot.ps1" in aggressive and "-Aggressive" in aggressive
-    assert "laptop-aggressive-pilot-a.ps1" in aggressive
-    assert '"smoke30"' in aggressive
-    assert '"smoke5"' in aggressive
-    assert "laptop-smoke-detached.ps1" in aggressive
-    assert "laptop-qualification-scheduled.ps1" in aggressive
-    assert '"state/laptop-profile-s4u.json"' in aggressive
-    assert "-ProfileScope LocalMachine" in aggressive
-    assert "if (-not $?)" in aggressive
-    assert "-SmokeMinutes 30" in aggressive
-    assert "-SmokeMinutes 5" in aggressive
+    assert '"qualify"' not in aggressive
+    assert '"canary"' not in aggressive
+    assert '"pilot"' not in aggressive
+    assert "laptop-smoke-detached.ps1" not in aggressive
+    assert "laptop-qualification-scheduled.ps1" not in aggressive
     assert "Start-Process" in detached_smoke
     assert "laptop_smoke_runner.py" in detached_smoke
     runner = Path("scripts/laptop_smoke_runner.py").read_text(encoding="utf-8")
@@ -369,9 +382,12 @@ function New-Secret([string]$Value) {{
     $secure.MakeReadOnly()
     return $secure
 }}
+$unlockBytes = [byte[]]::new(32)
+$unlockPart = [Convert]::ToBase64String($unlockBytes)
 $payload = [pscustomobject]@{{
-    SchemaVersion = 1
-    QualificationRoute = "BTC:bybit>okx"
+    SchemaVersion = 2
+    FastLiveRoute = "BTC:bybit>okx"
+    LocalLiveUnlockVerifier = "pbkdf2-sha256`$600000`$$unlockPart`$$unlockPart"
     TelegramOwnerChatId = "123456789"
     TelegramBotToken = New-Secret "123456789:AA_ab-CD/+= token"
     BinanceUsdmApiKey = New-Secret "binance-key"
@@ -384,6 +400,18 @@ $payload = [pscustomobject]@{{
     OkxApiSecret = New-Secret "okx-secret"
     OkxApiPassword = New-Secret "okx-passphrase"
 }}
+[IO.File]::WriteAllText('{envelope.as_posix()}', 'old-envelope')
+$existingAcl = [IO.File]::GetAccessControl('{envelope.as_posix()}')
+$everyone = [Security.Principal.SecurityIdentifier]::new(
+    [Security.Principal.WellKnownSidType]::WorldSid,
+    $null
+)
+$existingAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    $everyone,
+    [Security.AccessControl.FileSystemRights]::Read,
+    [Security.AccessControl.AccessControlType]::Allow
+))
+[IO.File]::SetAccessControl('{envelope.as_posix()}', $existingAcl)
 [IO.File]::WriteAllText(
     '{fixture.as_posix()}',
     [Management.Automation.PSSerializer]::Serialize($payload),
@@ -392,6 +420,23 @@ $payload = [pscustomobject]@{{
 & '{migration.as_posix()}' `
     -InputPath '{fixture.as_posix()}' `
     -OutputPath '{envelope.as_posix()}'
+$postAcl = [IO.File]::GetAccessControl(
+    '{envelope.as_posix()}',
+    [Security.AccessControl.AccessControlSections]::Access
+)
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$postRules = @($postAcl.GetAccessRules(
+    $true,
+    $false,
+    [Security.Principal.SecurityIdentifier]
+))
+if (
+    -not $postAcl.AreAccessRulesProtected -or
+    $postRules.Count -ne 1 -or
+    $postRules[0].IdentityReference -ne $currentSid
+) {{
+    throw "S4U migration retained a foreign explicit ACL"
+}}
 . '{loader.as_posix()}' `
     -ProfilePath '{envelope.as_posix()}' `
     -StatePath '{(tmp_path / "state.sqlite3").as_posix()}' `
@@ -399,8 +444,8 @@ $payload = [pscustomobject]@{{
 if ($env:IPEG_MODE -cne "shadow" -or $env:IPEG_LIVE_ENABLED -cne "false") {{
     throw "S4U loader widened live authority"
 }}
-if ($env:IPEG_QUALIFICATION_ROUTE -cne "BTC:bybit>okx") {{
-    throw "S4U loader changed the locked route"
+if ($env:IPEG_LOCAL_UNLOCK_VERIFIER -cne "pbkdf2-sha256`$600000`$$unlockPart`$$unlockPart") {{
+    throw "S4U loader changed the local unlock verifier"
 }}
 if (
     $env:IPEG_TELEGRAM_BOT_TOKEN -cne "123456789:AA_ab-CD/+= token" -or

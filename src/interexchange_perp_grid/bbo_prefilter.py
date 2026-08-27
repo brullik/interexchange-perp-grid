@@ -7,6 +7,7 @@ from decimal import Decimal
 from interexchange_perp_grid.domain import BboQuote, Venue
 from interexchange_perp_grid.market_universe import UniverseRoute
 from interexchange_perp_grid.reason_codes import ReasonCode
+from interexchange_perp_grid.spread_math import log_ratio_bps
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,10 +190,7 @@ def rank_bbo_prefilter(
                 )
             )
             continue
-        reference = (long_quote.ask_price + short_quote.bid_price) / Decimal(2)
-        if reference <= 0:
-            continue
-        spread_bps = (short_quote.bid_price - long_quote.ask_price) / reference * Decimal(10_000)
+        spread_bps = log_ratio_bps(short_quote.bid_price, long_quote.ask_price)
         fee_bps = Decimal(2) * (long.taker_fee_rate + short.taker_fee_rate) * Decimal(10_000)
         observations.append(
             BboPrefilterObservation(

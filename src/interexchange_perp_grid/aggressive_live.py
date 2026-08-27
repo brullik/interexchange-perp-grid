@@ -10,7 +10,9 @@ from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 
+from interexchange_perp_grid.aggressive_activation import AggressiveFastLiveBinding
 from interexchange_perp_grid.aggressive_evaluator import AggressiveEntryStage, CostReserves
+from interexchange_perp_grid.aggressive_grid import FrozenGridSizingPlan
 from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.aggressive_qualification import AggressiveQualificationBinding
 from interexchange_perp_grid.aggressive_runtime import AggressiveTrancheIntent
@@ -65,6 +67,73 @@ class AggressiveLiveIntentEnvelope:
                 raise ValueError("aggressive live intent envelope identity is invalid")
         if aggressive_intent_sha256(self.intent) != self.intent_sha256:
             raise ValueError("aggressive live intent envelope hash mismatch")
+
+
+@dataclass(frozen=True, slots=True)
+class AggressiveFastLiveIntentEnvelope:
+    schema_version: int
+    generated_at: datetime
+    activation_binding_sha256: str
+    intent: AggressiveTrancheIntent
+    sizing_plan: FrozenGridSizingPlan
+    intent_sha256: str
+    execution_authorized: bool = False
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 2 or self.execution_authorized:
+            raise ValueError("aggressive fast-live intent envelope is invalid")
+        if self.generated_at.tzinfo is None or self.generated_at.utcoffset() is None:
+            raise ValueError("aggressive fast-live intent time must be aware")
+        if self.intent.execution_authorized:
+            raise ValueError("aggressive fast-live intent cannot authorize execution")
+        if any(
+            re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in (self.activation_binding_sha256, self.intent_sha256)
+        ):
+            raise ValueError("aggressive fast-live intent identity is invalid")
+        if aggressive_intent_sha256(self.intent) != self.intent_sha256:
+            raise ValueError("aggressive fast-live intent hash mismatch")
+        if (
+            self.sizing_plan.route_identity != self.intent.route_identity
+            or self.sizing_plan.model_sha256 != self.intent.model_sha256
+            or self.sizing_plan.created_at != self.intent.decided_at
+            or self.sizing_plan.tranche_base_quantities[self.intent.level_index - 1]
+            != self.intent.quantity
+        ):
+            raise ValueError("aggressive fast-live sizing identity is invalid")
+
+
+def save_aggressive_fast_live_intent(
+    path: Path,
+    envelope: AggressiveFastLiveIntentEnvelope,
+) -> None:
+    envelope.__post_init__()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(json.dumps(asdict(envelope), default=str, indent=2, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_aggressive_fast_live_intent(path: Path) -> AggressiveFastLiveIntentEnvelope:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw = payload.get("intent") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or not isinstance(raw, dict):
+        raise ValueError("aggressive fast-live intent envelope is invalid")
+    return AggressiveFastLiveIntentEnvelope(
+        schema_version=int(payload["schema_version"]),
+        generated_at=datetime.fromisoformat(str(payload["generated_at"])),
+        activation_binding_sha256=str(payload["activation_binding_sha256"]),
+        intent=aggressive_intent_from_mapping(raw),
+        sizing_plan=frozen_grid_sizing_from_mapping(payload.get("sizing_plan")),
+        intent_sha256=str(payload["intent_sha256"]),
+        execution_authorized=bool(payload.get("execution_authorized", False)),
+    )
 
 
 def save_aggressive_live_intent(
@@ -150,6 +219,24 @@ def aggressive_intent_from_mapping(raw: object) -> AggressiveTrancheIntent:
     return intent
 
 
+def frozen_grid_sizing_from_mapping(raw: object) -> FrozenGridSizingPlan:
+    if not isinstance(raw, dict):
+        raise ValueError("aggressive fast-live sizing payload is invalid")
+    return FrozenGridSizingPlan(
+        route_identity=str(raw["route_identity"]),
+        model_sha256=str(raw["model_sha256"]),
+        full_route_base_quantity=Decimal(str(raw["full_route_base_quantity"])),
+        tranche_base_quantities=tuple(
+            Decimal(str(value)) for value in raw["tranche_base_quantities"]
+        ),
+        tranche_projected_losses_usdt=tuple(
+            Decimal(str(value)) for value in raw["tranche_projected_losses_usdt"]
+        ),
+        projected_margin_usdt=Decimal(str(raw["projected_margin_usdt"])),
+        created_at=datetime.fromisoformat(str(raw["created_at"])),
+    )
+
+
 def aggressive_intent_sha256(intent: AggressiveTrancheIntent) -> str:
     encoded = json.dumps(
         asdict(intent),
@@ -176,25 +263,8 @@ def prepare_aggressive_live_plan(
     This function cannot submit and cannot authorize execution. Owner, Telegram, live guard,
     private preflight, journal, reconciliation and supervisor gates remain downstream.
     """
-    limits = _LIMITS[stage]
     if intent.execution_authorized or not binding.accepted or binding.execution_authorized:
         raise ValueError("aggressive strategy artifacts cannot authorize execution")
-    if timeout_seconds <= 0:
-        raise ValueError("aggressive live timeout must be positive")
-    if intent.level_index > limits.maximum_level:
-        raise ValueError("aggressive level exceeds the selected laptop stage")
-    if (
-        stage == AggressiveLaptopLiveStage.PILOT_A
-        and intent.entry_stage != AggressiveEntryStage.NORMAL
-    ):
-        raise ValueError("aggressive intent economics do not match the selected laptop stage")
-    if not Decimal(0) < intent.incremental_tranche_loss_usdt <= limits.route_hard_loss_usdt:
-        raise ValueError("aggressive intent exceeds the selected laptop risk stage")
-    if stage == AggressiveLaptopLiveStage.PILOT_A and not (
-        intent.projected_route_loss_usdt <= limits.route_hard_loss_usdt
-        and intent.projected_portfolio_loss_usdt <= limits.portfolio_hard_loss_usdt
-    ):
-        raise ValueError("aggressive intent exceeds the selected laptop risk stage")
     identities = (
         (intent.model_sha256, binding.model_sha256),
         (intent.strategy_profile_sha256, binding.profile_sha256),
@@ -213,6 +283,109 @@ def prepare_aggressive_live_plan(
         qualified.short_venue,
     }:
         raise ValueError("aggressive live route is outside the qualified venue pair")
+    return _build_aggressive_live_plan(
+        intent,
+        long_instrument,
+        short_instrument,
+        route,
+        long_protected_price=long_protected_price,
+        short_protected_price=short_protected_price,
+        stage=stage,
+        timeout_seconds=timeout_seconds,
+        binding_sha256=binding.binding_sha256,
+        strategy_name="AGGRESSIVE_SYMBIOSIS_V1",
+        compatibility_qualification_hash=binding.qualification_hash,
+    )
+
+
+def prepare_aggressive_fast_live_plan(
+    intent: AggressiveTrancheIntent,
+    binding: AggressiveFastLiveBinding,
+    sizing_plan: FrozenGridSizingPlan,
+    long_instrument: Instrument,
+    short_instrument: Instrument,
+    *,
+    preflight_sha256: str,
+    preflight_expires_at: datetime,
+    long_protected_price: Decimal,
+    short_protected_price: Decimal,
+    stage: AggressiveLaptopLiveStage,
+    timeout_seconds: int,
+) -> CanaryExecutionPlan:
+    if intent.execution_authorized or binding.execution_authorized:
+        raise ValueError("fast-live strategy artifacts cannot authorize execution")
+    if (
+        sizing_plan.route_identity != intent.route_identity
+        or sizing_plan.model_sha256 != intent.model_sha256
+        or sizing_plan.tranche_base_quantities[intent.level_index - 1] != intent.quantity
+    ):
+        raise ValueError("fast-live sizing plan does not match intent")
+    identities = (
+        (intent.model_sha256, binding.model_sha256),
+        (intent.strategy_profile_sha256, binding.profile_sha256),
+        (intent.source_manifest_sha256, binding.source_manifest_sha256),
+        (intent.reference_manifest_sha256, binding.reference_manifest_sha256),
+        (intent.runtime_manifest_sha256, binding.decision_runtime_sha256),
+    )
+    if any(actual != expected for actual, expected in identities):
+        raise ValueError("aggressive live intent identity does not match fast-live binding")
+    route = DirectedRouteKey(intent.base, Venue(intent.long_venue), Venue(intent.short_venue))
+    if route.value != intent.route_identity or route.value != binding.route:
+        raise ValueError("aggressive fast-live route identity is inconsistent")
+    return _build_aggressive_live_plan(
+        intent,
+        long_instrument,
+        short_instrument,
+        route,
+        long_protected_price=long_protected_price,
+        short_protected_price=short_protected_price,
+        stage=stage,
+        timeout_seconds=timeout_seconds,
+        binding_sha256=binding.binding_sha256,
+        strategy_name="AGGRESSIVE_FAST_LIVE_V2",
+        # The baseline journal column is retained for schema compatibility only. V2 stores
+        # its single-use activation identity there and never treats it as qualification.
+        compatibility_qualification_hash=preflight_sha256,
+        activation_hash=preflight_sha256,
+        fast_live_preflight_expires_at=preflight_expires_at,
+        grid_sizing_plan=sizing_plan,
+    )
+
+
+def _build_aggressive_live_plan(
+    intent: AggressiveTrancheIntent,
+    long_instrument: Instrument,
+    short_instrument: Instrument,
+    route: DirectedRouteKey,
+    *,
+    long_protected_price: Decimal,
+    short_protected_price: Decimal,
+    stage: AggressiveLaptopLiveStage,
+    timeout_seconds: int,
+    binding_sha256: str,
+    strategy_name: str,
+    compatibility_qualification_hash: str,
+    activation_hash: str | None = None,
+    fast_live_preflight_expires_at: datetime | None = None,
+    grid_sizing_plan: FrozenGridSizingPlan | None = None,
+) -> CanaryExecutionPlan:
+    limits = _LIMITS[stage]
+    if timeout_seconds <= 0:
+        raise ValueError("aggressive live timeout must be positive")
+    if intent.level_index > limits.maximum_level:
+        raise ValueError("aggressive level exceeds the selected laptop stage")
+    if (
+        stage == AggressiveLaptopLiveStage.PILOT_A
+        and intent.entry_stage != AggressiveEntryStage.NORMAL
+    ):
+        raise ValueError("aggressive intent economics do not match the selected laptop stage")
+    if not Decimal(0) < intent.incremental_tranche_loss_usdt <= limits.route_hard_loss_usdt:
+        raise ValueError("aggressive intent exceeds the selected laptop risk stage")
+    if stage == AggressiveLaptopLiveStage.PILOT_A and not (
+        intent.projected_route_loss_usdt <= limits.route_hard_loss_usdt
+        and intent.projected_portfolio_loss_usdt <= limits.portfolio_hard_loss_usdt
+    ):
+        raise ValueError("aggressive intent exceeds the selected laptop risk stage")
     _validate_instrument(intent, long_instrument, route.long_venue, intent.long_symbol)
     _validate_instrument(intent, short_instrument, route.short_venue, intent.short_symbol)
     _validate_notional(intent.quantity, long_protected_price, long_instrument)
@@ -251,7 +424,7 @@ def prepare_aggressive_live_plan(
         long_request=long_request,
         short_request=short_request,
         risk_reservation={
-            "strategy": "AGGRESSIVE_SYMBIOSIS_V1",
+            "strategy": strategy_name,
             "stage": stage.value,
             "level_index": intent.level_index,
             "decision_cycle": intent.decision_cycle,
@@ -285,7 +458,10 @@ def prepare_aggressive_live_plan(
             "portfolio_hard_loss_usdt": limits.portfolio_hard_loss_usdt,
             "aggressive_intent_sha256": aggressive_intent_sha256(intent),
             "aggressive_intent": asdict(intent),
-            "aggressive_binding_sha256": binding.binding_sha256,
+            "grid_sizing_plan": (
+                asdict(grid_sizing_plan) if grid_sizing_plan is not None else None
+            ),
+            "aggressive_binding_sha256": binding_sha256,
             "strategy_profile_sha256": intent.strategy_profile_sha256,
             "opening_client_order_ids": {
                 "long": long_client_id,
@@ -293,10 +469,12 @@ def prepare_aggressive_live_plan(
             },
             "execution_authorized": False,
         },
-        qualification_hash=binding.qualification_hash,
+        qualification_hash=compatibility_qualification_hash,
         timeout_seconds=(
             24 * 60 * 60 if stage == AggressiveLaptopLiveStage.PILOT_A else timeout_seconds
         ),
+        activation_hash=activation_hash,
+        fast_live_preflight_expires_at=fast_live_preflight_expires_at,
     )
 
 

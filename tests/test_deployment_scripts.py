@@ -10,8 +10,10 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEPLOY = REPO_ROOT / "scripts" / "shadow-deploy.sh"
-UPGRADE = REPO_ROOT / "scripts" / "shadow-upgrade.sh"
+DEPLOY_ENTRY = REPO_ROOT / "scripts" / "shadow-deploy.sh"
+UPGRADE_ENTRY = REPO_ROOT / "scripts" / "shadow-upgrade.sh"
+DEPLOY = REPO_ROOT / "scripts" / "shadow-deploy-mechanics.sh"
+UPGRADE = REPO_ROOT / "scripts" / "shadow-upgrade-mechanics.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap-ubuntu.sh"
 IPEGCTL = REPO_ROOT / "scripts" / "ipegctl"
 OLD_IMAGE = f"ghcr.io/example/app@sha256:{'1' * 64}"
@@ -127,6 +129,40 @@ def test_deploy_requires_external_secrets_with_mode_0600(tmp_path: Path) -> None
     assert "mode 0600" in result.stderr
     assert not state_path.exists()
     assert not docker_log.exists()
+
+
+def test_deploy_is_physically_blocked_without_exact_laptop_acceptance(tmp_path: Path) -> None:
+    environment, state_path, docker_log = _fake_environment(tmp_path)
+    result = _run(DEPLOY_ENTRY, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+
+    assert result.returncode == 9
+    assert "VPS bootstrap/deploy/upgrade is disabled" in result.stderr
+    assert not state_path.exists()
+    assert not docker_log.exists()
+
+
+def test_upgrade_is_physically_blocked_before_docker_mutation(tmp_path: Path) -> None:
+    environment, state_path, docker_log = _fake_environment(tmp_path)
+
+    result = _run(UPGRADE_ENTRY, NEW_IMAGE, NEW_SHA, cwd=tmp_path, environment=environment)
+
+    assert result.returncode == 9
+    assert "VPS bootstrap/deploy/upgrade is disabled" in result.stderr
+    assert not state_path.exists()
+    assert not docker_log.exists()
+
+
+def test_bootstrap_rejects_destdir_that_resolves_to_physical_root(tmp_path: Path) -> None:
+    environment, _, _ = _fake_environment(tmp_path)
+    environment["DESTDIR"] = "/.."
+    os_release = tmp_path / "os-release"
+    os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8")
+    environment["IPEG_OS_RELEASE_PATH"] = str(os_release)
+
+    result = _run(BOOTSTRAP, cwd=tmp_path, environment=environment)
+
+    assert result.returncode == 2
+    assert "must not resolve" in result.stderr
 
 
 def test_deploy_is_idempotent_and_persists_only_healthy_exact_identity(tmp_path: Path) -> None:

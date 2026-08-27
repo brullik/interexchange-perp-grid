@@ -1,13 +1,12 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("verify", "shadow", "smoke5", "smoke30", "qualify", "canary", "pilot", "status", "stop")]
+    [ValidateSet("verify", "shadow", "status", "stop")]
     [string]$Mode,
     [string]$ProfilePath = "state/laptop-profile.clixml",
     [ValidateSet("CurrentUser", "LocalMachine")]
     [string]$ProfileScope = "CurrentUser",
-    [int]$ShadowMinutes = 0,
-    [switch]$OwnerException12h
+    [int]$ShadowMinutes = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -122,63 +121,11 @@ switch ($Mode) {
             Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
         }
     }
-    "qualify" {
-        if ($OwnerException12h) {
-            $scheduledProfile = if ($ProfileScope -ceq "LocalMachine") {
-                $ProfilePath
-            } else {
-                "state/laptop-profile-s4u.json"
-            }
-            & "$PSScriptRoot/laptop-qualification-scheduled.ps1" `
-                -ProfilePath $scheduledProfile -ProfileScope LocalMachine
-            if (-not $?) { throw "detached 12-hour qualification failed to start" }
-            return
-        }
-        Ensure-HistoricalModel
-        & "$PSScriptRoot/laptop-qualification.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope
-        if ($LASTEXITCODE -ne 0) { throw "base laptop qualification failed closed" }
-        & $python -m interexchange_perp_grid.cli aggressive-qualification-bind `
-            --qualification "state/qualification.json" `
-            --runtime-manifest "state/laptop/native-runtime-manifest.json" `
-            --model $model --grid $grid --profile $profile `
-            --output "state/aggressive-qualification.json"
-        if ($LASTEXITCODE -ne 0) { throw "aggressive qualification binding failed closed" }
-    }
-    "smoke30" {
-        & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope -SmokeMinutes 30
-        if ($LASTEXITCODE -ne 0) { throw "30-minute qualification rehearsal failed closed" }
-    }
-    "smoke5" {
-        & "$PSScriptRoot/laptop-smoke-detached.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope -SmokeMinutes 5
-        if ($LASTEXITCODE -ne 0) { throw "5-minute qualification rehearsal failed closed" }
-    }
-    "canary" {
-        Write-Host "Canary requires a separate, explicit live-money authorization at execution time."
-        & $python -m interexchange_perp_grid.cli aggressive-qualification-check `
-            --binding "state/aggressive-qualification.json" `
-            --qualification "state/qualification.json" `
-            --runtime-manifest "state/laptop/native-runtime-manifest.json" `
-            --model $model --grid $grid --profile $profile
-        if ($LASTEXITCODE -ne 0) { throw "aggressive qualification is missing or stale" }
-        & "$PSScriptRoot/laptop-pilot.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope -Aggressive
-        if ($LASTEXITCODE -ne 0) { throw "aggressive canary failed closed" }
-    }
-    "pilot" {
-        Write-Host "pilot_a requires separate owner authorization and a standard 24-hour qualification."
-        & "$PSScriptRoot/laptop-aggressive-pilot-a.ps1" -ProfilePath $ProfilePath `
-            -ProfileScope $ProfileScope
-        if ($LASTEXITCODE -ne 0) { throw "aggressive pilot_a failed closed" }
-    }
     "status" {
         $payload = [ordered]@{
             running = $false
             process_id = $null
             evidence = $null
-            qualification = $null
             live_enabled = $false
         }
         if (Test-Path -LiteralPath $pidFile -PathType Leaf) {
@@ -190,17 +137,6 @@ switch ($Mode) {
             $payload.evidence = Get-Content -LiteralPath $runtime -Raw | ConvertFrom-Json
         }
         Require-Python
-        $qualification = @(
-            & $python -m interexchange_perp_grid.cli qualification-epoch-status --config $config
-        )
-        if ($LASTEXITCODE -eq 0) {
-            $qualificationJson = $qualification |
-                Where-Object { $_ -is [string] -and $_.TrimStart().StartsWith("{") } |
-                Select-Object -Last 1
-            if ($qualificationJson) {
-                $payload.qualification = $qualificationJson | ConvertFrom-Json
-            }
-        }
         $payload | ConvertTo-Json -Depth 20
     }
     "stop" {

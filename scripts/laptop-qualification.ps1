@@ -11,6 +11,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+throw "Legacy qualification is non-authoritative in Aggressive Fast Live V2; use scripts/laptop-fast-live.ps1."
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 if ($ProfileScope -ceq "LocalMachine") {

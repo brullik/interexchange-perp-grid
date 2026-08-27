@@ -4,7 +4,7 @@ import hashlib
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import ROUND_FLOOR, Decimal, localcontext
+from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 from pathlib import Path
 
@@ -14,6 +14,7 @@ from interexchange_perp_grid.aggressive_grid import reverse_grid_target_bps
 from interexchange_perp_grid.aggressive_model import DivergenceDirection
 from interexchange_perp_grid.domain import OrderBookSnapshot, Venue
 from interexchange_perp_grid.routes import executable_vwap
+from interexchange_perp_grid.spread_math import log_ratio_bps
 
 _BPS = Decimal("10000")
 
@@ -565,11 +566,7 @@ def canonical_executable_spread_bps(
     has the canonical sign. Negative divergence is traded long A / short B and must be negated
     before comparing with the signed historical levels, targets, and stops.
     """
-    if any(not value.is_finite() or value <= 0 for value in (long_price, short_price)):
-        raise ValueError("executable spread prices must be positive and finite")
-    with localcontext() as context:
-        context.prec = 50
-        directed = (short_price / long_price).ln() * _BPS
+    directed = log_ratio_bps(short_price, long_price)
     return directed if direction == DivergenceDirection.POSITIVE else -directed
 
 

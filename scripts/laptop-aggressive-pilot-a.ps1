@@ -8,6 +8,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+throw "Legacy qualification-based pilot is disabled; use scripts/laptop-fast-live.ps1 -Action pilot."
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 if ($ProfileScope -ceq "LocalMachine") {

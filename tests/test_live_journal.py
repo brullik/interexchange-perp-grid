@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import threading
@@ -132,6 +133,201 @@ async def _prepare(
         },
         _QUALIFICATION,
     )
+
+
+async def _prepare_fast_live(
+    journal: LiveOrderJournal,
+    *,
+    pair_id: str,
+    base: str,
+    preflight_sha256: str,
+    expires_at: datetime,
+    now: datetime,
+) -> LiveJournalAction:
+    route = DirectedRouteKey(base, Venue.BINANCE_USDM, Venue.OKX)
+    long_request = _request(route.long_venue, venue_client_order_id(pair_id, "long"), Side.BUY)
+    short_request = _request(route.short_venue, venue_client_order_id(pair_id, "short"), Side.SELL)
+    return await journal.prepare(
+        pair_id,
+        route,
+        f"{pair_id}-tranche",
+        long_request,
+        short_request,
+        {route.long_venue: Decimal("0.001"), route.short_venue: Decimal("0.001")},
+        {route.long_venue: Decimal("100.1"), route.short_venue: Decimal("99.9")},
+        {
+            "strategy": "AGGRESSIVE_FAST_LIVE_V2",
+            "projected_stress_usdt": "0.8",
+            "activation_hash": preflight_sha256,
+            "fast_live_preflight_expires_at": expires_at.isoformat(),
+            "consumption_data_generation_sha256": "c" * 64,
+            "initial_adverse_funding_reserve_usdt": "0.1",
+            "initial_remaining_close_fees_usdt": "0.1",
+            "initial_measured_book_impact_usdt": "0.1",
+            "initial_total_reserves_usdt": "0.1",
+        },
+        "0" * 64,
+        now,
+        activation_hash=preflight_sha256,
+        fast_live_preflight_sha256=preflight_sha256,
+        fast_live_preflight_expires_at=expires_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_v2_reserves_update_twice_before_submit_and_never_after_order_event(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    now = datetime.now(UTC)
+    await journal.issue_fast_live_preflight("f" * 64, now + timedelta(minutes=10), now=now)
+    action = await _prepare_fast_live(
+        journal,
+        pair_id="v2-final-reserves",
+        base="BTC",
+        preflight_sha256="f" * 64,
+        expires_at=now + timedelta(minutes=10),
+        now=now,
+    )
+    components = {
+        "initial_adverse_funding_reserve_usdt": Decimal("0.2"),
+        "initial_remaining_close_fees_usdt": Decimal("0.3"),
+        "initial_measured_book_impact_usdt": Decimal("0.4"),
+        "initial_total_reserves_usdt": Decimal("0.5"),
+    }
+    first = await journal.update_final_opening_reserves(
+        action.pair_action_id, components, data_generation_sha256="d" * 64
+    )
+    await journal.mark_submit_attempted(
+        action.pair_action_id,
+        tuple(leg.client_order_id for leg in action.legs),
+    )
+    second = await journal.update_final_opening_reserves(
+        action.pair_action_id, components, data_generation_sha256="e" * 64
+    )
+
+    assert first.risk_reservation["initial_total_reserves_usdt"] == "0.5"
+    assert first.risk_reservation["consumption_data_generation_sha256"] == "c" * 64
+    assert first.risk_reservation["latest_opening_data_generation_sha256"] == "d" * 64
+    assert second.state == LiveActionState.SUBMITTING
+    assert second.risk_reservation["latest_opening_data_generation_sha256"] == "e" * 64
+    assert second.risk_reservation["opening_data_generation_sha256_history"] == [
+        "d" * 64,
+        "e" * 64,
+    ]
+    with sqlite3.connect(tmp_path / "state.sqlite3") as database:
+        details = tuple(
+            json.loads(str(row[0]))
+            for row in database.execute(
+                "SELECT details_json FROM live_action_transitions "
+                "WHERE pair_action_id = ? ORDER BY transition_id",
+                (action.pair_action_id,),
+            )
+        )
+    assert details[0]["fast_live_preflight_sha256"] == "f" * 64
+    assert details[0]["consumption_data_generation_sha256"] == "c" * 64
+    opening_details = tuple(item for item in details if "data_generation_sha256" in item)
+    assert [item["data_generation_sha256"] for item in opening_details] == [
+        "d" * 64,
+        "e" * 64,
+    ]
+    await journal.record_order_event(
+        action.pair_action_id,
+        replace(
+            _event(filled="0", status=PrivateOrderStatus.OPEN),
+            client_order_id=action.legs[0].client_order_id,
+        ),
+        "post-submit-event",
+    )
+    with pytest.raises(RuntimeError, match="after an order event"):
+        await journal.update_final_opening_reserves(
+            action.pair_action_id, components, data_generation_sha256="f" * 64
+        )
+
+
+@pytest.mark.asyncio
+async def test_fast_live_preflight_consumption_is_atomic_and_single_use(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    observed = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    activation = "c" * 64
+    await journal.issue_fast_live_preflight(
+        activation, observed + timedelta(seconds=600), now=observed
+    )
+
+    results = await asyncio.gather(
+        _prepare_fast_live(
+            journal,
+            pair_id="fast-btc",
+            base="BTC",
+            preflight_sha256=activation,
+            expires_at=observed + timedelta(seconds=600),
+            now=observed,
+        ),
+        _prepare_fast_live(
+            journal,
+            pair_id="fast-eth",
+            base="ETH",
+            preflight_sha256=activation,
+            expires_at=observed + timedelta(seconds=600),
+            now=observed,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, LiveJournalAction) for result in results) == 1
+    failures = tuple(result for result in results if isinstance(result, BaseException))
+    assert len(failures) == 1
+    assert "already consumed" in str(failures[0])
+    with sqlite3.connect(journal.path) as database:
+        assert database.execute(
+            "SELECT count(*) FROM fast_live_preflight_consumption"
+        ).fetchone() == (1,)
+        assert database.execute("SELECT count(*) FROM live_pair_actions").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_unissued_rehashed_fast_live_preflight_cannot_create_intent(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    observed = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    with pytest.raises(RuntimeError, match="not durably issued"):
+        await _prepare_fast_live(
+            journal,
+            pair_id="forged",
+            base="BTC",
+            preflight_sha256="e" * 64,
+            expires_at=observed + timedelta(seconds=600),
+            now=observed,
+        )
+
+
+@pytest.mark.asyncio
+async def test_expired_fast_live_preflight_never_creates_durable_intent(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    observed = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    with pytest.raises(RuntimeError, match="expired"):
+        await _prepare_fast_live(
+            journal,
+            pair_id="fast-expired",
+            base="BTC",
+            preflight_sha256="d" * 64,
+            expires_at=observed - timedelta(microseconds=1),
+            now=observed,
+        )
+    with sqlite3.connect(journal.path) as database:
+        assert database.execute(
+            "SELECT count(*) FROM fast_live_preflight_consumption"
+        ).fetchone() == (0,)
+        assert database.execute("SELECT count(*) FROM live_pair_actions").fetchone() == (0,)
 
 
 @pytest.mark.asyncio
@@ -470,10 +666,16 @@ async def test_actual_fill_repricing_blocks_next_tranche_at_hard_route_limit(
             "portfolio_total_usdt": "4.5",
             "actual_entry_spread_bps": "20",
             "fill_event_watermark": watermark,
+            "actual_open_fees_usdt": "0.1",
+            "remaining_close_fees_usdt": "0.1",
+            "initial_measured_book_impact_usdt": "0.2",
+            "adverse_funding_usdt": "0.05",
+            "other_reserves_usdt": "0.3",
         },
     )
 
     assert updated.risk_reservation["actual_fill_risk"]["incremental_stress_usdt"] == "4.5"
+    assert updated.risk_reservation["actual_fill_risk"]["actual_open_fees_usdt"] == "0.1"
     with pytest.raises(RuntimeError, match="maximum live route stress"):
         await _prepare(
             journal,

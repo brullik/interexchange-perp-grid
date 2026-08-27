@@ -165,10 +165,10 @@ class ExternalGridLevelProjection:
         ):
             raise ValueError("external open grid projection is invalid")
         if self.state == GridLevelState.CLOSED_WAIT_REARM and (
-            self.ownership is not None
-            or self.decision_cycle is not None
-            or self.reserved_stress_usdt != 0
+            self.decision_cycle is not None and self.decision_cycle < 0
         ):
+            raise ValueError("external closed grid projection cycle is invalid")
+        if self.state == GridLevelState.CLOSED_WAIT_REARM and (self.reserved_stress_usdt != 0):
             raise ValueError("external closed grid projection is invalid")
 
 
@@ -309,9 +309,34 @@ class AggressiveGridStore:
                 (route_identity,),
             ).fetchone()
             if existing is not None:
-                if (str(existing[0]), str(existing[1])) != (model_hash, direction.value):
-                    raise RuntimeError("active grid route model identity mismatch")
                 persisted = self._levels_locked(database, route_identity)
+                identity_matches = (str(existing[0]), str(existing[1])) == (
+                    model_hash,
+                    direction.value,
+                )
+                if not identity_matches:
+                    if not _model_refresh_allowed(persisted):
+                        raise RuntimeError("active grid route model identity mismatch")
+                    database.execute(
+                        "DELETE FROM aggressive_grid_sizing_plans WHERE route_identity = ?",
+                        (route_identity,),
+                    )
+                    database.execute(
+                        "DELETE FROM aggressive_grid_levels WHERE route_identity = ?",
+                        (route_identity,),
+                    )
+                    database.execute(
+                        """
+                        UPDATE aggressive_grid_routes
+                        SET model_sha256 = ?, direction = ?, updated_at = ?
+                        WHERE route_identity = ?
+                        """,
+                        (model_hash, direction.value, now.isoformat(), route_identity),
+                    )
+                    for record in records:
+                        self._write_level_locked(database, record)
+                    database.commit()
+                    return records
                 if tuple(_geometry(record) for record in persisted) != tuple(
                     _geometry(record) for record in records
                 ):
@@ -583,11 +608,27 @@ class AggressiveGridStore:
                     state=projection.state,
                     ownership=projection.ownership,
                     reserved_stress_usdt=projection.reserved_stress_usdt,
-                    pending_decision_cycle=projection.decision_cycle,
+                    pending_decision_cycle=(
+                        projection.decision_cycle
+                        if projection.state == GridLevelState.ENTRY_PENDING
+                        else None
+                    ),
                     now=now,
                 )
                 self._write_level_locked(database, record)
                 updated.append(record)
+            decision_cycles = tuple(
+                item.decision_cycle for item in projections if item.decision_cycle is not None
+            )
+            if decision_cycles:
+                database.execute(
+                    """
+                    UPDATE aggressive_grid_routes
+                    SET last_decision_cycle = MAX(last_decision_cycle, ?), updated_at = ?
+                    WHERE route_identity = ?
+                    """,
+                    (max(decision_cycles), now.isoformat(), route_identity),
+                )
             database.commit()
         return tuple(updated)
 
@@ -733,6 +774,19 @@ class AggressiveGridStore:
                 now=now,
             )
             self._write_level_locked(database, updated)
+            if target == GridLevelState.ARMED:
+                route_levels = self._levels_locked(database, route_identity)
+                if len(route_levels) == _LEVEL_COUNT and all(
+                    level.state in {GridLevelState.ARMED, GridLevelState.DISABLED}
+                    and level.ownership is None
+                    and level.pending_decision_cycle is None
+                    and level.reserved_stress_usdt == 0
+                    for level in route_levels
+                ):
+                    database.execute(
+                        "DELETE FROM aggressive_grid_sizing_plans WHERE route_identity = ?",
+                        (route_identity,),
+                    )
             database.commit()
             return updated
 
@@ -883,6 +937,20 @@ def _geometry(record: GridLevelRecord) -> tuple[object, ...]:
         record.trigger_bps,
         record.allocated_weight,
         record.rearm_boundary_bps,
+    )
+
+
+def _model_refresh_allowed(levels: tuple[GridLevelRecord, ...]) -> bool:
+    flat_states = {
+        GridLevelState.ARMED,
+        GridLevelState.DISABLED,
+    }
+    return len(levels) == _LEVEL_COUNT and all(
+        level.state in flat_states
+        and level.ownership is None
+        and level.pending_decision_cycle is None
+        and level.reserved_stress_usdt == 0
+        for level in levels
     )
 
 

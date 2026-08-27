@@ -944,9 +944,11 @@ async def test_hard_route_exit_closes_all_tranches_under_one_flat_barrier(tmp_pa
         assert await adapters[venue].fetch_all_positions() == ()
 
 
+@pytest.mark.parametrize("strategy", ["AGGRESSIVE_SYMBIOSIS_V1", "AGGRESSIVE_FAST_LIVE_V2"])
 @pytest.mark.asyncio
 async def test_real_fill_repricing_persists_reserves_and_closes_at_hard_limit(
     tmp_path: Path,
+    strategy: str,
 ) -> None:
     instruments = {venue: _instrument(venue) for venue in Venue}
     adapters = {
@@ -968,6 +970,24 @@ async def test_real_fill_repricing_persists_reserves_and_closes_at_hard_limit(
     }
     journal = LiveOrderJournal(tmp_path / "actual-risk.sqlite3")
     policy = load_aggressive_decision_policy(Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")).policy
+    plan = _aggressive_hard_breach_plan()
+    plan = replace(
+        plan,
+        risk_reservation={
+            **plan.risk_reservation,
+            "strategy": strategy,
+            "initial_measured_book_impact_usdt": "0.2",
+            "initial_adverse_funding_reserve_usdt": (
+                "0.3" if strategy == "AGGRESSIVE_FAST_LIVE_V2" else "0.1"
+            ),
+            "initial_remaining_close_fees_usdt": (
+                "0.4" if strategy == "AGGRESSIVE_FAST_LIVE_V2" else "0.2"
+            ),
+            "initial_total_reserves_usdt": (
+                "1.7" if strategy == "AGGRESSIVE_FAST_LIVE_V2" else "0.9"
+            ),
+        },
+    )
     result = await LiveCanaryCoordinator(
         journal,
         adapters,
@@ -982,7 +1002,7 @@ async def test_real_fill_repricing_persists_reserves_and_closes_at_hard_limit(
         DeterministicCanaryMonitor(CloseReason.CANARY_TIMEOUT),
         Venue.BYBIT,
         aggressive_policy=policy,
-    ).run(_aggressive_hard_breach_plan())
+    ).run(plan)
     stored = await journal.load("cycle-1")
 
     assert result.success and result.close_reason == CloseReason.HARD_STOP_OR_LOSS
@@ -991,13 +1011,28 @@ async def test_real_fill_repricing_persists_reserves_and_closes_at_hard_limit(
     actual = stored.risk_reservation["actual_fill_risk"]
     # Includes the explicit 0.20 USDT reserve for the two still-unexecuted close legs.
     assert Decimal(str(actual["incremental_stress_usdt"])) >= Decimal("1.2001")
+    assert Decimal(str(actual["actual_open_fees_usdt"])) > 0
+    assert actual["initial_measured_book_impact_usdt"] == "0.2"
+    assert actual["other_reserves_usdt"] == (
+        "1.7" if strategy == "AGGRESSIVE_FAST_LIVE_V2" else "0.9"
+    )
+    assert actual["adverse_funding_usdt"] == (
+        "0.3" if strategy == "AGGRESSIVE_FAST_LIVE_V2" else "0.1"
+    )
+    assert actual["remaining_close_fees_usdt"] == (
+        "0.4" if strategy == "AGGRESSIVE_FAST_LIVE_V2" else "0.2"
+    )
     assert all(
         adapter.submit_calls == 2 for venue, adapter in adapters.items() if venue != Venue.BYBIT
     )
 
 
+@pytest.mark.parametrize("strategy", ["AGGRESSIVE_SYMBIOSIS_V1", "AGGRESSIVE_FAST_LIVE_V2"])
 @pytest.mark.asyncio
-async def test_partial_fill_hard_breach_reduces_before_opening_top_up(tmp_path: Path) -> None:
+async def test_partial_fill_hard_breach_reduces_before_opening_top_up(
+    tmp_path: Path,
+    strategy: str,
+) -> None:
     instruments = {venue: _instrument(venue) for venue in Venue}
     adapters = {
         Venue.BINANCE_USDM: DeterministicPrivateExchange(
@@ -1018,7 +1053,15 @@ async def test_partial_fill_hard_breach_reduces_before_opening_top_up(tmp_path: 
     plan = _aggressive_hard_breach_plan()
     plan = replace(
         plan,
-        risk_reservation={**plan.risk_reservation, "route_hard_loss_usdt": "0.85"},
+        risk_reservation={
+            **plan.risk_reservation,
+            "route_hard_loss_usdt": "0.85",
+            "strategy": strategy,
+            "initial_measured_book_impact_usdt": "0.2",
+            "initial_adverse_funding_reserve_usdt": "0.1",
+            "initial_remaining_close_fees_usdt": "0.2",
+            "initial_total_reserves_usdt": "0.9",
+        },
     )
     journal = LiveOrderJournal(tmp_path / "partial-risk.sqlite3")
     policy = load_aggressive_decision_policy(Path("config/AGGRESSIVE_SYMBIOSIS_V1.yaml")).policy

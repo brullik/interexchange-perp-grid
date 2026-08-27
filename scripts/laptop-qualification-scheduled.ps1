@@ -8,6 +8,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+throw "Legacy scheduled qualification is disabled in Aggressive Fast Live V2."
+
 if ($ProfileScope -cne "LocalMachine") {
     throw "Scheduled qualification requires the LocalMachine DPAPI profile"
 }

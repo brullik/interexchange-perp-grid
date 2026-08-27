@@ -180,7 +180,7 @@ class LiveConfig(StrictModel):
     enabled: bool
     require_local_unlock_secret: Literal[True]
     require_telegram_challenge: Literal[True]
-    require_current_hash_qualification: Literal[True]
+    require_current_hash_qualification: Literal[True] = True
     canary_max_routes: Literal[1]
     canary_max_tranches: Literal[1]
     canary_pair_stressed_loss_limit_usdt: Decimal = Field(gt=0, le=Decimal("1"))
@@ -190,7 +190,7 @@ class LiveConfig(StrictModel):
     canary_close_slippage_cap_bps: Decimal = Field(gt=0, le=Decimal("200"))
     canary_timeout_seconds: int = Field(gt=0, le=3600)
     canary_minimum_profit_usdt: Decimal = Field(gt=0)
-    qualification_max_age_seconds: int = Field(gt=0, le=604800)
+    qualification_max_age_seconds: int = Field(default=86400, gt=0, le=604800)
     flat_barrier_consecutive_snapshots: int = Field(ge=2, le=10)
     flat_barrier_quiet_period_seconds: Decimal = Field(gt=0, le=Decimal("30"))
     flat_barrier_poll_interval_seconds: Decimal = Field(gt=0, le=Decimal("5"))
@@ -210,14 +210,16 @@ class ShadowConfig(StrictModel):
     scan_timeout_seconds: int = Field(gt=0, le=120)
     overload_pending_limit: int = Field(gt=0, le=10000)
     history_retention_days: int = Field(gt=0, le=3650)
-    qualification_min_duration_seconds: int = Field(ge=86400, le=604800)
-    qualification_min_synchronised_snapshots_per_venue: int = Field(ge=10000, le=10000000)
-    qualification_min_funding_checkpoints_per_venue: int = Field(ge=3, le=1000)
-    qualification_max_inter_snapshot_gap_seconds: int = Field(gt=0, le=3600)
-    qualification_max_sequence_gaps: int = Field(ge=0, le=10000)
-    qualification_max_stale_snapshots: int = Field(ge=0, le=10000)
-    qualification_max_sequence_unknown_snapshots: int = Field(ge=0, le=10000)
-    qualification_max_clock_skew_snapshots: int = Field(ge=0, le=10000)
+    qualification_min_duration_seconds: int = Field(default=86400, ge=86400, le=604800)
+    qualification_min_synchronised_snapshots_per_venue: int = Field(
+        default=10000, ge=10000, le=10000000
+    )
+    qualification_min_funding_checkpoints_per_venue: int = Field(default=3, ge=3, le=1000)
+    qualification_max_inter_snapshot_gap_seconds: int = Field(default=60, gt=0, le=3600)
+    qualification_max_sequence_gaps: int = Field(default=0, ge=0, le=10000)
+    qualification_max_stale_snapshots: int = Field(default=0, ge=0, le=10000)
+    qualification_max_sequence_unknown_snapshots: int = Field(default=0, ge=0, le=10000)
+    qualification_max_clock_skew_snapshots: int = Field(default=0, ge=0, le=10000)
 
     @model_validator(mode="after")
     def base_is_valid(self) -> ShadowConfig:

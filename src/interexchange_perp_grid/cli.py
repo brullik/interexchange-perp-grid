@@ -19,6 +19,11 @@ import typer
 
 from interexchange_perp_grid.adapters.ccxt_pro import CcxtProAdapter
 from interexchange_perp_grid.adapters.private import CcxtPrivateAdapter, PrivateCredentials
+from interexchange_perp_grid.aggressive_activation import (
+    AggressiveFastLiveBinding,
+    build_aggressive_fast_live_binding,
+    verify_aggressive_fast_live_binding,
+)
 from interexchange_perp_grid.aggressive_evaluator import (
     AggressiveEntryStage,
     AggressiveExitReason,
@@ -28,6 +33,7 @@ from interexchange_perp_grid.aggressive_evaluator import (
 from interexchange_perp_grid.aggressive_grid import (
     AggressiveGridStore,
     ExternalGridLevelProjection,
+    FrozenGridSizingPlan,
     GridLegFill,
     GridLevelState,
     GridTrancheOwnership,
@@ -42,10 +48,14 @@ from interexchange_perp_grid.aggressive_laptop_acceptance import (
     verify_aggressive_laptop_handoff,
 )
 from interexchange_perp_grid.aggressive_live import (
+    AggressiveFastLiveIntentEnvelope,
     AggressiveLaptopLiveStage,
     AggressiveLiveIntentEnvelope,
     aggressive_intent_sha256,
+    frozen_grid_sizing_from_mapping,
+    load_aggressive_fast_live_intent,
     load_aggressive_live_intent,
+    save_aggressive_fast_live_intent,
     save_aggressive_live_intent,
 )
 from interexchange_perp_grid.aggressive_model import (
@@ -85,10 +95,14 @@ from interexchange_perp_grid.canary_runtime import (
     collect_authoritative_live_flat_evidence,
     run_canary_once,
     run_emergency_flatten,
+    run_fast_live_once,
 )
 from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Instrument, InstrumentKey, ProductType, Venue
 from interexchange_perp_grid.execution import Side
+from interexchange_perp_grid.fast_live_preflight import load_fast_live_preflight
+from interexchange_perp_grid.github_checks import fetch_required_checks_evidence
+from interexchange_perp_grid.independent_review import verify_independent_review_receipt
 from interexchange_perp_grid.laptop_workflow import (
     LaptopQualificationIdentity,
     build_laptop_pilot_report,
@@ -98,6 +112,7 @@ from interexchange_perp_grid.laptop_workflow import (
 from interexchange_perp_grid.live_journal import (
     DeploymentUpgradeGate,
     LiveActionState,
+    LiveJournalAction,
     LiveOrderJournal,
     completed_normal_actions_sha256,
     is_completed_normal_paired_cycle,
@@ -110,6 +125,7 @@ from interexchange_perp_grid.maintenance import (
 from interexchange_perp_grid.native_runtime import (
     build_native_runtime_manifest,
     load_native_runtime_manifest,
+    native_runtime_manifest_sha256,
     resolve_runtime_artifact_digest,
     verify_native_runtime_manifest,
     write_native_runtime_manifest,
@@ -197,9 +213,12 @@ from interexchange_perp_grid.state import (
     promote_risk_stage,
     read_qualification_epoch,
     read_risk_stage,
+    read_runtime_controls,
     read_service_health,
     record_risk_stage_result,
+    select_fast_live_risk_stage,
     start_qualification_epoch,
+    update_runtime_controls,
 )
 from interexchange_perp_grid.strategy import DirectedRouteKey
 from interexchange_perp_grid.supervisor import SupervisorHealth, read_supervisor_health
@@ -858,10 +877,260 @@ def _journal_action_effective_stress(risk_reservation: object) -> Decimal:
     return max(planned, repriced)
 
 
+def _fast_live_cost_evidence_complete(action: LiveJournalAction) -> bool:
+    fees = action.risk_reservation.get("initial_private_taker_fee_rates")
+    rates = action.risk_reservation.get("initial_funding_rates")
+    timestamps = action.risk_reservation.get("initial_funding_next_timestamp_ms")
+    actual = action.risk_reservation.get("actual_fill_risk")
+    consumption_hash = str(action.risk_reservation.get("consumption_data_generation_sha256", ""))
+    opening_hashes = action.risk_reservation.get("opening_data_generation_sha256_history")
+    if (
+        not isinstance(fees, dict)
+        or not isinstance(rates, dict)
+        or not isinstance(timestamps, dict)
+        or not isinstance(actual, dict)
+        or re.fullmatch(r"[0-9a-f]{64}", consumption_hash) is None
+        or not isinstance(opening_hashes, list)
+        or len(opening_hashes) < 2
+        or any(re.fullmatch(r"[0-9a-f]{64}", str(value)) is None for value in opening_hashes)
+        or action.risk_reservation.get("latest_opening_data_generation_sha256")
+        != opening_hashes[-1]
+    ):
+        return False
+    funding_timestamps: list[int] = []
+    for venue in (action.route.long_venue.value, action.route.short_venue.value):
+        try:
+            fee = Decimal(str(fees[venue]))
+            rate = Decimal(str(rates[venue]))
+            timestamp = int(str(timestamps[venue]))
+        except (KeyError, ValueError, ArithmeticError):
+            return False
+        if not fee.is_finite() or fee < 0 or not rate.is_finite() or timestamp <= 0:
+            return False
+        funding_timestamps.append(timestamp)
+    try:
+        actual_values = tuple(
+            Decimal(str(actual[key]))
+            for key in (
+                "incremental_stress_usdt",
+                "route_total_usdt",
+                "portfolio_total_usdt",
+                "actual_entry_spread_bps",
+                "actual_open_fees_usdt",
+                "remaining_close_fees_usdt",
+                "initial_measured_book_impact_usdt",
+                "adverse_funding_usdt",
+                "other_reserves_usdt",
+            )
+        )
+        fill_watermark = int(str(actual["fill_event_watermark"]))
+    except (KeyError, ValueError, ArithmeticError):
+        return False
+    if any(
+        int(action.created_at.timestamp() * 1000)
+        <= timestamp
+        <= int(action.updated_at.timestamp() * 1000)
+        for timestamp in funding_timestamps
+    ):
+        try:
+            realised_funding = Decimal(str(actual["realized_funding_usdt"]))
+        except (KeyError, ValueError, ArithmeticError):
+            return False
+        if not realised_funding.is_finite():
+            return False
+    return not (
+        any(not value.is_finite() for value in actual_values)
+        or min(actual_values[:3]) <= 0
+        or min(actual_values[4:]) < 0
+        or fill_watermark <= 0
+    )
+
+
 def _required_order_decimal(value: Decimal | None) -> Decimal:
     if value is None or not value.is_finite():
         raise ValueError("live journal fill value is missing")
     return value
+
+
+async def _fast_live_grid_ownership(
+    journal: LiveOrderJournal,
+    action: LiveJournalAction,
+) -> GridTrancheOwnership:
+    orders = {
+        order.client_order_id: order
+        for order in await journal.latest_order_events(action.pair_action_id)
+    }
+    opening_ids = action.risk_reservation.get("opening_client_order_ids")
+    actual = action.risk_reservation.get("actual_fill_risk")
+    if not isinstance(opening_ids, dict) or not isinstance(actual, dict):
+        raise RuntimeError("V2 journal ownership is incomplete")
+    long_order = orders[str(opening_ids["long"])]
+    short_order = orders[str(opening_ids["short"])]
+    if (
+        long_order.filled_base_quantity <= 0
+        or long_order.filled_base_quantity != short_order.filled_base_quantity
+    ):
+        raise RuntimeError("V2 opening legs are not quantity matched")
+    return GridTrancheOwnership(
+        tranche_id=action.tranche_id,
+        normalized_base_quantity=long_order.filled_base_quantity,
+        legs=(
+            GridLegFill(
+                action.route.long_venue,
+                long_order.symbol,
+                Side.BUY,
+                long_order.filled_base_quantity,
+                _required_order_decimal(long_order.average_price),
+                _required_order_decimal(long_order.fee_usdt),
+                Decimal(0),
+            ),
+            GridLegFill(
+                action.route.short_venue,
+                short_order.symbol,
+                Side.SELL,
+                short_order.filled_base_quantity,
+                _required_order_decimal(short_order.average_price),
+                _required_order_decimal(short_order.fee_usdt),
+                Decimal(0),
+            ),
+        ),
+        executable_entry_spread_bps=Decimal(str(actual["actual_entry_spread_bps"])),
+        reverse_target_bps=Decimal(str(action.risk_reservation["target_exit_spread_bps"])),
+        effective_stop_bps=Decimal(str(action.risk_reservation["effective_stop_bps"])),
+        maximum_holding_deadline=datetime.fromisoformat(
+            str(action.risk_reservation["hard_holding_deadline"])
+        ),
+        reserved_stress_usdt=_journal_action_effective_stress(action.risk_reservation),
+        entry_slippage_usdt=Decimal(0),
+        realised_pnl_usdt=Decimal(0),
+        unrealised_pnl_usdt=Decimal(0),
+        opened_at=datetime.fromisoformat(str(action.risk_reservation["route_opened_at"])),
+    )
+
+
+async def _synchronize_fast_live_journal_grid(
+    settings: Settings,
+    grid: AggressiveGridStore,
+    route_identity: str,
+) -> bool:
+    """Repair the local strategy fence from the authoritative V2 journal."""
+    journal = LiveOrderJournal(Path(settings.storage.sqlite_path))
+    await journal.initialise()
+    active = await journal.active_actions()
+    completed = await journal.completed_fast_live_actions()
+    all_v2 = tuple(
+        action
+        for action in (*completed, *active)
+        if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+    )
+    route_actions = tuple(action for action in all_v2 if action.route.value == route_identity)
+    latest_by_level: dict[int, LiveJournalAction] = {}
+    for action in sorted(route_actions, key=lambda item: (item.updated_at, item.pair_action_id)):
+        reservation = action.risk_reservation
+        level = int(str(reservation["level_index"]))
+        cycle = int(str(reservation["decision_cycle"]))
+        if not 1 <= level <= 5 or cycle < 0:
+            raise RuntimeError("V2 journal grid identity is invalid")
+        latest_by_level[level] = action
+
+    projections: list[ExternalGridLevelProjection] = []
+    levels = {item.level_index: item for item in grid.levels(route_identity)}
+    non_canary = tuple(
+        action
+        for action in route_actions
+        if action.risk_reservation.get("stage") != AggressiveLaptopLiveStage.CANARY.value
+    )
+    if non_canary:
+        latest_plan_action = max(
+            non_canary,
+            key=lambda action: int(str(action.risk_reservation["decision_cycle"])),
+        )
+        latest_level = int(str(latest_plan_action.risk_reservation["level_index"]))
+        latest_cycle = int(str(latest_plan_action.risk_reservation["decision_cycle"]))
+        latest_was_rearmed = (
+            latest_plan_action.state == LiveActionState.FLAT
+            and levels[latest_level].state == GridLevelState.ARMED
+            and grid.next_decision_cycle(route_identity) > latest_cycle
+        )
+        if not latest_was_rearmed:
+            plan = frozen_grid_sizing_from_mapping(
+                latest_plan_action.risk_reservation.get("grid_sizing_plan")
+            )
+            active_plans = {
+                frozen_grid_sizing_from_mapping(action.risk_reservation.get("grid_sizing_plan"))
+                for action in active
+                if action.route.value == route_identity
+                and action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+                and action.risk_reservation.get("stage") != AggressiveLaptopLiveStage.CANARY.value
+            }
+            if active_plans and active_plans != {plan}:
+                raise RuntimeError("active V2 journal sizing plans are inconsistent")
+            observed = grid.frozen_sizing_plan(route_identity)
+            if observed is None:
+                grid.freeze_sizing_plan(plan)
+            elif observed != plan:
+                raise RuntimeError("V2 journal frozen sizing conflicts with local grid")
+    journal_cycles = {
+        (
+            int(str(action.risk_reservation["level_index"])),
+            int(str(action.risk_reservation["decision_cycle"])),
+        )
+        for action in route_actions
+    }
+    for current in levels.values():
+        if (
+            current.state == GridLevelState.ENTRY_PENDING
+            and current.pending_decision_cycle is not None
+            and (current.level_index, current.pending_decision_cycle) not in journal_cycles
+        ):
+            raise RuntimeError("orphan V2 grid reservation requires fail-closed recovery")
+    for level, action in sorted(latest_by_level.items()):
+        cycle = int(str(action.risk_reservation["decision_cycle"]))
+        current = levels[level]
+        if action.state == LiveActionState.FLAT:
+            # ARMED with an already-consumed cycle proves a later durable rearm; do not replay
+            # the historical close and erase the new-crossing fence.
+            if (
+                current.state == GridLevelState.ARMED
+                and grid.next_decision_cycle(route_identity) > cycle
+            ):
+                continue
+            ownership = await _fast_live_grid_ownership(journal, action)
+            projections.append(
+                ExternalGridLevelProjection(
+                    level,
+                    GridLevelState.CLOSED_WAIT_REARM,
+                    Decimal(0),
+                    decision_cycle=cycle,
+                    ownership=ownership,
+                )
+            )
+        elif action.state in {LiveActionState.HEDGED, LiveActionState.CLOSING}:
+            ownership = await _fast_live_grid_ownership(journal, action)
+            projections.append(
+                ExternalGridLevelProjection(
+                    level,
+                    GridLevelState.OPEN,
+                    _journal_action_effective_stress(action.risk_reservation),
+                    ownership=ownership,
+                )
+            )
+        else:
+            projections.append(
+                ExternalGridLevelProjection(
+                    level,
+                    GridLevelState.ENTRY_PENDING,
+                    _journal_action_effective_stress(action.risk_reservation),
+                    decision_cycle=cycle,
+                )
+            )
+    if projections:
+        grid.synchronize_journal_levels(
+            route_identity,
+            tuple(projections),
+            now=datetime.now(UTC),
+        )
+    return any(action.state != LiveActionState.FLAT for action in all_v2)
 
 
 @app.command()
@@ -877,10 +1146,18 @@ def health(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         )
 
     result, supervisor = asyncio.run(read_health())
+    observed_at = datetime.now(UTC)
+    supervisor_healthy = (
+        supervisor is not None
+        and supervisor.mode.value != "STOPPED"
+        and (observed_at - supervisor.heartbeat_at).total_seconds()
+        <= settings.app.health_max_age_seconds
+    )
+    healthy = result.healthy and supervisor_healthy
     typer.echo(
         json.dumps(
             {
-                "status": "PASS" if result.healthy else "FAIL",
+                "status": "PASS" if healthy else "FAIL",
                 "reason": result.reason,
                 "service_status": result.status,
                 "heartbeat_at": result.heartbeat_at,
@@ -897,12 +1174,15 @@ def health(config: ConfigPath = Path("config/defaults.yaml")) -> None:
                 ),
                 "recovery_outcome": supervisor.outcome if supervisor is not None else None,
                 "supervisor_failure": supervisor.failure if supervisor is not None else None,
+                "supervisor_heartbeat_at": (
+                    supervisor.heartbeat_at if supervisor is not None else None
+                ),
             },
             default=str,
             sort_keys=True,
         )
     )
-    if not result.healthy:
+    if not healthy:
         raise typer.Exit(code=1)
 
 
@@ -1528,6 +1808,937 @@ def aggressive_live_intent_once(
     )
 
 
+async def _current_private_fee_rates(model: HistoricalReferenceModel) -> dict[Venue, Decimal]:
+    adapters: dict[Venue, CcxtPrivateAdapter] = {}
+    try:
+        result: dict[Venue, Decimal] = {}
+        for venue in (Venue(model.venue_a), Venue(model.venue_b)):
+            adapter = CcxtPrivateAdapter(venue, PrivateCredentials.from_environment(venue))
+            adapters[venue] = adapter
+            instrument = next(
+                (
+                    item
+                    for item in await adapter.list_instruments()
+                    if item.base == model.base
+                    and item.quote == "USDT"
+                    and item.settle == "USDT"
+                    and item.product_type == ProductType.LINEAR_USDT_PERPETUAL
+                    and item.active
+                ),
+                None,
+            )
+            if instrument is None:
+                raise RuntimeError(f"{venue.value}: fast-live instrument is unavailable")
+            fee = await adapter.fetch_trading_fee(instrument)
+            if fee is None or not fee.is_finite() or fee < 0:
+                raise RuntimeError(f"{venue.value}: private taker fee is unavailable")
+            result[venue] = fee
+        return result
+    finally:
+        await asyncio.gather(
+            *(adapter.close() for adapter in adapters.values()),
+            return_exceptions=True,
+        )
+
+
+@app.command("aggressive-fast-live-intent-once")
+def aggressive_fast_live_intent_once(
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    output: Annotated[Path, typer.Option("--output")] = Path(
+        "state/aggressive-fast-live-intent.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    history_root: Annotated[Path, typer.Option("--history-root")] = Path("data/reference-history"),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-fast-live-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_FAST_LIVE_V2.yaml"
+    ),
+    stage: Annotated[AggressiveLaptopLiveStage, typer.Option("--stage")] = (
+        AggressiveLaptopLiveStage.CANARY
+    ),
+    timeout_seconds: Annotated[int, typer.Option("--timeout", min=1, max=120)] = 30,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create one current V2 intent without qualification, consent, or submit authority."""
+    settings = _load(config)
+    if settings.app.mode != "shadow" or settings.live.enabled:
+        raise typer.BadParameter("fast-live intent preparation requires shadow/live=false")
+    loaded_model = load_historical_model(model.resolve())
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest.resolve(), repo_root.resolve(), config.resolve()
+    )
+    profile_sha256 = hashlib.sha256(profile.read_bytes()).hexdigest()
+    if loaded_model.strategy_profile_sha256 != profile_sha256:
+        raise typer.BadParameter("fast-live model/profile identity mismatch")
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    grid_now = datetime.now(UTC)
+    for direction in (loaded_model.positive.direction, loaded_model.negative.direction):
+        grid_store.initialise_route(
+            loaded_model,
+            direction,
+            now=grid_now,
+            rearm_retreat_step_fraction=Decimal("0.25"),
+        )
+
+    async def synchronize_grid() -> bool:
+        transitional = False
+        for route_identity in (loaded_model.positive_route, loaded_model.negative_route):
+            transitional = (
+                await _synchronize_fast_live_journal_grid(
+                    settings,
+                    grid_store,
+                    route_identity,
+                )
+                or transitional
+            )
+        return transitional
+
+    if asyncio.run(synchronize_grid()):
+        typer.echo(json.dumps({"status": "WAITING_FOR_DURABLE_LIVE_TRANSITION"}))
+        raise typer.Exit(code=3)
+    fees = asyncio.run(_current_private_fee_rates(loaded_model))
+    intents: list[AggressiveTrancheIntent] = []
+    accepted_decisions: list[AggressiveStrategyDecision] = []
+    result = asyncio.run(
+        _run_aggressive_shadow_once(
+            settings,
+            model.resolve(),
+            history_root.resolve(),
+            grid.resolve(),
+            profile.resolve(),
+            config.resolve(),
+            timeout_seconds,
+            runtime_mode=AggressiveRuntimeMode.LIVE,
+            simulate_fills=False,
+            private_fee_rates=fees,
+            entry_stage=(
+                AggressiveEntryStage.LOCKED_CANARY
+                if stage == AggressiveLaptopLiveStage.CANARY
+                else AggressiveEntryStage.NORMAL
+            ),
+            intent_sink=intents,
+            decision_sink=accepted_decisions,
+            allow_journal_rearm=True,
+        )
+    )
+    if len(intents) != 1 or (
+        stage == AggressiveLaptopLiveStage.CANARY and intents[0].level_index != 1
+    ):
+        typer.echo(json.dumps(result, default=str, sort_keys=True))
+        raise typer.Exit(code=3)
+    intent = intents[0]
+    if len(accepted_decisions) != 1 or accepted_decisions[0].intent != intent:
+        raise RuntimeError("fast-live decision/sizing evidence is ambiguous")
+    sizing_plan = grid_store.frozen_sizing_plan(intent.route_identity) or FrozenGridSizingPlan(
+        route_identity=intent.route_identity,
+        model_sha256=intent.model_sha256,
+        full_route_base_quantity=accepted_decisions[0].sizing.full_route_base_quantity,
+        tranche_base_quantities=accepted_decisions[0].sizing.tranche_base_quantities,
+        tranche_projected_losses_usdt=(accepted_decisions[0].sizing.tranche_projected_losses_usdt),
+        projected_margin_usdt=accepted_decisions[0].sizing.projected_margin_usdt,
+        created_at=intent.decided_at,
+    )
+    generated_at = datetime.now(UTC)
+    binding = build_aggressive_fast_live_binding(
+        loaded_model,
+        runtime,
+        grid_store,
+        route=intent.route_identity,
+        profile_sha256=profile_sha256,
+        now=generated_at,
+    )
+    envelope = AggressiveFastLiveIntentEnvelope(
+        schema_version=2,
+        generated_at=generated_at,
+        activation_binding_sha256=binding.binding_sha256,
+        intent=intent,
+        sizing_plan=sizing_plan,
+        intent_sha256=aggressive_intent_sha256(intent),
+    )
+    save_aggressive_fast_live_intent(output.resolve(), envelope)
+    typer.echo(
+        json.dumps(
+            {
+                "status": "PASS",
+                "intent": asdict(envelope),
+                "execution_authorized": False,
+                "production_submit_calls": 0,
+            },
+            default=str,
+            sort_keys=True,
+        )
+    )
+
+
+def _load_fast_live_artifacts(
+    *,
+    intent_path: Path,
+    model_path: Path,
+    grid_path: Path,
+    profile_path: Path,
+    runtime_manifest_path: Path,
+    repo_root: Path,
+    config_path: Path,
+) -> tuple[AggressiveFastLiveIntentEnvelope, AggressiveFastLiveBinding]:
+    envelope = load_aggressive_fast_live_intent(intent_path.resolve())
+    model = load_historical_model(model_path.resolve())
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest_path.resolve(), repo_root.resolve(), config_path.resolve()
+    )
+    grid = AggressiveGridStore(grid_path.resolve())
+    grid.initialise()
+    profile_sha256 = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    binding = build_aggressive_fast_live_binding(
+        model,
+        runtime,
+        grid,
+        route=envelope.intent.route_identity,
+        profile_sha256=profile_sha256,
+        now=envelope.generated_at,
+    )
+    verify_aggressive_fast_live_binding(
+        binding,
+        model,
+        runtime,
+        grid,
+        profile_sha256=profile_sha256,
+    )
+    if envelope.activation_binding_sha256 != binding.binding_sha256:
+        raise typer.BadParameter("fast-live intent binding is no longer current")
+    return envelope, binding
+
+
+def _exact_merged_main_ready(repo_root: Path) -> bool:
+    root = repo_root.resolve()
+    commands = (
+        ("status", "--porcelain"),
+        ("rev-parse", "HEAD"),
+        ("rev-parse", "origin/main"),
+        ("branch", "--show-current"),
+    )
+    results = [
+        subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        for arguments in commands
+    ]
+    return (
+        all(item.returncode == 0 for item in results)
+        and not results[0].stdout.strip()
+        and results[1].stdout.strip() == results[2].stdout.strip()
+        and results[3].stdout.strip() == "main"
+    )
+
+
+def _run_fast_live_cli(
+    *,
+    preflight_only: bool,
+    stage: AggressiveLaptopLiveStage,
+    confirmation: str,
+    intent: Path,
+    preflight: Path,
+    model: Path,
+    grid: Path,
+    profile: Path,
+    runtime_manifest: Path,
+    repo_root: Path,
+    config: Path,
+) -> None:
+    settings = _load(config)
+    envelope, binding = _load_fast_live_artifacts(
+        intent_path=intent,
+        model_path=model,
+        grid_path=grid,
+        profile_path=profile,
+        runtime_manifest_path=runtime_manifest,
+        repo_root=repo_root,
+        config_path=config,
+    )
+    exact_source = _exact_merged_main_ready(repo_root)
+    required_checks_sha256 = "0" * 64
+    if exact_source:
+        try:
+            required_checks_sha256 = fetch_required_checks_evidence(
+                binding.release_sha
+            ).evidence_sha256
+        except (OSError, TimeoutError, ValueError):
+            exact_source = False
+    result = asyncio.run(
+        run_fast_live_once(
+            settings,
+            profile.resolve(),
+            preflight.resolve(),
+            confirmation,
+            envelope.intent,
+            binding,
+            envelope.sizing_plan,
+            grid.resolve(),
+            stage=stage,
+            exact_merged_clean_source=exact_source,
+            required_checks_sha256=required_checks_sha256,
+            preflight_only=preflight_only,
+        )
+    )
+    typer.echo(json.dumps(asdict(result), default=str, sort_keys=True))
+    if not result.success:
+        raise typer.Exit(code=5)
+
+
+@app.command("fast-live-preflight")
+def fast_live_preflight(
+    intent: Annotated[Path, typer.Option("--intent")] = Path(
+        "state/aggressive-fast-live-intent.json"
+    ),
+    preflight: Annotated[Path, typer.Option("--preflight")] = Path(
+        "state/fast-live-preflight.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-fast-live-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_FAST_LIVE_V2.yaml"
+    ),
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")] = Path(
+        "state/laptop/native-runtime-manifest.json"
+    ),
+    stage: Annotated[AggressiveLaptopLiveStage, typer.Option("--stage")] = (
+        AggressiveLaptopLiveStage.CANARY
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create one ignored TTL600 PASS/FAIL report; never request owner consent."""
+    _run_fast_live_cli(
+        preflight_only=True,
+        stage=stage,
+        confirmation="",
+        intent=intent,
+        preflight=preflight,
+        model=model,
+        grid=grid,
+        profile=profile,
+        runtime_manifest=runtime_manifest,
+        repo_root=repo_root,
+        config=config,
+    )
+
+
+def _fast_live_entry_command(
+    *,
+    stage: AggressiveLaptopLiveStage,
+    confirmation: str,
+    intent: Path,
+    preflight: Path,
+    model: Path,
+    grid: Path,
+    profile: Path,
+    runtime_manifest: Path,
+    repo_root: Path,
+    config: Path,
+) -> None:
+    _run_fast_live_cli(
+        preflight_only=False,
+        stage=stage,
+        confirmation=confirmation,
+        intent=intent,
+        preflight=preflight,
+        model=model,
+        grid=grid,
+        profile=profile,
+        runtime_manifest=runtime_manifest,
+        repo_root=repo_root,
+        config=config,
+    )
+
+
+@app.command("fast-live-canary")
+def fast_live_canary(
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    intent: Annotated[Path, typer.Option("--intent")] = Path(
+        "state/aggressive-fast-live-intent.json"
+    ),
+    preflight: Annotated[Path, typer.Option("--preflight")] = Path(
+        "state/fast-live-preflight.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-fast-live-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_FAST_LIVE_V2.yaml"
+    ),
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")] = Path(
+        "state/laptop/native-runtime-manifest.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Consume one current preflight and queue at most one minimum-notional pair."""
+    _fast_live_entry_command(
+        stage=AggressiveLaptopLiveStage.CANARY,
+        confirmation=confirmation,
+        intent=intent,
+        preflight=preflight,
+        model=model,
+        grid=grid,
+        profile=profile,
+        runtime_manifest=runtime_manifest,
+        repo_root=repo_root,
+        config=config,
+    )
+
+
+@app.command("fast-live-pilot")
+def fast_live_pilot(
+    confirmation: Annotated[str, typer.Option("--confirmation")],
+    intent: Annotated[Path, typer.Option("--intent")] = Path(
+        "state/aggressive-fast-live-intent.json"
+    ),
+    preflight: Annotated[Path, typer.Option("--preflight")] = Path(
+        "state/fast-live-preflight.json"
+    ),
+    model: Annotated[Path, typer.Option("--model")] = Path(
+        "state/aggressive-historical-model.json"
+    ),
+    grid: Annotated[Path, typer.Option("--grid")] = Path("state/aggressive-fast-live-grid.sqlite3"),
+    profile: Annotated[Path, typer.Option("--profile")] = Path(
+        "config/AGGRESSIVE_FAST_LIVE_V2.yaml"
+    ),
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")] = Path(
+        "state/laptop/native-runtime-manifest.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Consume a separate preflight and queue one normal-economics pilot tranche."""
+    _fast_live_entry_command(
+        stage=AggressiveLaptopLiveStage.PILOT_A,
+        confirmation=confirmation,
+        intent=intent,
+        preflight=preflight,
+        model=model,
+        grid=grid,
+        profile=profile,
+        runtime_manifest=runtime_manifest,
+        repo_root=repo_root,
+        config=config,
+    )
+
+
+@app.command("fast-live-status")
+def fast_live_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+    """Report durable V2 state without qualification or submit authority."""
+    settings = _load(config)
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def collect() -> dict[str, object]:
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        active = await journal.active_actions()
+        completed = await journal.completed_fast_live_actions()
+        fast_completed = tuple(
+            action
+            for action in completed
+            if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+            and is_completed_normal_paired_cycle(action)
+        )
+        controls = await read_runtime_controls(state_path)
+        supervisor = await read_supervisor_health(state_path)
+        return {
+            "status": "PASS",
+            "active_action_count": len(active),
+            "active_actions": [
+                {
+                    "pair_action_id": action.pair_action_id,
+                    "route": action.route.value,
+                    "state": action.state.value,
+                    "stage": action.risk_reservation.get("stage"),
+                    "activation_hash": action.activation_hash,
+                }
+                for action in active
+            ],
+            "completed_fast_live_round_trips": len(fast_completed),
+            "completed_fast_live_actions": [
+                {
+                    "pair_action_id": action.pair_action_id,
+                    "route": action.route.value,
+                    "stage": action.risk_reservation.get("stage"),
+                    "activation_hash": action.activation_hash,
+                    "binding_sha256": action.risk_reservation.get("aggressive_binding_sha256"),
+                    "profile_sha256": action.risk_reservation.get("strategy_profile_sha256"),
+                }
+                for action in fast_completed
+            ],
+            "paused": controls.paused,
+            "killed": controls.killed,
+            "supervisor_mode": supervisor.mode.value if supervisor is not None else None,
+            "recovery_required": (supervisor.recovery_required if supervisor is not None else None),
+            "execution_authorized": False,
+        }
+
+    typer.echo(json.dumps(asyncio.run(collect()), default=str, sort_keys=True))
+
+
+@app.command("fast-live-runtime-control")
+def fast_live_runtime_control(
+    action: Annotated[str, typer.Option("--action")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Pause or resume new V2 entries; never stop recovery or submit an order."""
+    if action not in {"pause", "resume"}:
+        raise typer.BadParameter("action must be pause or resume")
+    settings = _load(config)
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def apply() -> dict[str, object]:
+        await initialise_state(state_path)
+        controls = await update_runtime_controls(
+            state_path,
+            paused=action == "pause",
+        )
+        return {
+            "status": "PASS",
+            "action": action,
+            "paused": controls.paused,
+            "killed": controls.killed,
+            "execution_authorized": False,
+        }
+
+    typer.echo(json.dumps(asyncio.run(apply()), sort_keys=True))
+
+
+@app.command("fast-live-stage-select")
+def fast_live_stage_select(
+    target: Annotated[RiskStage, typer.Option("--target")],
+    actor: Annotated[str, typer.Option("--actor")] = "laptop-fast-live-wrapper",
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Select canary/pilot_a without qualification, duration, or submit authority."""
+    settings = _load(config)
+    table = load_locked_risk_stage_table(config.resolve().parent / "RUNTIME_POLICY.yaml")
+
+    async def select() -> RiskStageState:
+        state_path = Path(settings.storage.sqlite_path)
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        return await select_fast_live_risk_stage(
+            state_path,
+            target,
+            table.runtime_policy_sha256,
+            actor,
+        )
+
+    result = asyncio.run(select())
+    typer.echo(
+        json.dumps(
+            {"status": "PASS", "state": asdict(result), "execution_authorized": False},
+            default=str,
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("fast-live-stage-report")
+def fast_live_stage_report(
+    stage: Annotated[AggressiveLaptopLiveStage, typer.Option("--stage")],
+    pair_action_id: Annotated[str, typer.Option("--pair-action-id")],
+    model: Annotated[Path, typer.Option("--model")],
+    grid: Annotated[Path, typer.Option("--grid")],
+    profile: Annotated[Path, typer.Option("--profile")],
+    preflight: Annotated[Path, typer.Option("--preflight")],
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    output: Annotated[Path, typer.Option("--output")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Write stage evidence only after a fresh authoritative private stable-FLAT audit."""
+    settings = _load(config)
+    loaded_model = load_historical_model(model.resolve())
+    profile_sha256 = hashlib.sha256(profile.read_bytes()).hexdigest()
+    preflight_report = load_fast_live_preflight(preflight.resolve())
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest.resolve(),
+        Path(".").resolve(),
+        config.resolve(),
+    )
+    binding = build_aggressive_fast_live_binding(
+        loaded_model,
+        runtime,
+        grid_store,
+        route=preflight_report.identity.route,
+        profile_sha256=profile_sha256,
+    )
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def audit() -> tuple[LiveJournalAction, int]:
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        if await journal.active_actions():
+            raise typer.BadParameter("stage report requires zero active actions")
+        completed = await journal.completed_fast_live_actions()
+        matches = tuple(
+            action
+            for action in completed
+            if action.pair_action_id == pair_action_id
+            and action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+        )
+        if len(matches) != 1:
+            raise typer.BadParameter("stage report action identity is ambiguous")
+        action = matches[0]
+        orders = tuple(
+            order
+            for order in await journal.latest_order_events(action.pair_action_id)
+            if order.filled_base_quantity > 0
+        )
+        if (
+            action.risk_reservation.get("stage") != stage.value
+            or not is_completed_normal_paired_cycle(action)
+            or not _fast_live_cost_evidence_complete(action)
+            or len(orders) != 4
+            or any(
+                order.status is None
+                or order.status.value != "FILLED"
+                or order.average_price is None
+                or order.average_price <= 0
+                or order.fee_usdt is None
+                or order.fee_usdt < 0
+                for order in orders
+            )
+            or action.activation_hash != preflight_report.preflight_sha256
+            or action.risk_reservation.get("aggressive_binding_sha256") != binding.binding_sha256
+            or action.risk_reservation.get("strategy_profile_sha256") != profile_sha256
+            or action.route.value != binding.route
+            or action.recovery_action is not None
+        ):
+            raise typer.BadParameter("stage report journal evidence is incomplete")
+        return action, await journal.event_watermark()
+
+    action, journal_watermark_before = asyncio.run(audit())
+    flat = asyncio.run(collect_authoritative_live_flat_evidence(settings, loaded_model.base))
+    action_after, journal_watermark_after = asyncio.run(audit())
+    if (
+        not flat.stable_flat
+        or action_after != action
+        or journal_watermark_after != journal_watermark_before
+    ):
+        raise typer.BadParameter("stage report private stable-FLAT audit changed")
+    stage_label = "canary" if stage == AggressiveLaptopLiveStage.CANARY else "pilot"
+    payload = {
+        "schema_version": 2,
+        "stage": stage_label,
+        "pair_action_id": action.pair_action_id,
+        "route": action.route.value,
+        "activation_hash": action.activation_hash,
+        "binding_sha256": binding.binding_sha256,
+        "profile_sha256": profile_sha256,
+        "release_sha": runtime.release_sha,
+        "stable_flat": True,
+        "active_action_count": 0,
+        "private_event_watermark": flat.private_event_watermark,
+        "reconciliation_sha256": flat.reconciliation_sha256,
+        "journal_event_watermark": journal_watermark_after,
+        "completed_at": datetime.now(UTC).isoformat(),
+        "execution_authorized": False,
+    }
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_name(f".{output.name}.pending")
+    pending.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    pending.replace(output)
+    typer.echo(json.dumps(payload, sort_keys=True))
+
+
+@app.command("fast-live-acceptance")
+def fast_live_acceptance(
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    model: Annotated[Path, typer.Option("--model")],
+    grid: Annotated[Path, typer.Option("--grid")],
+    profile: Annotated[Path, typer.Option("--profile")],
+    preflight: Annotated[Path, typer.Option("--preflight")],
+    canary_evidence: Annotated[Path, typer.Option("--canary-evidence")],
+    pilot_evidence: Annotated[Path, typer.Option("--pilot-evidence")],
+    independent_review: Annotated[Path, typer.Option("--independent-review")] = Path(
+        "state/fast-live-independent-review.json"
+    ),
+    output: Annotated[Path, typer.Option("--output")] = Path(
+        "state/laptop-fast-live-acceptance.json"
+    ),
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Create exact laptop acceptance only after genuine canary and pilot stable-FLAT."""
+    settings = _load(config)
+    if not _exact_merged_main_ready(repo_root):
+        raise typer.BadParameter("fast-live acceptance requires exact clean merged main")
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest.resolve(), repo_root.resolve(), config.resolve()
+    )
+    loaded_model = load_historical_model(model.resolve())
+    profile_sha256 = hashlib.sha256(profile.read_bytes()).hexdigest()
+    if loaded_model.strategy_profile_sha256 != profile_sha256:
+        raise typer.BadParameter("fast-live acceptance model/profile mismatch")
+    preflight_report = load_fast_live_preflight(preflight.resolve())
+    try:
+        checks_evidence = fetch_required_checks_evidence(runtime.release_sha)
+    except (OSError, TimeoutError, ValueError) as error:
+        raise typer.BadParameter("exact required GitHub checks are unavailable") from error
+    try:
+        review_receipt = verify_independent_review_receipt(
+            independent_review.resolve(),
+            release_sha=runtime.release_sha,
+            source_sha256=runtime.source_sha256,
+            config_sha256=runtime.config_sha256,
+            required_checks_sha256=checks_evidence.evidence_sha256,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise typer.BadParameter("exact independent review receipt is unavailable") from error
+    if preflight_report.status != "PASS":
+        raise typer.BadParameter("fast-live acceptance requires a genuine PASS preflight")
+    if (
+        preflight_report.identity.release_sha != runtime.release_sha
+        or preflight_report.identity.source_sha256 != runtime.source_sha256
+        or preflight_report.identity.config_sha256 != runtime.config_sha256
+        or preflight_report.identity.profile_sha256 != profile_sha256
+        or preflight_report.identity.history_sha256 != loaded_model.reference_manifest_sha256
+        or preflight_report.identity.model_sha256 != historical_model_sha256(loaded_model)
+        or preflight_report.identity.required_checks_sha256 != checks_evidence.evidence_sha256
+    ):
+        raise typer.BadParameter("fast-live acceptance identity is stale")
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    asyncio.run(
+        _synchronize_fast_live_journal_grid(
+            settings,
+            grid_store,
+            preflight_report.identity.route,
+        )
+    )
+    current_binding = build_aggressive_fast_live_binding(
+        loaded_model,
+        runtime,
+        grid_store,
+        route=preflight_report.identity.route,
+        profile_sha256=profile_sha256,
+    )
+
+    def load_stage(path: Path, expected: str) -> dict[str, object]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise typer.BadParameter(f"{expected} evidence is unreadable") from error
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 2
+            or payload.get("stage") != expected
+            or payload.get("stable_flat") is not True
+            or payload.get("active_action_count") != 0
+            or payload.get("route") != current_binding.route
+            or payload.get("binding_sha256") != current_binding.binding_sha256
+            or payload.get("profile_sha256") != profile_sha256
+            or payload.get("release_sha") != runtime.release_sha
+            or payload.get("execution_authorized") is not False
+            or not isinstance(payload.get("private_event_watermark"), int)
+            or not isinstance(payload.get("journal_event_watermark"), int)
+            or re.fullmatch(r"[0-9a-f]{64}", str(payload.get("reconciliation_sha256"))) is None
+        ):
+            raise typer.BadParameter(f"{expected} evidence is not stable-FLAT")
+        return {str(key): value for key, value in payload.items()}
+
+    canary_stage = load_stage(canary_evidence.resolve(), "canary")
+    pilot_stage = load_stage(pilot_evidence.resolve(), "pilot")
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def audit() -> tuple[
+        tuple[LiveJournalAction, ...],
+        tuple[LiveJournalAction, ...],
+        int,
+        frozenset[str],
+    ]:
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        active = await journal.active_actions()
+        completed = await journal.completed_fast_live_actions()
+        fast = tuple(
+            sorted(
+                (
+                    action
+                    for action in completed
+                    if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+                ),
+                key=lambda action: action.pair_action_id,
+            )
+        )
+        complete_actual_orders: set[str] = set()
+        for action in fast:
+            orders = tuple(
+                order
+                for order in await journal.latest_order_events(action.pair_action_id)
+                if order.filled_base_quantity > 0
+            )
+            if len(orders) == 4 and all(
+                order.status is not None
+                and order.status.value == "FILLED"
+                and order.average_price is not None
+                and order.average_price.is_finite()
+                and order.average_price > 0
+                and order.fee_usdt is not None
+                and order.fee_usdt.is_finite()
+                and order.fee_usdt >= 0
+                for order in orders
+            ):
+                complete_actual_orders.add(action.pair_action_id)
+        return (
+            active,
+            fast,
+            await journal.event_watermark(),
+            frozenset(complete_actual_orders),
+        )
+
+    active_before, fast_before, journal_watermark_before, actual_orders_before = asyncio.run(
+        audit()
+    )
+    if active_before:
+        raise typer.BadParameter("fast-live acceptance requires zero active journal actions")
+    fresh_flat = asyncio.run(collect_authoritative_live_flat_evidence(settings, loaded_model.base))
+    active_actions, fast_actions, journal_watermark_after, actual_orders_after = asyncio.run(
+        audit()
+    )
+    if (
+        not fresh_flat.stable_flat
+        or active_actions
+        or fast_actions != fast_before
+        or actual_orders_after != actual_orders_before
+        or journal_watermark_after != journal_watermark_before
+    ):
+        raise typer.BadParameter("fresh exchange-verified stable-FLAT evidence is required")
+    canary_actions = tuple(
+        action
+        for action in fast_actions
+        if action.risk_reservation.get("stage") == AggressiveLaptopLiveStage.CANARY.value
+    )
+    pilot_actions = tuple(
+        action
+        for action in fast_actions
+        if action.risk_reservation.get("stage") == AggressiveLaptopLiveStage.PILOT_A.value
+    )
+    if len(canary_actions) != 1 or not pilot_actions or len(pilot_actions) > 5:
+        raise typer.BadParameter("fast-live acceptance requires one canary and 1-5 pilot cycles")
+    if len(fast_actions) != len(canary_actions) + len(pilot_actions):
+        raise typer.BadParameter("fast-live journal contains an unauthorized stage")
+    if actual_orders_after != {action.pair_action_id for action in fast_actions}:
+        raise typer.BadParameter("fast-live journal lacks complete actual fill and fee evidence")
+    pilot_stage_action = next(
+        (
+            action
+            for action in pilot_actions
+            if action.pair_action_id == pilot_stage.get("pair_action_id")
+        ),
+        None,
+    )
+    if (
+        canary_stage.get("pair_action_id") != canary_actions[0].pair_action_id
+        or canary_stage.get("activation_hash") != canary_actions[0].activation_hash
+        or pilot_stage_action is None
+        or pilot_stage.get("activation_hash") != pilot_stage_action.activation_hash
+    ):
+        raise typer.BadParameter("fast-live stage evidence is not bound to the durable journal")
+    if any(
+        not is_completed_normal_paired_cycle(action)
+        or not _fast_live_cost_evidence_complete(action)
+        or action.activation_hash is None
+        or action.risk_reservation.get("activation_hash") != action.activation_hash
+        or action.risk_reservation.get("aggressive_binding_sha256")
+        != current_binding.binding_sha256
+        or action.risk_reservation.get("strategy_profile_sha256") != profile_sha256
+        or action.route.value != current_binding.route
+        or action.recovery_action is not None
+        for action in fast_actions
+    ):
+        raise typer.BadParameter("fast-live journal lacks genuine paired normal completion")
+    if preflight_report.preflight_sha256 not in {
+        action.activation_hash for action in pilot_actions
+    }:
+        raise typer.BadParameter("pilot evidence is not bound to the current consumed preflight")
+    if any(
+        _journal_action_effective_stress(action.risk_reservation) > Decimal("1")
+        or int(str(action.risk_reservation.get("level_index", 0))) != 1
+        for action in canary_actions
+    ) or any(
+        _journal_action_effective_stress(action.risk_reservation) > Decimal("5")
+        for action in pilot_actions
+    ):
+        raise typer.BadParameter("fast-live journal exceeds the authorized laptop stage")
+    native_runtime_sha256 = native_runtime_manifest_sha256(runtime)
+    if preflight_report.identity.native_runtime_sha256 != native_runtime_sha256:
+        raise typer.BadParameter("fast-live native runtime identity changed")
+    independent_review_payload = {
+        "release_sha": runtime.release_sha,
+        "receipt_sha256": review_receipt.receipt_sha256,
+        "reviewed_at": review_receipt.reviewed_at.isoformat(),
+        "reviewers": review_receipt.reviewers,
+        "p0_open": review_receipt.p0_open,
+        "p1_open": review_receipt.p1_open,
+        "p2_open": review_receipt.p2_open,
+    }
+    independent_review_sha256 = hashlib.sha256(
+        json.dumps(independent_review_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    payload = {
+        "schema_version": 1,
+        "accepted": True,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "release_sha": runtime.release_sha,
+        "source_sha256": runtime.source_sha256,
+        "config_sha256": runtime.config_sha256,
+        "profile_sha256": profile_sha256,
+        "native_runtime_sha256": native_runtime_sha256,
+        "history_sha256": loaded_model.reference_manifest_sha256,
+        "model_sha256": historical_model_sha256(loaded_model),
+        "pilot_preflight_sha256": preflight_report.preflight_sha256,
+        "route": preflight_report.identity.route,
+        "canary_pair_action_id": canary_actions[0].pair_action_id,
+        "pilot_pair_action_ids": [action.pair_action_id for action in pilot_actions],
+        "completed_actions_sha256": completed_normal_actions_sha256(fast_actions),
+        "stable_flat": True,
+        "active_action_count": 0,
+        "unknown_action_count": 0,
+        "final_private_event_watermark": fresh_flat.private_event_watermark,
+        "final_reconciliation_sha256": fresh_flat.reconciliation_sha256,
+        "final_journal_event_watermark": journal_watermark_after,
+        "required_checks_sha256": checks_evidence.evidence_sha256,
+        "p0_open": review_receipt.p0_open,
+        "p1_open": review_receipt.p1_open,
+        "p2_open": review_receipt.p2_open,
+        "independent_review_sha256": independent_review_sha256,
+        "production_submit_scope": "owner_confirmed_canary_and_pilot_only",
+        "execution_authorized": False,
+    }
+    payload["acceptance_sha256"] = hashlib.sha256(
+        json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_name(f".{output.name}.pending")
+    pending.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    pending.replace(output)
+    typer.echo(json.dumps(payload, sort_keys=True))
+
+
 @app.command("aggressive-model-proof")
 def aggressive_model_proof(
     venue_a: Annotated[Venue, typer.Option("--venue-a")],
@@ -1718,7 +2929,10 @@ def _aggressive_reserves_per_base(settings: Settings, price: Decimal) -> CostRes
         reconciliation_forced_exit_usdt=(
             unit * settings.execution.reconciliation_forced_exit_reserve_bps
         ),
-        liquidation_distance_usdt=Decimal(0),
+        # Charge a distinct liquidation-proximity reserve in addition to normal exit slippage.
+        # This keeps margin/leverage checks from being the only protection while paired
+        # recovery is still in progress.
+        liquidation_distance_usdt=unit * settings.live.canary_close_slippage_cap_bps,
     )
 
 
@@ -1748,9 +2962,7 @@ def _aggressive_effective_stop(
     direction_model = (
         model.positive if direction == DivergenceDirection.POSITIVE else model.negative
     )
-    tail = model.window_30d.q999_abs_bps
-    if tail is None:
-        return direction_model.reference_stop_bps
+    tail = direction_model.directional_q999_bps
     adaptive = (
         model.s0_bps + tail if direction == DivergenceDirection.POSITIVE else model.s0_bps - tail
     )
@@ -1775,6 +2987,8 @@ async def _run_aggressive_shadow_once(
     private_fee_rates: dict[Venue, Decimal] | None = None,
     entry_stage: AggressiveEntryStage = AggressiveEntryStage.NORMAL,
     intent_sink: list[AggressiveTrancheIntent] | None = None,
+    decision_sink: list[AggressiveStrategyDecision] | None = None,
+    allow_journal_rearm: bool = False,
 ) -> dict[str, object]:
     model = load_historical_model(model_path)
     profile = load_aggressive_decision_policy(profile_path)
@@ -1812,6 +3026,21 @@ async def _run_aggressive_shadow_once(
     core = AggressiveDecisionCore(profile.policy)
     bridge = AggressiveShadowDecisionBridge(core, grid)
     portfolio = AggressiveShadowPortfolio(grid, profile.policy)
+    rearmed: dict[str, tuple[int, ...]] = {}
+    if allow_journal_rearm:
+        for route, direction in (
+            (model.positive_route, model.positive.direction),
+            (model.negative_route, model.negative.direction),
+        ):
+            rearmed[route] = portfolio.rearm_stable_flat(
+                route,
+                reference_spread_bps=(
+                    reference_bar.high_bps
+                    if direction == DivergenceDirection.POSITIVE
+                    else reference_bar.low_bps
+                ),
+                now=now,
+            )
     runtime_identity = aggressive_runtime_manifest_sha256(model, config_hash(config_path))
     engine = PublicMarketEngine(
         settings,
@@ -1819,7 +3048,6 @@ async def _run_aggressive_shadow_once(
     )
     decisions: list[AggressiveStrategyDecision] = []
     exits: list[tuple[int, AggressiveExitReason]] = []
-    rearmed: dict[str, tuple[int, ...]] = {}
     try:
         broad = await engine.scan_once(
             model.base,
@@ -1936,6 +3164,8 @@ async def _run_aggressive_shadow_once(
                 decisions.append(decision)
                 if decision.accepted and decision.intent is not None and intent_sink is not None:
                     intent_sink.append(decision.intent)
+                if decision.accepted and decision_sink is not None:
+                    decision_sink.append(decision)
                 if decision.accepted and simulate_fills:
                     portfolio.open(decision)
             if confirmation + 1 < profile.policy.confirmation_snapshots:
@@ -2027,15 +3257,125 @@ def native_runtime_manifest(
 
 
 @app.command("run")
-def run_service(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+def run_service(
+    runtime_manifest: Annotated[Path | None, typer.Option("--runtime-manifest")] = None,
+    runtime_handshake: Annotated[Path | None, typer.Option("--runtime-handshake")] = None,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
     """Run the safe asynchronous bootstrap service."""
+    if (runtime_manifest is None) != (runtime_handshake is None):
+        raise typer.BadParameter(
+            "exact supervisor runtime requires manifest and handshake together"
+        )
+    runtime = None
+    handshake: dict[str, object] | None = None
+    handshake_target: Path | None = None
+    if runtime_manifest is not None:
+        assert runtime_handshake is not None
+        if not _exact_merged_main_ready(repo_root):
+            raise typer.BadParameter("exact supervisor requires clean merged main")
+        runtime = verify_native_runtime_manifest(
+            runtime_manifest.resolve(), repo_root.resolve(), config.resolve()
+        )
+        process_started_at = datetime.now(UTC)
+        handshake = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "executable": str(Path(sys.executable).resolve()),
+            "working_directory": str(Path.cwd().resolve()),
+            "argv": tuple(sys.argv),
+            "release_sha": runtime.release_sha,
+            "source_sha256": runtime.source_sha256,
+            "config_sha256": runtime.config_sha256,
+            "native_runtime_sha256": native_runtime_manifest_sha256(runtime),
+            "runtime_manifest_sha256": runtime.artifact_digest.removeprefix("sha256:"),
+            "started_at": process_started_at.isoformat(),
+        }
+        handshake_target = runtime_handshake.resolve()
+        handshake_target.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["IPEG_FAST_LIVE_SUPERVISOR_RELEASE_SHA"] = runtime.release_sha
+        os.environ["IPEG_FAST_LIVE_SUPERVISOR_SOURCE_SHA256"] = runtime.source_sha256
+        os.environ["IPEG_FAST_LIVE_SUPERVISOR_CONFIG_SHA256"] = runtime.config_sha256
+        os.environ["IPEG_FAST_LIVE_SUPERVISOR_NATIVE_RUNTIME_SHA256"] = str(
+            handshake["native_runtime_sha256"]
+        )
     settings = _load(config)
     decision = evaluate_live_order(settings, LiveContext())
     if settings.app.mode == "live" or decision.allowed:
         typer.echo("service refuses live mode without runtime gates", err=True)
         raise typer.Exit(code=2)
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(run_until_signal(settings))
+
+    async def run_with_exact_readiness() -> None:
+        service_task = asyncio.create_task(
+            run_until_signal(settings), name="exact-bootstrap-service"
+        )
+        try:
+            if handshake is not None:
+                assert handshake_target is not None
+                started_at = datetime.fromisoformat(str(handshake["started_at"]))
+                deadline = asyncio.get_running_loop().time() + 60
+                state_path = Path(settings.storage.sqlite_path)
+                while True:
+                    if service_task.done():
+                        await service_task
+                        raise RuntimeError("exact safety supervisor stopped before readiness")
+                    service_health, supervisor_health = await asyncio.gather(
+                        read_service_health(
+                            state_path,
+                            settings.app.health_max_age_seconds,
+                        ),
+                        read_supervisor_health(state_path),
+                    )
+                    if (
+                        service_health.healthy
+                        and service_health.status == "running"
+                        and service_health.heartbeat_at is not None
+                        and service_health.heartbeat_at >= started_at
+                        and supervisor_health is not None
+                        and supervisor_health.mode.value != "STOPPED"
+                        and supervisor_health.heartbeat_at >= started_at
+                    ):
+                        ready_at = datetime.now(UTC)
+                        handshake.update(
+                            {
+                                "ready_at": ready_at.isoformat(),
+                                "service_starts": service_health.starts,
+                                "service_heartbeat_at": service_health.heartbeat_at.isoformat(),
+                                "supervisor_heartbeat_at": (
+                                    supervisor_health.heartbeat_at.isoformat()
+                                ),
+                            }
+                        )
+                        pending = handshake_target.with_name(f".{handshake_target.name}.pending")
+                        pending.write_text(
+                            json.dumps(handshake, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                        pending.replace(handshake_target)
+                        break
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise RuntimeError("exact safety supervisor readiness timed out")
+                    await asyncio.sleep(0.1)
+            await service_task
+        finally:
+            if not service_task.done():
+                service_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await service_task
+
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(run_with_exact_readiness())
+    finally:
+        if runtime is not None:
+            for name in (
+                "IPEG_FAST_LIVE_SUPERVISOR_RELEASE_SHA",
+                "IPEG_FAST_LIVE_SUPERVISOR_SOURCE_SHA256",
+                "IPEG_FAST_LIVE_SUPERVISOR_CONFIG_SHA256",
+                "IPEG_FAST_LIVE_SUPERVISOR_NATIVE_RUNTIME_SHA256",
+            ):
+                os.environ.pop(name, None)
 
 
 @app.command("run-for")
@@ -3199,7 +4539,7 @@ def private_probe(
     typer.echo(json.dumps(asdict(report), default=str, sort_keys=True))
 
 
-@app.command("canary-run")
+@app.command("canary-run", hidden=True)
 def canary_run(
     confirmation: Annotated[str, typer.Option("--confirmation")],
     qualification: Annotated[Path, typer.Option("--qualification")] = Path(
@@ -3225,7 +4565,12 @@ def canary_run(
     ),
     config: ConfigPath = Path("config/defaults.yaml"),
 ) -> None:
-    """Run at most one minimum-notional canary pair after every independent gate."""
+    """Rejected legacy qualification-based entrypoint retained only for compatibility."""
+    raise typer.BadParameter(
+        "legacy canary-run is disabled; use fast-live-preflight and fast-live-canary"
+    )
+    # The unreachable implementation is retained for nondestructive source and
+    # SQLite compatibility during the V2 transition. It has no live authority.
     settings = _load(config)
     if (aggressive_intent is None) != (aggressive_binding is None):
         raise typer.BadParameter("aggressive intent and binding must be supplied together")

@@ -8,6 +8,7 @@ import pytest
 import interexchange_perp_grid.service as service_module
 from interexchange_perp_grid.autonomous_orchestrator import AutonomousOrchestrator
 from interexchange_perp_grid.config import load_settings
+from interexchange_perp_grid.qualification import qualification_policy_from_settings
 from interexchange_perp_grid.reason_codes import ReasonCode
 from interexchange_perp_grid.service import BootstrapService, run_for_duration
 from interexchange_perp_grid.shadow import ContinuousShadowEvaluator
@@ -101,20 +102,18 @@ async def test_service_owns_exactly_one_telegram_poller(
 
 
 @pytest.mark.asyncio
-async def test_service_owns_one_persistent_autonomous_orchestrator(
+async def test_normal_service_does_not_start_legacy_qualification_orchestrator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state_path = tmp_path / "service.sqlite3"
     settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
-    started = asyncio.Event()
     calls = 0
 
     async def fake_orchestrator(self: object, stop_event: asyncio.Event) -> None:
         nonlocal calls
         del self
         calls += 1
-        started.set()
         await stop_event.wait()
 
     monkeypatch.setattr(AutonomousOrchestrator, "run", fake_orchestrator)
@@ -127,14 +126,44 @@ async def test_service_owns_one_persistent_autonomous_orchestrator(
     stop_event = asyncio.Event()
     task = asyncio.create_task(service.run(stop_event))
     try:
-        await asyncio.wait_for(started.wait(), timeout=2)
         await wait_for_health(state_path, 1)
-        assert calls == 1
+        assert calls == 0
     finally:
         stop_event.set()
         await asyncio.wait_for(task, timeout=2)
 
-    assert calls == 1
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_legacy_policy_can_still_start_compatibility_orchestrator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "service.sqlite3"
+    settings = load_settings(CONFIG, {"IPEG_STATE_PATH": str(state_path)})
+    started = asyncio.Event()
+
+    async def fake_orchestrator(self: object, stop_event: asyncio.Event) -> None:
+        del self
+        started.set()
+        await stop_event.wait()
+
+    monkeypatch.setattr(AutonomousOrchestrator, "run", fake_orchestrator)
+    service = BootstrapService(
+        settings,
+        heartbeat_interval_seconds=0.01,
+        run_shadow=False,
+        supervisor_poll_interval_seconds=0.01,
+        qualification_policy=qualification_policy_from_settings(settings),
+    )
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(service.run(stop_event))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=2)
 
 
 @pytest.mark.asyncio

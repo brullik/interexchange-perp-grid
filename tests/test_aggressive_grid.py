@@ -24,6 +24,7 @@ from interexchange_perp_grid.aggressive_model import (
     HistoricalModelPolicy,
     HistoricalReferenceModel,
     build_historical_reference_model,
+    historical_model_sha256,
 )
 from interexchange_perp_grid.domain import InstrumentKey, ProductType, Venue
 from interexchange_perp_grid.execution import Side
@@ -196,6 +197,68 @@ def test_initialise_persists_exact_five_level_geometry_across_restart(tmp_path: 
     assert AggressiveGridStore(store.path).levels(route) == levels
 
 
+def test_model_refresh_is_allowed_only_while_route_has_no_owned_tranche(tmp_path: Path) -> None:
+    store, route = _store(tmp_path)
+    refreshed_model = replace(_model(), code_sha="b" * 40)
+
+    refreshed = store.initialise_route(
+        refreshed_model,
+        DivergenceDirection.POSITIVE,
+        now=_NOW + timedelta(minutes=1),
+        rearm_retreat_step_fraction=Decimal("0.25"),
+    )
+    assert all(
+        level.model_sha256 == historical_model_sha256(refreshed_model) for level in refreshed
+    )
+    assert all(level.state == GridLevelState.ARMED for level in refreshed)
+    assert store.next_decision_cycle(route) == 0
+
+    store.reserve_entry(
+        route,
+        reference_spread_bps=Decimal("10"),
+        decision_cycle=0,
+        reserved_stress_usdt=Decimal("0.5"),
+        now=_NOW + timedelta(minutes=2),
+    )
+    with pytest.raises(RuntimeError, match="active grid route model identity mismatch"):
+        store.initialise_route(
+            replace(refreshed_model, code_sha="c" * 40),
+            DivergenceDirection.POSITIVE,
+            now=_NOW + timedelta(minutes=3),
+            rearm_retreat_step_fraction=Decimal("0.25"),
+        )
+
+    store.mark_entry_failed(
+        route,
+        1,
+        decision_cycle=0,
+        now=_NOW + timedelta(minutes=4),
+    )
+    newest_model = replace(refreshed_model, code_sha="d" * 40)
+    store.initialise_route(
+        newest_model,
+        DivergenceDirection.POSITIVE,
+        now=_NOW + timedelta(minutes=5),
+        rearm_retreat_step_fraction=Decimal("0.25"),
+    )
+    assert store.next_decision_cycle(route) == 1
+    store.reserve_entry(
+        route,
+        reference_spread_bps=Decimal("10"),
+        decision_cycle=1,
+        reserved_stress_usdt=Decimal("0.5"),
+        now=_NOW + timedelta(minutes=6),
+    )
+    with pytest.raises(RuntimeError, match="decision cycle is stale"):
+        store.mark_open(
+            route,
+            1,
+            _ownership(1),
+            decision_cycle=0,
+            now=_NOW + timedelta(minutes=7),
+        )
+
+
 def test_negative_route_uses_its_own_levels_and_crossing_direction(tmp_path: Path) -> None:
     store = AggressiveGridStore(tmp_path / "grid.sqlite3")
     store.initialise()
@@ -300,6 +363,34 @@ def test_reverse_close_rearm_requires_flat_retreat_and_new_cross(tmp_path: Path)
     assert rearmed.ownership is None
     assert store.first_unfilled_crossed_level(route, Decimal("1.5")) is None
     assert store.first_unfilled_crossed_level(route, Decimal("2.1")).level_index == 1  # type: ignore[union-attr]
+
+
+def test_model_refresh_cannot_erase_closed_level_rearm_fence(tmp_path: Path) -> None:
+    store, route = _store(tmp_path)
+    pending = store.reserve_entry(
+        route,
+        reference_spread_bps=Decimal("2.1"),
+        decision_cycle=1,
+        reserved_stress_usdt=Decimal("0.5"),
+        now=_NOW + timedelta(seconds=1),
+    )
+    ownership = _ownership(pending.level_index)
+    store.mark_open(route, 1, ownership, decision_cycle=1, now=_NOW + timedelta(minutes=1))
+    store.reserve_exit(route, 1, tranche_id=ownership.tranche_id, now=_NOW + timedelta(minutes=2))
+    store.mark_closed(route, 1, ownership, now=_NOW + timedelta(minutes=3))
+
+    changed = replace(_model(), source_manifest_sha256="e" * 64)
+    with pytest.raises(RuntimeError, match="active grid route model identity mismatch"):
+        store.initialise_route(
+            changed,
+            DivergenceDirection.POSITIVE,
+            now=_NOW + timedelta(minutes=4),
+            rearm_retreat_step_fraction=Decimal("0.25"),
+        )
+
+    assert store.levels(route)[0].state == GridLevelState.CLOSED_WAIT_REARM
+    assert store.first_unfilled_crossed_level(route, Decimal("100")) is not None
+    assert store.first_unfilled_crossed_level(route, Decimal("100")).level_index == 2  # type: ignore[union-attr]
 
 
 def test_restart_preserves_pending_open_exit_and_closed_states_without_duplicates(
@@ -618,6 +709,52 @@ def test_journal_projection_preserves_active_risk_and_closes_idempotently(tmp_pa
     assert closed.reserved_stress_usdt == 0
 
 
+def test_journal_completed_level_survives_restart_until_retreat_and_new_cross(
+    tmp_path: Path,
+) -> None:
+    store, route = _store(tmp_path)
+    ownership = _ownership(1)
+    store.synchronize_journal_levels(
+        route,
+        (
+            ExternalGridLevelProjection(
+                1,
+                GridLevelState.ENTRY_PENDING,
+                Decimal("0.5"),
+                decision_cycle=7,
+            ),
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+    store.synchronize_journal_levels(
+        route,
+        (
+            ExternalGridLevelProjection(
+                1,
+                GridLevelState.CLOSED_WAIT_REARM,
+                Decimal(0),
+                decision_cycle=7,
+                ownership=ownership,
+            ),
+        ),
+        now=_NOW + timedelta(seconds=2),
+    )
+
+    restarted = AggressiveGridStore(store.path)
+    assert restarted.next_decision_cycle(route) == 8
+    assert restarted.first_unfilled_crossed_level(route, Decimal("100")).level_index == 2  # type: ignore[union-attr]
+    restarted.rearm(
+        route,
+        1,
+        reference_spread_bps=Decimal("1.5"),
+        stable_flat=True,
+        tranche_id=ownership.tranche_id,
+        now=_NOW + timedelta(seconds=3),
+    )
+    assert restarted.first_unfilled_crossed_level(route, Decimal("1.5")) is None
+    assert restarted.first_unfilled_crossed_level(route, Decimal("2.1")).level_index == 1  # type: ignore[union-attr]
+
+
 def test_route_sizing_plan_is_frozen_and_restart_durable(tmp_path: Path) -> None:
     model = _model()
     route = model.positive_route
@@ -643,3 +780,38 @@ def test_route_sizing_plan_is_frozen_and_restart_durable(tmp_path: Path) -> None
     assert AggressiveGridStore(store.path).frozen_sizing_plan(route) == plan
     with pytest.raises(RuntimeError, match="cannot change"):
         store.freeze_sizing_plan(replace(plan, projected_margin_usdt=Decimal("11")))
+
+
+def test_full_stable_flat_rearm_releases_frozen_route_sizing(tmp_path: Path) -> None:
+    store, route = _store(tmp_path)
+    plan = FrozenGridSizingPlan(
+        route,
+        store.levels(route)[0].model_sha256,
+        Decimal("1"),
+        (Decimal(".1"), Decimal(".15"), Decimal(".2"), Decimal(".25"), Decimal(".3")),
+        tuple(Decimal(".5") for _ in range(5)),
+        Decimal("10"),
+        _NOW,
+    )
+    store.freeze_sizing_plan(plan)
+    store.reserve_entry(
+        route,
+        reference_spread_bps=Decimal("2.1"),
+        decision_cycle=1,
+        reserved_stress_usdt=Decimal("0.5"),
+        now=_NOW + timedelta(seconds=1),
+    )
+    ownership = _ownership(1)
+    store.mark_open(route, 1, ownership, decision_cycle=1, now=_NOW + timedelta(minutes=1))
+    store.reserve_exit(route, 1, tranche_id=ownership.tranche_id, now=_NOW + timedelta(minutes=2))
+    store.mark_closed(route, 1, ownership, now=_NOW + timedelta(minutes=3))
+    store.rearm(
+        route,
+        1,
+        reference_spread_bps=Decimal("1.5"),
+        stable_flat=True,
+        tranche_id=ownership.tranche_id,
+        now=_NOW + timedelta(minutes=4),
+    )
+
+    assert store.frozen_sizing_plan(route) is None

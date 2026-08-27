@@ -305,10 +305,15 @@ class AggressiveShadowPortfolio:
         adverse_funding_destroys_profit: bool = False,
         emergency_or_unknown: bool = False,
     ) -> tuple[tuple[int, AggressiveExitReason], ...]:
+        del reference_bar
         if market.route.value not in {model.positive_route, model.negative_route}:
             return ()
         closed: list[tuple[int, AggressiveExitReason]] = []
-        for level in self._grid.levels(market.route.value):
+        for level in sorted(
+            self._grid.levels(market.route.value),
+            key=lambda item: item.level_index,
+            reverse=True,
+        ):
             if level.state != GridLevelState.OPEN or level.ownership is None:
                 continue
             ownership = level.ownership
@@ -329,22 +334,13 @@ class AggressiveShadowPortfolio:
                 long_exit.price,
                 short_exit.price,
             )
-            reference_stop_crossed = (
-                reference_bar.high_bps >= ownership.effective_stop_bps
-                if level.direction == DivergenceDirection.POSITIVE
-                else reference_bar.low_bps <= ownership.effective_stop_bps
-            )
             reason = select_aggressive_exit_reason(
                 AggressiveExitInput(
                     direction=level.direction,
                     executable_spread_bps=executable_spread,
                     effective_stop_bps=ownership.effective_stop_bps,
                     reverse_target_bps=ownership.reverse_target_bps,
-                    projected_route_loss_usdt=(
-                        self._policy.route_hard_projected_loss_limit_usdt
-                        if reference_stop_crossed
-                        else ownership.reserved_stress_usdt
-                    ),
+                    projected_route_loss_usdt=ownership.reserved_stress_usdt,
                     projected_portfolio_loss_usdt=projected_portfolio_loss_usdt,
                     holding_deadline=ownership.maximum_holding_deadline,
                     now=now,

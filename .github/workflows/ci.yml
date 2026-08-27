@@ -181,6 +181,35 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  fast-live-adversarial:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install exact lock
+        run: |
+          python -m pip install -r requirements.lock
+          python -m pip install -e . --no-deps --no-build-isolation
+          python scripts/check_lock.py --lock requirements.lock --pyproject pyproject.toml --verify-installed
+      - name: Run Fast Live adversarial gate
+        run: |
+          pytest -q \
+            tests/test_fast_live_preflight.py \
+            tests/test_fast_live_v2_contract.py \
+            tests/test_live_journal.py \
+            tests/test_supervisor.py \
+            tests/test_github_checks.py \
+            tests/test_native_runtime.py \
+            tests/test_deployment_scripts.py
+
   docker-smoke:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -240,14 +269,13 @@ jobs:
           docker push "$local_tag"
           image_ref="$(docker image inspect "$local_tag" --format '{{index .RepoDigests 0}}')"
           [[ "$image_ref" =~ @sha256:[0-9a-f]{64}$ ]]
-          bash scripts/shadow-deploy.sh "$image_ref" "$release_sha"
-          bash scripts/shadow-deploy.sh "$image_ref" "$release_sha"
-          docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml
+          IPEG_ENV_FILE="$PWD/.env" \
+            bash scripts/shadow-deploy-mechanics.sh "$image_ref" "$release_sha"
           docker compose exec -T app interexchange-grid deployment-identity \
             --config /app/config/defaults.yaml --expected-release-sha "$release_sha" \
             --expected-image-digest "${image_ref##*@}" \
             > state/ops-evidence/deployment-identity.json
-      - name: Prove real unhealthy upgrade restores image and SQLite state
+      - name: Prove preserved upgrade rollback mechanics while VPS entrypoints stay blocked
         run: |
           release_sha="$(git rev-parse HEAD)"
           image_ref="$(sed -n 's/^image_ref=//p' .ipeg-deployment-state)"
@@ -259,12 +287,10 @@ jobs:
           docker push "$bad_tag"
           bad_ref="$(docker image inspect "$bad_tag" --format '{{index .RepoDigests 0}}')"
           set +e
-          bash scripts/shadow-upgrade.sh "$bad_ref" "$release_sha"
+          bash scripts/shadow-upgrade-mechanics.sh "$bad_ref" "$release_sha"
           upgrade_status=$?
           set -e
           test "$upgrade_status" -ne 0
-          test "$(sed -n 's/^image_ref=//p' .ipeg-deployment-state)" = "$image_ref"
-          test "$(sed -n 's/^release_sha=//p' .ipeg-deployment-state)" = "$release_sha"
           docker compose exec -T app interexchange-grid health --config /app/config/defaults.yaml
           sentinel="$(docker compose exec -T app python -c \
             "import sqlite3; d=sqlite3.connect('/app/state/ipeg.sqlite3'); print(d.execute(\"SELECT value FROM metadata WHERE key='ops_rollback_sentinel'\").fetchone()[0])")"
@@ -337,7 +363,7 @@ jobs:
           docker volume rm "$SMOKE_VOLUME"
       - name: Validate deployment scripts
         run: |
-          bash -n scripts/release-build.sh scripts/shadow-deploy.sh scripts/shadow-upgrade.sh scripts/shadow-rollback.sh scripts/bootstrap-ubuntu.sh scripts/ipegctl
+          bash -n scripts/release-build.sh scripts/shadow-deploy.sh scripts/shadow-deploy-mechanics.sh scripts/shadow-upgrade.sh scripts/shadow-upgrade-mechanics.sh scripts/shadow-rollback.sh scripts/require-fast-live-acceptance.sh scripts/bootstrap-ubuntu.sh scripts/ipegctl
           mapfile -t nodeids < <(python -c 'import json; p=json.load(open("config/ops-scenario-nodeids.json")); print("\n".join(sorted({v for xs in p.values() for v in xs if v.startswith("tests/")})))')
           pytest -q "${nodeids[@]}" --junitxml=state/ops-proof.junit.xml
           interexchange-grid ops-proof \

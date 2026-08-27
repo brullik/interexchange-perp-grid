@@ -12,6 +12,8 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+throw "Legacy qualification rehearsal is disabled in Aggressive Fast Live V2."
+
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 if ($ProfileScope -ceq "LocalMachine") {

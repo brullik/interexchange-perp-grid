@@ -28,14 +28,18 @@ if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
 }
 $serialized = [IO.File]::ReadAllText($resolved, [Text.Encoding]::UTF8)
 $profile = [Management.Automation.PSSerializer]::Deserialize($serialized)
-if ($profile.SchemaVersion -ne 1 -or $profile.QualificationRoute -cne "BTC:bybit>okx") {
+if (
+    $profile.SchemaVersion -ne 2 -or
+    $profile.FastLiveRoute -cne "BTC:bybit>okx" -or
+    [string]$profile.LocalLiveUnlockVerifier -notmatch '^pbkdf2-sha256\$600000\$[A-Za-z0-9+/]+={0,2}\$[A-Za-z0-9+/]+={0,2}$'
+) {
     throw "Encrypted laptop onboarding identity is invalid"
 }
 
 $env:IPEG_MODE = "shadow"
 $env:IPEG_LIVE_ENABLED = "false"
 $env:IPEG_OWNER_ONBOARDING_CONFIRMED = "true"
-$env:IPEG_QUALIFICATION_ROUTE = "BTC:bybit>okx"
+$env:IPEG_LOCAL_UNLOCK_VERIFIER = [string]$profile.LocalLiveUnlockVerifier
 $env:IPEG_STATE_PATH = [System.IO.Path]::GetFullPath((Join-Path $root $StatePath))
 $env:IPEG_PARQUET_DIR = [System.IO.Path]::GetFullPath((Join-Path $root $MarketPath))
 $env:IPEG_RUNTIME_KIND = "native-python"

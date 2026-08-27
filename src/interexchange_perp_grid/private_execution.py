@@ -233,6 +233,7 @@ def run_private_preflight(inputs: PrivatePreflightInput) -> PrivatePreflightRepo
     )
     checks = {
         "capability": inputs.capability.ready,
+        "account_identity": account.account_identity_sha256 is not None,
         "account_mode": account.margin_mode == "cross",
         "position_mode": account.position_mode == "oneway",
         "trading_permission": (
@@ -257,6 +258,7 @@ def run_private_preflight(inputs: PrivatePreflightInput) -> PrivatePreflightRepo
     }
     reasons = (
         ("capability", ReasonCode.PRIVATE_CAPABILITY_MISSING),
+        ("account_identity", ReasonCode.PREFLIGHT_FAILED),
         ("account_mode", ReasonCode.ACCOUNT_MODE_INVALID),
         ("position_mode", ReasonCode.POSITION_MODE_INVALID),
         ("trading_permission", ReasonCode.TRADING_PERMISSION_MISSING),

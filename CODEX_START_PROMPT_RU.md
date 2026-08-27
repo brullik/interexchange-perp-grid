@@ -1,170 +1,132 @@
-# Стартовая цель для Codex — Aggressive Symbiosis V1
-
-Отправьте Codex весь текст ниже одной задачей.
+# Стартовая цель для Codex: Aggressive Fast Live V2
 
 ```text
 /goal
 
 Репозиторий: brullik/interexchange-perp-grid
-Локальный первый runtime: Windows-ноутбук владельца
-Целевая ветка: codex/aggressive-symbiosis-v1
 
 ЕДИНАЯ ЦЕЛЬ
 
-Максимально быстро и автономно реализовать Aggressive Symbiosis V1: детерминированный historical 1m OHLC reference-spread pipeline + текущая robust/adaptive regime model + фактически исполнимый L2/VWAP spread + persistent five-level back-loaded grid + существующий защищённый paired execution/recovery. Сначала полностью проверить и запустить алгоритм на ноутбуке. Реальный live на ноутбуке должен быть технически готов и запускаться только после локальных restricted credentials и отдельного явного owner confirmation. Любой VPS upload/deploy/live запрещён до accepted laptop artifact.
+Максимально быстро и автономно довести текущий проект до laptop-tested live торговли агрессивным межбиржевым симбиозом. Полностью убрать длительную квалификацию из пути к live и не заменять её другим многочасовым ожиданием.
 
-ПАКЕТ-КОНТРАКТ
+Под «убрать квалификацию» понимается:
 
-Найди приложенный пакет и установи в корень репозитория с сохранением указанных путей:
+- live guard, canary, pilot, risk-stage и supervisor не требуют qualification epoch/file/hash/age;
+- отсутствуют требования 12h/24h, 10,000 observations и funding checkpoints;
+- старые qualification artifacts не могут ни разрешить, ни запретить live;
+- laptop path не запускает qualification task и не имеет action `qualify`;
+- вместо этого непосредственно перед live выполняется быстрый exact-hash-bound FAST_LIVE_PREFLIGHT с TTL 600 секунд и single-use intent.
 
-- repo_files/AGENTS.md -> AGENTS.md
-- repo_files/GOAL.md -> GOAL.md
-- repo_files/FAST_TRACK_PLAN.md -> FAST_TRACK_PLAN.md
-- repo_files/ACCEPTANCE.md -> ACCEPTANCE.md
-- repo_files/config/AGGRESSIVE_SYMBIOSIS_V1.yaml -> config/AGGRESSIVE_SYMBIOSIS_V1.yaml
-- repo_files/CODEX_START_PROMPT_RU.md -> CODEX_START_PROMPT_RU.md
-- repo_files/CODEX_RESUME_PROMPT_RU.md -> CODEX_RESUME_PROMPT_RU.md
+Не отключай обязательные проверки текущего состояния: stale/sequence/depth, fee/funding/metadata, account/margin/position mode, FLAT/open orders/unknown journal, economics, risk, protected paired execution, local unlock, Telegram challenge и explicit owner consent остаются fail-closed.
 
-Не заменяй и не сокращай STATUS.md: сохрани всю историю и обновляй только его верхний current-state блок и краткие новые checkpoint/evidence записи.
+Сначала прочитай только:
 
-Сначала:
+1. AGENTS.md
+2. GOAL.md
+3. config/AGGRESSIVE_FAST_LIVE_V2.yaml
+4. FAST_TRACK_PLAN.md
+5. ACCEPTANCE.md
+6. верхний Current state и последние релевантные записи STATUS.md
 
-1. Получи фактический origin/main и полный SHA. Пакет подготовлен относительно main 8ef3ad3dbf746917a5fa6cb46f366634ea5747f9, но более новые изменения имеют приоритет и не должны быть потеряны.
-2. Проверь отсутствие другого активного PR по этой же цели. Если ветка/PR codex/aggressive-symbiosis-v1 уже существуют, безопасно продолжи их; иначе создай одну ветку и один draft PR.
-3. Один раз полностью прочитай только AGENTS.md, GOAL.md, FAST_TRACK_PLAN.md, ACCEPTANCE.md, config/AGGRESSIVE_SYMBIOSIS_V1.yaml и актуальный верх STATUS.md.
-4. Запусти текущий baseline verify и зафиксируй исходное состояние. Default/live должны оставаться shadow/false, production submit = 0.
-5. Немедленно начинай реализацию с первого незавершённого checkpoint. Не останавливайся на плане, аудите, документации или каркасе.
+После одного чтения немедленно начинай работу. Не создавай новый PRD, план, matrix, ADR, аудит или статусный документ.
 
-ЖЁСТКАЯ ГРАНИЦА SCOPE
+BASELINE И GITHUB
 
-Не переписывай уже работающие:
+- Получи фактический origin/main и запиши exact baseline SHA.
+- Не предполагай, что baseline по пакету всё ещё является HEAD.
+- Создай или продолжи одну ветку codex/aggressive-fast-live-v2.
+- Создай или продолжи один draft PR.
+- Не создавай серию PR по checkpoint.
+- После каждого coherent checkpoint запускай focused tests; перед commit запускай make verify.
+- После exact-head green required checks получи independent review, устрани P0/P1/P2 и material threads, mark Ready и squash-merge автоматически при unchanged head.
 
-- ExchangeAdapter и существующие venue transports;
-- broad BBO / candidate L2;
-- protected aggressive IOC execution;
-- private streams, journal, idempotent client IDs;
-- actual-fill reconciliation;
-- partial-fill correction, third-venue hedge, emergency flatten;
-- atomic risk ownership, restart recovery и stable-FLAT;
-- Telegram owner challenge;
-- Windows native manifest, DPAPI/S4U onboarding, qualification и laptop pilot foundation.
+ОБЯЗАТЕЛЬНАЯ РЕАЛИЗАЦИЯ
 
-Расширяй их только узко, если новый executable acceptance test доказывает необходимость. Основной scope: reference 1m bars/history, historical model, five-level state machine, economics/risk/exit wiring, replay-shadow-live parity, laptop wrapper/evidence.
+A1. Удалить active qualification dependencies из config/runtime policy, live guard, canary, pilot, risk-stage, orchestrator, CLI, laptop scripts, scheduled tasks, status/runbook и tests. Сохранять legacy DB/code можно только как unreachable compatibility, если физическое удаление создаёт лишний риск. Tests должны доказать, что legacy artifact не имеет authority.
 
-ОБЯЗАТЕЛЬНЫЙ АЛГОРИТМ
+A2. Реализовать FAST_LIVE_PREFLIGHT: exact merged SHA/config/profile/native runtime/route/account/data-generation/risk-stage; current private capabilities; exchange-verified FLAT; no open/unknown orders; clocks/fresh BBO+L2/sequence/depth; fee/funding/metadata; 1m model; executable economics; route/portfolio/margin/leverage. PASS expires in 600s, single-use, never submits orders.
 
-Реализуй точно GOAL.md и config/AGGRESSIVE_SYMBIOSIS_V1.yaml. Критические свойства:
+A3. Реализовать reference spread:
 
-- закрытые синхронные 1m OHLC;
-- spread O=O_A/O_B, H=H_A/L_B, L=L_A/H_B, C=C_A/C_B;
-- старшие интервалы только из готовых 1m spread bars;
-- никаких forward-fill и прямых spread 1h из exchange 1h;
-- canonical reference pair и два directed executable routes;
-- S0 = детерминированная mode, separate H+/H-, historical episodes;
-- current 24h/7d/30d adaptive model остаётся regime/long-tail guard;
-- levels 20/40/60/80/100%; weights 10/15/20/25/30%; stop buffer 15%;
-- first_unfilled_crossed_level, один tranche за cycle, fresh L2/risk между catch-up частями;
-- reverse-grid close и re-arm после retreat 0.25 step;
-- normal cost multiplier 1.35; minimum net 0.15 USDT; canary-only 0.01;
-- 50% favorable funding credit, 100% adverse, 2x adverse stress;
-- route modelled risk <=4.50 USDT, hard projected <=5.00;
-- portfolio normal admission <=45 USDT, hard projected <=50.00;
-- hard stop реально закрывает в replay, shadow и live supervisor;
-- один shared evaluator для replay/shadow/live;
-- live всегда использует свежий executable L2/VWAP и actual fills.
+Open  = 10000*ln(Open_A/Open_B)
+High  = 10000*ln(High_A/Low_B)
+Low   = 10000*ln(Low_A/High_B)
+Close = 10000*ln(Close_A/Close_B)
 
-МЕТОД МАКСИМАЛЬНО БЫСТРОЙ РЕАЛИЗАЦИИ
+Только synchronized closed UTC 1m, no forward-fill. 5m/15m/1h/4h/1d строятся только из 1m spread bars. Сначала on-demand один Wave 1 route и 30 complete days; не скачивать весь universe до vertical slice.
 
-- Сделай один полный Wave 1 vertical slice прежде широкого universe rollout.
-- Историю загружай on-demand для кандидатов/открытых routes; не скачивай весь рынок заранее.
-- Используй существующие Python 3.12, asyncio, Decimal, SQLite WAL, Parquet и DuckDB.
-- Не добавляй web UI, microservices, Redis, Kafka, Celery, Kubernetes, ML, новый framework или вторую БД.
-- Не создавай новый PRD, roadmap, ADR, audit report, requirements matrix, research backlog или status-файлы.
-- Не делай массовый рефакторинг ради стиля.
-- Не меняй exchange transport без measured capability gap.
-- После каждого coherent slice запускай focused tests; перед каждым checkpoint commit — полный make verify/Windows equivalent.
-- При долгом qualification не жди пассивно: используй существующий durable Windows Task Scheduler/S4U workflow и продолжай все независимые задачи. Не сокращай qualification ниже уже отдельно разрешённой 12h laptop-only policy.
-- Любой найденный дефект исправляй сразу в этой цели, добавляя regression test. Не проси владельца выбирать техническое решение.
+A4. Historical model: mode/normal zone, positive/negative extremes, q99/q99.9, episodes, convergence, adverse excursion, 24h/7d/30d regime. First laptop live: >=30 complete days, >=10 episodes, >=70% 24h convergence, no regime block.
 
-АВТОНОМНОСТЬ GITHUB
+A5. Grid: levels 20/40/60/80/100%, weights 10/15/20/25/30%, 15% reference stop plus adaptive tail, one level once, one tranche per cycle, fresh-book catch-up, frozen model, reverse-grid exits, 0.25-step re-arm, no sixth tranche, stop executable in replay/shadow/live.
 
-В рамках одной ветки/PR самостоятельно:
+A6. Economics/risk: 1.35x stressed cost, normal minimum 0.15 USDT, canary 0.01 only, positive funding credit 50%, adverse 100% and stress 2x, positive convergence without positive funding. Normal sizing <=4.50 modelled and <=5 hard per route; portfolio <=45/50; actual-fill recalculation.
 
-- меняй код, конфигурацию, тесты и необходимые существующие документы;
-- запускай/перезапускай CI;
-- исправляй failures;
-- запрашивай независимый review после exact-head green;
-- устраняй P0/P1/P2 и material review threads;
-- mark Ready;
-- squash-merge PR, только если все required checks green, head SHA не изменился, scope точный и unresolved material threads отсутствуют.
+A7. Один decision core для replay/shadow/canary/pilot. Сохранить protected IOC caps, actual-fill reconciliation, durable journal, restart, residual recovery, third venue, emergency flatten, stable-FLAT и текущие C4/security proofs.
 
-Не создавай несколько PR для последовательных checkpoint. Допустим один узкий follow-up PR только если реальный laptop canary позже обнаружит дефект уже после software merge.
+A8. Создать один scripts/laptop-fast-live.ps1 с actions:
 
-LAPTOP-FIRST DELIVERY
+verify
+onboard
+preflight
+canary
+pilot
+status
+stop
 
-Создай один scripts/laptop-aggressive.ps1, который композиционно использует существующие laptop scripts и поддерживает:
+Нет action qualify. Использовать existing DPAPI/S4U/native runtime/Telegram/supervisor.
 
-- verify;
-- shadow;
-- qualify;
-- canary;
-- pilot;
-- status;
-- stop.
+Canary: current single-use PASS preflight, local unlock, Telegram challenge, separate owner phrase, one route, one tranche, minimum notional, hard risk <=1 USDT. Success — actual exchange evidence and stable-FLAT. Никакого многочасового post-FLAT ожидания.
 
-Software/public этапы выполни без production credentials. На ноутбуке Docker не обязателен. Все CI/replay/shadow evidence должны иметь production_submit_calls=0.
+Pilot: новый PASS preflight и отдельное owner confirmation, one route, up to five tranches, hard risk <=5 USDT, normal economics. Replay обязан доказать все пять levels; live pilot обязан сделать хотя бы один реальный paired round-trip и закончиться stable-FLAT, но не должен форсировать невыгодные уровни.
 
-После software merge выдай ровно один owner action только для действий, которые физически требуют владельца:
+После successful pilot немедленно создать ignored state/laptop-fast-live-acceptance.json с accepted=true и exact hashes. Не ждать 8 часов.
 
-1. локально ввести restricted trade-only/no-withdrawal credentials в существующий DPAPI/S4U профиль, не показывая их Codex/чату/GitHub;
-2. отдельно подтвердить minimum-notional live canary;
-3. после successful canary отдельно подтвердить pilot_a: один route, до пяти tranches, hard route risk <=5 USDT.
+МИНИМАЛЬНЫЙ SCOPE
 
-До этого live физически выключен. Не запрашивай API keys, Telegram token, unlock secret или секретные значения в сообщении.
+- Не переписывай working execution/recovery/security foundation без failing regression test.
+- Не вводи web UI, microservices, Redis, Kafka, Celery, Kubernetes или вторую orchestration system.
+- Не расширяй сначала все семь venues. Сделай один полный Wave 1 route, затем только необходимое обобщение.
+- Не проводи необязательный refactoring, rename, formatting sweep или cleanup.
+- Не создавай новые документы кроме явно требуемых существующими contracts/evidence.
+- Не жди рыночную возможность во время coding: используй deterministic replay, а реальный live оставь owner-run path.
 
-Успешный laptop pilot обязан закончиться exchange-verified stable-FLAT, zero active action, честными fill/fee/funding/reconciliation evidence и не менее 28,800 секунд post-FLAT service. Только после этого создай локальный ignored state/laptop-aggressive-acceptance.json с accepted=true и exact hashes.
+LAPTOP И OWNER ACTION
+
+Все software/public/replay/shadow действия выполни автономно и с production_submit_calls=0.
+
+После merge выдай ровно один owner action:
+
+1. локально ввести restricted trade-only/no-withdrawal credentials через existing DPAPI/S4U onboarding;
+2. запустить preflight;
+3. отдельно подтвердить minimum-notional canary;
+4. после stable-FLAT отдельно подтвердить pilot.
+
+Не проси ключи, токены, unlock secret или их значения в чате.
 
 VPS ЗАПРЕЩЁН
 
-Не подключайся к VPS, не загружай туда файлы, не deploy, не переносись secrets и не запускай qualification/live. Можно подготовить только fail-closed handoff command, который отказывает без verified accepted laptop artifact и exact merged release identity.
-
-НЕИЗМЕНЯЕМЫЕ ОГРАНИЧЕНИЯ
-
-- paired long/short only;
-- linear USDT perpetual only;
-- reference capital 500 USDT;
-- max hard route projected loss 5 USDT;
-- max hard portfolio projected loss 50 USDT;
-- max 10 routes, one route per base, five tranches;
-- cross bot-dedicated accounts/subaccounts;
-- free margin >=20%; initial effective leverage <=3x;
-- hard hold <=24h;
-- no withdrawal/transfer/wallet/address-book/API-key management;
-- protected taker execution with cap; unbounded market emergency-only;
-- unknown/stale/incomplete/unreconciled state fails closed;
-- no invented profitability, fills, qualification, latency or live evidence;
-- realised loss and profit are never guaranteed.
+Не подключайся к VPS, не загружай файлы, не deploy и не переносись secrets. Разрешено только подготовить fail-closed future handoff, который отказывает без exact state/laptop-fast-live-acceptance.json и exact merged release.
 
 ОСТАНОВКА
 
-Не останавливайся из-за объёма задачи, CI, review, исправимого дефекта, недоступности одной биржи, отсутствия долгого результата в текущей сессии или обычного технического выбора.
+Не останавливайся из-за объёма, CI failure, review, обычного технического решения, недоступности одной venue или отсутствия рыночной возможности.
 
 Остановка допустима только когда:
 
-A. A0–A7 из FAST_TRACK_PLAN.md завершены, software PR merged, Windows public-shadow accepted, и остался один точный owner action для локальных credentials/real-money consent; либо
-B. laptop live ladder честно завершён и state/laptop-aggressive-acceptance.json accepted; либо
-C. остался настоящий внешний blocker, который нельзя устранить кодом, тестом, mock/replay, public API, CI или уже доступными GitHub правами.
+A. A0–A7 завершены, один PR merged, Windows fast-live path готов, и осталось только локальное credential/live-money owner action; либо
+B. owner позже выполнил canary/pilot и accepted laptop artifact создан; либо
+C. существует реальный внешний blocker, который невозможно устранить code/test/replay/public API/CI/GitHub permissions.
 
 ФИНАЛЬНЫЙ ОТЧЁТ
 
-Дай только проверяемое:
+Сообщи только проверяемое:
 
-- merged/current SHA и PR;
-- какие checkpoint/acceptance IDs завершены;
-- точные команды и результаты tests/checks;
-- ссылки/пути exact-head artifacts;
+- baseline, PR, exact merged/current SHA;
+- завершённые plan/acceptance IDs;
+- команды и результаты tests/required checks/review;
 - production_submit_calls;
-- laptop shadow/qualification/canary/pilot/stable-FLAT status без преувеличений;
-- один remaining owner action, если он действительно остался;
+- подтверждение отсутствия qualification dependency и long wait;
+- fast preflight/laptop wrapper status;
+- единственный owner action;
 - подтверждение, что VPS не изменялся.
 ```
