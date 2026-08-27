@@ -33,6 +33,8 @@ def _identity(**updates: str) -> FastLiveIdentity:
         "account_generation_sha256": "2" * 64,
         "data_generation_sha256": "3" * 64,
         "risk_stage": "canary",
+        "risk_stage_generation_sha256": "5" * 64,
+        "required_checks_sha256": "6" * 64,
         "intent_sha256": "4" * 64,
     }
     values.update(updates)
@@ -132,10 +134,18 @@ def test_fast_live_preflight_expires_and_identity_change_invalidates() -> None:
     assert (
         validate_fast_live_preflight(
             report,
-            _identity(data_generation_sha256="4" * 64),
+            _identity(account_generation_sha256="4" * 64),
             now=now,
         )
         == ReasonCode.FAST_LIVE_PREFLIGHT_IDENTITY_CHANGED
+    )
+    assert (
+        validate_fast_live_preflight(
+            report,
+            _identity(data_generation_sha256="4" * 64),
+            now=now,
+        )
+        is None
     )
 
 

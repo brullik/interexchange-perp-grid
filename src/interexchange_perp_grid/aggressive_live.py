@@ -343,7 +343,9 @@ def prepare_aggressive_fast_live_plan(
         timeout_seconds=timeout_seconds,
         binding_sha256=binding.binding_sha256,
         strategy_name="AGGRESSIVE_FAST_LIVE_V2",
-        compatibility_qualification_hash="0" * 64,
+        # The baseline journal column is retained for schema compatibility only. V2 stores
+        # its single-use activation identity there and never treats it as qualification.
+        compatibility_qualification_hash=preflight_sha256,
         activation_hash=preflight_sha256,
         fast_live_preflight_expires_at=preflight_expires_at,
         grid_sizing_plan=sizing_plan,

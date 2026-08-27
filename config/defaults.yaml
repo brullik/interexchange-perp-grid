@@ -82,7 +82,6 @@ live:
   enabled: false
   require_local_unlock_secret: true
   require_telegram_challenge: true
-  require_current_hash_qualification: true
   canary_max_routes: 1
   canary_max_tranches: 1
   canary_pair_stressed_loss_limit_usdt: "1"
@@ -92,7 +91,6 @@ live:
   canary_close_slippage_cap_bps: "8"
   canary_timeout_seconds: 300
   canary_minimum_profit_usdt: "0.01"
-  qualification_max_age_seconds: 86400
   flat_barrier_consecutive_snapshots: 2
   flat_barrier_quiet_period_seconds: "2"
   flat_barrier_poll_interval_seconds: "0.25"

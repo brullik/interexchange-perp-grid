@@ -2176,8 +2176,28 @@ def _select_fast_live_risk_stage_sync(
             database.rollback()
             raise RuntimeError("fast-live stage selection requires zero active actions")
         if current.stage == target and current.runtime_policy_sha256 == runtime_policy_sha256:
+            if current.qualification_hash is None and not current.completion_frozen:
+                database.commit()
+                return current
+            database.execute(
+                "UPDATE risk_stage_runtime SET qualification_hash = NULL, "
+                "completion_frozen = 0, promoted_by = ?, promoted_at = ? "
+                "WHERE singleton = 1",
+                (actor, now.isoformat()),
+            )
+            database.execute(
+                "UPDATE live_entry_controls SET risk_stage_completion_frozen = 0 "
+                "WHERE singleton = 1"
+            )
             database.commit()
-            return current
+            return RiskStageState(
+                target,
+                None,
+                runtime_policy_sha256,
+                actor,
+                now,
+                False,
+            )
         if target == RiskStage.CANARY and current.stage != RiskStage.SHADOW:
             database.rollback()
             raise RuntimeError("fast-live canary stage must start from shadow")
@@ -2185,15 +2205,13 @@ def _select_fast_live_risk_stage_sync(
             if current.stage != RiskStage.CANARY:
                 database.rollback()
                 raise RuntimeError("fast-live pilot_a stage requires current canary")
-            completed_ids, _ = LiveOrderJournal(path).completed_normal_snapshot_in_transaction(
-                database,
-                current.promoted_at,
-                "0" * 64,
-            )
+            completed_ids, _ = LiveOrderJournal(
+                path
+            ).completed_fast_live_normal_snapshot_in_transaction(database, current.promoted_at)
             canary_rows = database.execute(
                 "SELECT pair_action_id, risk_reservation_json, recovery_action "
-                "FROM live_pair_actions WHERE state = 'FLAT' AND qualification_hash = ?",
-                ("0" * 64,),
+                "FROM live_pair_actions WHERE state = 'FLAT' AND created_at >= ?",
+                (current.promoted_at.isoformat(),),
             ).fetchall()
             eligible_canaries = tuple(
                 str(candidate["pair_action_id"])
@@ -2204,6 +2222,8 @@ def _select_fast_live_risk_stage_sync(
                 == "AGGRESSIVE_FAST_LIVE_V2"
                 and json.loads(str(candidate["risk_reservation_json"])).get("stage")
                 == RiskStage.CANARY.value
+                and json.loads(str(candidate["risk_reservation_json"])).get("activation_hash")
+                is not None
             )
             if len(eligible_canaries) != 1:
                 database.rollback()

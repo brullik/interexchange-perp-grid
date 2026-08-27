@@ -400,6 +400,7 @@ def test_private_preflight_checks_every_account_and_runtime_gate() -> None:
         datetime.now(UTC),
         False,
         False,
+        "a" * 64,
     )
     inputs = PrivatePreflightInput(
         ready_capability(),
@@ -437,6 +438,7 @@ def test_private_preflight_checks_every_account_and_runtime_gate() -> None:
         datetime.now(UTC),
         True,
         True,
+        "b" * 64,
     )
     rejected = run_private_preflight(
         PrivatePreflightInput(

@@ -6,9 +6,12 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import interexchange_perp_grid.canary_runtime as canary_runtime_module
+from interexchange_perp_grid.canary_runtime import recover_active_actions, recover_active_canary
 from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.domain import Venue
 from interexchange_perp_grid.execution import Side
@@ -309,6 +312,7 @@ async def test_v2_portfolio_accepts_distinct_single_use_activations_under_one_ow
         action_id = f"fast-aggressive-{level}"
         activation = f"{level}" * 64
         expires_at = observed + timedelta(seconds=600)
+        await journal.issue_fast_live_preflight(activation, expires_at, now=observed)
         await journal.prepare(
             action_id,
             _ROUTE,
@@ -332,6 +336,7 @@ async def test_v2_portfolio_accepts_distinct_single_use_activations_under_one_ow
                 "projected_stress_usdt": "0.8",
                 "activation_hash": activation,
                 "fast_live_preflight_expires_at": expires_at.isoformat(),
+                "consumption_data_generation_sha256": "a" * 64,
             },
             "0" * 64,
             observed,
@@ -352,6 +357,265 @@ async def test_v2_portfolio_accepts_distinct_single_use_activations_under_one_ow
 
     assert calls == 1
     assert health.mode == SupervisorMode.IDLE, health
+
+
+@pytest.mark.asyncio
+async def test_v2_recovery_rejects_supervisor_without_exact_runtime_handshake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "runtime-mismatch.sqlite3")
+    await journal.initialise()
+    activation = "e" * 64
+    observed = datetime.now(UTC)
+    await journal.issue_fast_live_preflight(
+        activation, observed + timedelta(seconds=600), now=observed
+    )
+    action = await journal.prepare(
+        "runtime-mismatch",
+        _ROUTE,
+        "fast-level-1",
+        replace(
+            _request(Venue.BINANCE_USDM, Side.BUY, "runtime-long"),
+            client_order_id=venue_client_order_id("runtime-mismatch", "long"),
+        ),
+        replace(
+            _request(Venue.OKX, Side.SELL, "runtime-short"),
+            client_order_id=venue_client_order_id("runtime-mismatch", "short"),
+        ),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {
+            "strategy": "AGGRESSIVE_FAST_LIVE_V2",
+            "stage": "canary",
+            "level_index": 1,
+            "aggressive_binding_sha256": "c" * 64,
+            "strategy_profile_sha256": "d" * 64,
+            "projected_stress_usdt": "0.8",
+            "activation_hash": activation,
+            "fast_live_preflight_expires_at": (observed + timedelta(seconds=600)).isoformat(),
+            "consumption_data_generation_sha256": "f" * 64,
+            "supervisor_intent": "LIVE_CANARY",
+            "supervisor_queued": True,
+            "opening_client_order_ids": {
+                "long": venue_client_order_id("runtime-mismatch", "long"),
+                "short": venue_client_order_id("runtime-mismatch", "short"),
+            },
+            "fast_live_identity": {
+                "release_sha": "a" * 40,
+                "source_sha256": "b" * 64,
+                "config_sha256": "c" * 64,
+                "native_runtime_sha256": "d" * 64,
+            },
+        },
+        activation,
+        observed,
+        activation_hash=activation,
+        fast_live_preflight_sha256=activation,
+        fast_live_preflight_expires_at=observed + timedelta(seconds=600),
+    )
+    for name in (
+        "IPEG_FAST_LIVE_SUPERVISOR_RELEASE_SHA",
+        "IPEG_FAST_LIVE_SUPERVISOR_SOURCE_SHA256",
+        "IPEG_FAST_LIVE_SUPERVISOR_CONFIG_SHA256",
+        "IPEG_FAST_LIVE_SUPERVISOR_NATIVE_RUNTIME_SHA256",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(RuntimeError, match="supervisor runtime identity"):
+        await recover_active_canary(object(), journal, action)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exposed_state",
+    [LiveActionState.PARTIAL, LiveActionState.HEDGED, LiveActionState.RECOVERING],
+)
+async def test_v2_exposed_recovery_ignores_runtime_drift_and_reaches_flat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exposed_state: LiveActionState,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / f"runtime-drift-{exposed_state.value}.sqlite3")
+    await journal.initialise()
+    activation = "9" * 64
+    observed = datetime.now(UTC)
+    expires_at = observed + timedelta(seconds=600)
+    await journal.issue_fast_live_preflight(activation, expires_at, now=observed)
+    action = await journal.prepare(
+        f"runtime-drift-{exposed_state.value.lower()}",
+        _ROUTE,
+        "fast-level-1",
+        replace(
+            _request(Venue.BINANCE_USDM, Side.BUY, "drift-long"),
+            client_order_id=venue_client_order_id("runtime-drift", "long"),
+        ),
+        replace(
+            _request(Venue.OKX, Side.SELL, "drift-short"),
+            client_order_id=venue_client_order_id("runtime-drift", "short"),
+        ),
+        {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+        {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+        {
+            "strategy": "AGGRESSIVE_FAST_LIVE_V2",
+            "stage": "canary",
+            "level_index": 1,
+            "aggressive_binding_sha256": "c" * 64,
+            "strategy_profile_sha256": "d" * 64,
+            "projected_stress_usdt": "0.8",
+            "activation_hash": activation,
+            "fast_live_preflight_expires_at": expires_at.isoformat(),
+            "consumption_data_generation_sha256": "8" * 64,
+            "fast_live_identity": {
+                "release_sha": "a" * 40,
+                "source_sha256": "b" * 64,
+                "config_sha256": "c" * 64,
+                "native_runtime_sha256": "d" * 64,
+            },
+        },
+        activation,
+        observed,
+        activation_hash=activation,
+        fast_live_preflight_sha256=activation,
+        fast_live_preflight_expires_at=expires_at,
+    )
+    await journal.mark_submit_attempted(
+        action.pair_action_id,
+        tuple(leg.client_order_id for leg in action.legs),
+    )
+    action = await journal.transition(action.pair_action_id, LiveActionState.PARTIAL)
+    if exposed_state == LiveActionState.HEDGED:
+        action = await journal.transition(action.pair_action_id, LiveActionState.HEDGED)
+    elif exposed_state == LiveActionState.RECOVERING:
+        action = await journal.transition(action.pair_action_id, LiveActionState.RECOVERING)
+    for name in (
+        "IPEG_FAST_LIVE_SUPERVISOR_RELEASE_SHA",
+        "IPEG_FAST_LIVE_SUPERVISOR_SOURCE_SHA256",
+        "IPEG_FAST_LIVE_SUPERVISOR_CONFIG_SHA256",
+        "IPEG_FAST_LIVE_SUPERVISOR_NATIVE_RUNTIME_SHA256",
+    ):
+        monkeypatch.setenv(name, "0" * 64)
+
+    async def recover_to_flat(
+        _settings: object,
+        current_journal: LiveOrderJournal,
+        active: LiveJournalAction,
+        **_kwargs: object,
+    ) -> object:
+        await _force_exchange_verified_flat(current_journal, active)
+        return object()
+
+    monkeypatch.setattr(canary_runtime_module, "_resume_active_canary", recover_to_flat)
+    await recover_active_canary(object(), journal, action)  # type: ignore[arg-type]
+
+    recovered = await journal.load(action.pair_action_id)
+    assert recovered is not None and recovered.state == LiveActionState.FLAT
+
+
+@pytest.mark.asyncio
+async def test_v2_portfolio_runtime_drift_recovers_exposure_but_never_opens_prepared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "portfolio-runtime-drift.sqlite3")
+    await journal.initialise()
+    observed = datetime.now(UTC)
+    prepared: list[LiveJournalAction] = []
+    for level in (1, 2):
+        action_id = f"portfolio-runtime-drift-{level}"
+        activation = f"{level}" * 64
+        expires_at = observed + timedelta(seconds=600)
+        await journal.issue_fast_live_preflight(activation, expires_at, now=observed)
+        long_id = venue_client_order_id(action_id, "long")
+        short_id = venue_client_order_id(action_id, "short")
+        prepared.append(
+            await journal.prepare(
+                action_id,
+                _ROUTE,
+                f"fast-level-{level}",
+                replace(
+                    _request(Venue.BINANCE_USDM, Side.BUY, f"portfolio-long-{level}"),
+                    client_order_id=long_id,
+                ),
+                replace(
+                    _request(Venue.OKX, Side.SELL, f"portfolio-short-{level}"),
+                    client_order_id=short_id,
+                ),
+                {Venue.BINANCE_USDM: Decimal("0.001"), Venue.OKX: Decimal("0.001")},
+                {Venue.BINANCE_USDM: Decimal("100"), Venue.OKX: Decimal("100")},
+                {
+                    "strategy": "AGGRESSIVE_FAST_LIVE_V2",
+                    "stage": "pilot_a",
+                    "level_index": level,
+                    "aggressive_binding_sha256": "c" * 64,
+                    "strategy_profile_sha256": "d" * 64,
+                    "projected_stress_usdt": "0.8",
+                    "activation_hash": activation,
+                    "fast_live_preflight_expires_at": expires_at.isoformat(),
+                    "consumption_data_generation_sha256": "8" * 64,
+                    "supervisor_intent": "LIVE_CANARY",
+                    "supervisor_queued": True,
+                    "opening_client_order_ids": {"long": long_id, "short": short_id},
+                    "fast_live_identity": {
+                        "release_sha": "a" * 40,
+                        "source_sha256": "b" * 64,
+                        "config_sha256": "c" * 64,
+                        "native_runtime_sha256": "d" * 64,
+                    },
+                },
+                activation,
+                observed,
+                activation_hash=activation,
+                fast_live_preflight_sha256=activation,
+                fast_live_preflight_expires_at=expires_at,
+            )
+        )
+    await journal.mark_submit_attempted(
+        prepared[0].pair_action_id,
+        tuple(leg.client_order_id for leg in prepared[0].legs),
+    )
+    first = await journal.transition(prepared[0].pair_action_id, LiveActionState.PARTIAL)
+    first = await journal.transition(first.pair_action_id, LiveActionState.HEDGED)
+    second = prepared[1]
+    for name in (
+        "IPEG_FAST_LIVE_SUPERVISOR_RELEASE_SHA",
+        "IPEG_FAST_LIVE_SUPERVISOR_SOURCE_SHA256",
+        "IPEG_FAST_LIVE_SUPERVISOR_CONFIG_SHA256",
+        "IPEG_FAST_LIVE_SUPERVISOR_NATIVE_RUNTIME_SHA256",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    resumed: list[str] = []
+
+    async def resume_exposed(
+        _settings: object,
+        current_journal: LiveOrderJournal,
+        active: LiveJournalAction,
+        **_kwargs: object,
+    ) -> object:
+        resumed.append(active.pair_action_id)
+        await _force_exchange_verified_flat(current_journal, active)
+        return SimpleNamespace(success=True, terminal_state=LiveActionState.FLAT)
+
+    emergency_called = False
+
+    class FakeControlPlane:
+        def __init__(self, _settings: object) -> None:
+            pass
+
+        async def emergency_flatten(self) -> object:
+            nonlocal emergency_called
+            emergency_called = True
+            for active in await journal.active_actions():
+                await _force_exchange_verified_flat(journal, active)
+            return SimpleNamespace(success=True, instruction=None)
+
+    monkeypatch.setattr(canary_runtime_module, "_resume_active_canary", resume_exposed)
+    monkeypatch.setattr(canary_runtime_module, "OnDemandLiveControlPlane", FakeControlPlane)
+
+    await recover_active_actions(object(), journal, (first, second))  # type: ignore[arg-type]
+
+    assert resumed == [first.pair_action_id]
+    assert emergency_called is True
+    assert await journal.active_actions() == ()
 
 
 @pytest.mark.asyncio

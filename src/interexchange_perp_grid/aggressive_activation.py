@@ -14,7 +14,10 @@ from interexchange_perp_grid.aggressive_model import (
     historical_model_sha256,
 )
 from interexchange_perp_grid.aggressive_runtime import aggressive_runtime_manifest_sha256
-from interexchange_perp_grid.native_runtime import NativeRuntimeManifest
+from interexchange_perp_grid.native_runtime import (
+    NativeRuntimeManifest,
+    native_runtime_manifest_sha256,
+)
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -147,9 +150,7 @@ def _completed_episode_count(direction: DirectionHistoricalModel) -> int:
 
 
 def _native_runtime_sha256(runtime: NativeRuntimeManifest) -> str:
-    return hashlib.sha256(
-        json.dumps(asdict(runtime), default=str, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    return native_runtime_manifest_sha256(runtime)
 
 
 def _binding_sha256(binding: AggressiveFastLiveBinding) -> str:

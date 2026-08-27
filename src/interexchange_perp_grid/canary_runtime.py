@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import subprocess
 import time
 from collections.abc import Coroutine
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -48,6 +50,7 @@ from interexchange_perp_grid.aggressive_runtime import (
 from interexchange_perp_grid.client_ids import venue_client_order_id
 from interexchange_perp_grid.config import Settings
 from interexchange_perp_grid.domain import (
+    BookLevel,
     CapabilityReport,
     FundingSnapshot,
     Instrument,
@@ -61,6 +64,7 @@ from interexchange_perp_grid.fast_live_preflight import (
     FastLivePreflightReport,
     consume_fast_live_preflight,
     evaluate_fast_live_preflight,
+    fast_live_control_identity_matches,
     load_fast_live_preflight,
     save_fast_live_preflight,
     validate_fast_live_preflight,
@@ -93,6 +97,7 @@ from interexchange_perp_grid.live_journal import (
     LiveActionState,
     LiveJournalAction,
     LiveOrderJournal,
+    is_completed_normal_paired_cycle,
     request_payload_hash,
 )
 from interexchange_perp_grid.live_reconciliation import (
@@ -138,6 +143,7 @@ from interexchange_perp_grid.routes import (
 from interexchange_perp_grid.safety import LiveContext, evaluate_live_order
 from interexchange_perp_grid.state import (
     RiskStage,
+    RiskStageState,
     RuntimeControls,
     initialise_state,
     live_confirmation_valid,
@@ -155,10 +161,35 @@ OWNER_CONFIRMATION = "I_ACCEPT_LIVE_CANARY_RISK"
 PILOT_A_OWNER_CONFIRMATION = "I_ACCEPT_AGGRESSIVE_PILOT_A_RISK"
 _OPENING_GATE_TASKS: set[asyncio.Task[object]] = set()
 _AGGRESSIVE_STRATEGIES = frozenset({"AGGRESSIVE_SYMBIOSIS_V1", "AGGRESSIVE_FAST_LIVE_V2"})
+_LOCAL_UNLOCK_ITERATIONS = 600_000
 
 
 def _is_aggressive_strategy(reservation: dict[str, object]) -> bool:
     return reservation.get("strategy") in _AGGRESSIVE_STRATEGIES
+
+
+def local_live_unlock_valid(environ: dict[str, str] | None = None) -> bool:
+    """Verify the locally entered unlock against the DPAPI-profile PBKDF2 verifier."""
+    source = os.environ if environ is None else environ
+    secret = source.get("IPEG_LOCAL_UNLOCK_SECRET", "")
+    verifier = source.get("IPEG_LOCAL_UNLOCK_VERIFIER", "")
+    try:
+        algorithm, iterations_text, salt_text, expected_text = verifier.split("$", 3)
+        iterations = int(iterations_text)
+        salt = base64.b64decode(salt_text, validate=True)
+        expected = base64.b64decode(expected_text, validate=True)
+    except (ValueError, TypeError):
+        return False
+    if (
+        algorithm != "pbkdf2-sha256"
+        or iterations != _LOCAL_UNLOCK_ITERATIONS
+        or len(secret) < 16
+        or len(salt) != 32
+        or len(expected) != 32
+    ):
+        return False
+    observed = hashlib.pbkdf2_hmac("sha256", secret.encode(), salt, iterations, dklen=32)
+    return hmac.compare_digest(observed, expected)
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +371,7 @@ class _OpeningGateSnapshot:
     controls: RuntimeControls
     actions: tuple[LiveJournalAction, ...]
     known_client_ids: set[str]
+    risk_stage: RiskStageState
 
 
 class PublicProtectionProvider(ProtectionProvider):
@@ -1187,6 +1219,7 @@ async def _coordinate_live_action(
                 read_runtime_controls(Path(settings.storage.sqlite_path)),
                 journal.active_actions(),
                 journal.known_client_order_ids(),
+                read_risk_stage(Path(settings.storage.sqlite_path)),
             )
             books, quality = cast(
                 tuple[dict[Venue, OrderBookSnapshot], dict[Venue, DataQualityAssessment]],
@@ -1202,6 +1235,7 @@ async def _coordinate_live_action(
                 controls=cast(RuntimeControls, results[5]),
                 actions=cast(tuple[LiveJournalAction, ...], results[6]),
                 known_client_ids=cast(set[str], results[7]),
+                risk_stage=cast(RiskStageState, results[8]),
             )
 
         try:
@@ -1349,6 +1383,7 @@ async def _coordinate_live_action(
         )
         aggressive_revalidated = True
         final_v2_reserves: dict[str, Decimal] | None = None
+        final_v2_data_generation_sha256: str | None = None
         strategy = current_plan.risk_reservation.get("strategy")
         if strategy in _AGGRESSIVE_STRATEGIES:
             aggressive_revalidated = False
@@ -1375,6 +1410,33 @@ async def _coordinate_live_action(
                     expires_at = datetime.fromisoformat(
                         str(current_plan.risk_reservation["fast_live_preflight_expires_at"])
                     )
+                    raw_identity = current_plan.risk_reservation["fast_live_identity"]
+                    if not isinstance(raw_identity, dict):
+                        raise ValueError("fast-live final-gate identity is missing")
+                    stored_identity = FastLiveIdentity(
+                        **{str(key): str(value) for key, value in raw_identity.items()}
+                    )
+                    current_identity = replace(
+                        stored_identity,
+                        account_generation_sha256=_fast_live_account_generation_sha256(
+                            snapshot.private_states,
+                            reconciliation,
+                        ),
+                        data_generation_sha256=_fast_live_data_generation_sha256(
+                            instruments,
+                            stored_identity.history_sha256,
+                            stored_identity.model_sha256,
+                            intent,
+                            snapshot.books,
+                            snapshot.quality,
+                            funding,
+                        ),
+                        risk_stage=snapshot.risk_stage.stage.value,
+                        risk_stage_generation_sha256=(
+                            _fast_live_risk_stage_generation_sha256(snapshot.risk_stage)
+                        ),
+                    )
+                    final_v2_data_generation_sha256 = current_identity.data_generation_sha256
                     v2_activation_valid = (
                         current_plan.activation_hash is not None
                         and current_plan.risk_reservation.get("activation_hash")
@@ -1387,6 +1449,7 @@ async def _coordinate_live_action(
                         and expires_at.tzinfo is not None
                         and expires_at.utcoffset() is not None
                         and now <= expires_at
+                        and fast_live_control_identity_matches(stored_identity, current_identity)
                     )
                 legacy_qualification_valid = (
                     strategy != "AGGRESSIVE_SYMBIOSIS_V1"
@@ -1546,11 +1609,16 @@ async def _coordinate_live_action(
             )
             and aggressive_revalidated
         )
-        if gate_allowed and final_v2_reserves is not None:
+        if (
+            gate_allowed
+            and final_v2_reserves is not None
+            and final_v2_data_generation_sha256 is not None
+        ):
             try:
                 await journal.update_final_opening_reserves(
                     current_plan.pair_action_id,
                     final_v2_reserves,
+                    data_generation_sha256=final_v2_data_generation_sha256,
                 )
             except (KeyError, RuntimeError, ValueError, ArithmeticError):
                 return False
@@ -1963,7 +2031,34 @@ async def recover_active_canary(
         "CLOSE_ALL_LIVE",
     }:
         return await OnDemandLiveControlPlane(settings).emergency_flatten()
+    # Runtime identity is authority to open new risk, never authority to reduce
+    # existing exposure.  Exposed/recovering actions must remain recoverable after
+    # a crash, reboot, or runtime drift.
+    _require_fast_live_opening_runtime_identity(active)
     return await _resume_active_canary(settings, journal, active)
+
+
+def _require_fast_live_opening_runtime_identity(active: LiveJournalAction) -> None:
+    if (
+        active.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+        and active.state == LiveActionState.PREPARED
+        and _fresh_supervisor_handoff(active)
+    ):
+        identity = active.risk_reservation.get("fast_live_identity")
+        expected = {
+            "release_sha": os.environ.get("IPEG_FAST_LIVE_SUPERVISOR_RELEASE_SHA"),
+            "source_sha256": os.environ.get("IPEG_FAST_LIVE_SUPERVISOR_SOURCE_SHA256"),
+            "config_sha256": os.environ.get("IPEG_FAST_LIVE_SUPERVISOR_CONFIG_SHA256"),
+            "native_runtime_sha256": os.environ.get(
+                "IPEG_FAST_LIVE_SUPERVISOR_NATIVE_RUNTIME_SHA256"
+            ),
+        }
+        if (
+            not isinstance(identity, dict)
+            or any(value is None for value in expected.values())
+            or any(identity.get(key) != value for key, value in expected.items())
+        ):
+            raise RuntimeError("fast-live supervisor runtime identity does not match action")
 
 
 async def recover_active_actions(
@@ -2016,6 +2111,7 @@ async def recover_active_actions(
                 current = await journal.load(snapshot.pair_action_id)
                 if current is None or current.state == LiveActionState.FLAT:
                     continue
+                _require_fast_live_opening_runtime_identity(current)
                 result = await _resume_active_canary(
                     settings,
                     journal,
@@ -2124,6 +2220,7 @@ async def run_fast_live_once(
     *,
     stage: AggressiveLaptopLiveStage,
     exact_merged_clean_source: bool,
+    required_checks_sha256: str,
     preflight_only: bool = False,
 ) -> FastLiveRunEvidence:
     """Evaluate V2 immediately; only the non-preflight path may durably queue one pair."""
@@ -2152,6 +2249,12 @@ async def run_fast_live_once(
         return _fast_live_denied(
             ReasonCode.FAST_LIVE_PREFLIGHT_IDENTITY_CHANGED, route, intent.quantity
         )
+    now = datetime.now(UTC)
+    last_closed_minute = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+    if intent.reference_interval_start != last_closed_minute:
+        return _fast_live_denied(
+            ReasonCode.FAST_LIVE_PREFLIGHT_IDENTITY_CHANGED, route, intent.quantity
+        )
     if not preflight_only and owner_confirmation != owner_phrase:
         return _fast_live_denied(ReasonCode.OWNER_CONFIRMATION_MISSING, route, intent.quantity)
     state_path = Path(settings.storage.sqlite_path)
@@ -2165,13 +2268,31 @@ async def run_fast_live_once(
     )
     # Legacy risk-stage qualification lineage is intentionally non-authoritative in V2.
     # The selected stage is exact-bound by the preflight and enforced directly below.
-    if (
-        actions
-        or risk_stage.completion_frozen
-        or risk_stage.stage != expected_risk_stage
-        or risk_stage.qualification_hash is not None
-    ):
+    if actions or risk_stage.completion_frozen or risk_stage.stage != expected_risk_stage:
         return _fast_live_denied(ReasonCode.RECONCILIATION_INCOMPLETE, route, intent.quantity)
+    completed = await journal.completed_fast_live_actions()
+    completed_v2 = tuple(
+        action
+        for action in completed
+        if action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+        and is_completed_normal_paired_cycle(action)
+    )
+    completed_canaries = tuple(
+        action
+        for action in completed_v2
+        if action.risk_reservation.get("stage") == AggressiveLaptopLiveStage.CANARY.value
+    )
+    if stage == AggressiveLaptopLiveStage.CANARY and completed_canaries:
+        return _fast_live_denied(ReasonCode.CANARY_POLICY_VIOLATION, route, intent.quantity)
+    if stage == AggressiveLaptopLiveStage.PILOT_A and (
+        len(completed_canaries) != 1
+        or completed_canaries[0].route != route
+        or completed_canaries[0].risk_reservation.get("aggressive_binding_sha256")
+        != binding.binding_sha256
+        or completed_canaries[0].risk_reservation.get("strategy_profile_sha256")
+        != binding.profile_sha256
+    ):
+        return _fast_live_denied(ReasonCode.CANARY_POLICY_VIOLATION, route, intent.quantity)
     try:
         history_days = Decimal(binding.history_days)
         convergence_rate = Decimal(binding.convergence_rate)
@@ -2263,6 +2384,12 @@ async def run_fast_live_once(
             slippage_cap_bps=settings.live.canary_close_slippage_cap_bps,
         )
         now = datetime.now(UTC)
+        if intent.reference_interval_start != now.replace(second=0, microsecond=0) - timedelta(
+            minutes=1
+        ):
+            return _fast_live_denied(
+                ReasonCode.FAST_LIVE_PREFLIGHT_IDENTITY_CHANGED, route, intent.quantity
+            )
         projections = {
             venue: _gate_funding_projection(
                 funding[venue],
@@ -2356,22 +2483,33 @@ async def run_fast_live_once(
             model_sha256=binding.model_sha256,
             route=route.value,
             direction=binding.direction.value,
-            account_generation_sha256=_fast_live_account_generation_sha256(
-                states, reconciliation, await journal.event_watermark()
+            account_generation_sha256=_fast_live_account_generation_sha256(states, reconciliation),
+            data_generation_sha256=_fast_live_data_generation_sha256(
+                instruments,
+                binding.reference_manifest_sha256,
+                binding.model_sha256,
+                intent,
+                books,
+                quality,
+                funding,
             ),
-            data_generation_sha256=_fast_live_data_generation_sha256(instruments, binding),
             risk_stage=risk_stage.stage.value,
+            risk_stage_generation_sha256=_fast_live_risk_stage_generation_sha256(risk_stage),
+            required_checks_sha256=required_checks_sha256,
             intent_sha256=aggressive_intent_sha256(intent),
         )
         controls = await read_runtime_controls(state_path)
-        unlock_present = bool(os.environ.get("IPEG_LOCAL_UNLOCK_SECRET"))
+        unlock_secret_present = bool(os.environ.get("IPEG_LOCAL_UNLOCK_SECRET"))
+        unlock_valid = local_live_unlock_valid()
         telegram_valid = await live_confirmation_valid(state_path)
         quality_ready = all(item.accepted for item in quality.values())
         if preflight_only:
             report = evaluate_fast_live_preflight(
                 FastLivePreflightInput(
                     identity=current_identity,
-                    exact_merged_clean_source=exact_merged_clean_source,
+                    exact_merged_clean_source=(
+                        exact_merged_clean_source and required_checks_sha256 != "0" * 64
+                    ),
                     money_movement_capability_absent=all(
                         state.account is not None
                         and state.account.withdrawal_enabled is False
@@ -2394,7 +2532,7 @@ async def run_fast_live_once(
                     regime_clear=binding.regime_clear,
                     economics_positive=economic.accepted,
                     risk_margin_leverage_ready=risk.accepted,
-                    owner_unlock_absent=not unlock_present,
+                    owner_unlock_absent=not unlock_secret_present,
                     telegram_challenge_absent=not telegram_valid,
                     numerical_breakdown={
                         "history_days": binding.history_days,
@@ -2410,6 +2548,12 @@ async def run_fast_live_once(
                 now=now,
             )
             save_fast_live_preflight(preflight_path, report)
+            if report.status == "PASS":
+                await journal.issue_fast_live_preflight(
+                    report.preflight_sha256,
+                    report.expires_at,
+                    now=report.created_at,
+                )
             return FastLiveRunEvidence(
                 report.status == "PASS",
                 None if report.status == "PASS" else report.reason,
@@ -2430,7 +2574,7 @@ async def run_fast_live_once(
             LiveContext(
                 ci_or_test=_ci_or_test_environment(),
                 simulation_or_replay=settings.app.mode != "live",
-                local_unlock_present=unlock_present,
+                local_unlock_present=unlock_valid,
                 telegram_challenge_valid=telegram_valid,
                 fast_live_preflight_valid=True,
                 route_allowlisted=report.identity.route == route.value,
@@ -2491,6 +2635,8 @@ async def run_fast_live_once(
                 ),
                 "activation_hash": report.preflight_sha256,
                 "fast_live_preflight_expires_at": report.expires_at.isoformat(),
+                "fast_live_identity": asdict(report.identity),
+                "consumption_data_generation_sha256": current_identity.data_generation_sha256,
                 "supervisor_intent": "LIVE_CANARY",
                 "supervisor_queued": True,
                 "initial_private_taker_fee_rates": {
@@ -2595,12 +2741,14 @@ async def _fast_live_reconciliation(
 def _fast_live_account_generation_sha256(
     states: dict[Venue, VenuePrivateState],
     reconciliation: ReconciliationReport,
-    journal_watermark: int,
 ) -> str:
     payload = {
         "venues": [
             {
                 "venue": venue.value,
+                "account_identity_sha256": (
+                    state.account.account_identity_sha256 if state.account else None
+                ),
                 "margin_mode": state.account.margin_mode if state.account else None,
                 "position_mode": state.account.position_mode if state.account else None,
                 "trading_enabled": state.account.trading_enabled if state.account else None,
@@ -2620,7 +2768,6 @@ def _fast_live_account_generation_sha256(
             for venue, state in sorted(states.items(), key=lambda item: item[0].value)
         ],
         "reconciliation_sha256": reconciliation_position_signature_sha256(reconciliation),
-        "journal_watermark": journal_watermark,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -2629,11 +2776,19 @@ def _fast_live_account_generation_sha256(
 
 def _fast_live_data_generation_sha256(
     instruments: dict[Venue, Instrument],
-    binding: AggressiveFastLiveBinding,
+    reference_manifest_sha256: str,
+    model_sha256: str,
+    intent: AggressiveTrancheIntent,
+    books: dict[Venue, OrderBookSnapshot],
+    quality: dict[Venue, DataQualityAssessment],
+    funding: dict[Venue, FundingSnapshot],
 ) -> str:
     payload = {
-        "reference_manifest_sha256": binding.reference_manifest_sha256,
-        "model_sha256": binding.model_sha256,
+        "reference_manifest_sha256": reference_manifest_sha256,
+        "model_sha256": model_sha256,
+        "reference_interval_start": intent.reference_interval_start.isoformat(),
+        "reference_spread_bps": str(intent.reference_spread_bps),
+        "quantity": str(intent.quantity),
         "instruments": [
             {
                 "venue": venue.value,
@@ -2652,6 +2807,66 @@ def _fast_live_data_generation_sha256(
             }
             for venue, instrument in sorted(instruments.items(), key=lambda item: item[0].value)
         ],
+        "current_books": [
+            {
+                "venue": venue.value,
+                "symbol": book.symbol,
+                "quality_accepted": quality[venue].accepted,
+                "quality_reason": quality[venue].reason.value,
+                "synchronised": book.synchronised,
+                "exchange_timestamp_ms": book.exchange_timestamp_ms,
+                "received_at": book.received_at.isoformat(),
+                "received_monotonic_ns": book.received_monotonic_ns,
+                "sequence_start": book.sequence_start,
+                "sequence_end": book.sequence_end,
+                "sequence_contiguous": book.sequence_contiguous,
+                "sequence_reset": book.sequence_reset,
+                "is_snapshot": book.is_snapshot,
+                "clock_skew_ms": book.clock_skew_ms,
+                "bids": tuple((str(level.price), str(level.base_quantity)) for level in book.bids),
+                "asks": tuple((str(level.price), str(level.base_quantity)) for level in book.asks),
+                "executable_bid_levels": _levels_needed(book.bids, intent.quantity),
+                "executable_ask_levels": _levels_needed(book.asks, intent.quantity),
+            }
+            for venue, book in sorted(books.items(), key=lambda item: item[0].value)
+        ],
+        "current_funding": [
+            {
+                "venue": venue.value,
+                "symbol": snapshot.symbol,
+                "rate": str(snapshot.rate) if snapshot.rate is not None else None,
+                "next_funding_timestamp_ms": snapshot.next_funding_timestamp_ms,
+                "interval": snapshot.interval,
+                "mark_price": str(snapshot.mark_price) if snapshot.mark_price is not None else None,
+                "index_price": (
+                    str(snapshot.index_price) if snapshot.index_price is not None else None
+                ),
+                "exchange_timestamp_ms": snapshot.exchange_timestamp_ms,
+            }
+            for venue, snapshot in sorted(funding.items(), key=lambda item: item[0].value)
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _levels_needed(levels: tuple[BookLevel, ...], quantity: Decimal) -> int | None:
+    remaining = quantity
+    for index, level in enumerate(levels, start=1):
+        remaining -= min(remaining, level.base_quantity)
+        if remaining <= 0:
+            return index
+    return None
+
+
+def _fast_live_risk_stage_generation_sha256(state: RiskStageState) -> str:
+    payload = {
+        "stage": state.stage.value,
+        "runtime_policy_sha256": state.runtime_policy_sha256,
+        "promoted_by": state.promoted_by,
+        "promoted_at": state.promoted_at.isoformat() if state.promoted_at is not None else None,
+        "completion_frozen": state.completion_frozen,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

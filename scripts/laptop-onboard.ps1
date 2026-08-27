@@ -2,7 +2,8 @@
 param(
     [string]$OutputPath = "state/laptop-profile.clixml",
     [switch]$RuntimeSelfTest,
-    [switch]$DialogSelfTest
+    [switch]$DialogSelfTest,
+    [switch]$UnlockVerifierSelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -152,6 +153,90 @@ function Read-OptionalSecret([string]$Prompt) {
     return Read-SecretDialog -Prompt $Prompt -Required $false
 }
 
+function New-UnlockVerifierFromPlain([string]$Value) {
+    $scalarCount = 0
+    for ($index = 0; $index -lt $Value.Length; $index++) {
+        if (
+            [char]::IsHighSurrogate($Value[$index]) -and
+            $index + 1 -lt $Value.Length -and
+            [char]::IsLowSurrogate($Value[$index + 1])
+        ) {
+            $index++
+        }
+        $scalarCount++
+    }
+    if ($scalarCount -lt 16) {
+        throw "Local live unlock secret must contain at least 16 characters"
+    }
+    $salt = [byte[]]::new(32)
+    $derived = $null
+    $kdf = $null
+    try {
+        [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($salt)
+        $kdf = [Security.Cryptography.Rfc2898DeriveBytes]::new(
+            $Value,
+            $salt,
+            600000,
+            [Security.Cryptography.HashAlgorithmName]::SHA256
+        )
+        $derived = $kdf.GetBytes(32)
+        return "pbkdf2-sha256`$600000`${0}`${1}" -f @(
+            [Convert]::ToBase64String($salt),
+            [Convert]::ToBase64String($derived)
+        )
+    } finally {
+        if ($null -ne $derived) { [Array]::Clear($derived, 0, $derived.Length) }
+        [Array]::Clear($salt, 0, $salt.Length)
+        if ($null -ne $kdf) { $kdf.Dispose() }
+    }
+}
+
+function New-LiveUnlockVerifier {
+    $first = $null
+    $second = $null
+    $firstPointer = [IntPtr]::Zero
+    $secondPointer = [IntPtr]::Zero
+    try {
+        $first = Read-RequiredSecret "Create local live unlock secret (minimum 16 characters)"
+        $second = Read-RequiredSecret "Repeat local live unlock secret"
+        $firstPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($first)
+        $secondPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($second)
+        $firstPlain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($firstPointer)
+        $secondPlain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($secondPointer)
+        if ($firstPlain -cne $secondPlain) {
+            throw "Local live unlock secrets do not match"
+        }
+        return New-UnlockVerifierFromPlain -Value $firstPlain
+    } finally {
+        if ($firstPointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($firstPointer)
+        }
+        if ($secondPointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secondPointer)
+        }
+        $firstPlain = $null
+        $secondPlain = $null
+        if ($null -ne $first) { $first.Dispose() }
+        if ($null -ne $second) { $second.Dispose() }
+    }
+}
+
+if ($UnlockVerifierSelfTest) {
+    $verifier = New-UnlockVerifierFromPlain -Value "correct horse battery staple"
+    if ($verifier -notmatch '^pbkdf2-sha256\$600000\$[A-Za-z0-9+/]+={0,2}\$[A-Za-z0-9+/]+={0,2}$') {
+        throw "Local live unlock verifier self-test failed"
+    }
+    try {
+        $supplementaryCharacter = [char]::ConvertFromUtf32(0x1F600)
+        $null = New-UnlockVerifierFromPlain -Value ($supplementaryCharacter * 8)
+        throw "Unicode scalar-length self-test failed"
+    } catch {
+        if ($_.Exception.Message -notlike "*at least 16 characters*") { throw }
+    }
+    Write-Host "Local live unlock verifier self-test PASS"
+    return
+}
+
 if ($DialogSelfTest) {
     $timer = [Windows.Forms.Timer]::new()
     $timer.Interval = 50
@@ -205,8 +290,9 @@ if ($chatId -notmatch '^-?[0-9]+$') {
 }
 
 $payload = [pscustomobject]@{
-    SchemaVersion = 1
-    QualificationRoute = "BTC:bybit>okx"
+    SchemaVersion = 2
+    FastLiveRoute = "BTC:bybit>okx"
+    LocalLiveUnlockVerifier = New-LiveUnlockVerifier
     TelegramOwnerChatId = $chatId
     TelegramBotToken = Read-RequiredSecret "Telegram bot token"
     BinanceUsdmApiKey = Read-RequiredSecret "BINANCEUSDM API key"
@@ -239,6 +325,9 @@ try {
     }
     $owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     & icacls.exe $resolved /inheritance:r /grant:r "${owner}:(F)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Credential profile ACL hardening failed"
+    }
 } finally {
     if ([IO.File]::Exists($temporary)) {
         [IO.File]::Delete($temporary)

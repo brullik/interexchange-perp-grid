@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -29,6 +29,8 @@ class FastLiveIdentity:
     account_generation_sha256: str
     data_generation_sha256: str
     risk_stage: str
+    risk_stage_generation_sha256: str
+    required_checks_sha256: str
     intent_sha256: str
 
     def __post_init__(self) -> None:
@@ -43,6 +45,8 @@ class FastLiveIdentity:
             self.model_sha256,
             self.account_generation_sha256,
             self.data_generation_sha256,
+            self.risk_stage_generation_sha256,
+            self.required_checks_sha256,
             self.intent_sha256,
         )
         if any(_SHA256.fullmatch(value) is None for value in digests):
@@ -97,7 +101,7 @@ class FastLivePreflightReport:
     execution_authorized: bool = False
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1 or self.status not in {"PASS", "FAIL"}:
+        if self.schema_version != 2 or self.status not in {"PASS", "FAIL"}:
             raise ValueError("fast-live preflight schema or status is invalid")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("fast-live preflight creation time must be aware")
@@ -105,6 +109,22 @@ class FastLivePreflightReport:
             raise ValueError("fast-live preflight TTL must be exactly 600 seconds")
         if self.execution_authorized:
             raise ValueError("fast-live preflight cannot authorize execution")
+        expected_checks = tuple(
+            FastLivePreflightCheck(name, check.passed, reason)
+            for check, (name, _, reason) in zip(self.checks, _CHECKS, strict=False)
+        )
+        if (
+            len(self.checks) != len(_CHECKS)
+            or any(type(check.passed) is not bool for check in self.checks)
+            or self.checks != expected_checks
+        ):
+            raise ValueError("fast-live preflight check roster is invalid")
+        failure = next((check.failure_reason for check in self.checks if not check.passed), None)
+        if (
+            failure is None
+            and (self.status != "PASS" or self.reason != ReasonCode.FAST_LIVE_PREFLIGHT_PASSED)
+        ) or (failure is not None and (self.status != "FAIL" or self.reason != failure)):
+            raise ValueError("fast-live preflight status is inconsistent with checks")
         if _SHA256.fullmatch(self.preflight_sha256) is None:
             raise ValueError("fast-live preflight hash is invalid")
         if self.consumed_at is not None:
@@ -112,6 +132,10 @@ class FastLivePreflightReport:
                 raise ValueError("fast-live preflight consumption time must be aware")
             if self.consumed_intent_sha256 is None:
                 raise ValueError("consumed fast-live preflight requires an intent hash")
+            if self.consumed_at < self.created_at or self.consumed_at > self.expires_at:
+                raise ValueError("fast-live preflight consumption time is outside its TTL")
+        elif self.consumed_intent_sha256 is not None:
+            raise ValueError("unconsumed fast-live preflight cannot contain an intent hash")
         if (
             self.consumed_intent_sha256 is not None
             and _SHA256.fullmatch(self.consumed_intent_sha256) is None
@@ -204,7 +228,7 @@ def evaluate_fast_live_preflight(
     )
     failure = next((check.failure_reason for check in checks if not check.passed), None)
     unsigned = FastLivePreflightReport(
-        schema_version=1,
+        schema_version=2,
         status="FAIL" if failure is not None else "PASS",
         reason=failure or ReasonCode.FAST_LIVE_PREFLIGHT_PASSED,
         created_at=created_at,
@@ -227,13 +251,26 @@ def validate_fast_live_preflight(
     checked_at = now or datetime.now(UTC)
     if report.status != "PASS":
         return ReasonCode.FAST_LIVE_PREFLIGHT_FAILED
+    if any(not check.passed for check in report.checks):
+        return ReasonCode.FAST_LIVE_PREFLIGHT_FAILED
     if report.consumed_at is not None:
         return ReasonCode.FAST_LIVE_PREFLIGHT_ALREADY_USED
     if checked_at < report.created_at or checked_at > report.expires_at:
         return ReasonCode.FAST_LIVE_PREFLIGHT_EXPIRED
-    if report.identity != current_identity:
+    # Volatile L2/funding observations are hashed exactly, detected, and then revalidated
+    # by the same execution core at consumption and both pre-submit opening gates. Normal
+    # market progression does not invalidate the 600-second source/account/risk grant.
+    if not fast_live_control_identity_matches(report.identity, current_identity):
         return ReasonCode.FAST_LIVE_PREFLIGHT_IDENTITY_CHANGED
     return None
+
+
+def fast_live_control_identity_matches(
+    expected: FastLiveIdentity,
+    current: FastLiveIdentity,
+) -> bool:
+    """Compare non-market authority; exact market observations are audited separately."""
+    return replace(expected, data_generation_sha256=current.data_generation_sha256) == current
 
 
 def save_fast_live_preflight(path: Path, report: FastLivePreflightReport) -> None:
@@ -263,6 +300,26 @@ def load_fast_live_preflight(path: Path) -> FastLivePreflightReport:
         or not isinstance(raw_breakdown, dict)
     ):
         raise ValueError("fast-live preflight payload is invalid")
+    expected_identity_fields = {field.name for field in fields(FastLiveIdentity)}
+    if set(raw_identity) != expected_identity_fields:
+        raise ValueError("fast-live preflight identity roster is invalid")
+
+    def require_bool(value: object, field: str) -> bool:
+        if type(value) is not bool:
+            raise ValueError(f"fast-live preflight {field} must be boolean")
+        return value
+
+    parsed_checks: list[FastLivePreflightCheck] = []
+    for item in raw_checks:
+        if not isinstance(item, dict):
+            raise ValueError("fast-live preflight check must be an object")
+        parsed_checks.append(
+            FastLivePreflightCheck(
+                name=str(item["name"]),
+                passed=require_bool(item["passed"], "check result"),
+                failure_reason=ReasonCode(str(item["failure_reason"])),
+            )
+        )
     report = FastLivePreflightReport(
         schema_version=int(payload["schema_version"]),
         status=str(payload["status"]),
@@ -270,15 +327,7 @@ def load_fast_live_preflight(path: Path) -> FastLivePreflightReport:
         created_at=datetime.fromisoformat(str(payload["created_at"])),
         expires_at=datetime.fromisoformat(str(payload["expires_at"])),
         identity=FastLiveIdentity(**{key: str(value) for key, value in raw_identity.items()}),
-        checks=tuple(
-            FastLivePreflightCheck(
-                name=str(item["name"]),
-                passed=bool(item["passed"]),
-                failure_reason=ReasonCode(str(item["failure_reason"])),
-            )
-            for item in raw_checks
-            if isinstance(item, dict)
-        ),
+        checks=tuple(parsed_checks),
         numerical_breakdown={str(key): str(value) for key, value in raw_breakdown.items()},
         preflight_sha256=str(payload["preflight_sha256"]),
         consumed_at=(
@@ -291,7 +340,9 @@ def load_fast_live_preflight(path: Path) -> FastLivePreflightReport:
             if payload.get("consumed_intent_sha256") is not None
             else None
         ),
-        execution_authorized=bool(payload.get("execution_authorized", False)),
+        execution_authorized=require_bool(
+            payload.get("execution_authorized", False), "execution_authorized"
+        ),
     )
     if report.preflight_sha256 == "0" * 64:
         raise ValueError("fast-live preflight hash is not finalized")

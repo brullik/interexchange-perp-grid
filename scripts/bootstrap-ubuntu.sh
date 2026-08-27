@@ -5,6 +5,18 @@ source_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 destdir="${DESTDIR:-}"
 os_release_path="${IPEG_OS_RELEASE_PATH:-/etc/os-release}"
 
+if [[ -n "$destdir" ]]; then
+  if [[ "$destdir" != /* ]]; then
+    echo "DESTDIR must be an absolute staging directory" >&2
+    exit 2
+  fi
+  destdir="$(realpath -m -- "$destdir")"
+  if [[ "$destdir" == "/" ]]; then
+    echo "DESTDIR must not resolve to the physical filesystem root" >&2
+    exit 2
+  fi
+fi
+
 if [[ ! -r "$os_release_path" ]]; then
   echo "Ubuntu release metadata is unavailable" >&2
   exit 2
@@ -18,6 +30,9 @@ fi
 if [[ -z "$destdir" && "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "ipeg bootstrap requires root" >&2
   exit 3
+fi
+if [[ -z "$destdir" ]]; then
+  bash "$source_root/scripts/require-fast-live-acceptance.sh" "${IPEG_RELEASE_SHA:-}"
 fi
 
 prefix() {
@@ -37,7 +52,11 @@ install -d -m 0755 "$(prefix /opt/ipeg)" "$(prefix /opt/ipeg/scripts)" \
 install -m 0644 "$source_root/docker-compose.yml" "$(prefix /opt/ipeg/docker-compose.yml)"
 install -m 0755 "$source_root/scripts/shadow-deploy.sh" "$(prefix /opt/ipeg/scripts/)"
 install -m 0755 "$source_root/scripts/shadow-upgrade.sh" "$(prefix /opt/ipeg/scripts/)"
+install -m 0755 "$source_root/scripts/shadow-deploy-mechanics.sh" "$(prefix /opt/ipeg/scripts/)"
+install -m 0755 "$source_root/scripts/shadow-upgrade-mechanics.sh" "$(prefix /opt/ipeg/scripts/)"
 install -m 0755 "$source_root/scripts/shadow-rollback.sh" "$(prefix /opt/ipeg/scripts/)"
+install -m 0755 "$source_root/scripts/require-fast-live-acceptance.sh" \
+  "$(prefix /opt/ipeg/scripts/)"
 install -m 0755 "$source_root/scripts/ipegctl" "$(prefix /usr/local/sbin/ipegctl)"
 install -m 0755 "$source_root/scripts/bootstrap-ubuntu.sh" \
   "$(prefix /usr/local/sbin/ipeg-bootstrap)"

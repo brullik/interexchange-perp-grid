@@ -44,12 +44,20 @@ class AccountSnapshot:
     observed_at: datetime
     withdrawal_enabled: bool | None = None
     transfer_enabled: bool | None = None
+    account_identity_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.equity_usdt < 0 or self.free_margin_usdt < 0:
             raise ValueError("account balances must be non-negative")
         if self.free_margin_usdt > self.equity_usdt:
             raise ValueError("free margin cannot exceed equity")
+        if self.account_identity_sha256 is not None and (
+            len(self.account_identity_sha256) != 64
+            or any(
+                character not in "0123456789abcdef" for character in self.account_identity_sha256
+            )
+        ):
+            raise ValueError("account identity must be a SHA-256 digest")
 
 
 @dataclass(frozen=True, slots=True)

@@ -101,6 +101,8 @@ from interexchange_perp_grid.config import Settings, load_settings
 from interexchange_perp_grid.domain import Instrument, InstrumentKey, ProductType, Venue
 from interexchange_perp_grid.execution import Side
 from interexchange_perp_grid.fast_live_preflight import load_fast_live_preflight
+from interexchange_perp_grid.github_checks import fetch_required_checks_evidence
+from interexchange_perp_grid.independent_review import verify_independent_review_receipt
 from interexchange_perp_grid.laptop_workflow import (
     LaptopQualificationIdentity,
     build_laptop_pilot_report,
@@ -123,6 +125,7 @@ from interexchange_perp_grid.maintenance import (
 from interexchange_perp_grid.native_runtime import (
     build_native_runtime_manifest,
     load_native_runtime_manifest,
+    native_runtime_manifest_sha256,
     resolve_runtime_artifact_digest,
     verify_native_runtime_manifest,
     write_native_runtime_manifest,
@@ -879,11 +882,19 @@ def _fast_live_cost_evidence_complete(action: LiveJournalAction) -> bool:
     rates = action.risk_reservation.get("initial_funding_rates")
     timestamps = action.risk_reservation.get("initial_funding_next_timestamp_ms")
     actual = action.risk_reservation.get("actual_fill_risk")
+    consumption_hash = str(action.risk_reservation.get("consumption_data_generation_sha256", ""))
+    opening_hashes = action.risk_reservation.get("opening_data_generation_sha256_history")
     if (
         not isinstance(fees, dict)
         or not isinstance(rates, dict)
         or not isinstance(timestamps, dict)
         or not isinstance(actual, dict)
+        or re.fullmatch(r"[0-9a-f]{64}", consumption_hash) is None
+        or not isinstance(opening_hashes, list)
+        or len(opening_hashes) < 2
+        or any(re.fullmatch(r"[0-9a-f]{64}", str(value)) is None for value in opening_hashes)
+        or action.risk_reservation.get("latest_opening_data_generation_sha256")
+        != opening_hashes[-1]
     ):
         return False
     funding_timestamps: list[int] = []
@@ -1006,7 +1017,7 @@ async def _synchronize_fast_live_journal_grid(
     journal = LiveOrderJournal(Path(settings.storage.sqlite_path))
     await journal.initialise()
     active = await journal.active_actions()
-    completed = await journal.completed_actions_since(datetime.fromtimestamp(0, UTC), "0" * 64)
+    completed = await journal.completed_fast_live_actions()
     all_v2 = tuple(
         action
         for action in (*completed, *active)
@@ -1135,10 +1146,18 @@ def health(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         )
 
     result, supervisor = asyncio.run(read_health())
+    observed_at = datetime.now(UTC)
+    supervisor_healthy = (
+        supervisor is not None
+        and supervisor.mode.value != "STOPPED"
+        and (observed_at - supervisor.heartbeat_at).total_seconds()
+        <= settings.app.health_max_age_seconds
+    )
+    healthy = result.healthy and supervisor_healthy
     typer.echo(
         json.dumps(
             {
-                "status": "PASS" if result.healthy else "FAIL",
+                "status": "PASS" if healthy else "FAIL",
                 "reason": result.reason,
                 "service_status": result.status,
                 "heartbeat_at": result.heartbeat_at,
@@ -1155,12 +1174,15 @@ def health(config: ConfigPath = Path("config/defaults.yaml")) -> None:
                 ),
                 "recovery_outcome": supervisor.outcome if supervisor is not None else None,
                 "supervisor_failure": supervisor.failure if supervisor is not None else None,
+                "supervisor_heartbeat_at": (
+                    supervisor.heartbeat_at if supervisor is not None else None
+                ),
             },
             default=str,
             sort_keys=True,
         )
     )
-    if not result.healthy:
+    if not healthy:
         raise typer.Exit(code=1)
 
 
@@ -2041,6 +2063,15 @@ def _run_fast_live_cli(
         repo_root=repo_root,
         config_path=config,
     )
+    exact_source = _exact_merged_main_ready(repo_root)
+    required_checks_sha256 = "0" * 64
+    if exact_source:
+        try:
+            required_checks_sha256 = fetch_required_checks_evidence(
+                binding.release_sha
+            ).evidence_sha256
+        except (OSError, TimeoutError, ValueError):
+            exact_source = False
     result = asyncio.run(
         run_fast_live_once(
             settings,
@@ -2052,7 +2083,8 @@ def _run_fast_live_cli(
             envelope.sizing_plan,
             grid.resolve(),
             stage=stage,
-            exact_merged_clean_source=_exact_merged_main_ready(repo_root),
+            exact_merged_clean_source=exact_source,
+            required_checks_sha256=required_checks_sha256,
             preflight_only=preflight_only,
         )
     )
@@ -2214,7 +2246,7 @@ def fast_live_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
         journal = LiveOrderJournal(state_path)
         await journal.initialise()
         active = await journal.active_actions()
-        completed = await journal.completed_actions_since(datetime.fromtimestamp(0, UTC), "0" * 64)
+        completed = await journal.completed_fast_live_actions()
         fast_completed = tuple(
             action
             for action in completed
@@ -2237,6 +2269,17 @@ def fast_live_status(config: ConfigPath = Path("config/defaults.yaml")) -> None:
                 for action in active
             ],
             "completed_fast_live_round_trips": len(fast_completed),
+            "completed_fast_live_actions": [
+                {
+                    "pair_action_id": action.pair_action_id,
+                    "route": action.route.value,
+                    "stage": action.risk_reservation.get("stage"),
+                    "activation_hash": action.activation_hash,
+                    "binding_sha256": action.risk_reservation.get("aggressive_binding_sha256"),
+                    "profile_sha256": action.risk_reservation.get("strategy_profile_sha256"),
+                }
+                for action in fast_completed
+            ],
             "paused": controls.paused,
             "killed": controls.killed,
             "supervisor_mode": supervisor.mode.value if supervisor is not None else None,
@@ -2307,6 +2350,118 @@ def fast_live_stage_select(
     )
 
 
+@app.command("fast-live-stage-report")
+def fast_live_stage_report(
+    stage: Annotated[AggressiveLaptopLiveStage, typer.Option("--stage")],
+    pair_action_id: Annotated[str, typer.Option("--pair-action-id")],
+    model: Annotated[Path, typer.Option("--model")],
+    grid: Annotated[Path, typer.Option("--grid")],
+    profile: Annotated[Path, typer.Option("--profile")],
+    preflight: Annotated[Path, typer.Option("--preflight")],
+    runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
+    output: Annotated[Path, typer.Option("--output")],
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
+    """Write stage evidence only after a fresh authoritative private stable-FLAT audit."""
+    settings = _load(config)
+    loaded_model = load_historical_model(model.resolve())
+    profile_sha256 = hashlib.sha256(profile.read_bytes()).hexdigest()
+    preflight_report = load_fast_live_preflight(preflight.resolve())
+    grid_store = AggressiveGridStore(grid.resolve())
+    grid_store.initialise()
+    runtime = verify_native_runtime_manifest(
+        runtime_manifest.resolve(),
+        Path(".").resolve(),
+        config.resolve(),
+    )
+    binding = build_aggressive_fast_live_binding(
+        loaded_model,
+        runtime,
+        grid_store,
+        route=preflight_report.identity.route,
+        profile_sha256=profile_sha256,
+    )
+    state_path = Path(settings.storage.sqlite_path)
+
+    async def audit() -> tuple[LiveJournalAction, int]:
+        await initialise_state(state_path)
+        journal = LiveOrderJournal(state_path)
+        await journal.initialise()
+        if await journal.active_actions():
+            raise typer.BadParameter("stage report requires zero active actions")
+        completed = await journal.completed_fast_live_actions()
+        matches = tuple(
+            action
+            for action in completed
+            if action.pair_action_id == pair_action_id
+            and action.risk_reservation.get("strategy") == "AGGRESSIVE_FAST_LIVE_V2"
+        )
+        if len(matches) != 1:
+            raise typer.BadParameter("stage report action identity is ambiguous")
+        action = matches[0]
+        orders = tuple(
+            order
+            for order in await journal.latest_order_events(action.pair_action_id)
+            if order.filled_base_quantity > 0
+        )
+        if (
+            action.risk_reservation.get("stage") != stage.value
+            or not is_completed_normal_paired_cycle(action)
+            or not _fast_live_cost_evidence_complete(action)
+            or len(orders) != 4
+            or any(
+                order.status is None
+                or order.status.value != "FILLED"
+                or order.average_price is None
+                or order.average_price <= 0
+                or order.fee_usdt is None
+                or order.fee_usdt < 0
+                for order in orders
+            )
+            or action.activation_hash != preflight_report.preflight_sha256
+            or action.risk_reservation.get("aggressive_binding_sha256") != binding.binding_sha256
+            or action.risk_reservation.get("strategy_profile_sha256") != profile_sha256
+            or action.route.value != binding.route
+            or action.recovery_action is not None
+        ):
+            raise typer.BadParameter("stage report journal evidence is incomplete")
+        return action, await journal.event_watermark()
+
+    action, journal_watermark_before = asyncio.run(audit())
+    flat = asyncio.run(collect_authoritative_live_flat_evidence(settings, loaded_model.base))
+    action_after, journal_watermark_after = asyncio.run(audit())
+    if (
+        not flat.stable_flat
+        or action_after != action
+        or journal_watermark_after != journal_watermark_before
+    ):
+        raise typer.BadParameter("stage report private stable-FLAT audit changed")
+    stage_label = "canary" if stage == AggressiveLaptopLiveStage.CANARY else "pilot"
+    payload = {
+        "schema_version": 2,
+        "stage": stage_label,
+        "pair_action_id": action.pair_action_id,
+        "route": action.route.value,
+        "activation_hash": action.activation_hash,
+        "binding_sha256": binding.binding_sha256,
+        "profile_sha256": profile_sha256,
+        "release_sha": runtime.release_sha,
+        "stable_flat": True,
+        "active_action_count": 0,
+        "private_event_watermark": flat.private_event_watermark,
+        "reconciliation_sha256": flat.reconciliation_sha256,
+        "journal_event_watermark": journal_watermark_after,
+        "completed_at": datetime.now(UTC).isoformat(),
+        "execution_authorized": False,
+    }
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pending = output.with_name(f".{output.name}.pending")
+    pending.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    pending.replace(output)
+    typer.echo(json.dumps(payload, sort_keys=True))
+
+
 @app.command("fast-live-acceptance")
 def fast_live_acceptance(
     runtime_manifest: Annotated[Path, typer.Option("--runtime-manifest")],
@@ -2316,6 +2471,9 @@ def fast_live_acceptance(
     preflight: Annotated[Path, typer.Option("--preflight")],
     canary_evidence: Annotated[Path, typer.Option("--canary-evidence")],
     pilot_evidence: Annotated[Path, typer.Option("--pilot-evidence")],
+    independent_review: Annotated[Path, typer.Option("--independent-review")] = Path(
+        "state/fast-live-independent-review.json"
+    ),
     output: Annotated[Path, typer.Option("--output")] = Path(
         "state/laptop-fast-live-acceptance.json"
     ),
@@ -2334,6 +2492,20 @@ def fast_live_acceptance(
     if loaded_model.strategy_profile_sha256 != profile_sha256:
         raise typer.BadParameter("fast-live acceptance model/profile mismatch")
     preflight_report = load_fast_live_preflight(preflight.resolve())
+    try:
+        checks_evidence = fetch_required_checks_evidence(runtime.release_sha)
+    except (OSError, TimeoutError, ValueError) as error:
+        raise typer.BadParameter("exact required GitHub checks are unavailable") from error
+    try:
+        review_receipt = verify_independent_review_receipt(
+            independent_review.resolve(),
+            release_sha=runtime.release_sha,
+            source_sha256=runtime.source_sha256,
+            config_sha256=runtime.config_sha256,
+            required_checks_sha256=checks_evidence.evidence_sha256,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise typer.BadParameter("exact independent review receipt is unavailable") from error
     if preflight_report.status != "PASS":
         raise typer.BadParameter("fast-live acceptance requires a genuine PASS preflight")
     if (
@@ -2343,6 +2515,7 @@ def fast_live_acceptance(
         or preflight_report.identity.profile_sha256 != profile_sha256
         or preflight_report.identity.history_sha256 != loaded_model.reference_manifest_sha256
         or preflight_report.identity.model_sha256 != historical_model_sha256(loaded_model)
+        or preflight_report.identity.required_checks_sha256 != checks_evidence.evidence_sha256
     ):
         raise typer.BadParameter("fast-live acceptance identity is stale")
     grid_store = AggressiveGridStore(grid.resolve())
@@ -2369,9 +2542,18 @@ def fast_live_acceptance(
             raise typer.BadParameter(f"{expected} evidence is unreadable") from error
         if (
             not isinstance(payload, dict)
+            or payload.get("schema_version") != 2
             or payload.get("stage") != expected
             or payload.get("stable_flat") is not True
             or payload.get("active_action_count") != 0
+            or payload.get("route") != current_binding.route
+            or payload.get("binding_sha256") != current_binding.binding_sha256
+            or payload.get("profile_sha256") != profile_sha256
+            or payload.get("release_sha") != runtime.release_sha
+            or payload.get("execution_authorized") is not False
+            or not isinstance(payload.get("private_event_watermark"), int)
+            or not isinstance(payload.get("journal_event_watermark"), int)
+            or re.fullmatch(r"[0-9a-f]{64}", str(payload.get("reconciliation_sha256"))) is None
         ):
             raise typer.BadParameter(f"{expected} evidence is not stable-FLAT")
         return {str(key): value for key, value in payload.items()}
@@ -2390,7 +2572,7 @@ def fast_live_acceptance(
         journal = LiveOrderJournal(state_path)
         await journal.initialise()
         active = await journal.active_actions()
-        completed = await journal.completed_actions_since(datetime.fromtimestamp(0, UTC), "0" * 64)
+        completed = await journal.completed_fast_live_actions()
         fast = tuple(
             sorted(
                 (
@@ -2460,9 +2642,20 @@ def fast_live_acceptance(
         raise typer.BadParameter("fast-live journal contains an unauthorized stage")
     if actual_orders_after != {action.pair_action_id for action in fast_actions}:
         raise typer.BadParameter("fast-live journal lacks complete actual fill and fee evidence")
-    if canary_stage.get("pair_action_id") != canary_actions[0].pair_action_id or pilot_stage.get(
-        "pair_action_id"
-    ) not in {action.pair_action_id for action in pilot_actions}:
+    pilot_stage_action = next(
+        (
+            action
+            for action in pilot_actions
+            if action.pair_action_id == pilot_stage.get("pair_action_id")
+        ),
+        None,
+    )
+    if (
+        canary_stage.get("pair_action_id") != canary_actions[0].pair_action_id
+        or canary_stage.get("activation_hash") != canary_actions[0].activation_hash
+        or pilot_stage_action is None
+        or pilot_stage.get("activation_hash") != pilot_stage_action.activation_hash
+    ):
         raise typer.BadParameter("fast-live stage evidence is not bound to the durable journal")
     if any(
         not is_completed_normal_paired_cycle(action)
@@ -2490,11 +2683,21 @@ def fast_live_acceptance(
         for action in pilot_actions
     ):
         raise typer.BadParameter("fast-live journal exceeds the authorized laptop stage")
-    native_runtime_sha256 = hashlib.sha256(
-        json.dumps(asdict(runtime), default=str, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    native_runtime_sha256 = native_runtime_manifest_sha256(runtime)
     if preflight_report.identity.native_runtime_sha256 != native_runtime_sha256:
         raise typer.BadParameter("fast-live native runtime identity changed")
+    independent_review_payload = {
+        "release_sha": runtime.release_sha,
+        "receipt_sha256": review_receipt.receipt_sha256,
+        "reviewed_at": review_receipt.reviewed_at.isoformat(),
+        "reviewers": review_receipt.reviewers,
+        "p0_open": review_receipt.p0_open,
+        "p1_open": review_receipt.p1_open,
+        "p2_open": review_receipt.p2_open,
+    }
+    independent_review_sha256 = hashlib.sha256(
+        json.dumps(independent_review_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     payload = {
         "schema_version": 1,
         "accepted": True,
@@ -2517,11 +2720,17 @@ def fast_live_acceptance(
         "final_private_event_watermark": fresh_flat.private_event_watermark,
         "final_reconciliation_sha256": fresh_flat.reconciliation_sha256,
         "final_journal_event_watermark": journal_watermark_after,
-        "p0_findings": 0,
-        "p1_findings": 0,
+        "required_checks_sha256": checks_evidence.evidence_sha256,
+        "p0_open": review_receipt.p0_open,
+        "p1_open": review_receipt.p1_open,
+        "p2_open": review_receipt.p2_open,
+        "independent_review_sha256": independent_review_sha256,
         "production_submit_scope": "owner_confirmed_canary_and_pilot_only",
         "execution_authorized": False,
     }
+    payload["acceptance_sha256"] = hashlib.sha256(
+        json.dumps(payload, default=str, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     output = output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     pending = output.with_name(f".{output.name}.pending")
@@ -3048,15 +3257,125 @@ def native_runtime_manifest(
 
 
 @app.command("run")
-def run_service(config: ConfigPath = Path("config/defaults.yaml")) -> None:
+def run_service(
+    runtime_manifest: Annotated[Path | None, typer.Option("--runtime-manifest")] = None,
+    runtime_handshake: Annotated[Path | None, typer.Option("--runtime-handshake")] = None,
+    repo_root: Annotated[Path, typer.Option("--repo-root")] = Path("."),
+    config: ConfigPath = Path("config/defaults.yaml"),
+) -> None:
     """Run the safe asynchronous bootstrap service."""
+    if (runtime_manifest is None) != (runtime_handshake is None):
+        raise typer.BadParameter(
+            "exact supervisor runtime requires manifest and handshake together"
+        )
+    runtime = None
+    handshake: dict[str, object] | None = None
+    handshake_target: Path | None = None
+    if runtime_manifest is not None:
+        assert runtime_handshake is not None
+        if not _exact_merged_main_ready(repo_root):
+            raise typer.BadParameter("exact supervisor requires clean merged main")
+        runtime = verify_native_runtime_manifest(
+            runtime_manifest.resolve(), repo_root.resolve(), config.resolve()
+        )
+        process_started_at = datetime.now(UTC)
+        handshake = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "executable": str(Path(sys.executable).resolve()),
+            "working_directory": str(Path.cwd().resolve()),
+            "argv": tuple(sys.argv),
+            "release_sha": runtime.release_sha,
+            "source_sha256": runtime.source_sha256,
+            "config_sha256": runtime.config_sha256,
+            "native_runtime_sha256": native_runtime_manifest_sha256(runtime),
+            "runtime_manifest_sha256": runtime.artifact_digest.removeprefix("sha256:"),
+            "started_at": process_started_at.isoformat(),
+        }
+        handshake_target = runtime_handshake.resolve()
+        handshake_target.parent.mkdir(parents=True, exist_ok=True)
+        os.environ["IPEG_FAST_LIVE_SUPERVISOR_RELEASE_SHA"] = runtime.release_sha
+        os.environ["IPEG_FAST_LIVE_SUPERVISOR_SOURCE_SHA256"] = runtime.source_sha256
+        os.environ["IPEG_FAST_LIVE_SUPERVISOR_CONFIG_SHA256"] = runtime.config_sha256
+        os.environ["IPEG_FAST_LIVE_SUPERVISOR_NATIVE_RUNTIME_SHA256"] = str(
+            handshake["native_runtime_sha256"]
+        )
     settings = _load(config)
     decision = evaluate_live_order(settings, LiveContext())
     if settings.app.mode == "live" or decision.allowed:
         typer.echo("service refuses live mode without runtime gates", err=True)
         raise typer.Exit(code=2)
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(run_until_signal(settings))
+
+    async def run_with_exact_readiness() -> None:
+        service_task = asyncio.create_task(
+            run_until_signal(settings), name="exact-bootstrap-service"
+        )
+        try:
+            if handshake is not None:
+                assert handshake_target is not None
+                started_at = datetime.fromisoformat(str(handshake["started_at"]))
+                deadline = asyncio.get_running_loop().time() + 60
+                state_path = Path(settings.storage.sqlite_path)
+                while True:
+                    if service_task.done():
+                        await service_task
+                        raise RuntimeError("exact safety supervisor stopped before readiness")
+                    service_health, supervisor_health = await asyncio.gather(
+                        read_service_health(
+                            state_path,
+                            settings.app.health_max_age_seconds,
+                        ),
+                        read_supervisor_health(state_path),
+                    )
+                    if (
+                        service_health.healthy
+                        and service_health.status == "running"
+                        and service_health.heartbeat_at is not None
+                        and service_health.heartbeat_at >= started_at
+                        and supervisor_health is not None
+                        and supervisor_health.mode.value != "STOPPED"
+                        and supervisor_health.heartbeat_at >= started_at
+                    ):
+                        ready_at = datetime.now(UTC)
+                        handshake.update(
+                            {
+                                "ready_at": ready_at.isoformat(),
+                                "service_starts": service_health.starts,
+                                "service_heartbeat_at": service_health.heartbeat_at.isoformat(),
+                                "supervisor_heartbeat_at": (
+                                    supervisor_health.heartbeat_at.isoformat()
+                                ),
+                            }
+                        )
+                        pending = handshake_target.with_name(f".{handshake_target.name}.pending")
+                        pending.write_text(
+                            json.dumps(handshake, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
+                        pending.replace(handshake_target)
+                        break
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise RuntimeError("exact safety supervisor readiness timed out")
+                    await asyncio.sleep(0.1)
+            await service_task
+        finally:
+            if not service_task.done():
+                service_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await service_task
+
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(run_with_exact_readiness())
+    finally:
+        if runtime is not None:
+            for name in (
+                "IPEG_FAST_LIVE_SUPERVISOR_RELEASE_SHA",
+                "IPEG_FAST_LIVE_SUPERVISOR_SOURCE_SHA256",
+                "IPEG_FAST_LIVE_SUPERVISOR_CONFIG_SHA256",
+                "IPEG_FAST_LIVE_SUPERVISOR_NATIVE_RUNTIME_SHA256",
+            ):
+                os.environ.pop(name, None)
 
 
 @app.command("run-for")

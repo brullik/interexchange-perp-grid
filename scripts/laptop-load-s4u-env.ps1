@@ -57,7 +57,7 @@ foreach ($rule in $rules) {
 
 $envelope = Get-Content -LiteralPath $resolved -Raw | ConvertFrom-Json
 if (
-    $envelope.schema_version -ne 1 -or
+    $envelope.schema_version -ne 2 -or
     $envelope.protection_scope -cne "LocalMachine"
 ) {
     throw "Encrypted S4U laptop profile envelope is invalid"
@@ -77,8 +77,9 @@ try {
     $plainJson = [Text.Encoding]::UTF8.GetString($clearBytes)
     $profile = $plainJson | ConvertFrom-Json
     if (
-        $profile.SchemaVersion -ne 1 -or
-        $profile.QualificationRoute -cne "BTC:bybit>okx"
+        $profile.SchemaVersion -ne 2 -or
+        $profile.FastLiveRoute -cne "BTC:bybit>okx" -or
+        [string]$profile.LocalLiveUnlockVerifier -notmatch '^pbkdf2-sha256\$600000\$[A-Za-z0-9+/]+={0,2}\$[A-Za-z0-9+/]+={0,2}$'
     ) {
         throw "Encrypted S4U laptop profile identity is invalid"
     }
@@ -101,7 +102,7 @@ try {
     $env:IPEG_MODE = "shadow"
     $env:IPEG_LIVE_ENABLED = "false"
     $env:IPEG_OWNER_ONBOARDING_CONFIRMED = "true"
-    $env:IPEG_QUALIFICATION_ROUTE = "BTC:bybit>okx"
+    $env:IPEG_LOCAL_UNLOCK_VERIFIER = [string]$profile.LocalLiveUnlockVerifier
     $env:IPEG_STATE_PATH = Resolve-LaptopPath $root $StatePath
     $env:IPEG_PARQUET_DIR = Resolve-LaptopPath $root $MarketPath
     $env:IPEG_RUNTIME_KIND = "native-python"

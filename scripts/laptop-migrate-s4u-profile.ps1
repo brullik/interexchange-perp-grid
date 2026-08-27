@@ -46,6 +46,40 @@ function Resolve-LaptopPath([string]$Root, [string]$Path) {
     return [IO.Path]::GetFullPath((Join-Path $Root $Path))
 }
 
+function Set-OwnerOnlyAcl([string]$Path) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $security = [Security.AccessControl.FileSecurity]::new()
+    $security.SetOwner($identity.User)
+    $security.SetAccessRuleProtection($true, $false)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $identity.User,
+        [Security.AccessControl.FileSystemRights]::FullControl,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $security.AddAccessRule($rule)
+    [IO.File]::SetAccessControl($Path, $security)
+
+    $verified = [IO.File]::GetAccessControl(
+        $Path,
+        [Security.AccessControl.AccessControlSections]::Access
+    )
+    $rules = @($verified.GetAccessRules(
+        $true,
+        $false,
+        [Security.Principal.SecurityIdentifier]
+    ))
+    if (
+        -not $verified.AreAccessRulesProtected -or
+        $rules.Count -ne 1 -or
+        $rules[0].IdentityReference -ne $identity.User -or
+        $rules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        ($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne
+            [Security.AccessControl.FileSystemRights]::FullControl
+    ) {
+        throw "S4U profile ACL is not restricted to the current Windows identity"
+    }
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 $input = Resolve-LaptopPath $root $InputPath
 $output = Resolve-LaptopPath $root $OutputPath
@@ -55,7 +89,11 @@ if (-not (Test-Path -LiteralPath $input -PathType Leaf)) {
 
 $serialized = [IO.File]::ReadAllText($input, [Text.Encoding]::UTF8)
 $profile = [Management.Automation.PSSerializer]::Deserialize($serialized)
-if ($profile.SchemaVersion -ne 1 -or $profile.QualificationRoute -cne "BTC:bybit>okx") {
+if (
+    $profile.SchemaVersion -ne 2 -or
+    $profile.FastLiveRoute -cne "BTC:bybit>okx" -or
+    [string]$profile.LocalLiveUnlockVerifier -notmatch '^pbkdf2-sha256\$600000\$[A-Za-z0-9+/]+={0,2}\$[A-Za-z0-9+/]+={0,2}$'
+) {
     throw "Encrypted current-user laptop profile identity is invalid"
 }
 
@@ -64,11 +102,13 @@ $cipherBytes = $null
 $roundTripBytes = $null
 $entropy = [byte[]]::new(32)
 $temporary = "$output.tmp"
+$backup = "$output.backup"
 try {
     [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($entropy)
     $plain = [ordered]@{
-        SchemaVersion = 1
-        QualificationRoute = "BTC:bybit>okx"
+        SchemaVersion = 2
+        FastLiveRoute = "BTC:bybit>okx"
+        LocalLiveUnlockVerifier = [string]$profile.LocalLiveUnlockVerifier
         TelegramOwnerChatId = [string]$profile.TelegramOwnerChatId
         TelegramBotToken = Convert-Secret $profile.TelegramBotToken
         BinanceUsdmApiKey = Convert-Secret $profile.BinanceUsdmApiKey
@@ -98,7 +138,7 @@ try {
     }
 
     $envelope = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         protection_scope = "LocalMachine"
         entropy = [Convert]::ToBase64String($entropy)
         ciphertext = [Convert]::ToBase64String($cipherBytes)
@@ -106,25 +146,26 @@ try {
     $parent = Split-Path -Parent $output
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     [IO.File]::WriteAllText($temporary, "", [Text.UTF8Encoding]::new($false))
-    $owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    & icacls.exe $temporary /inheritance:r /grant:r "${owner}:(F)" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "S4U temporary profile ACL could not be restricted"
-    }
+    Set-OwnerOnlyAcl $temporary
     [IO.File]::WriteAllText(
         $temporary,
         ($envelope | ConvertTo-Json -Compress),
         [Text.UTF8Encoding]::new($false)
     )
     if ([IO.File]::Exists($output)) {
-        [IO.File]::Replace($temporary, $output, $null)
+        # File.Replace preserves the destination DACL.  Remove every foreign ACE
+        # before replacement so machine-wide DPAPI ciphertext is never installed
+        # behind a permissive pre-existing ACL.
+        Set-OwnerOnlyAcl $output
+        if ([IO.File]::Exists($backup)) {
+            [IO.File]::Delete($backup)
+        }
+        [IO.File]::Replace($temporary, $output, $backup)
+        [IO.File]::Delete($backup)
     } else {
         [IO.File]::Move($temporary, $output)
     }
-    & icacls.exe $output /inheritance:r /grant:r "${owner}:(F)" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "S4U profile ACL could not be restricted to the current Windows identity"
-    }
+    Set-OwnerOnlyAcl $output
 } finally {
     Clear-Bytes $clearBytes
     Clear-Bytes $cipherBytes
@@ -135,6 +176,9 @@ try {
     $serialized = $null
     if ([IO.File]::Exists($temporary)) {
         [IO.File]::Delete($temporary)
+    }
+    if ([IO.File]::Exists($backup)) {
+        [IO.File]::Delete($backup)
     }
 }
 

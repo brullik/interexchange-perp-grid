@@ -200,6 +200,9 @@ def test_current_fast_live_contract_has_no_qualification_dependency(command: str
 def test_fast_live_acceptance_requires_complete_private_fee_and_funding_evidence() -> None:
     observed = datetime(2026, 8, 26, tzinfo=UTC)
     reservation: dict[str, object] = {
+        "consumption_data_generation_sha256": "a" * 64,
+        "opening_data_generation_sha256_history": ["b" * 64, "c" * 64],
+        "latest_opening_data_generation_sha256": "c" * 64,
         "initial_private_taker_fee_rates": {
             Venue.BYBIT.value: "0.00055",
             Venue.OKX.value: "0.00050",

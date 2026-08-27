@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import threading
@@ -159,6 +160,7 @@ async def _prepare_fast_live(
             "projected_stress_usdt": "0.8",
             "activation_hash": preflight_sha256,
             "fast_live_preflight_expires_at": expires_at.isoformat(),
+            "consumption_data_generation_sha256": "c" * 64,
             "initial_adverse_funding_reserve_usdt": "0.1",
             "initial_remaining_close_fees_usdt": "0.1",
             "initial_measured_book_impact_usdt": "0.1",
@@ -179,6 +181,7 @@ async def test_final_v2_reserves_update_twice_before_submit_and_never_after_orde
     journal = LiveOrderJournal(tmp_path / "state.sqlite3")
     await journal.initialise()
     now = datetime.now(UTC)
+    await journal.issue_fast_live_preflight("f" * 64, now + timedelta(minutes=10), now=now)
     action = await _prepare_fast_live(
         journal,
         pair_id="v2-final-reserves",
@@ -193,15 +196,42 @@ async def test_final_v2_reserves_update_twice_before_submit_and_never_after_orde
         "initial_measured_book_impact_usdt": Decimal("0.4"),
         "initial_total_reserves_usdt": Decimal("0.5"),
     }
-    first = await journal.update_final_opening_reserves(action.pair_action_id, components)
+    first = await journal.update_final_opening_reserves(
+        action.pair_action_id, components, data_generation_sha256="d" * 64
+    )
     await journal.mark_submit_attempted(
         action.pair_action_id,
         tuple(leg.client_order_id for leg in action.legs),
     )
-    second = await journal.update_final_opening_reserves(action.pair_action_id, components)
+    second = await journal.update_final_opening_reserves(
+        action.pair_action_id, components, data_generation_sha256="e" * 64
+    )
 
     assert first.risk_reservation["initial_total_reserves_usdt"] == "0.5"
+    assert first.risk_reservation["consumption_data_generation_sha256"] == "c" * 64
+    assert first.risk_reservation["latest_opening_data_generation_sha256"] == "d" * 64
     assert second.state == LiveActionState.SUBMITTING
+    assert second.risk_reservation["latest_opening_data_generation_sha256"] == "e" * 64
+    assert second.risk_reservation["opening_data_generation_sha256_history"] == [
+        "d" * 64,
+        "e" * 64,
+    ]
+    with sqlite3.connect(tmp_path / "state.sqlite3") as database:
+        details = tuple(
+            json.loads(str(row[0]))
+            for row in database.execute(
+                "SELECT details_json FROM live_action_transitions "
+                "WHERE pair_action_id = ? ORDER BY transition_id",
+                (action.pair_action_id,),
+            )
+        )
+    assert details[0]["fast_live_preflight_sha256"] == "f" * 64
+    assert details[0]["consumption_data_generation_sha256"] == "c" * 64
+    opening_details = tuple(item for item in details if "data_generation_sha256" in item)
+    assert [item["data_generation_sha256"] for item in opening_details] == [
+        "d" * 64,
+        "e" * 64,
+    ]
     await journal.record_order_event(
         action.pair_action_id,
         replace(
@@ -211,7 +241,9 @@ async def test_final_v2_reserves_update_twice_before_submit_and_never_after_orde
         "post-submit-event",
     )
     with pytest.raises(RuntimeError, match="after an order event"):
-        await journal.update_final_opening_reserves(action.pair_action_id, components)
+        await journal.update_final_opening_reserves(
+            action.pair_action_id, components, data_generation_sha256="f" * 64
+        )
 
 
 @pytest.mark.asyncio
@@ -222,6 +254,9 @@ async def test_fast_live_preflight_consumption_is_atomic_and_single_use(
     await journal.initialise()
     observed = datetime(2026, 8, 26, 12, tzinfo=UTC)
     activation = "c" * 64
+    await journal.issue_fast_live_preflight(
+        activation, observed + timedelta(seconds=600), now=observed
+    )
 
     results = await asyncio.gather(
         _prepare_fast_live(
@@ -252,6 +287,24 @@ async def test_fast_live_preflight_consumption_is_atomic_and_single_use(
             "SELECT count(*) FROM fast_live_preflight_consumption"
         ).fetchone() == (1,)
         assert database.execute("SELECT count(*) FROM live_pair_actions").fetchone() == (1,)
+
+
+@pytest.mark.asyncio
+async def test_unissued_rehashed_fast_live_preflight_cannot_create_intent(
+    tmp_path: Path,
+) -> None:
+    journal = LiveOrderJournal(tmp_path / "state.sqlite3")
+    await journal.initialise()
+    observed = datetime(2026, 8, 26, 12, tzinfo=UTC)
+    with pytest.raises(RuntimeError, match="not durably issued"):
+        await _prepare_fast_live(
+            journal,
+            pair_id="forged",
+            base="BTC",
+            preflight_sha256="e" * 64,
+            expires_at=observed + timedelta(seconds=600),
+            now=observed,
+        )
 
 
 @pytest.mark.asyncio
