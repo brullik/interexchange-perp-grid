@@ -164,6 +164,12 @@ def test_windows_onboarding_keeps_live_consent_out_of_encrypted_profile() -> Non
     assert "$secure.MakeReadOnly()" in onboarding
     assert "$secretTextBox.Clear()" in onboarding
     assert "Write-Host $plain" not in onboarding
+    assert "Windows PowerShell 5.1 rejects a null backup path" in onboarding
+    assert "[IO.File]::Replace($temporary, $Destination, $backup)" in onboarding
+    assert "[IO.File]::Replace($temporary, $resolved, $null)" not in onboarding
+    assert "Existing-profile ACL failure did not restore the old profile" in onboarding
+    assert "New profile survived failed ACL hardening" in onboarding
+    assert "Credential profile update failed and rollback failed closed" in onboarding
     assert 'FastLiveRoute = "BTC:bybit>okx"' in onboarding
     assert "LocalLiveUnlockVerifier = New-LiveUnlockVerifier" in onboarding
     assert "pbkdf2-sha256" in onboarding
@@ -327,6 +333,25 @@ $env:IPEG_TELEGRAM_BOT_TOKEN = ([string]123456789) + ":" + ("A" * 33)
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell 5.1 only")
 def test_windows_onboarding_secure_string_runtime_round_trip() -> None:
+    atomic_completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(Path("scripts/laptop-onboard.ps1").resolve()),
+            "-AtomicReplaceSelfTest",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=20,
+    )
+
+    assert "Atomic existing-profile replacement PASS" in atomic_completed.stdout
+
     completed = subprocess.run(
         [
             "powershell.exe",

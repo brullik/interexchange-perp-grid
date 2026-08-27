@@ -3,7 +3,8 @@ param(
     [string]$OutputPath = "state/laptop-profile.clixml",
     [switch]$RuntimeSelfTest,
     [switch]$DialogSelfTest,
-    [switch]$UnlockVerifierSelfTest
+    [switch]$UnlockVerifierSelfTest,
+    [switch]$AtomicReplaceSelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,6 +31,192 @@ function Convert-PlainTextToSecureString([string]$Value) {
     }
     $secure.MakeReadOnly()
     return $secure
+}
+
+function Remove-FileWithRetry([string]$Path) {
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        if (-not [IO.File]::Exists($Path)) { return }
+        try {
+            [IO.File]::Delete($Path)
+            return
+        } catch [IO.IOException] {
+            if ($attempt -eq 9) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
+function Remove-EmptyDirectoryWithRetry([string]$Path) {
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        if (-not [IO.Directory]::Exists($Path)) { return }
+        try {
+            [IO.Directory]::Delete($Path)
+            return
+        } catch [IO.IOException] {
+            if ($attempt -eq 9) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
+function Set-OwnerOnlyAcl([string]$Path) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $security = [Security.AccessControl.FileSecurity]::new()
+    $security.SetAccessRuleProtection($true, $false)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        $identity.User,
+        [Security.AccessControl.FileSystemRights]::FullControl,
+        [Security.AccessControl.AccessControlType]::Allow
+    )
+    $security.AddAccessRule($rule)
+    [IO.File]::SetAccessControl($Path, $security)
+
+    $verified = [IO.File]::GetAccessControl(
+        $Path,
+        [Security.AccessControl.AccessControlSections]::Access -bor
+            [Security.AccessControl.AccessControlSections]::Owner
+    )
+    $rules = @($verified.GetAccessRules(
+        $true,
+        $false,
+        [Security.Principal.SecurityIdentifier]
+    ))
+    if (
+        $verified.GetOwner([Security.Principal.SecurityIdentifier]) -ne $identity.User -or
+        -not $verified.AreAccessRulesProtected -or
+        $rules.Count -ne 1 -or
+        $rules[0].IdentityReference -ne $identity.User -or
+        $rules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+        ($rules[0].FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne
+            [Security.AccessControl.FileSystemRights]::FullControl
+    ) {
+        throw "Credential profile ACL is not restricted to the current Windows identity"
+    }
+}
+
+function Write-AtomicUtf8File(
+    [string]$Destination,
+    [string]$Value,
+    [scriptblock]$AclHardener
+) {
+    $parent = Split-Path -Parent $Destination
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $temporary = "$Destination.tmp"
+    $backup = "$Destination.bak"
+    $discard = "$Destination.discard"
+    $hadDestination = [IO.File]::Exists($Destination)
+    $originalAcl = if ($hadDestination) {
+        [IO.File]::GetAccessControl(
+            $Destination,
+            [Security.AccessControl.AccessControlSections]::Access
+        )
+    } else { $null }
+    $installed = $false
+    $transactionClosed = $false
+    if ([IO.File]::Exists($backup) -or [IO.File]::Exists($discard)) {
+        throw "Previous credential profile transaction requires fail-closed recovery"
+    }
+    try {
+        [IO.File]::WriteAllText(
+            $temporary,
+            $Value,
+            [Text.UTF8Encoding]::new($false)
+        )
+        if ($hadDestination) {
+            # Windows PowerShell 5.1 rejects a null backup path in this overload.
+            # Retain a real same-directory backup until ACL verification succeeds.
+            [IO.File]::Replace($temporary, $Destination, $backup)
+        } else {
+            [IO.File]::Move($temporary, $Destination)
+        }
+        $installed = $true
+        & $AclHardener $Destination
+        Remove-FileWithRetry -Path $backup
+        $transactionClosed = $true
+    } catch {
+        $failure = $_.Exception
+        if ($installed) {
+            try {
+                if ($hadDestination) {
+                    if (-not [IO.File]::Exists($backup)) {
+                        throw "Credential profile rollback backup is missing"
+                    }
+                    [IO.File]::Replace($backup, $Destination, $discard)
+                    if ($null -ne $originalAcl) {
+                        [IO.File]::SetAccessControl($Destination, $originalAcl)
+                    }
+                    Remove-FileWithRetry -Path $discard
+                } else {
+                    Remove-FileWithRetry -Path $Destination
+                }
+                $transactionClosed = $true
+            } catch {
+                throw "Credential profile update failed and rollback failed closed: $($_.Exception.Message)"
+            }
+        }
+        throw $failure
+    } finally {
+        Remove-FileWithRetry -Path $temporary
+        if ($transactionClosed) {
+            Remove-FileWithRetry -Path $backup
+            Remove-FileWithRetry -Path $discard
+        }
+    }
+}
+
+if ($AtomicReplaceSelfTest) {
+    $testRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "ipeg-onboard-atomic-" + [Guid]::NewGuid().ToString("N")
+    )
+    $testPath = Join-Path $testRoot "profile.clixml"
+    $realAclHardener = { param([string]$Path) Set-OwnerOnlyAcl -Path $Path }
+    $failingAclHardener = { param([string]$Path) throw "injected ACL hardening failure" }
+    try {
+        Write-AtomicUtf8File `
+            -Destination $testPath -Value "first" -AclHardener $realAclHardener
+        try {
+            Write-AtomicUtf8File `
+                -Destination $testPath -Value "must-rollback" `
+                -AclHardener $failingAclHardener
+            throw "Existing-profile ACL failure did not fail closed"
+        } catch {
+            if ($_.Exception.Message -notlike "*injected ACL hardening failure*") { throw }
+        }
+        if ([IO.File]::ReadAllText($testPath) -cne "first") {
+            throw "Existing-profile ACL failure did not restore the old profile"
+        }
+        Remove-FileWithRetry -Path $testPath
+        try {
+            Write-AtomicUtf8File `
+                -Destination $testPath -Value "must-delete" `
+                -AclHardener $failingAclHardener
+            throw "New-profile ACL failure did not fail closed"
+        } catch {
+            if ($_.Exception.Message -notlike "*injected ACL hardening failure*") { throw }
+        }
+        if ([IO.File]::Exists($testPath)) {
+            throw "New profile survived failed ACL hardening"
+        }
+        Write-AtomicUtf8File `
+            -Destination $testPath -Value "first" -AclHardener $realAclHardener
+        Write-AtomicUtf8File `
+            -Destination $testPath -Value "second" -AclHardener $realAclHardener
+        if ([IO.File]::ReadAllText($testPath) -cne "second") {
+            throw "Atomic existing-profile replacement self-test failed"
+        }
+        if (
+            [IO.File]::Exists("$testPath.tmp") -or
+            [IO.File]::Exists("$testPath.bak") -or
+            [IO.File]::Exists("$testPath.discard")
+        ) {
+            throw "Atomic existing-profile replacement left temporary material"
+        }
+    } finally {
+        Remove-FileWithRetry -Path $testPath
+        Remove-EmptyDirectoryWithRetry -Path $testRoot
+    }
+    Write-Host "Atomic existing-profile replacement PASS"
+    return
 }
 
 if ($RuntimeSelfTest) {
@@ -308,30 +495,14 @@ $payload = [pscustomobject]@{
 
 $root = Split-Path -Parent $PSScriptRoot
 $resolved = [System.IO.Path]::GetFullPath((Join-Path $root $OutputPath))
-$parent = Split-Path -Parent $resolved
-New-Item -ItemType Directory -Path $parent -Force | Out-Null
-$temporary = "$resolved.tmp"
+$serialized = $null
 try {
     $serialized = [Management.Automation.PSSerializer]::Serialize($payload)
-    [IO.File]::WriteAllText(
-        $temporary,
-        $serialized,
-        [Text.UTF8Encoding]::new($false)
-    )
-    if ([IO.File]::Exists($resolved)) {
-        [IO.File]::Replace($temporary, $resolved, $null)
-    } else {
-        [IO.File]::Move($temporary, $resolved)
-    }
-    $owner = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-    & icacls.exe $resolved /inheritance:r /grant:r "${owner}:(F)" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Credential profile ACL hardening failed"
-    }
+    $aclHardener = { param([string]$Path) Set-OwnerOnlyAcl -Path $Path }
+    Write-AtomicUtf8File `
+        -Destination $resolved -Value $serialized -AclHardener $aclHardener
 } finally {
-    if ([IO.File]::Exists($temporary)) {
-        [IO.File]::Delete($temporary)
-    }
+    $serialized = $null
 }
 
 Write-Host "Encrypted current-user DPAPI credentials stored outside Git: $resolved"
